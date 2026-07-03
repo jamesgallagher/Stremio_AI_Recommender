@@ -13,6 +13,17 @@ const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', true); // correct req.protocol/host behind Cloudflare Tunnel
 
+// Request logging: all /api calls and every error response, with timestamps.
+// docker logs ai-recommender  (or the Unraid log button) shows these.
+app.use((req, res, next) => {
+  res.on('finish', () => {
+    if (res.statusCode >= 400 || req.originalUrl.startsWith('/api')) {
+      console.log(`[http] ${new Date().toISOString()} ${req.method} ${req.originalUrl} -> ${res.statusCode}`);
+    }
+  });
+  next();
+});
+
 // Public assets (Unraid icon, favicon, Stremio manifest logo) — intentionally
 // outside admin auth: Unraid and Stremio fetch these without credentials.
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');

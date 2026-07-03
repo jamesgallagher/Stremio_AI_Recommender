@@ -118,6 +118,7 @@ function render(profiles) {
   container.innerHTML = profiles.map(p => {
     const installUrl = p.install_url;
     const keysOk = Object.values(p.keys_set).every(Boolean);
+    const traktKeysOk = p.keys_set.trakt_client_id && p.keys_set.trakt_client_secret;
     const badge = p.trakt_connected
       ? '<span class="badge ok">Trakt connected</span>'
       : (keysOk ? '<span class="badge warn">Trakt not authorized</span>' : '<span class="badge err">Keys missing</span>');
@@ -135,15 +136,34 @@ function render(profiles) {
       </div>
 
       <details>
-        <summary>API keys ${keysOk ? '✓' : '— required'}</summary>
-        <div class="muted" style="margin-top:8px">Create each key while signed in as <b>${esc(p.name)}</b>'s account on that service.</div>
+        <summary>Trakt — account & authorization ${p.trakt_connected ? '✓ connected' : (traktKeysOk ? '— ready to connect' : '— keys required')}</summary>
+        <div class="muted" style="margin-top:8px">Steps: 1) create a Trakt API app while signed in as <b>${esc(p.name)}</b>'s Trakt account, 2) paste both values, 3) Save &amp; Test, 4) Connect.</div>
         <div class="cols">
-          <div><label>Trakt Client ID <span class="muted">(${p.keys_preview.trakt_client_id || 'not set'})</span>
+          <div><label>Client ID <span class="muted">(${p.keys_preview.trakt_client_id || 'not set'})</span>
               <a class="getkey" href="https://app.trakt.tv/settings/advanced?mode=media" target="_blank" rel="noopener">get key ↗</a></label>
             <input type="password" data-key="trakt_client_id" placeholder="leave blank to keep"></div>
-          <div><label>Trakt Client Secret <span class="muted">(${p.keys_preview.trakt_client_secret || 'not set'})</span>
+          <div><label>Client Secret <span class="muted">(${p.keys_preview.trakt_client_secret || 'not set'})</span>
               <a class="getkey" href="https://app.trakt.tv/settings/advanced?mode=media" target="_blank" rel="noopener">get key ↗</a></label>
             <input type="password" data-key="trakt_client_secret" placeholder="leave blank to keep"></div>
+        </div>
+        <div style="margin-top:10px" class="row">
+          <button onclick="saveKeys('${p.id}')">Save</button>
+          <button class="ghost mini" onclick="testKey('${p.id}','trakt',this)">Test</button><span class="tres" data-tres="trakt"></span>
+        </div>
+        <div class="trakt-flow" style="margin-top:12px; padding-top:10px; border-top:1px solid var(--border)">
+          ${p.trakt_connected
+            ? `<div class="muted">✓ Authorized. Token auto-refreshes; expires ${p.trakt_expires_at ? new Date(p.trakt_expires_at).toLocaleDateString() : '—'}.</div>
+               <div style="margin-top:8px"><button class="ghost" onclick="disconnectTrakt('${p.id}')">Disconnect</button></div>`
+            : `<div><button onclick="connectTrakt('${p.id}')" ${traktKeysOk ? '' : 'disabled'}>Connect Trakt</button>
+               <span class="muted"> — sign in as <b>${esc(p.name)}</b>'s Trakt account when prompted${traktKeysOk ? '' : ' (save both keys above first)'}</span></div>
+               <div class="flow-status" style="margin-top:10px"></div>`}
+        </div>
+      </details>
+
+      <details>
+        <summary>API keys — TMDB &amp; Gemini ${p.keys_set.tmdb_api_key && p.keys_set.gemini_api_key ? '✓' : '— required'}</summary>
+        <div class="muted" style="margin-top:8px">Create each key while signed in as <b>${esc(p.name)}</b>'s account on that service.</div>
+        <div class="cols">
           <div><label>TMDB API Key <span class="muted">(${p.keys_preview.tmdb_api_key || 'not set'})</span>
               <a class="getkey" href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">get key ↗</a></label>
             <input type="password" data-key="tmdb_api_key" placeholder="leave blank to keep"></div>
@@ -152,23 +172,9 @@ function render(profiles) {
             <input type="password" data-key="gemini_api_key" placeholder="leave blank to keep"></div>
         </div>
         <div style="margin-top:10px" class="row">
-          <button onclick="saveKeys('${p.id}')">Save keys</button>
-          <span class="muted">Test buttons save any filled-in fields first:</span>
-          <button class="ghost mini" onclick="testKey('${p.id}','trakt',this)">Test Trakt</button><span class="tres" data-tres="trakt"></span>
+          <button onclick="saveKeys('${p.id}')">Save</button>
           <button class="ghost mini" onclick="testKey('${p.id}','tmdb',this)">Test TMDB</button><span class="tres" data-tres="tmdb"></span>
           <button class="ghost mini" onclick="testKey('${p.id}','gemini',this)">Test Gemini</button><span class="tres" data-tres="gemini"></span>
-        </div>
-      </details>
-
-      <details>
-        <summary>Trakt authorization</summary>
-        <div class="trakt-flow">
-          ${p.trakt_connected
-            ? `<div class="muted">Connected. Token auto-refreshes; expires ${p.trakt_expires_at ? new Date(p.trakt_expires_at).toLocaleDateString() : '—'}.</div>
-               <div style="margin-top:8px"><button class="ghost" onclick="disconnectTrakt('${p.id}')">Disconnect</button></div>`
-            : `<div style="margin-top:8px"><button onclick="connectTrakt('${p.id}')" ${keysOk ? '' : 'disabled'}>Connect Trakt</button>
-               <span class="muted"> — sign in as <b>${esc(p.name)}</b>'s Trakt account when prompted</span></div>
-               <div class="flow-status" style="margin-top:10px"></div>`}
         </div>
       </details>
 
@@ -269,6 +275,7 @@ async function connectTrakt(id) {
   const card = document.querySelector(`[data-id="${id}"]`);
   const statusEl = card.querySelector('.flow-status');
   try {
+    await saveKeys(id, true); // persist anything typed but not yet saved
     const { user_code, verification_url } = await api(`/profiles/${id}/trakt/connect`, { method: 'POST' });
     statusEl.innerHTML = `Go to <a href="${verification_url}" target="_blank" style="color:var(--accent)">${verification_url}</a> and enter:
       <div class="pin">${user_code}</div><div class="muted">Waiting for authorization…</div>`;

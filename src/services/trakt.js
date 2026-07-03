@@ -18,14 +18,23 @@ function headers(profile, withAuth = true) {
 
 // ---- Device flow ----
 async function startDeviceFlow(profile) {
+  console.log(`[trakt] ${profile.name}: requesting device code (client_id ${profile.keys.trakt_client_id.slice(0, 8)}…)`);
   const res = await fetch(`${API}/oauth/device/code`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ client_id: profile.keys.trakt_client_id }),
   });
-  if (!res.ok) throw new Error(`Trakt device code failed (${res.status}) — check the Client ID`);
-  // { device_code, user_code, verification_url, expires_in, interval }
-  return res.json();
+  if (!res.ok) {
+    const body = (await res.text().catch(() => '')).slice(0, 300);
+    console.error(`[trakt] ${profile.name}: device code failed ${res.status}${body ? ` — response: ${body}` : ''}`);
+    const hint = res.status === 403
+      ? ' (403 = Trakt does not recognize this Client ID — re-copy it from your Trakt app page)'
+      : ' — check the Client ID';
+    throw new Error(`Trakt device code failed (${res.status})${body ? `: ${body}` : ''}${hint}`);
+  }
+  const dc = await res.json();
+  console.log(`[trakt] ${profile.name}: device code issued, user code ${dc.user_code}, expires in ${dc.expires_in}s`);
+  return dc; // { device_code, user_code, verification_url, expires_in, interval }
 }
 
 async function pollDeviceToken(profile, deviceCode) {
@@ -43,8 +52,14 @@ async function pollDeviceToken(profile, deviceCode) {
   if (res.status === 404) return { error: 'Invalid device code (expired?)' };
   if (res.status === 410) return { error: 'Code expired — start again' };
   if (res.status === 418) return { error: 'User denied the authorization' };
-  if (!res.ok) return { error: `Trakt token poll failed (${res.status})` };
+  if (res.status === 403) return { error: 'Trakt rejected the Client Secret (403) — re-copy it from your Trakt app page' };
+  if (!res.ok) {
+    const body = (await res.text().catch(() => '')).slice(0, 200);
+    console.error(`[trakt] ${profile.name}: token poll failed ${res.status}${body ? ` — ${body}` : ''}`);
+    return { error: `Trakt token poll failed (${res.status})${body ? `: ${body}` : ''}` };
+  }
   const tok = await res.json();
+  console.log(`[trakt] ${profile.name}: authorization complete, token expires ${new Date(Date.now() + (tok.expires_in || 7776000) * 1000).toISOString()}`);
   return {
     token: {
       access_token: tok.access_token,
@@ -67,7 +82,12 @@ async function refreshToken(profile) {
       grant_type: 'refresh_token',
     }),
   });
-  if (!res.ok) throw new Error(`Trakt token refresh failed (${res.status}) — profile may need re-authorization`);
+  if (!res.ok) {
+    const body = (await res.text().catch(() => '')).slice(0, 200);
+    console.error(`[trakt] ${profile.name}: token refresh failed ${res.status}${body ? ` — ${body}` : ''}`);
+    throw new Error(`Trakt token refresh failed (${res.status}) — profile may need re-authorization`);
+  }
+  console.log(`[trakt] ${profile.name}: token refreshed`);
   const tok = await res.json();
   const trakt_auth = {
     access_token: tok.access_token,

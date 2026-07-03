@@ -85,6 +85,7 @@ router.delete('/profiles/:id', (req, res) => {
 // ---- Key testing ----
 async function testTrakt(profile) {
   if (!profile.keys.trakt_client_id) return { ok: false, error: 'Client ID not set' };
+  if (!profile.keys.trakt_client_secret) return { ok: false, error: 'Client Secret not set — both fields are required before Trakt can be used' };
   // Full check when already authorized
   if (profile.trakt_auth?.access_token) {
     const res = await fetch('https://api.trakt.tv/sync/last_activities', {
@@ -137,8 +138,11 @@ router.post('/profiles/:id/test/:service', async (req, res) => {
   const tester = TESTERS[req.params.service];
   if (!tester) return res.status(400).json({ error: 'Unknown service' });
   try {
-    res.json(await tester(profile));
+    const result = await tester(profile);
+    console.log(`[test] ${profile.name}/${req.params.service}: ${result.ok ? `OK — ${result.detail}` : `FAIL — ${result.error}`}`);
+    res.json(result);
   } catch (err) {
+    console.error(`[test] ${profile.name}/${req.params.service}: ERROR — ${err.message}`);
     res.json({ ok: false, error: `Test failed: ${err.message}` });
   }
 });
@@ -180,9 +184,11 @@ router.post('/profiles/:id/trakt/connect', async (req, res) => {
         if (result.token) {
           config.updateProfile(profile.id, { trakt_auth: result.token });
           flow.state = 'connected';
+          console.log(`[trakt] ${profile.name}: connected via device flow`);
         } else {
           flow.state = 'error';
           flow.error = result.error || 'Authorization failed';
+          console.error(`[trakt] ${profile.name}: device flow failed — ${flow.error}`);
         }
       } catch (err) {
         clearInterval(poll);
