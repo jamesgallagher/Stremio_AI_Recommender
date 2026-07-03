@@ -128,7 +128,7 @@ function render(profiles) {
       <div class="row">
         <h2>${esc(p.name)}</h2> ${badge} ${rebuilding}
         <div class="grow"></div>
-        <button class="ghost" onclick="rebuildNow('${p.id}')" ${p.trakt_connected ? '' : 'disabled'}>Rebuild now</button>
+        <button class="ghost" onclick="rebuildNow('${p.id}', this)" ${p.trakt_connected && !p.status.rebuilding ? '' : 'disabled'}>${p.status.rebuilding ? 'Rebuilding…' : 'Rebuild now'}</button>
         <button class="danger" onclick="delProfile('${p.id}', '${esc(p.name)}')">Delete</button>
       </div>
       <div class="status-line">
@@ -294,16 +294,22 @@ async function disconnectTrakt(id) {
   load();
 }
 
-async function rebuildNow(id) {
-  toast('Rebuild started — this can take a minute');
+async function rebuildNow(id, btn) {
+  // Standard async-action pattern: disable + progress label while running,
+  // transient result state on completion, then revert to the idle state.
+  btn.disabled = true;
+  btn.textContent = 'Rebuilding…';
   try {
     const { results } = await api(`/profiles/${id}/rebuild`, { method: 'POST' });
-    const parts = Object.entries(results).map(([t, r]) => `${t}: ${r.ok ? r.count + ' ✓' : '✗ ' + r.error}`);
+    const allOk = Object.values(results).every(r => r.ok);
+    const parts = Object.entries(results).map(([t, r]) => `${t}: ${r.ok ? r.count + ' titles ✓' : '✗ ' + r.error}`);
     toast(parts.join(' · '));
+    btn.textContent = allOk ? '✓ Rebuilt' : '⚠ Partial — see message';
   } catch (err) {
     toast('Rebuild failed: ' + err.message);
+    btn.textContent = '✗ Failed';
   }
-  load();
+  setTimeout(load, 2500); // re-render from server state -> "Rebuild now", enabled
 }
 
 function copyText(t) { navigator.clipboard.writeText(t).then(() => toast('Copied')); }
