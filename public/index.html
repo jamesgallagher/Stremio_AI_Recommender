@@ -116,7 +116,7 @@ function catalogLine(label, entry) {
 function render(profiles) {
   const container = $('#profiles');
   container.innerHTML = profiles.map(p => {
-    const base = location.origin + '/addon/' + p.token;
+    const installUrl = p.install_url;
     const keysOk = Object.values(p.keys_set).every(Boolean);
     const badge = p.trakt_connected
       ? '<span class="badge ok">Trakt connected</span>'
@@ -194,10 +194,11 @@ function render(profiles) {
 
       <details>
         <summary>Install in Stremio / Nuvio</summary>
-        <div class="install">${base}/manifest.json</div>
+        ${p.external_url_set ? '' : `<div style="color:var(--warn);font-size:12px;margin:6px 0">⚠ EXTERNAL_URL is not set — this link uses the address you opened this page from, which Stremio clients outside your network can't reach. Set the EXTERNAL_URL variable to your public hostname (e.g. your Cloudflare Tunnel URL).</div>`}
+        <div class="install">${esc(installUrl)}</div>
         <div style="margin-top:8px" class="row">
-          <button class="ghost" onclick="copyText('${base}/manifest.json')">Copy URL</button>
-          <a href="${base.replace(/^https?:\/\//, 'stremio://')}/manifest.json"><button class="ghost">Open in Stremio</button></a>
+          <button class="ghost" onclick="copyText('${esc(installUrl)}')">Copy URL</button>
+          <a href="${esc(installUrl.replace(/^https?:\/\//, 'stremio://'))}"><button class="ghost">Open in Stremio</button></a>
         </div>
         <div class="muted" style="margin-top:6px">Paste the URL in Stremio → Addons → Add addon. This link is ${esc(p.name)}'s personal list — don't share it outside the family.</div>
       </details>

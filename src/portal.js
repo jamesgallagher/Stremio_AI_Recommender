@@ -17,11 +17,15 @@ function redactKey(v) {
   return v.length > 8 ? `${v.slice(0, 4)}…${v.slice(-4)}` : '••••';
 }
 
-function publicProfile(p) {
+const { baseUrl, normalizeExternal } = require('./baseurl');
+
+function publicProfile(p, req) {
   return {
     id: p.id,
     name: p.name,
     token: p.token,
+    install_url: `${baseUrl(req)}/addon/${p.token}/manifest.json`,
+    external_url_set: !!normalizeExternal(process.env.EXTERNAL_URL),
     filters: p.filters,
     keys_set: {
       trakt_client_id: !!p.keys.trakt_client_id,
@@ -46,14 +50,14 @@ router.get('/genres', (req, res) => {
 });
 
 router.get('/profiles', (req, res) => {
-  res.json({ profiles: config.listProfiles().map(publicProfile) });
+  res.json({ profiles: config.listProfiles().map((p) => publicProfile(p, req)) });
 });
 
 router.post('/profiles', (req, res) => {
   const name = (req.body?.name || '').trim();
   if (!name) return res.status(400).json({ error: 'Name is required' });
   const profile = config.addProfile(name);
-  res.json({ profile: publicProfile(profile) });
+  res.json({ profile: publicProfile(profile, req) });
 });
 
 router.put('/profiles/:id', (req, res) => {
@@ -69,7 +73,7 @@ router.put('/profiles/:id', (req, res) => {
   }
   const profile = config.updateProfile(req.params.id, patch);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
-  res.json({ profile: publicProfile(profile) });
+  res.json({ profile: publicProfile(profile, req) });
 });
 
 router.delete('/profiles/:id', (req, res) => {

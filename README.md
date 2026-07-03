@@ -102,6 +102,7 @@ Docker tab → **Add Container** (or point a Compose stack at this repo's
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
+| `EXTERNAL_URL` | Yes (for real use) | — | Public base URL, e.g. `https://recs.yourdomain.com` (your Cloudflare Tunnel hostname). Baked into install URLs and the manifest logo. Without it, links use the LAN address you opened the portal from — Stremio clients outside your network can't reach those |
 | `ADMIN_USER` | Recommended | — | Admin portal username (Basic Auth) |
 | `ADMIN_PASSWORD` | Recommended | — | Admin portal password. If either is unset, `/configure` is unprotected (startup log warns) |
 | `PORT` | No | `7000` | Internal HTTP port — only change if you also change the container port mapping |
@@ -117,7 +118,9 @@ admin credentials, add profiles.
 
 ## Exposure (Cloudflare Tunnel)
 
-Point a tunnel at `http://<unraid-ip>:7000`. Then:
+Point a tunnel at `http://<unraid-ip>:7000` and set `EXTERNAL_URL` to the
+tunnel hostname (e.g. `https://recs.yourdomain.com`) so install links and the
+manifest point somewhere Stremio clients can actually reach. Then:
 
 - `/addon/*` — must be publicly reachable **without** auth (Stremio can't do
   login prompts). Safe: profile tokens are unguessable 128-bit values.

@@ -50,9 +50,10 @@ router.use((req, res, next) => {
   next();
 });
 
+const { baseUrl } = require('./baseurl');
+
 router.get('/manifest.json', (req, res) => {
-  const baseUrl = `${req.protocol}://${req.get('host')}`;
-  res.json(manifestFor(req.profile, baseUrl));
+  res.json(manifestFor(req.profile, baseUrl(req)));
 });
 
 // Matches /catalog/movie/ai-recs-movies.json and .../ai-recs-movies/skip=20.json

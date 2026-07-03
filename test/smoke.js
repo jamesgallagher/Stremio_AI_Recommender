@@ -96,6 +96,17 @@ ok('gemini: parses fenced + raw JSON output', () => {
   assert.throws(() => gemini.parseJsonArray('{"not":"array"}'));
 });
 
+ok('baseurl: trailing slashes and missing schemes normalized', () => {
+  const { normalizeExternal } = require('../src/baseurl');
+  assert.strictEqual(normalizeExternal('https://test.url/'), 'https://test.url');
+  assert.strictEqual(normalizeExternal('https://test.url///'), 'https://test.url');
+  assert.strictEqual(normalizeExternal('http://test.url'), 'http://test.url');
+  assert.strictEqual(normalizeExternal(' recs.example.com/ '), 'https://recs.example.com');
+  assert.strictEqual(normalizeExternal('HTTPS://Test.URL/'), 'HTTPS://Test.URL');
+  assert.strictEqual(normalizeExternal(''), '');
+  assert.strictEqual(normalizeExternal(undefined), '');
+});
+
 ok('tmdb: genre aliases map across movie/tv vocabularies', () => {
   const movieIds = tmdb.excludedGenreIds(['Horror', 'Science Fiction'], 'movie');
   assert.ok(movieIds.has(27) && movieIds.has(878));

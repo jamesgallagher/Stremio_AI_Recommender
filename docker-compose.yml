@@ -15,6 +15,7 @@ services:
     environment:
       - PORT=7000
       - DATA_DIR=/data
+      - EXTERNAL_URL=https://recs.example.com   # public hostname (Cloudflare Tunnel etc.) — used in install URLs
       - ADMIN_USER=admin            # admin portal login (change these!)
       - ADMIN_PASSWORD=change-me    # if either is unset, the portal is unprotected
       # - STALE_HOURS=24        # cache staleness threshold
