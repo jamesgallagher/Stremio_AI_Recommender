@@ -131,8 +131,10 @@ async function resolveTitle(apiKey, type, title, year, log = console) {
   }
 }
 
-// Cold-start path: no Gemini, just TMDB discover driven by the same profile filters.
-async function discover(apiKey, type, filters, count = 20, log = console) {
+// Cold-start path: no Gemini, just TMDB discover driven by the same profile
+// filters. One page per call — the rebuild pipeline walks pages until its
+// quota is filled (post-filtering can discard many results per page).
+async function discoverPage(apiKey, type, filters, page = 1, log = console) {
   const endpoint = type === 'series' ? 'discover/tv' : 'discover/movie';
   const dateField = type === 'series' ? 'first_air_date' : 'primary_release_date';
   const params = {
@@ -141,6 +143,7 @@ async function discover(apiKey, type, filters, count = 20, log = console) {
     'vote_average.gte': filters.min_rating || 0,
     'vote_count.gte': type === 'series' ? 100 : 200, // avoid obscure high-rated titles
     include_adult: false,
+    page,
   };
   if (filters.max_age_years > 0) {
     const from = new Date();
@@ -150,22 +153,18 @@ async function discover(apiKey, type, filters, count = 20, log = console) {
   const excludeIds = excludedGenreIds(filters.excluded_genres, type);
   if (excludeIds.size) params.without_genres = [...excludeIds].join(',');
 
+  const data = await get(apiKey, endpoint, params);
+  if (page > (data.total_pages || 1)) return [];
   const metas = [];
-  for (let page = 1; page <= 3 && metas.length < count; page++) {
-    const data = await get(apiKey, endpoint, { ...params, page });
-    for (const item of data.results || []) {
-      if (metas.length >= count) break;
-      const extEndpoint = type === 'series' ? `tv/${item.id}/external_ids` : `movie/${item.id}/external_ids`;
-      try {
-        const ext = await get(apiKey, extEndpoint);
-        if (ext.imdb_id) metas.push(toMeta(item, type, ext.imdb_id));
-      } catch (err) {
-        log.warn(`[tmdb] discover external_ids error: ${err.message}`);
-      }
+  for (const item of data.results || []) {
+    const extEndpoint = type === 'series' ? `tv/${item.id}/external_ids` : `movie/${item.id}/external_ids`;
+    try {
+      const ext = await get(apiKey, extEndpoint);
+      if (ext.imdb_id) metas.push(toMeta(item, type, ext.imdb_id));
+    } catch (err) {
+      log.warn(`[tmdb] discover external_ids error: ${err.message}`);
     }
-    if (!data.results?.length || page >= (data.total_pages || 1)) break;
   }
-  log.log(`[tmdb] discover ${type}: ${metas.length} titles`);
   return metas;
 }
 
@@ -175,5 +174,5 @@ module.exports = {
   GENRE_ALIASES,
   excludedGenreIds,
   resolveTitle,
-  discover,
+  discoverPage,
 };

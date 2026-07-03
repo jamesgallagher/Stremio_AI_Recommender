@@ -60,6 +60,21 @@ Each profile carries its own full key set — nothing is shared.
 First list generates within a minute or two (a "warming up" card shows until
 then). After that, lists refresh in the background roughly daily.
 
+## Kids mode (Common Sense age limit)
+
+Per profile: tick **Limit to age** in Filters and pick a tier (5+, 6+, 8+,
+10+, 12+, 13+, 15+ — granular at the younger end). Requires that profile's
+**MDBList API key** (free: sign in at mdblist.com → Preferences; 1,000
+requests/day, a rebuild uses a few dozen).
+
+Strict by design: with an age limit set, **every** candidate title is checked
+against Common Sense Media (via MDBList) at rebuild time. Titles CSM hasn't
+rated are never listed — there is no fallback to MPAA/TMDB certifications or
+any other rating system. The Gemini prompt is also steered toward
+age-appropriate content, but the CSM check is the enforcement. If MDBList
+lookups fail mid-rebuild, the previous list is kept rather than serving an
+unverified one.
+
 ## Behavior notes
 
 - **Cold start:** with fewer than 3 watched titles, the list comes from TMDB
@@ -67,7 +82,15 @@ then). After that, lists refresh in the background roughly daily.
   exists, the next rebuild upgrades to personalized ("picked for you").
 - **De-dupe guarantee:** everything ever watched on Trakt (even one episode of
   a show) is excluded, matched on canonical IMDb/TMDB IDs after resolution —
-  not on title text.
+  not on title text. Between daily rebuilds, a cheap hourly watched-set
+  refresh prunes newly-watched titles from the served list, so items you just
+  watched disappear within the hour.
+- **Fill-to-quota:** each catalog targets its profile's list size (default
+  20). The Gemini path runs extra suggestion rounds (expanding the exclusion
+  list each time) and the discover path walks extra pages until the quota is
+  filled or attempts are exhausted — heavy watchers still get full lists.
+- **Full prompt logging:** every Gemini prompt is printed in the container
+  log between PROMPT START/END markers for troubleshooting.
 - **Failure = stale, never empty:** if Gemini/TMDB/Trakt error out or return
   too few usable titles (<5), the previous list stays live and a 30 min
   backoff prevents API hammering.

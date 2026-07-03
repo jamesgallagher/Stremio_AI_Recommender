@@ -5,6 +5,7 @@ const config = require('./config');
 const rebuild = require('./rebuild');
 const trakt = require('./services/trakt');
 const tmdb = require('./services/tmdb');
+const mdblistService = require('./services/mdblist');
 
 const router = express.Router();
 router.use(express.json());
@@ -33,6 +34,7 @@ function publicProfile(p, req) {
       tmdb_api_key: !!p.keys.tmdb_api_key,
       gemini_api_key: !!p.keys.gemini_api_key,
       rpdb_api_key: !!p.keys.rpdb_api_key,
+      mdblist_api_key: !!p.keys.mdblist_api_key,
     },
     keys_preview: {
       trakt_client_id: redactKey(p.keys.trakt_client_id),
@@ -40,6 +42,7 @@ function publicProfile(p, req) {
       tmdb_api_key: redactKey(p.keys.tmdb_api_key),
       gemini_api_key: redactKey(p.keys.gemini_api_key),
       rpdb_api_key: redactKey(p.keys.rpdb_api_key),
+      mdblist_api_key: redactKey(p.keys.mdblist_api_key),
     },
     trakt_connected: !!p.trakt_auth?.access_token,
     trakt_expires_at: p.trakt_auth?.expires_at || null,
@@ -69,7 +72,7 @@ router.put('/profiles/:id', (req, res) => {
   if (req.body.keys) {
     // Only overwrite keys that were actually provided (non-empty)
     patch.keys = {};
-    for (const k of ['trakt_client_id', 'trakt_client_secret', 'tmdb_api_key', 'gemini_api_key', 'rpdb_api_key']) {
+    for (const k of ['trakt_client_id', 'trakt_client_secret', 'tmdb_api_key', 'gemini_api_key', 'rpdb_api_key', 'mdblist_api_key']) {
       if (req.body.keys[k]) patch.keys[k] = String(req.body.keys[k]).trim();
     }
     // Explicit clear for optional keys ('' disables RPDB again)
@@ -144,7 +147,18 @@ async function testRpdb(profile) {
   return { ok: false, error: `Invalid RPDB key (${res.status})` };
 }
 
-const TESTERS = { trakt: testTrakt, tmdb: testTmdb, gemini: testGemini, rpdb: testRpdb };
+async function testMdblist(profile) {
+  const key = profile.keys.mdblist_api_key;
+  if (!key) return { ok: false, error: 'MDBList key not set (required only when an age limit is enabled)' };
+  try {
+    const r = await mdblistService.testKey(key);
+    return { ok: true, detail: `MDBList key valid (sample Common Sense lookup: ${r.sampleAge ? r.sampleAge + '+' : 'not rated'})` };
+  } catch (err) {
+    return { ok: false, error: `MDBList test failed: ${err.message}` };
+  }
+}
+
+const TESTERS = { trakt: testTrakt, tmdb: testTmdb, gemini: testGemini, rpdb: testRpdb, mdblist: testMdblist };
 
 router.post('/profiles/:id/test/:service', async (req, res) => {
   const profile = config.getProfile(req.params.id);

@@ -12,9 +12,7 @@ const FALLBACK_MODELS = [
   'gemini-pro-latest',
 ];
 
-const ASK_COUNT = 25; // ask for more than we need; hard filters will drop some
-
-function buildPrompt(type, history, filters, excludeTitles) {
+function buildPrompt(type, history, filters, excludeTitles, askCount = 25) {
   const kind = type === 'series' ? 'TV series' : 'movies';
   const historyText = history.map((m) => `${m.title} (${m.year})`).join(', ');
 
@@ -30,16 +28,19 @@ function buildPrompt(type, history, filters, excludeTitles) {
   if (filters.excluded_genres.length > 0) {
     rules.push(`NEVER recommend anything in these genres: ${filters.excluded_genres.join(', ')}.`);
   }
+  if (filters.age_limit > 0) {
+    rules.push(`Every recommendation MUST be age-appropriate for a viewer aged ${filters.age_limit} or younger, with a Common Sense Media age rating of ${filters.age_limit}+ or lower. Family and children's ${kind} only — no exceptions.`);
+  }
   rules.push(`Do not include ${kind} I already watched.`);
 
   const excludeBlock = excludeTitles.length
-    ? `\nDo absolutely NOT include these titles I already watched:\n- ${excludeTitles.slice(0, 80).join('\n- ')}`
+    ? `\nDo absolutely NOT include these titles (already watched or already suggested):\n- ${excludeTitles.slice(0, 150).join('\n- ')}`
     : '';
 
   return `Based on the following ${kind} I recently watched:
 ${historyText}
 
-Recommend ${ASK_COUNT} ${kind} I might like. Consider similar themes, genres, actors, and creators.
+Recommend ${askCount} ${kind} I might like. Consider similar themes, genres, actors, and creators.
 CRITICAL RULES YOU MUST FOLLOW:
 ${rules.map((r, i) => `${i + 1}. ${r}`).join('\n')}${excludeBlock}
 
@@ -81,8 +82,9 @@ async function callModel(apiKey, model, prompt) {
 
 // Returns [{title, year}] suggestions — treated as suggestions, not ground truth.
 // Every title must still resolve against TMDB before it can appear in a catalog.
-async function getSuggestions(apiKey, type, history, filters, excludeTitles, log = console) {
-  const prompt = buildPrompt(type, history, filters, excludeTitles);
+async function getSuggestions(apiKey, type, history, filters, excludeTitles, log = console, askCount = 25) {
+  const prompt = buildPrompt(type, history, filters, excludeTitles, askCount);
+  log.log(`[gemini] full prompt for ${type}:\n----- PROMPT START -----\n${prompt}\n----- PROMPT END -----`);
   let lastError = null;
   for (const model of FALLBACK_MODELS) {
     try {
@@ -92,13 +94,7 @@ async function getSuggestions(apiKey, type, history, filters, excludeTitles, log
     } catch (err) {
       lastError = err;
       const quota = err.status === 429 || /quota/i.test(err.message);
-      if (quota) {
-        log.warn(`[gemini] ${model} quota exhausted, trying next model`);
-        continue;
-      }
-      // Non-quota errors on the primary model: try one fallback anyway
-      // (transient 500s are common on free tier), then give up.
-      log.warn(`[gemini] ${model} error: ${err.message}`);
+      log.warn(`[gemini] ${model} ${quota ? 'quota exhausted' : `error: ${err.message}`} — trying next model`);
       continue;
     }
   }

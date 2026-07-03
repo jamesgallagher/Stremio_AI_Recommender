@@ -175,17 +175,22 @@ function render(profiles) {
               <a class="getkey" href="https://ratingposterdb.com/" target="_blank" rel="noopener">get key ↗</a></label>
             <input type="password" data-key="rpdb_api_key" placeholder="leave blank to keep">
             <div class="muted" style="font-size:11px;margin-top:3px">Pre-set with the free-tier key (t0-free-rpdb) — posters show ratings out of the box. Paste a personal key here to upgrade tiers. Applies immediately, no rebuild.</div></div>
+          <div><label>MDBList API Key <span class="muted">(for age limits · ${p.keys_preview.mdblist_api_key || 'not set'})</span>
+              <a class="getkey" href="https://mdblist.com/preferences/" target="_blank" rel="noopener">get key ↗</a></label>
+            <input type="password" data-key="mdblist_api_key" placeholder="leave blank to keep">
+            <div class="muted" style="font-size:11px;margin-top:3px">Required only when an age limit is set — used to verify every title's Common Sense Media age rating. Free key: sign in at mdblist.com → Preferences.</div></div>
         </div>
         <div style="margin-top:10px" class="row">
           <button onclick="saveKeys('${p.id}')">Save</button>
           <button class="ghost mini" onclick="testKey('${p.id}','tmdb',this)">Test TMDB</button><span class="tres" data-tres="tmdb"></span>
           <button class="ghost mini" onclick="testKey('${p.id}','gemini',this)">Test Gemini</button><span class="tres" data-tres="gemini"></span>
           <button class="ghost mini" onclick="testKey('${p.id}','rpdb',this)">Test RPDB</button><span class="tres" data-tres="rpdb"></span>
+          <button class="ghost mini" onclick="testKey('${p.id}','mdblist',this)">Test MDBList</button><span class="tres" data-tres="mdblist"></span>
         </div>
       </details>
 
       <details>
-        <summary>Filters — min rating ${p.filters.min_rating}, ${p.filters.max_age_years > 0 ? 'last ' + p.filters.max_age_years + ' years' : 'any year'}, ${p.filters.excluded_genres.length ? p.filters.excluded_genres.length + ' genres excluded' : 'no genre exclusions'}</summary>
+        <summary>Filters — min rating ${p.filters.min_rating}, ${p.filters.max_age_years > 0 ? 'last ' + p.filters.max_age_years + ' years' : 'any year'}, ${p.filters.list_size} titles${p.filters.age_limit > 0 ? ', age ' + p.filters.age_limit + '+ limit' : ''}${p.filters.excluded_genres.length ? ', ' + p.filters.excluded_genres.length + ' genres excluded' : ''}</summary>
         <div class="cols">
           <div><label>Minimum rating</label>
             <select data-filter="min_rating">
@@ -195,6 +200,22 @@ function render(profiles) {
             <select data-filter="max_age_years">
               ${[[1,'1 year'],[2,'2 years'],[5,'5 years'],[10,'10 years'],[20,'20 years'],[0,'No limit']].map(([v,l]) => `<option value="${v}" ${v === p.filters.max_age_years ? 'selected' : ''}>${l}</option>`).join('')}
             </select></div>
+          <div><label>List size (per catalog)</label>
+            <select data-filter="list_size">
+              ${[10,15,20,25,30,40].map(v => `<option value="${v}" ${v === p.filters.list_size ? 'selected' : ''}>${v} titles</option>`).join('')}
+            </select></div>
+          <div><label>Age limit (Common Sense Media)</label>
+            <div class="row" style="gap:8px">
+              <label style="margin:0;display:flex;align-items:center;gap:6px;color:var(--text);font-size:13px">
+                <input type="checkbox" data-filter="age_limit_on" ${p.filters.age_limit > 0 ? 'checked' : ''} onchange="this.closest('.row').querySelector('[data-filter=age_limit]').disabled = !this.checked"> Limit to age
+              </label>
+              <select data-filter="age_limit" style="width:auto;flex:1" ${p.filters.age_limit > 0 ? '' : 'disabled'}>
+                ${[[5,'5+ (~G, young kids)'],[6,'6+'],[8,'8+ (~PG)'],[10,'10+'],[12,'12+'],[13,'13+ (~PG-13)'],[15,'15+ (~M)']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.age_limit || 8) ? 'selected' : ''}>${l}</option>`).join('')}
+              </select>
+            </div>
+            <div class="muted" style="font-size:11px;margin-top:3px">Strict: every title is checked against Common Sense Media (via MDBList). Titles CSM hasn't rated are never listed. Requires the MDBList key.</div>
+            ${p.filters.age_limit > 0 && !p.keys_set.mdblist_api_key ? '<div style="color:var(--err);font-size:12px;margin-top:4px">⚠ Age limit is on but no MDBList key is set — rebuilds will fail until you add one.</div>' : ''}
+          </div>
         </div>
         <label>Excluded genres <span class="muted">(ticked = never recommended)</span></label>
         <div class="genres">
@@ -267,9 +288,12 @@ async function testKey(id, service, btn) {
 
 async function saveFilters(id) {
   const card = document.querySelector(`[data-id="${id}"]`);
+  const ageOn = card.querySelector('[data-filter=age_limit_on]').checked;
   const filters = {
     min_rating: parseFloat(card.querySelector('[data-filter=min_rating]').value),
     max_age_years: parseInt(card.querySelector('[data-filter=max_age_years]').value, 10),
+    list_size: parseInt(card.querySelector('[data-filter=list_size]').value, 10),
+    age_limit: ageOn ? parseInt(card.querySelector('[data-filter=age_limit]').value, 10) : 0,
     excluded_genres: [...card.querySelectorAll('.genres input:checked')].map(i => i.value),
   };
   await api('/profiles/' + id, { method: 'PUT', body: { filters } });

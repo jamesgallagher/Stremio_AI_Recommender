@@ -11,6 +11,8 @@ const DEFAULT_FILTERS = {
   min_rating: 7.0,
   max_age_years: 5, // recency window; 0 = no limit
   excluded_genres: [], // TMDB genre names, e.g. ["Horror", "War"]
+  age_limit: 0, // Common Sense age gate; 0 = off. >0 requires an MDBList key
+  list_size: 20, // fill-to-quota target per catalog
 };
 
 function newProfile(name) {
@@ -24,6 +26,7 @@ function newProfile(name) {
       tmdb_api_key: '',
       gemini_api_key: '',
       rpdb_api_key: DEFAULT_RPDB_KEY, // rating-overlay posters; free key pre-set
+      mdblist_api_key: '', // required only when an age limit is set (CSM lookups)
     },
     trakt_auth: null, // { access_token, refresh_token, expires_at(ms) }
     filters: { ...DEFAULT_FILTERS },
@@ -37,6 +40,9 @@ function listProfiles() {
   // key too (undefined = pre-feature; '' = explicitly cleared, respected).
   for (const p of profiles) {
     if (p.keys.rpdb_api_key === undefined) p.keys.rpdb_api_key = DEFAULT_RPDB_KEY;
+    if (p.keys.mdblist_api_key === undefined) p.keys.mdblist_api_key = '';
+    if (p.filters.age_limit === undefined) p.filters.age_limit = 0;
+    if (p.filters.list_size === undefined) p.filters.list_size = 20;
   }
   return profiles;
 }
@@ -69,6 +75,8 @@ function updateProfile(id, patch) {
     if (f.min_rating !== undefined) profile.filters.min_rating = Math.max(0, Number(f.min_rating) || 0);
     if (f.max_age_years !== undefined) profile.filters.max_age_years = Math.max(0, parseInt(f.max_age_years, 10) || 0);
     if (Array.isArray(f.excluded_genres)) profile.filters.excluded_genres = f.excluded_genres.map(String);
+    if (f.age_limit !== undefined) profile.filters.age_limit = Math.max(0, parseInt(f.age_limit, 10) || 0);
+    if (f.list_size !== undefined) profile.filters.list_size = Math.min(50, Math.max(5, parseInt(f.list_size, 10) || 20));
   }
   if (patch.trakt_auth !== undefined) profile.trakt_auth = patch.trakt_auth;
   store.saveProfiles(data);

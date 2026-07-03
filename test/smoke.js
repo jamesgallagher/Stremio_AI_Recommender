@@ -35,6 +35,8 @@ ok('config: profile CRUD + filter clamping', () => {
   assert.strictEqual(p.filters.min_rating, 7.0);
   assert.strictEqual(p.filters.max_age_years, 5);
   assert.strictEqual(p.keys.rpdb_api_key, 't0-free-rpdb'); // free RPDB key pre-set
+  assert.strictEqual(p.filters.age_limit, 0); // age gate off by default
+  assert.strictEqual(p.filters.list_size, 20); // fill-to-quota default
   config.updateProfile(p.id, { filters: { min_rating: -3, excluded_genres: ['Horror'] } });
   const p2 = config.getProfile(p.id);
   assert.strictEqual(p2.filters.min_rating, 0); // clamped
@@ -88,6 +90,22 @@ ok('gemini: prompt includes per-profile constraints', () => {
     { min_rating: 0, max_age_years: 0, excluded_genres: [] }, []);
   assert.ok(!p2.includes('or higher'));
   assert.ok(!p2.includes('last '));
+});
+
+ok('gemini: age-limited prompt demands Common Sense compliance', () => {
+  const p = gemini.buildPrompt('movie', [{ title: 'Bluey', year: 2018 }],
+    { min_rating: 0, max_age_years: 0, excluded_genres: [], age_limit: 8 }, [], 30);
+  assert.ok(p.includes('Common Sense Media age rating of 8+'));
+  assert.ok(p.includes('Recommend 30 movies'));
+});
+
+ok('mdblist: Common Sense age parsing (strict, CSM only)', () => {
+  const { parseCommonSenseAge } = require('../src/services/mdblist');
+  assert.strictEqual(parseCommonSenseAge({ commonsense: 8 }), 8);
+  assert.strictEqual(parseCommonSenseAge({ commonsense: '10+' }), 10);
+  assert.strictEqual(parseCommonSenseAge({ ratings: [{ source: 'commonsense', value: 13 }] }), 13);
+  assert.strictEqual(parseCommonSenseAge({ commonsense: null, ratings: [{ source: 'imdb', value: 9 }] }), null);
+  assert.strictEqual(parseCommonSenseAge({}), null);
 });
 
 ok('gemini: parses fenced + raw JSON output', () => {
@@ -167,7 +185,8 @@ async function httpTests() {
   ], 'gemini');
   cat = await (await fetch(`${BASE}/addon/${profile.token}/catalog/movie/ai-recs-movies.json`)).json();
   assert.strictEqual(cat.metas[0].id, 'tt0111161');
-  assert.strictEqual(cat.staleRevalidate, 86400);
+  assert.strictEqual(cat.cacheMaxAge, 3600); // short hint so pruned lists appear fast
+  assert.strictEqual(cat.staleRevalidate, 43200);
   console.log('  ✓ seeded cache served with SWR headers');
 
   // RPDB: setting a key rewrites poster URLs at serve time (no rebuild)
@@ -178,6 +197,23 @@ async function httpTests() {
   cat = await (await fetch(`${BASE}/addon/${profile.token}/catalog/movie/ai-recs-movies.json`)).json();
   assert.strictEqual(cat.metas[0].poster, 'https://api.ratingposterdb.com/t0-testkey/imdb/poster-default/tt0111161.jpg?fallback=true');
   console.log('  ✓ RPDB poster substitution at serve time');
+
+  // Serve-time watched pruning: watched snapshot removes titles immediately
+  store.saveWatched(profile.id, 'movie', { imdbIds: new Set(['tt0111161']), tmdbIds: new Set() });
+  cat = await (await fetch(`${BASE}/addon/${profile.token}/catalog/movie/ai-recs-movies.json`)).json();
+  assert.strictEqual(cat.metas.length, 0);
+  console.log('  ✓ serve-time watched pruning');
+  store.saveWatched(profile.id, 'movie', { imdbIds: new Set(), tmdbIds: new Set() });
+
+  // Age-limit + list-size filters persist and clamp
+  res = await fetch(`${BASE}/api/profiles/${profile.id}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filters: { age_limit: 8, list_size: 999 } }),
+  });
+  const f = (await res.json()).profile.filters;
+  assert.strictEqual(f.age_limit, 8);
+  assert.strictEqual(f.list_size, 50); // clamped to max
+  console.log('  ✓ age limit + list size persisted (clamped)');
 
   // Pagination extra: skip past end -> empty
   cat = await (await fetch(`${BASE}/addon/${profile.token}/catalog/movie/ai-recs-movies/skip=20.json`)).json();
@@ -204,7 +240,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 12 http).`);
+  console.log(`\nAll checks passed (${passed} unit + 14 http).`);
   process.exit(0);
 }
 

@@ -5,20 +5,31 @@
 //   trigger a second concurrent job.
 // - Backoff: failed attempts set last_attempt_at; no retry within BACKOFF_MS.
 // - Failure never purges cache: each catalog type is atomically swapped only on
-//   success with >= MIN_METAS usable titles. A 2-item "success" won't clobber a
-//   good 20-item list.
+//   success with >= MIN_METAS usable titles.
+// - Fill-to-quota: each catalog targets filters.list_size titles; the Gemini
+//   path runs extra rounds (expanding the exclusion list) until filled or
+//   rounds are exhausted; the discover path walks extra pages.
+// - Age limit (kids mode): when filters.age_limit > 0, EVERY candidate is
+//   verified against Common Sense Media (via MDBList). No CSM rating => not
+//   listed. CSM only — no fallback to other rating systems. A broken MDBList
+//   lookup fails the rebuild (old list stays) rather than serving unverified.
 const store = require('./store');
 const trakt = require('./services/trakt');
 const gemini = require('./services/gemini');
 const tmdb = require('./services/tmdb');
+const mdblist = require('./services/mdblist');
 
 const STALE_MS = (parseInt(process.env.STALE_HOURS, 10) || 24) * 3600e3;
 const BACKOFF_MS = (parseInt(process.env.BACKOFF_MINUTES, 10) || 30) * 60e3;
+const WATCHED_REFRESH_MS = 60 * 60e3; // exclusion-only refresh cadence
 const MIN_METAS = 5;
-const TARGET_COUNT = 20;
-const COLD_START_THRESHOLD = 3; // fewer history titles than this -> discover path
+const DEFAULT_LIST_SIZE = 20;
+const MAX_GEMINI_ROUNDS = 4;
+const MAX_DISCOVER_PAGES = 10;
+const COLD_START_THRESHOLD = 3;
 
 const locks = new Set(); // profile ids currently rebuilding
+const exclusionLocks = new Set(); // profile ids currently refreshing watched sets
 
 function isStale(catalog) {
   return !catalog || Date.now() - (catalog.generated_at || 0) > STALE_MS;
@@ -41,16 +52,16 @@ function status(profile) {
 
 // Hard post-resolution filter — the guarantee layer.
 // Dedupe on canonical IDs against full watch history, then rating/recency/genre.
-function applyHardFilters(metas, type, filters, watched, log = console) {
+function applyHardFilters(metas, type, filters, watched, log = console, alreadyHave = new Set()) {
   const excludeGenreIds = tmdb.excludedGenreIds(filters.excluded_genres, type);
   const cutoff = filters.max_age_years > 0
     ? new Date(new Date().setFullYear(new Date().getFullYear() - filters.max_age_years))
     : null;
-  const seen = new Set();
+  const seen = new Set(alreadyHave);
   const out = [];
   for (const meta of metas) {
     if (!meta) continue;
-    if (seen.has(meta.id)) continue; // dedupe within the list itself
+    if (seen.has(meta.id)) continue;
     if (watched.imdbIds.has(meta.id) || watched.tmdbIds.has(meta._tmdb_id)) {
       log.log(`[filter] "${meta.name}" already watched — dropped`);
       continue;
@@ -73,6 +84,34 @@ function applyHardFilters(metas, type, filters, watched, log = console) {
   return out;
 }
 
+// Kids-mode gate: strict Common Sense verification via MDBList.
+// Every candidate is looked up; unrated titles are dropped, full stop.
+async function applyCsmGate(metas, type, profile, log = console) {
+  const limit = profile.filters.age_limit || 0;
+  if (limit <= 0) return metas;
+  if (!profile.keys.mdblist_api_key) {
+    throw new Error('Age limit is set but no MDBList API key is configured — cannot verify Common Sense ratings');
+  }
+  const ages = await mdblist.commonSenseAges(
+    profile.keys.mdblist_api_key, type, metas.map((m) => m.id), log
+  );
+  const out = [];
+  for (const meta of metas) {
+    const age = ages.get(meta.id);
+    if (age === null || age === undefined) {
+      log.log(`[csm] "${meta.name}" has no Common Sense rating — dropped (strict mode)`);
+      continue;
+    }
+    if (age > limit) {
+      log.log(`[csm] "${meta.name}" rated ${age}+ > limit ${limit}+ — dropped`);
+      continue;
+    }
+    log.log(`[csm] "${meta.name}" rated ${age}+ — allowed`);
+    out.push(meta);
+  }
+  return out;
+}
+
 // Strip internal fields before the metas are served to Stremio.
 function cleanMetas(metas) {
   return metas.map(({ _tmdb_id, _genre_ids, _vote_average, _vote_count, _release_date, ...meta }) => meta);
@@ -80,31 +119,65 @@ function cleanMetas(metas) {
 
 async function buildCatalog(profile, type, log = console) {
   const { keys, filters } = profile;
+  const listSize = filters.list_size || DEFAULT_LIST_SIZE;
   const history = await trakt.getRecentHistory(profile, type);
   const watched = await trakt.getWatchedSets(profile, type);
+  store.saveWatched(profile.id, type, watched); // snapshot for serve-time pruning
 
-  let metas;
+  const collected = [];
+  const haveIds = new Set();
   let source;
+
   if (history.length < COLD_START_THRESHOLD) {
-    // Cold start: skip Gemini entirely, use TMDB discover with the same filters
-    log.log(`[rebuild] ${profile.name}/${type}: cold start (${history.length} history titles) — TMDB discover`);
+    // Cold start: TMDB discover with the same filters, page by page until full
+    log.log(`[rebuild] ${profile.name}/${type}: cold start (${history.length} history titles) — TMDB discover, target ${listSize}`);
     source = 'discover';
-    const discovered = await tmdb.discover(keys.tmdb_api_key, type, filters, TARGET_COUNT * 2, log);
-    metas = applyHardFilters(discovered, type, filters, watched, log);
+    for (let page = 1; page <= MAX_DISCOVER_PAGES && collected.length < listSize; page++) {
+      const pageMetas = await tmdb.discoverPage(keys.tmdb_api_key, type, filters, page, log);
+      if (!pageMetas.length) break;
+      let usable = applyHardFilters(pageMetas, type, filters, watched, log, haveIds);
+      usable = await applyCsmGate(usable, type, profile, log);
+      for (const m of usable) {
+        if (collected.length >= listSize) break;
+        collected.push(m);
+        haveIds.add(m.id);
+      }
+      log.log(`[rebuild] ${profile.name}/${type}: discover page ${page} -> ${collected.length}/${listSize}`);
+    }
   } else {
-    log.log(`[rebuild] ${profile.name}/${type}: ${history.length} history titles — Gemini`);
+    log.log(`[rebuild] ${profile.name}/${type}: ${history.length} history titles — Gemini, target ${listSize}`);
     source = 'gemini';
-    const suggestions = await gemini.getSuggestions(
-      keys.gemini_api_key, type, history, filters, watched.titles, log
-    );
-    // Resolve all suggestions against TMDB in parallel; drop non-resolving
-    const resolved = await Promise.all(
-      suggestions.map((s) => tmdb.resolveTitle(keys.tmdb_api_key, type, s.title, s.year, log))
-    );
-    metas = applyHardFilters(resolved, type, filters, watched, log);
+    const suggestedTitles = new Set(); // avoid re-suggesting across rounds
+    for (let round = 1; round <= MAX_GEMINI_ROUNDS && collected.length < listSize; round++) {
+      const need = listSize - collected.length;
+      const askCount = Math.min(40, Math.max(15, need * 2 + 5));
+      const excludeTitles = [
+        ...watched.titles,
+        ...collected.map((m) => m.name),
+        ...suggestedTitles,
+      ];
+      const suggestions = await gemini.getSuggestions(
+        keys.gemini_api_key, type, history, filters, excludeTitles, log, askCount
+      );
+      suggestions.forEach((s) => suggestedTitles.add(s.title));
+      const resolved = await Promise.all(
+        suggestions.map((s) => tmdb.resolveTitle(keys.tmdb_api_key, type, s.title, s.year, log))
+      );
+      let usable = applyHardFilters(resolved, type, filters, watched, log, haveIds);
+      usable = await applyCsmGate(usable, type, profile, log);
+      for (const m of usable) {
+        if (collected.length >= listSize) break;
+        collected.push(m);
+        haveIds.add(m.id);
+      }
+      log.log(`[rebuild] ${profile.name}/${type}: round ${round} -> ${collected.length}/${listSize}`);
+    }
   }
 
-  return { metas: cleanMetas(metas.slice(0, TARGET_COUNT)), source };
+  if (collected.length < listSize) {
+    log.warn(`[rebuild] ${profile.name}/${type}: could not fully fill quota (${collected.length}/${listSize}) after all rounds`);
+  }
+  return { metas: cleanMetas(collected), source };
 }
 
 async function rebuildProfile(profile, log = console) {
@@ -142,19 +215,54 @@ function ensureFresh(profile, log = console) {
   if (!stale) return false;
   if (locks.has(profile.id)) return false;
   if (Date.now() - (cache.last_attempt_at || 0) < BACKOFF_MS) return false;
-  if (!profile.trakt_auth?.access_token) return false; // not onboarded yet
+  if (!profile.trakt_auth?.access_token) return false;
   rebuildProfile(profile, log).catch((err) => log.error(`[rebuild] unexpected: ${err.message}`));
+  return true;
+}
+
+// Cheap hourly exclusion refresh: re-fetch ONLY the watched sets (2 Trakt
+// calls) and prune newly-watched titles from the cached lists in place, so
+// watched items disappear within the hour instead of waiting for the daily
+// rebuild. Never generates new recommendations.
+function ensureExclusionsFresh(profile, log = console) {
+  const cache = store.loadCache(profile.id);
+  if (Date.now() - (cache.watched_synced_at || 0) < WATCHED_REFRESH_MS) return false;
+  if (locks.has(profile.id) || exclusionLocks.has(profile.id)) return false;
+  if (!profile.trakt_auth?.access_token) return false;
+  exclusionLocks.add(profile.id);
+  (async () => {
+    try {
+      for (const type of ['movie', 'series']) {
+        const entry = store.loadCache(profile.id)[type];
+        const watched = await trakt.getWatchedSets(profile, type);
+        store.saveWatched(profile.id, type, watched);
+        if (!entry) continue;
+        const kept = entry.metas.filter((m) => !watched.imdbIds.has(m.id));
+        if (kept.length < entry.metas.length) {
+          log.log(`[exclusions] ${profile.name}/${type}: pruned ${entry.metas.length - kept.length} newly-watched title(s)`);
+          store.replaceMetas(profile.id, type, kept);
+        }
+      }
+    } catch (err) {
+      log.warn(`[exclusions] ${profile.name}: refresh failed: ${err.message}`);
+    } finally {
+      exclusionLocks.delete(profile.id);
+    }
+  })();
   return true;
 }
 
 module.exports = {
   ensureFresh,
+  ensureExclusionsFresh,
   rebuildProfile,
   status,
   applyHardFilters,
+  applyCsmGate,
   cleanMetas,
   isStale,
   STALE_MS,
   MIN_METAS,
+  DEFAULT_LIST_SIZE,
   COLD_START_THRESHOLD,
 };

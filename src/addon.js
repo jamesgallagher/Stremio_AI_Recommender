@@ -81,6 +81,7 @@ router.get('/catalog/:type/:catalogId{/:extra}', (req, res) => {
 
   const profile = req.profile;
   rebuild.ensureFresh(profile); // SWR: fire-and-forget; this request serves cache
+  rebuild.ensureExclusionsFresh(profile); // hourly watched-set refresh (background)
 
   const cache = store.loadCache(profile.id);
   const entry = cache[catalog.type];
@@ -93,12 +94,17 @@ router.get('/catalog/:type/:catalogId{/:extra}', (req, res) => {
     return res.json({ metas: skip > 0 ? [] : [errorCard(catalog.type, description)], cacheMaxAge: 5 * 60 });
   }
 
-  const sliced = skip > 0 ? entry.metas.slice(skip) : entry.metas;
+  // Serve-time watched pruning: never show something the watched snapshot
+  // says has been seen, even if the daily rebuild hasn't run yet.
+  const watchedImdb = new Set(cache.watched?.[catalog.type]?.imdb || []);
+  const unwatched = entry.metas.filter((m) => !watchedImdb.has(m.id));
+
+  const sliced = skip > 0 ? unwatched.slice(skip) : unwatched;
   const metas = applyRpdb(sliced, profile.keys.rpdb_api_key);
   res.json({
     metas,
-    cacheMaxAge: 12 * 3600, // client-side hint; server cache refreshes daily
-    staleRevalidate: 24 * 3600,
+    cacheMaxAge: 3600, // short client hint so pruned/rebuilt lists appear quickly
+    staleRevalidate: 12 * 3600,
   });
 });
 

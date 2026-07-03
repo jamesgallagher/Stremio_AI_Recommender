@@ -58,6 +58,25 @@ function swapCatalog(profileId, type, metas, source) {
   writeJsonAtomic(cacheFile(profileId), cache);
 }
 
+// Persist the watched-ID snapshot (per type) so the addon can prune watched
+// titles at serve time without touching Trakt in the request path.
+function saveWatched(profileId, type, sets) {
+  const cache = loadCache(profileId);
+  cache.watched = cache.watched || {};
+  cache.watched[type] = { imdb: [...sets.imdbIds], tmdb: [...sets.tmdbIds] };
+  cache.watched_synced_at = Date.now();
+  writeJsonAtomic(cacheFile(profileId), cache);
+}
+
+// Replace a catalog's metas without touching generated_at/source (used when
+// pruning newly-watched titles between rebuilds).
+function replaceMetas(profileId, type, metas) {
+  const cache = loadCache(profileId);
+  if (!cache[type]) return;
+  cache[type].metas = metas;
+  writeJsonAtomic(cacheFile(profileId), cache);
+}
+
 function markAttempt(profileId) {
   const cache = loadCache(profileId);
   cache.last_attempt_at = Date.now();
@@ -75,6 +94,8 @@ module.exports = {
   saveProfiles,
   loadCache,
   swapCatalog,
+  saveWatched,
+  replaceMetas,
   markAttempt,
   deleteCache,
 };
