@@ -78,6 +78,67 @@ router.delete('/profiles/:id', (req, res) => {
   res.json({ ok: true });
 });
 
+// ---- Key testing ----
+async function testTrakt(profile) {
+  if (!profile.keys.trakt_client_id) return { ok: false, error: 'Client ID not set' };
+  // Full check when already authorized
+  if (profile.trakt_auth?.access_token) {
+    const res = await fetch('https://api.trakt.tv/sync/last_activities', {
+      headers: {
+        'Content-Type': 'application/json',
+        'trakt-api-version': '2',
+        'trakt-api-key': profile.keys.trakt_client_id,
+        Authorization: `Bearer ${profile.trakt_auth.access_token}`,
+      },
+    });
+    if (res.ok) return { ok: true, detail: 'Client ID and OAuth token both valid' };
+    return { ok: false, error: `Trakt returned ${res.status} — token may need re-authorization` };
+  }
+  // Not authorized yet: validate the Client ID via a device-code request
+  // (harmless — the code simply expires unused). The secret can only be
+  // verified by completing Connect Trakt.
+  const res = await fetch('https://api.trakt.tv/oauth/device/code', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ client_id: profile.keys.trakt_client_id }),
+  });
+  if (res.ok) return { ok: true, detail: 'Client ID valid. Secret is verified when you Connect Trakt.' };
+  return { ok: false, error: `Invalid Client ID (Trakt returned ${res.status})` };
+}
+
+async function testTmdb(profile) {
+  const key = profile.keys.tmdb_api_key;
+  if (!key) return { ok: false, error: 'TMDB key not set' };
+  const isBearer = key.length > 50;
+  const url = `https://api.themoviedb.org/3/authentication${isBearer ? '' : `?api_key=${encodeURIComponent(key)}`}`;
+  const res = await fetch(url, { headers: isBearer ? { Authorization: `Bearer ${key}` } : {} });
+  if (res.ok) return { ok: true, detail: 'TMDB key valid' };
+  return { ok: false, error: `Invalid TMDB key (${res.status})` };
+}
+
+async function testGemini(profile) {
+  const key = profile.keys.gemini_api_key;
+  if (!key) return { ok: false, error: 'Gemini key not set' };
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(key)}`);
+  if (res.ok) return { ok: true, detail: 'Gemini key valid' };
+  if (res.status === 429) return { ok: true, detail: 'Key valid, but free-tier quota is currently exhausted' };
+  return { ok: false, error: `Invalid Gemini key (${res.status})` };
+}
+
+const TESTERS = { trakt: testTrakt, tmdb: testTmdb, gemini: testGemini };
+
+router.post('/profiles/:id/test/:service', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  const tester = TESTERS[req.params.service];
+  if (!tester) return res.status(400).json({ error: 'Unknown service' });
+  try {
+    res.json(await tester(profile));
+  } catch (err) {
+    res.json({ ok: false, error: `Test failed: ${err.message}` });
+  }
+});
+
 // ---- Trakt device flow ----
 router.post('/profiles/:id/trakt/connect', async (req, res) => {
   const profile = config.getProfile(req.params.id);

@@ -1,0 +1,23 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2b2350"/>
+      <stop offset="1" stop-color="#0f1117"/>
+    </linearGradient>
+    <linearGradient id="tri" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#a78bfa"/>
+      <stop offset="1" stop-color="#6d3fe0"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="100" fill="url(#bg)"/>
+  <!-- play triangle -->
+  <path d="M186 152 L378 256 L186 360 Z" fill="url(#tri)" stroke="url(#tri)"
+        stroke-width="44" stroke-linejoin="round"/>
+  <!-- AI sparkles -->
+  <path d="M382 92 Q392 124 424 134 Q392 144 382 176 Q372 144 340 134 Q372 124 382 92 Z"
+        fill="#e9e6ff"/>
+  <path d="M436 180 Q441 196 457 201 Q441 206 436 222 Q431 206 415 201 Q431 196 436 180 Z"
+        fill="#c4b5fd"/>
+  <path d="M118 396 Q123 412 139 417 Q123 422 118 438 Q113 422 97 417 Q113 412 118 396 Z"
+        fill="#8b5cf6"/>
+</svg>

@@ -36,11 +36,14 @@ npm start          # http://localhost:7000/configure/
 Each profile carries its own full key set — nothing is shared.
 
 1. Open the portal (`/configure/`) → **Add profile**.
-2. That family member creates, under **their own accounts**:
-   - a Trakt API app at trakt.tv/oauth/applications → Client ID + Secret
-     (redirect URI: `urn:ietf:wg:oauth:2.0:oob`, enable the device code grant)
-   - a TMDB API key at themoviedb.org/settings/api
-   - a Gemini API key at aistudio.google.com/app/apikey
+2. That family member creates, under **their own accounts** (each key field in
+   the portal has a "get key" link to the right page):
+   - a Trakt API app at
+     [app.trakt.tv/settings/advanced?mode=media](https://app.trakt.tv/settings/advanced?mode=media)
+     → Client ID + Secret (redirect URI: `urn:ietf:wg:oauth:2.0:oob`, enable
+     the device code grant)
+   - a TMDB API key at [themoviedb.org/settings/api](https://www.themoviedb.org/settings/api)
+   - a Gemini API key at [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
 3. Paste the four keys into the profile card → **Save keys**.
 4. **Connect Trakt** → enter the PIN at trakt.tv/activate while signed in as
    that member's Trakt account. Tokens auto-refresh from then on.
@@ -81,6 +84,7 @@ Docker tab → **Add Container** (or point a Compose stack at this repo's
 | Repository | `ghcr.io/jamesgallagher/stremio_ai_recommender:latest` |
 | Network type | `bridge` |
 | Restart policy | `unless-stopped` |
+| Icon URL | `https://raw.githubusercontent.com/jamesgallagher/Stremio_AI_Recommender/main/public/logo.png` |
 
 **Ports**
 

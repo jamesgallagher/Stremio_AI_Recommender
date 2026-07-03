@@ -13,12 +13,13 @@ const CATALOGS = {
   'ai-recs-series': { type: 'series', name: 'Series recommended for you' },
 };
 
-function manifestFor(profile) {
+function manifestFor(profile, baseUrl = '') {
   return {
     id: `au.com.jscc.airecommender.${profile.id.substring(0, 8)}`,
     version: '1.0.0',
     name: `AI Recommender — ${profile.name}`,
     description: `Personalized movie & series recommendations for ${profile.name}, generated from Trakt watch history via Gemini.`,
+    ...(baseUrl ? { logo: `${baseUrl}/logo.png` } : {}),
     types: ['movie', 'series'],
     idPrefixes: ['tt'],
     resources: ['catalog'],
@@ -50,7 +51,8 @@ router.use((req, res, next) => {
 });
 
 router.get('/manifest.json', (req, res) => {
-  res.json(manifestFor(req.profile));
+  const baseUrl = `${req.protocol}://${req.get('host')}`;
+  res.json(manifestFor(req.profile, baseUrl));
 });
 
 // Matches /catalog/movie/ai-recs-movies.json and .../ai-recs-movies/skip=20.json

@@ -11,6 +11,14 @@ store.ensureDirs();
 
 const app = express();
 app.disable('x-powered-by');
+app.set('trust proxy', true); // correct req.protocol/host behind Cloudflare Tunnel
+
+// Public assets (Unraid icon, favicon, Stremio manifest logo) — intentionally
+// outside admin auth: Unraid and Stremio fetch these without credentials.
+const PUBLIC_DIR = path.join(__dirname, '..', 'public');
+for (const f of ['logo.png', 'logo.svg', 'favicon.ico']) {
+  app.get(`/${f}`, (req, res) => res.sendFile(path.join(PUBLIC_DIR, f)));
+}
 
 // CORS: Stremio clients fetch manifests/catalogs cross-origin
 app.use((req, res, next) => {

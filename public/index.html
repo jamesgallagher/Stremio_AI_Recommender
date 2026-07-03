@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AI Recommender — Configure</title>
+<link rel="icon" type="image/svg+xml" href="logo.svg">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
 <style>
   :root {
     --bg: #0f1117; --card: #171a23; --card2: #1e222e; --border: #2a2f3d;
@@ -51,11 +53,18 @@
   details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin: 12px 0 4px; }
   .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
     background: var(--card2); border: 1px solid var(--accent); border-radius: 10px; padding: 10px 18px; font-size: 13px; display: none; }
+  .getkey { color: var(--accent); font-size: 11px; text-decoration: none; margin-left: 6px; }
+  .getkey:hover { text-decoration: underline; }
+  button.mini { padding: 4px 10px; font-size: 12px; }
+  .tres { font-size: 12px; margin-left: 8px; }
+  .tres.ok { color: var(--ok); }
+  .tres.err { color: var(--err); }
+  .brand { width: 34px; height: 34px; vertical-align: middle; margin-right: 8px; border-radius: 8px; }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>🎬 AI Recommender</h1>
+  <h1><img src="logo.svg" alt="" class="brand">AI Recommender</h1>
   <div class="sub">Admin portal — each section below manages one family member's addon: their keys, Trakt link, filters, and install URL.</div>
 
   <div class="card">
@@ -127,17 +136,28 @@ function render(profiles) {
 
       <details>
         <summary>API keys ${keysOk ? '✓' : '— required'}</summary>
+        <div class="muted" style="margin-top:8px">Create each key while signed in as <b>${esc(p.name)}</b>'s account on that service.</div>
         <div class="cols">
-          <div><label>Trakt Client ID <span class="muted">(${p.keys_preview.trakt_client_id || 'not set'})</span></label>
+          <div><label>Trakt Client ID <span class="muted">(${p.keys_preview.trakt_client_id || 'not set'})</span>
+              <a class="getkey" href="https://app.trakt.tv/settings/advanced?mode=media" target="_blank" rel="noopener">get key ↗</a></label>
             <input type="password" data-key="trakt_client_id" placeholder="leave blank to keep"></div>
-          <div><label>Trakt Client Secret <span class="muted">(${p.keys_preview.trakt_client_secret || 'not set'})</span></label>
+          <div><label>Trakt Client Secret <span class="muted">(${p.keys_preview.trakt_client_secret || 'not set'})</span>
+              <a class="getkey" href="https://app.trakt.tv/settings/advanced?mode=media" target="_blank" rel="noopener">get key ↗</a></label>
             <input type="password" data-key="trakt_client_secret" placeholder="leave blank to keep"></div>
-          <div><label>TMDB API Key <span class="muted">(${p.keys_preview.tmdb_api_key || 'not set'})</span></label>
+          <div><label>TMDB API Key <span class="muted">(${p.keys_preview.tmdb_api_key || 'not set'})</span>
+              <a class="getkey" href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">get key ↗</a></label>
             <input type="password" data-key="tmdb_api_key" placeholder="leave blank to keep"></div>
-          <div><label>Gemini API Key <span class="muted">(${p.keys_preview.gemini_api_key || 'not set'})</span></label>
+          <div><label>Gemini API Key <span class="muted">(${p.keys_preview.gemini_api_key || 'not set'})</span>
+              <a class="getkey" href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">get key ↗</a></label>
             <input type="password" data-key="gemini_api_key" placeholder="leave blank to keep"></div>
         </div>
-        <div style="margin-top:10px"><button onclick="saveKeys('${p.id}')">Save keys</button></div>
+        <div style="margin-top:10px" class="row">
+          <button onclick="saveKeys('${p.id}')">Save keys</button>
+          <span class="muted">Test buttons save any filled-in fields first:</span>
+          <button class="ghost mini" onclick="testKey('${p.id}','trakt',this)">Test Trakt</button><span class="tres" data-tres="trakt"></span>
+          <button class="ghost mini" onclick="testKey('${p.id}','tmdb',this)">Test TMDB</button><span class="tres" data-tres="tmdb"></span>
+          <button class="ghost mini" onclick="testKey('${p.id}','gemini',this)">Test Gemini</button><span class="tres" data-tres="gemini"></span>
+        </div>
       </details>
 
       <details>
@@ -207,13 +227,29 @@ async function delProfile(id, name) {
   load();
 }
 
-async function saveKeys(id) {
+async function saveKeys(id, silent = false) {
   const card = document.querySelector(`[data-id="${id}"]`);
   const keys = {};
   card.querySelectorAll('[data-key]').forEach(i => { if (i.value.trim()) keys[i.dataset.key] = i.value.trim(); });
-  await api('/profiles/' + id, { method: 'PUT', body: { keys } });
-  toast('Keys saved');
-  load();
+  if (Object.keys(keys).length) await api('/profiles/' + id, { method: 'PUT', body: { keys } });
+  if (!silent) { toast('Keys saved'); load(); }
+}
+
+async function testKey(id, service, btn) {
+  const card = document.querySelector(`[data-id="${id}"]`);
+  const out = card.querySelector(`[data-tres="${service}"]`);
+  btn.disabled = true;
+  out.className = 'tres'; out.textContent = 'testing…';
+  try {
+    await saveKeys(id, true); // persist anything typed but not yet saved
+    const r = await api(`/profiles/${id}/test/${service}`, { method: 'POST' });
+    out.className = 'tres ' + (r.ok ? 'ok' : 'err');
+    out.textContent = r.ok ? `✓ ${r.detail}` : `✗ ${r.error}`;
+  } catch (err) {
+    out.className = 'tres err';
+    out.textContent = '✗ ' + err.message;
+  }
+  btn.disabled = false;
 }
 
 async function saveFilters(id) {
