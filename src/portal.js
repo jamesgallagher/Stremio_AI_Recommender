@@ -90,9 +90,7 @@ async function testTrakt(profile) {
   if (profile.trakt_auth?.access_token) {
     const res = await fetch('https://api.trakt.tv/sync/last_activities', {
       headers: {
-        'Content-Type': 'application/json',
-        'trakt-api-version': '2',
-        'trakt-api-key': profile.keys.trakt_client_id,
+        ...trakt.baseHeaders(profile.keys.trakt_client_id),
         Authorization: `Bearer ${profile.trakt_auth.access_token}`,
       },
     });
@@ -104,11 +102,12 @@ async function testTrakt(profile) {
   // verified by completing Connect Trakt.
   const res = await fetch('https://api.trakt.tv/oauth/device/code', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: trakt.baseHeaders(profile.keys.trakt_client_id),
     body: JSON.stringify({ client_id: profile.keys.trakt_client_id }),
   });
   if (res.ok) return { ok: true, detail: 'Client ID valid. Secret is verified when you Connect Trakt.' };
-  return { ok: false, error: `Invalid Client ID (Trakt returned ${res.status})` };
+  const body = (await res.text().catch(() => '')).slice(0, 200);
+  return { ok: false, error: `Trakt rejected the request (${res.status}${body ? `: ${body}` : ''})` };
 }
 
 async function testTmdb(profile) {
@@ -116,7 +115,8 @@ async function testTmdb(profile) {
   if (!key) return { ok: false, error: 'TMDB key not set' };
   const isBearer = key.length > 50;
   const url = `https://api.themoviedb.org/3/authentication${isBearer ? '' : `?api_key=${encodeURIComponent(key)}`}`;
-  const res = await fetch(url, { headers: isBearer ? { Authorization: `Bearer ${key}` } : {} });
+  const headers = { 'User-Agent': trakt.USER_AGENT, ...(isBearer ? { Authorization: `Bearer ${key}` } : {}) };
+  const res = await fetch(url, { headers });
   if (res.ok) return { ok: true, detail: 'TMDB key valid' };
   return { ok: false, error: `Invalid TMDB key (${res.status})` };
 }

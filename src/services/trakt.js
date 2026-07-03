@@ -4,12 +4,23 @@ const config = require('../config');
 
 const API = 'https://api.trakt.tv';
 
-function headers(profile, withAuth = true) {
-  const h = {
+// Node's built-in fetch sends NO User-Agent by default; Trakt (behind
+// Cloudflare) rejects UA-less requests with 403. Always send a real one,
+// and send the trakt-api-key/version headers on every call including OAuth,
+// per Trakt's API docs.
+const USER_AGENT = 'AI-Recommender/1.0 (+https://github.com/jamesgallagher/Stremio_AI_Recommender)';
+
+function baseHeaders(clientId) {
+  return {
     'Content-Type': 'application/json',
+    'User-Agent': USER_AGENT,
     'trakt-api-version': '2',
-    'trakt-api-key': profile.keys.trakt_client_id,
+    'trakt-api-key': clientId,
   };
+}
+
+function headers(profile, withAuth = true) {
+  const h = baseHeaders(profile.keys.trakt_client_id);
   if (withAuth && profile.trakt_auth?.access_token) {
     h.Authorization = `Bearer ${profile.trakt_auth.access_token}`;
   }
@@ -21,7 +32,7 @@ async function startDeviceFlow(profile) {
   console.log(`[trakt] ${profile.name}: requesting device code (client_id ${profile.keys.trakt_client_id.slice(0, 8)}…)`);
   const res = await fetch(`${API}/oauth/device/code`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: baseHeaders(profile.keys.trakt_client_id),
     body: JSON.stringify({ client_id: profile.keys.trakt_client_id }),
   });
   if (!res.ok) {
@@ -40,7 +51,7 @@ async function startDeviceFlow(profile) {
 async function pollDeviceToken(profile, deviceCode) {
   const res = await fetch(`${API}/oauth/device/token`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: baseHeaders(profile.keys.trakt_client_id),
     body: JSON.stringify({
       code: deviceCode,
       client_id: profile.keys.trakt_client_id,
@@ -73,7 +84,7 @@ async function pollDeviceToken(profile, deviceCode) {
 async function refreshToken(profile) {
   const res = await fetch(`${API}/oauth/token`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: baseHeaders(profile.keys.trakt_client_id),
     body: JSON.stringify({
       refresh_token: profile.trakt_auth.refresh_token,
       client_id: profile.keys.trakt_client_id,
@@ -158,4 +169,6 @@ module.exports = {
   refreshToken,
   getRecentHistory,
   getWatchedSets,
+  baseHeaders,
+  USER_AGENT,
 };
