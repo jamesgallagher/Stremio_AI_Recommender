@@ -1,0 +1,159 @@
+# Stremio/Nuvio AI Recommender — Design Notes
+
+**Status:** Design phase — no build yet. Last updated 2026-07-03.
+
+## Goal
+
+Self-hosted Stremio/Nuvio catalog addon on Unraid (Docker) generating personalized
+movie/series recommendations per family profile, using watch history + Gemini.
+
+## Reference implementation
+
+`reference/` contains a snapshot of https://github.com/rocsx/stremiorecomendacion
+(commit b89bf47, 2026-03-15). Treat as reference, not fork base.
+
+- **License:** No LICENSE file; README says MIT, package.json says ISC. Fine for
+  private use; ambiguous if ever published.
+- **Structure:** Single Express app (`server.js`), not per-route serverless functions.
+  Already runs standalone via `node server.js` — Dockerizing is near-zero effort.
+- **Reuse verbatim (~250 lines):**
+  - `services/gemini.js`: prompt (strict-JSON contract, ≥7.0 rating, last-5-years,
+    quality-over-popularity, genre injection) + 429 model fallback chain
+    (2.5-flash → 2.5-flash-lite → 2.0-flash-lite → flash-lite-latest → pro-latest).
+    Parameterize the hardcoded rating/recency filters per profile.
+  - `services/tmdb.js`: search-with-year → retry-without-year → `external_ids` for
+    `tt...` IMDb ID → drop if absent; failures cached as `false`.
+  - Stremio response cache hints: `cacheMaxAge: 72h` / `staleRevalidate: 24h` on
+    success, 5 min on the error card. Error-card meta on total failure (nice UX).
+- **Discard:** `stremioAddonsConfig` signature, BYO-keys config page + validation
+  endpoints, in-memory Map caches, `skip>0 → empty metas` non-pagination.
+- **Known flaws it has (we fix):** movie deny-list built from only last 15 days of
+  history (shows use full watched list); exclusion done only inside the Gemini prompt
+  (first 50 titles, fuzzy text) — never as post-resolution ID dedupe; taste seed is
+  last 15 days capped at 5 titles; no OAuth — uses public
+  `/users/{username}/history|watched` with client ID + username only.
+
+## Architecture: stale-while-revalidate, disk-backed
+
+- Serve cached recommendations instantly on every request.
+- If cache older than staleness threshold (**24 h, decided 2026-07-03**) → background rebuild
+  (Trakt/Plex fetch → Gemini → TMDB resolve) updates cache when done.
+- **Disk-backed** cache (SQLite or JSON on mounted volume) — survives container restarts.
+- **Staleness-gated:** rebuild only when `generated_at` past threshold; per-profile
+  lock so overlapping opens serve stale, never trigger a second job.
+- **Failure keeps old cache:** rebuild writes to staging, atomic swap only on full
+  success (Gemini responded AND ≥N titles TMDB-resolved — a 2-item "success" must not
+  clobber a good 20-item list). On failure, `generated_at` unchanged; record
+  `last_attempt_at` with backoff window (~30 min) so opens during an outage serve
+  stale silently instead of hammering APIs.
+- Per-profile cache keys: list, `generated_at`, rebuild lock all independent.
+
+## Config
+
+- **All keys per profile (decided 2026-07-03):** Trakt client ID + tokens, TMDB key,
+  Gemini key — each profile carries its own full set. No global keys.
+- Per-profile also: filter settings (see Configure portal), profile token for
+  install URL.
+- All server-side (env vars/config file) — no BYO-keys-in-URL.
+- Side benefit: all rate limits (Trakt, Gemini free tier, TMDB) are isolated per
+  profile — one heavy user can't starve the others.
+- ~3 profiles to start; design is count-agnostic (profiles are config entries).
+- One Trakt API app per profile, registered under each member's own Trakt account.
+
+## Data source: Trakt only (decided 2026-07-03)
+
+Plex and Netflix dropped as sources. One Trakt account = one profile.
+
+- `/sync/history/*` for taste signal; `/sync/watched/movies` +
+  `/sync/watched/shows` for exclusion (any watched history excludes a show, even
+  partial). Don't derive exclusion from the history event log.
+- **Auth: OAuth device flow (decided 2026-07-03).** One-time PIN authorization per
+  profile; works with private profiles; unlocks `/sync/*` endpoints. Each profile
+  stores its own client ID + tokens; refresh-token handling needed (Trakt access
+  tokens expire ~3 months).
+
+## Generation pipeline
+
+1. Build per-profile taste prompt from history → Gemini → suggested titles.
+2. Gemini output = suggestions, not ground truth: resolve every title against TMDB
+   for canonical ID + IMDb `tt...` ID (Cinemeta needs it). Drop non-resolving.
+3. Dedupe against exclusion list **after** resolving to canonical IDs — never
+   fuzzy-match Gemini's raw title text.
+4. Filters (min rating, recency window, genre excludes) applied per profile —
+   enforced three ways: soft in the Gemini prompt, via `without_genres` /
+   `vote_average.gte` / date window on the TMDB discover path, and as a hard
+   post-resolution filter on resolved TMDB `genre_ids` + rating + release date
+   (the guarantee, same principle as the watch-history dedupe).
+
+### Empty/thin-history fallback (cold start)
+
+If profile history has fewer than ~3 titles: **skip Gemini entirely**, use TMDB
+`/discover/movie` + `/discover/tv` with `vote_average >= 7`, `vote_count >= X`
+(avoids obscure high-rated titles), release-date window, genre filters — driven by
+the same per-profile defaults as the Gemini path. Results carry TMDB IDs, so only
+the `external_ids` lookup remains. Deterministic, no quota risk. Same cache shape,
+so the addon endpoint doesn't care which path produced the list. Optional: tag
+catalog name "Popular picks" vs. "Picked for you". Next scheduled rebuild after
+history exists upgrades to personalized automatically.
+
+## Addon endpoint
+
+- Thin: reads pre-computed cached list per profile only. Never calls
+  Trakt/Gemini/TMDB in the request path.
+- Multi-profile via per-profile install URLs:
+  `https://yourdomain/addon/<profileToken>/manifest.json` (Stremio has no native
+  user concept).
+- **Two catalogs (decided 2026-07-03):** "Movies recommended for you" and
+  "Series recommended for you".
+
+## Configure portal (decided 2026-07-03)
+
+Web page (behind Cloudflare Access) for per-profile settings, editable anytime.
+Changes take effect on next rebuild (or offer a "rebuild now" button per profile).
+
+Per-profile controls:
+
+- **Minimum rating** — selectable (e.g. 0–9 in 0.5 steps). Default **7.0**.
+- **Recency window** — selectable in years (e.g. 1/2/5/10/20/no limit). Default
+  **5 years**.
+- **Genre exclude list** — multi-select checkboxes over the TMDB official genre
+  vocabulary (used because all titles resolve against TMDB, making exclusion
+  enforceable on real `genre_ids`, not just prompt text). Default: **none excluded**.
+  - Movie genres: Action, Adventure, Animation, Comedy, Crime, Documentary, Drama,
+    Family, Fantasy, History, Horror, Music, Mystery, Romance, Science Fiction,
+    TV Movie, Thriller, War, Western.
+  - TV genres: Action & Adventure, Animation, Comedy, Crime, Documentary, Drama,
+    Family, Kids, Mystery, News, Reality, Sci-Fi & Fantasy, Soap, Talk,
+    War & Politics, Western.
+  - UI can present a merged de-duplicated list and map to the per-type TMDB genre
+    IDs internally.
+
+Portal is also the natural home for profile onboarding (Trakt device-flow PIN
+authorization, key entry) and install-URL display/QR per profile.
+
+## Infra
+
+- Docker on Unraid, exposed via Cloudflare Tunnel (no open ports, free TLS).
+- Optional Cloudflare Access on the config page only — NOT the addon endpoints
+  (Stremio must hit them without a login prompt).
+
+## Open decisions
+
+None — design is build-ready.
+
+## Decided
+
+- Trakt-only data source (no Plex/Netflix). One Trakt account = one profile.
+- Trakt auth: OAuth device flow per profile (needs refresh-token handling).
+- One Trakt API app per profile, registered under each member's own Trakt account —
+  fully independent client IDs, tokens, and rate limits (decided 2026-07-03).
+- Recommendation lists always de-duped against full watch history on canonical IDs
+  post-TMDB-resolution (reaffirmed 2026-07-03).
+- All API keys per profile (Trakt, TMDB, Gemini) — no globals.
+- Staleness threshold: 24 h.
+- Rebuild failure never purges cache; atomic swap on success only.
+- Cold start (<~3 history titles): TMDB discover path, no Gemini.
+- Two catalogs: "Movies recommended for you" / "Series recommended for you".
+- ~3 profiles initially; count-agnostic design.
+- Per-profile filters editable in configure portal: min rating (default 7.0),
+  recency window (default 5 years), TMDB-genre exclude list (default none).

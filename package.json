@@ -1,0 +1,19 @@
+{
+  "name": "ai-recommender",
+  "version": "1.0.0",
+  "description": "Self-hosted Stremio/Nuvio AI recommendation addon — Trakt history + Gemini + TMDB, per-family-profile",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node test/smoke.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1"
+  },
+  "license": "MIT",
+  "private": true
+}

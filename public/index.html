@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Recommender — Configure</title>
+<style>
+  :root {
+    --bg: #0f1117; --card: #171a23; --card2: #1e222e; --border: #2a2f3d;
+    --text: #e6e8ee; --muted: #8b91a3; --accent: #8b5cf6; --accent2: #6d3fe0;
+    --ok: #34d399; --warn: #fbbf24; --err: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 24px 16px 80px; }
+  h1 { font-size: 22px; margin: 8px 0 2px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 18px; }
+  .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .grow { flex: 1; }
+  h2 { font-size: 16px; margin: 0; }
+  .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+  .badge.ok { color: var(--ok); border-color: var(--ok); }
+  .badge.warn { color: var(--warn); border-color: var(--warn); }
+  .badge.err { color: var(--err); border-color: var(--err); }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 4px; }
+  input[type=text], input[type=password], select {
+    width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--card2); color: var(--text); font-size: 14px; outline: none;
+  }
+  input:focus, select:focus { border-color: var(--accent); }
+  button {
+    background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+    padding: 8px 14px; font-size: 13px; cursor: pointer; font-weight: 600;
+  }
+  button:hover { background: var(--accent2); }
+  button.ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); }
+  button.ghost:hover { color: var(--text); border-color: var(--muted); }
+  button.danger { background: transparent; border: 1px solid var(--err); color: var(--err); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .genres { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px; margin-top: 6px; }
+  .genres label { display: flex; align-items: center; gap: 6px; margin: 0; font-size: 13px; color: var(--text);
+    background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px; cursor: pointer; }
+  .genres label:has(input:checked) { border-color: var(--err); color: var(--err); }
+  .install { background: var(--card2); border: 1px dashed var(--border); border-radius: 8px; padding: 10px; font-family: monospace; font-size: 12px; word-break: break-all; margin-top: 6px; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .status-line { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .pin { font-size: 28px; letter-spacing: 6px; font-weight: 700; color: var(--accent); }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 640px) { .cols { grid-template-columns: 1fr; } }
+  details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin: 12px 0 4px; }
+  .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: var(--card2); border: 1px solid var(--accent); border-radius: 10px; padding: 10px 18px; font-size: 13px; display: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🎬 AI Recommender</h1>
+  <div class="sub">Admin portal — each section below manages one family member's addon: their keys, Trakt link, filters, and install URL.</div>
+
+  <div class="card">
+    <div class="row">
+      <input type="text" id="newName" class="grow" placeholder="New profile name (e.g. James)">
+      <button onclick="addProfile()">Add profile</button>
+    </div>
+  </div>
+
+  <div id="profiles"></div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (s, el = document) => el.querySelector(s);
+let GENRES = [];
+
+function toast(msg) {
+  const t = $('#toast');
+  t.textContent = msg; t.style.display = 'block';
+  clearTimeout(t._h); t._h = setTimeout(() => t.style.display = 'none', 3000);
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch('/api' + path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+function fmtAge(ms) {
+  if (!ms) return 'never';
+  const h = (Date.now() - ms) / 3600e3;
+  if (h < 1) return `${Math.round(h * 60)} min ago`;
+  if (h < 48) return `${Math.round(h)} h ago`;
+  return `${Math.round(h / 24)} d ago`;
+}
+
+function catalogLine(label, entry) {
+  if (!entry) return `${label}: <span style="color:var(--warn)">not generated yet</span>`;
+  const src = entry.source === 'gemini' ? 'picked for you' : 'popular picks';
+  return `${label}: ${entry.count} titles (${src}, ${fmtAge(entry.generated_at)})`;
+}
+
+function render(profiles) {
+  const container = $('#profiles');
+  container.innerHTML = profiles.map(p => {
+    const base = location.origin + '/addon/' + p.token;
+    const keysOk = Object.values(p.keys_set).every(Boolean);
+    const badge = p.trakt_connected
+      ? '<span class="badge ok">Trakt connected</span>'
+      : (keysOk ? '<span class="badge warn">Trakt not authorized</span>' : '<span class="badge err">Keys missing</span>');
+    const rebuilding = p.status.rebuilding ? '<span class="badge warn">rebuilding…</span>' : '';
+    return `
+    <div class="card" data-id="${p.id}">
+      <div class="row">
+        <h2>${esc(p.name)}</h2> ${badge} ${rebuilding}
+        <div class="grow"></div>
+        <button class="ghost" onclick="rebuildNow('${p.id}')" ${p.trakt_connected ? '' : 'disabled'}>Rebuild now</button>
+        <button class="danger" onclick="delProfile('${p.id}', '${esc(p.name)}')">Delete</button>
+      </div>
+      <div class="status-line">
+        ${catalogLine('🎬 Movies', p.status.movie)} &nbsp;·&nbsp; ${catalogLine('📺 Series', p.status.series)}
+      </div>
+
+      <details>
+        <summary>API keys ${keysOk ? '✓' : '— required'}</summary>
+        <div class="cols">
+          <div><label>Trakt Client ID <span class="muted">(${p.keys_preview.trakt_client_id || 'not set'})</span></label>
+            <input type="password" data-key="trakt_client_id" placeholder="leave blank to keep"></div>
+          <div><label>Trakt Client Secret <span class="muted">(${p.keys_preview.trakt_client_secret || 'not set'})</span></label>
+            <input type="password" data-key="trakt_client_secret" placeholder="leave blank to keep"></div>
+          <div><label>TMDB API Key <span class="muted">(${p.keys_preview.tmdb_api_key || 'not set'})</span></label>
+            <input type="password" data-key="tmdb_api_key" placeholder="leave blank to keep"></div>
+          <div><label>Gemini API Key <span class="muted">(${p.keys_preview.gemini_api_key || 'not set'})</span></label>
+            <input type="password" data-key="gemini_api_key" placeholder="leave blank to keep"></div>
+        </div>
+        <div style="margin-top:10px"><button onclick="saveKeys('${p.id}')">Save keys</button></div>
+      </details>
+
+      <details>
+        <summary>Trakt authorization</summary>
+        <div class="trakt-flow">
+          ${p.trakt_connected
+            ? `<div class="muted">Connected. Token auto-refreshes; expires ${p.trakt_expires_at ? new Date(p.trakt_expires_at).toLocaleDateString() : '—'}.</div>
+               <div style="margin-top:8px"><button class="ghost" onclick="disconnectTrakt('${p.id}')">Disconnect</button></div>`
+            : `<div style="margin-top:8px"><button onclick="connectTrakt('${p.id}')" ${keysOk ? '' : 'disabled'}>Connect Trakt</button>
+               <span class="muted"> — sign in as <b>${esc(p.name)}</b>'s Trakt account when prompted</span></div>
+               <div class="flow-status" style="margin-top:10px"></div>`}
+        </div>
+      </details>
+
+      <details>
+        <summary>Filters — min rating ${p.filters.min_rating}, ${p.filters.max_age_years > 0 ? 'last ' + p.filters.max_age_years + ' years' : 'any year'}, ${p.filters.excluded_genres.length ? p.filters.excluded_genres.length + ' genres excluded' : 'no genre exclusions'}</summary>
+        <div class="cols">
+          <div><label>Minimum rating</label>
+            <select data-filter="min_rating">
+              ${[0,5,5.5,6,6.5,7,7.5,8,8.5,9].map(v => `<option value="${v}" ${v === p.filters.min_rating ? 'selected' : ''}>${v === 0 ? 'No minimum' : '≥ ' + v.toFixed(1)}</option>`).join('')}
+            </select></div>
+          <div><label>Released within</label>
+            <select data-filter="max_age_years">
+              ${[[1,'1 year'],[2,'2 years'],[5,'5 years'],[10,'10 years'],[20,'20 years'],[0,'No limit']].map(([v,l]) => `<option value="${v}" ${v === p.filters.max_age_years ? 'selected' : ''}>${l}</option>`).join('')}
+            </select></div>
+        </div>
+        <label>Excluded genres <span class="muted">(ticked = never recommended)</span></label>
+        <div class="genres">
+          ${GENRES.map(g => `<label><input type="checkbox" value="${esc(g)}" ${p.filters.excluded_genres.includes(g) ? 'checked' : ''}>${esc(g)}</label>`).join('')}
+        </div>
+        <div style="margin-top:10px"><button onclick="saveFilters('${p.id}')">Save filters</button>
+        <span class="muted"> — applies on next rebuild (or hit Rebuild now)</span></div>
+      </details>
+
+      <details>
+        <summary>Install in Stremio / Nuvio</summary>
+        <div class="install">${base}/manifest.json</div>
+        <div style="margin-top:8px" class="row">
+          <button class="ghost" onclick="copyText('${base}/manifest.json')">Copy URL</button>
+          <a href="${base.replace(/^https?:\/\//, 'stremio://')}/manifest.json"><button class="ghost">Open in Stremio</button></a>
+        </div>
+        <div class="muted" style="margin-top:6px">Paste the URL in Stremio → Addons → Add addon. This link is ${esc(p.name)}'s personal list — don't share it outside the family.</div>
+      </details>
+    </div>`;
+  }).join('') || '<div class="card muted">No profiles yet — add one above.</div>';
+}
+
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+async function load() {
+  if (!GENRES.length) GENRES = (await api('/genres')).genres;
+  const { profiles } = await api('/profiles');
+  render(profiles);
+}
+
+async function addProfile() {
+  const name = $('#newName').value.trim();
+  if (!name) return toast('Enter a name first');
+  await api('/profiles', { method: 'POST', body: { name } });
+  $('#newName').value = '';
+  load();
+}
+
+async function delProfile(id, name) {
+  if (!confirm(`Delete profile "${name}"? Their install link stops working immediately.`)) return;
+  await api('/profiles/' + id, { method: 'DELETE' });
+  load();
+}
+
+async function saveKeys(id) {
+  const card = document.querySelector(`[data-id="${id}"]`);
+  const keys = {};
+  card.querySelectorAll('[data-key]').forEach(i => { if (i.value.trim()) keys[i.dataset.key] = i.value.trim(); });
+  await api('/profiles/' + id, { method: 'PUT', body: { keys } });
+  toast('Keys saved');
+  load();
+}
+
+async function saveFilters(id) {
+  const card = document.querySelector(`[data-id="${id}"]`);
+  const filters = {
+    min_rating: parseFloat(card.querySelector('[data-filter=min_rating]').value),
+    max_age_years: parseInt(card.querySelector('[data-filter=max_age_years]').value, 10),
+    excluded_genres: [...card.querySelectorAll('.genres input:checked')].map(i => i.value),
+  };
+  await api('/profiles/' + id, { method: 'PUT', body: { filters } });
+  toast('Filters saved — applies on next rebuild');
+  load();
+}
+
+async function connectTrakt(id) {
+  const card = document.querySelector(`[data-id="${id}"]`);
+  const statusEl = card.querySelector('.flow-status');
+  try {
+    const { user_code, verification_url } = await api(`/profiles/${id}/trakt/connect`, { method: 'POST' });
+    statusEl.innerHTML = `Go to <a href="${verification_url}" target="_blank" style="color:var(--accent)">${verification_url}</a> and enter:
+      <div class="pin">${user_code}</div><div class="muted">Waiting for authorization…</div>`;
+    const poll = setInterval(async () => {
+      const { connected, flow } = await api(`/profiles/${id}/trakt/status`);
+      if (connected) { clearInterval(poll); toast('Trakt connected 🎉'); load(); }
+      else if (flow && flow.state === 'error') { clearInterval(poll); statusEl.innerHTML = `<span style="color:var(--err)">${esc(flow.error)}</span>`; }
+    }, 3000);
+  } catch (err) {
+    statusEl.innerHTML = `<span style="color:var(--err)">${esc(err.message)}</span>`;
+  }
+}
+
+async function disconnectTrakt(id) {
+  await api(`/profiles/${id}/trakt/disconnect`, { method: 'POST' });
+  load();
+}
+
+async function rebuildNow(id) {
+  toast('Rebuild started — this can take a minute');
+  try {
+    const { results } = await api(`/profiles/${id}/rebuild`, { method: 'POST' });
+    const parts = Object.entries(results).map(([t, r]) => `${t}: ${r.ok ? r.count + ' ✓' : '✗ ' + r.error}`);
+    toast(parts.join(' · '));
+  } catch (err) {
+    toast('Rebuild failed: ' + err.message);
+  }
+  load();
+}
+
+function copyText(t) { navigator.clipboard.writeText(t).then(() => toast('Copied')); }
+
+load();
+setInterval(load, 30000); // keep status lines fresh
+</script>
+</body>
+</html>

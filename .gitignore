@@ -1,0 +1,9 @@
+node_modules/
+data/
+.env
+*.log
+
+# Snapshot of rocsx/stremiorecomendacion — kept locally for reference only.
+# Excluded from the public repo: it ships no LICENSE file (README says MIT,
+# package.json says ISC), so redistribution rights are ambiguous.
+reference/

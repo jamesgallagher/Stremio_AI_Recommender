@@ -1,0 +1,7 @@
+node_modules
+data
+reference
+test
+DESIGN.md
+.env
+*.md

@@ -1,0 +1,21 @@
+# Unraid: point a "Compose" stack at this file, or replicate in the Docker UI:
+#   image: built from this folder; port 7000; path /data -> /mnt/user/appdata/ai-recommender
+services:
+  ai-recommender:
+    # Pull the CI-built image (pin to a version tag, e.g. :1.0.0, if desired) …
+    image: ghcr.io/jamesgallagher/stremio_ai_recommender:latest
+    # … or comment out `image:` and uncomment `build:` to build locally:
+    # build: .
+    container_name: ai-recommender
+    restart: unless-stopped
+    ports:
+      - "7000:7000"
+    volumes:
+      - /mnt/user/appdata/ai-recommender:/data
+    environment:
+      - PORT=7000
+      - DATA_DIR=/data
+      - ADMIN_USER=admin            # admin portal login (change these!)
+      - ADMIN_PASSWORD=change-me    # if either is unset, the portal is unprotected
+      # - STALE_HOURS=24        # cache staleness threshold
+      # - BACKOFF_MINUTES=30    # retry backoff after a failed rebuild
