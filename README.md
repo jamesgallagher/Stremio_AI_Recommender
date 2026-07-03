@@ -68,6 +68,49 @@ then). After that, lists refresh in the background roughly daily.
   is parameterized, and a final hard filter checks resolved rating, release
   date, and genre IDs.
 
+## Unraid setup
+
+Docker tab → **Add Container** (or point a Compose stack at this repo's
+`docker-compose.yml`). Everything the template needs:
+
+**Basic**
+
+| Field | Value |
+|---|---|
+| Name | `ai-recommender` |
+| Repository | `ghcr.io/jamesgallagher/stremio_ai_recommender:latest` |
+| Network type | `bridge` |
+| Restart policy | `unless-stopped` |
+
+**Ports**
+
+| Container port | Host port | Protocol | Purpose |
+|---|---|---|---|
+| `7000` | `7000` (or any free port) | TCP | Web portal + addon endpoints — point your Cloudflare Tunnel here |
+
+**Paths**
+
+| Container path | Host path | Purpose |
+|---|---|---|
+| `/data` | `/mnt/user/appdata/ai-recommender` | **Required.** Profiles, API keys, Trakt tokens, recommendation caches. Back this up; losing it means re-entering keys and re-authorizing Trakt for every profile. |
+
+**Variables**
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `ADMIN_USER` | Recommended | — | Admin portal username (Basic Auth) |
+| `ADMIN_PASSWORD` | Recommended | — | Admin portal password. If either is unset, `/configure` is unprotected (startup log warns) |
+| `PORT` | No | `7000` | Internal HTTP port — only change if you also change the container port mapping |
+| `DATA_DIR` | No | `/data` | Storage location inside the container — leave as is |
+| `STALE_HOURS` | No | `24` | How old a cached list may get before a background rebuild |
+| `BACKOFF_MINUTES` | No | `30` | Wait after a failed rebuild before retrying |
+
+No API keys go in the template — Trakt/TMDB/Gemini keys are entered per
+profile in the web portal and stored in `/data/profiles.json`.
+
+After starting: open `http://<unraid-ip>:7000/configure/`, log in with the
+admin credentials, add profiles.
+
 ## Exposure (Cloudflare Tunnel)
 
 Point a tunnel at `http://<unraid-ip>:7000`. Then:
