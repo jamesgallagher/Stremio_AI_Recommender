@@ -128,10 +128,13 @@ async function authedGet(profile, urlPath) {
   return res.json();
 }
 
-// ---- Taste signal: recent history (unique titles) ----
+// ---- Taste signal: the last N unique watched titles (per type) ----
+const HISTORY_SEED_COUNT = 10;
+
 async function getRecentHistory(profile, type /* 'movie' | 'series' */) {
   const endpoint = type === 'series' ? 'shows' : 'movies';
-  const items = await authedGet(profile, `/sync/history/${endpoint}?limit=50`);
+  // history returns most-recent plays first; walk until we have N unique titles
+  const items = await authedGet(profile, `/sync/history/${endpoint}?limit=100`);
   const seen = new Set();
   const recent = [];
   for (const item of items) {
@@ -140,9 +143,17 @@ async function getRecentHistory(profile, type /* 'movie' | 'series' */) {
     if (seen.has(media.ids.trakt)) continue;
     seen.add(media.ids.trakt);
     recent.push({ title: media.title, year: media.year });
-    if (recent.length >= 15) break;
+    if (recent.length >= HISTORY_SEED_COUNT) break;
   }
   return recent;
+}
+
+// Which Trakt account does this profile's token actually belong to?
+// Surfaced in the portal so a profile authorized against the wrong family
+// member's account is immediately visible.
+async function getAccountUsername(profile) {
+  const data = await authedGet(profile, '/users/settings');
+  return data?.user?.username || null;
 }
 
 // ---- Exclusion: full watched state (canonical IDs + titles) ----
@@ -169,6 +180,7 @@ module.exports = {
   refreshToken,
   getRecentHistory,
   getWatchedSets,
+  getAccountUsername,
   baseHeaders,
   USER_AGENT,
 };

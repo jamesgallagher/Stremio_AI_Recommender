@@ -46,6 +46,7 @@ function publicProfile(p, req) {
     },
     trakt_connected: !!p.trakt_auth?.access_token,
     trakt_expires_at: p.trakt_auth?.expires_at || null,
+    trakt_username: p.trakt_auth?.username || null,
     status: rebuild.status(p),
   };
 }
@@ -101,7 +102,10 @@ async function testTrakt(profile) {
         Authorization: `Bearer ${profile.trakt_auth.access_token}`,
       },
     });
-    if (res.ok) return { ok: true, detail: 'Client ID and OAuth token both valid' };
+    if (res.ok) {
+      const who = profile.trakt_auth.username ? ` (authorized as Trakt user "${profile.trakt_auth.username}")` : '';
+      return { ok: true, detail: `Client ID and OAuth token both valid${who}` };
+    }
     return { ok: false, error: `Trakt returned ${res.status} — token may need re-authorization` };
   }
   // Not authorized yet: validate the Client ID via a device-code request
@@ -212,7 +216,16 @@ router.post('/profiles/:id/trakt/connect', async (req, res) => {
         if (result.token) {
           config.updateProfile(profile.id, { trakt_auth: result.token });
           flow.state = 'connected';
-          console.log(`[trakt] ${profile.name}: connected via device flow`);
+          // Record which Trakt account actually authorized — mismatches
+          // (wrong family member signed in) become visible in the portal.
+          try {
+            const fresh = config.getProfile(profile.id);
+            const username = await trakt.getAccountUsername(fresh);
+            config.updateProfile(profile.id, { trakt_auth: { ...fresh.trakt_auth, username } });
+            console.log(`[trakt] ${profile.name}: connected via device flow as Trakt user "${username}"`);
+          } catch {
+            console.log(`[trakt] ${profile.name}: connected via device flow (could not fetch account name)`);
+          }
         } else {
           flow.state = 'error';
           flow.error = result.error || 'Authorization failed';

@@ -115,6 +115,12 @@ function catalogLine(label, entry) {
 
 function render(profiles) {
   const container = $('#profiles');
+  // Preserve which sections are open across re-renders (auto-refresh must
+  // never yank the page out from under the user)
+  const openMap = {};
+  container.querySelectorAll('.card[data-id]').forEach(card => {
+    openMap[card.dataset.id] = [...card.querySelectorAll('details')].map(d => d.open);
+  });
   container.innerHTML = profiles.map(p => {
     const installUrl = p.install_url;
     // RPDB is optional — excluded from the required-keys gate
@@ -153,7 +159,8 @@ function render(profiles) {
         </div>
         <div class="trakt-flow" style="margin-top:12px; padding-top:10px; border-top:1px solid var(--border)">
           ${p.trakt_connected
-            ? `<div class="muted">✓ Authorized. Token auto-refreshes; expires ${p.trakt_expires_at ? new Date(p.trakt_expires_at).toLocaleDateString() : '—'}.</div>
+            ? `<div class="muted">✓ Authorized${p.trakt_username ? ` as Trakt account <b style="color:var(--ok)">${esc(p.trakt_username)}</b>` : ''}. Token auto-refreshes; expires ${p.trakt_expires_at ? new Date(p.trakt_expires_at).toLocaleDateString() : '—'}.
+               ${p.trakt_username ? `<div style="font-size:11px;margin-top:2px">If that isn't ${esc(p.name)}'s own Trakt account, disconnect and re-authorize signed in as ${esc(p.name)} — recommendations are built from this account's history.</div>` : ''}</div>
                <div style="margin-top:8px"><button class="ghost" onclick="disconnectTrakt('${p.id}')">Disconnect</button></div>`
             : `<div><button onclick="connectTrakt('${p.id}')" ${traktKeysOk ? '' : 'disabled'}>Connect Trakt</button>
                <span class="muted"> — sign in as <b>${esc(p.name)}</b>'s Trakt account when prompted${traktKeysOk ? '' : ' (save both keys above first)'}</span></div>
@@ -207,9 +214,9 @@ function render(profiles) {
           <div><label>Age limit (Common Sense Media)</label>
             <div class="row" style="gap:8px">
               <label style="margin:0;display:flex;align-items:center;gap:6px;color:var(--text);font-size:13px">
-                <input type="checkbox" data-filter="age_limit_on" ${p.filters.age_limit > 0 ? 'checked' : ''} onchange="this.closest('.row').querySelector('[data-filter=age_limit]').disabled = !this.checked"> Limit to age
+                <input type="checkbox" data-filter="age_limit_on" ${p.filters.age_limit > 0 ? 'checked' : ''} onchange="const s=this.closest('.row').querySelector('[data-filter=age_limit]'); s.disabled=!this.checked; s.style.display=this.checked?'':'none'"> Limit to age
               </label>
-              <select data-filter="age_limit" style="width:auto;flex:1" ${p.filters.age_limit > 0 ? '' : 'disabled'}>
+              <select data-filter="age_limit" style="width:auto;flex:1;${p.filters.age_limit > 0 ? '' : 'display:none'}" ${p.filters.age_limit > 0 ? '' : 'disabled'}>
                 ${[[5,'5+ (~G, young kids)'],[6,'6+'],[8,'8+ (~PG)'],[10,'10+'],[12,'12+'],[13,'13+ (~PG-13)'],[15,'15+ (~M)']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.age_limit || 8) ? 'selected' : ''}>${l}</option>`).join('')}
               </select>
             </div>
@@ -237,6 +244,13 @@ function render(profiles) {
       </details>
     </div>`;
   }).join('') || '<div class="card muted">No profiles yet — add one above.</div>';
+  // Restore open sections
+  container.querySelectorAll('.card[data-id]').forEach(card => {
+    (openMap[card.dataset.id] || []).forEach((wasOpen, i) => {
+      const d = card.querySelectorAll('details')[i];
+      if (d && wasOpen) d.open = true;
+    });
+  });
 }
 
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -266,7 +280,7 @@ async function saveKeys(id, silent = false) {
   const keys = {};
   card.querySelectorAll('[data-key]').forEach(i => { if (i.value.trim()) keys[i.dataset.key] = i.value.trim(); });
   if (Object.keys(keys).length) await api('/profiles/' + id, { method: 'PUT', body: { keys } });
-  if (!silent) { toast('Keys saved'); load(); }
+  if (!silent) { dirty = false; toast('Keys saved'); load(); }
 }
 
 async function testKey(id, service, btn) {
@@ -297,6 +311,7 @@ async function saveFilters(id) {
     excluded_genres: [...card.querySelectorAll('.genres input:checked')].map(i => i.value),
   };
   await api('/profiles/' + id, { method: 'PUT', body: { filters } });
+  dirty = false;
   toast('Filters saved — applies on next rebuild');
   load();
 }
@@ -344,8 +359,18 @@ async function rebuildNow(id, btn) {
 
 function copyText(t) { navigator.clipboard.writeText(t).then(() => toast('Copied')); }
 
+// Auto-refresh keeps status lines fresh, but must NEVER interrupt the user:
+// it skips whenever there is unsaved input (typing, ticking checkboxes) or a
+// Trakt authorization in progress (PIN on screen).
+let dirty = false;
+document.addEventListener('input', e => { if (e.target.closest('#profiles')) dirty = true; });
+
+function flowActive() {
+  return [...document.querySelectorAll('.flow-status')].some(el => el.textContent.trim() !== '');
+}
+
 load();
-setInterval(load, 30000); // keep status lines fresh
+setInterval(() => { if (!dirty && !flowActive()) load(); }, 30000);
 </script>
 </body>
 </html>

@@ -186,6 +186,16 @@ async function rebuildProfile(profile, log = console) {
   const results = {};
   try {
     store.markAttempt(profile.id);
+    // Backfill the Trakt account name for profiles connected before we
+    // started recording it — surfaces wrong-account authorizations.
+    if (profile.trakt_auth?.access_token && !profile.trakt_auth.username) {
+      try {
+        const username = await trakt.getAccountUsername(profile);
+        const config = require('./config');
+        config.updateProfile(profile.id, { trakt_auth: { ...profile.trakt_auth, username } });
+        log.log(`[trakt] ${profile.name}: profile is authorized as Trakt user "${username}"`);
+      } catch { /* non-fatal */ }
+    }
     for (const type of ['movie', 'series']) {
       try {
         const { metas, source } = await buildCatalog(profile, type, log);
