@@ -34,6 +34,7 @@ ok('config: profile CRUD + filter clamping', () => {
   assert.ok(p.token.length === 32);
   assert.strictEqual(p.filters.min_rating, 7.0);
   assert.strictEqual(p.filters.max_age_years, 5);
+  assert.strictEqual(p.keys.rpdb_api_key, 't0-free-rpdb'); // free RPDB key pre-set
   config.updateProfile(p.id, { filters: { min_rating: -3, excluded_genres: ['Horror'] } });
   const p2 = config.getProfile(p.id);
   assert.strictEqual(p2.filters.min_rating, 0); // clamped
@@ -169,6 +170,15 @@ async function httpTests() {
   assert.strictEqual(cat.staleRevalidate, 86400);
   console.log('  ✓ seeded cache served with SWR headers');
 
+  // RPDB: setting a key rewrites poster URLs at serve time (no rebuild)
+  await fetch(`${BASE}/api/profiles/${profile.id}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ keys: { rpdb_api_key: 't0-testkey' } }),
+  });
+  cat = await (await fetch(`${BASE}/addon/${profile.token}/catalog/movie/ai-recs-movies.json`)).json();
+  assert.strictEqual(cat.metas[0].poster, 'https://api.ratingposterdb.com/t0-testkey/imdb/poster-default/tt0111161.jpg?fallback=true');
+  console.log('  ✓ RPDB poster substitution at serve time');
+
   // Pagination extra: skip past end -> empty
   cat = await (await fetch(`${BASE}/addon/${profile.token}/catalog/movie/ai-recs-movies/skip=20.json`)).json();
   assert.deepStrictEqual(cat.metas, []);
@@ -194,7 +204,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 11 http).`);
+  console.log(`\nAll checks passed (${passed} unit + 12 http).`);
   process.exit(0);
 }
 

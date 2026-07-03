@@ -13,6 +13,17 @@ const CATALOGS = {
   'ai-recs-series': { type: 'series', name: 'Series recommended for you' },
 };
 
+// RPDB (ratingposterdb.com): poster images with the rating rendered on them.
+// Pure URL substitution at serve time — cache keeps canonical TMDB posters, so
+// adding/removing a key applies instantly without a rebuild. fallback=true
+// makes RPDB redirect to a plain poster when it doesn't know the title.
+function applyRpdb(metas, rpdbKey) {
+  if (!rpdbKey) return metas;
+  return metas.map((m) => (m.id && m.id.startsWith('tt')
+    ? { ...m, poster: `https://api.ratingposterdb.com/${rpdbKey}/imdb/poster-default/${m.id}.jpg?fallback=true` }
+    : m));
+}
+
 function manifestFor(profile, baseUrl = '') {
   return {
     id: `au.com.jscc.airecommender.${profile.id.substring(0, 8)}`,
@@ -82,7 +93,8 @@ router.get('/catalog/:type/:catalogId{/:extra}', (req, res) => {
     return res.json({ metas: skip > 0 ? [] : [errorCard(catalog.type, description)], cacheMaxAge: 5 * 60 });
   }
 
-  const metas = skip > 0 ? entry.metas.slice(skip) : entry.metas;
+  const sliced = skip > 0 ? entry.metas.slice(skip) : entry.metas;
+  const metas = applyRpdb(sliced, profile.keys.rpdb_api_key);
   res.json({
     metas,
     cacheMaxAge: 12 * 3600, // client-side hint; server cache refreshes daily

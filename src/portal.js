@@ -32,12 +32,14 @@ function publicProfile(p, req) {
       trakt_client_secret: !!p.keys.trakt_client_secret,
       tmdb_api_key: !!p.keys.tmdb_api_key,
       gemini_api_key: !!p.keys.gemini_api_key,
+      rpdb_api_key: !!p.keys.rpdb_api_key,
     },
     keys_preview: {
       trakt_client_id: redactKey(p.keys.trakt_client_id),
       trakt_client_secret: redactKey(p.keys.trakt_client_secret),
       tmdb_api_key: redactKey(p.keys.tmdb_api_key),
       gemini_api_key: redactKey(p.keys.gemini_api_key),
+      rpdb_api_key: redactKey(p.keys.rpdb_api_key),
     },
     trakt_connected: !!p.trakt_auth?.access_token,
     trakt_expires_at: p.trakt_auth?.expires_at || null,
@@ -67,9 +69,11 @@ router.put('/profiles/:id', (req, res) => {
   if (req.body.keys) {
     // Only overwrite keys that were actually provided (non-empty)
     patch.keys = {};
-    for (const k of ['trakt_client_id', 'trakt_client_secret', 'tmdb_api_key', 'gemini_api_key']) {
+    for (const k of ['trakt_client_id', 'trakt_client_secret', 'tmdb_api_key', 'gemini_api_key', 'rpdb_api_key']) {
       if (req.body.keys[k]) patch.keys[k] = String(req.body.keys[k]).trim();
     }
+    // Explicit clear for optional keys ('' disables RPDB again)
+    if (req.body.keys.rpdb_api_key === null) patch.keys.rpdb_api_key = '';
   }
   const profile = config.updateProfile(req.params.id, patch);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
@@ -130,7 +134,17 @@ async function testGemini(profile) {
   return { ok: false, error: `Invalid Gemini key (${res.status})` };
 }
 
-const TESTERS = { trakt: testTrakt, tmdb: testTmdb, gemini: testGemini };
+async function testRpdb(profile) {
+  const key = profile.keys.rpdb_api_key;
+  if (!key) return { ok: false, error: 'RPDB key not set (optional — posters stay standard without it)' };
+  const res = await fetch(`https://api.ratingposterdb.com/${encodeURIComponent(key)}/isValid`, {
+    headers: { 'User-Agent': trakt.USER_AGENT },
+  });
+  if (res.ok) return { ok: true, detail: 'RPDB key valid — posters will show ratings' };
+  return { ok: false, error: `Invalid RPDB key (${res.status})` };
+}
+
+const TESTERS = { trakt: testTrakt, tmdb: testTmdb, gemini: testGemini, rpdb: testRpdb };
 
 router.post('/profiles/:id/test/:service', async (req, res) => {
   const profile = config.getProfile(req.params.id);

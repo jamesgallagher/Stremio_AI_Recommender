@@ -44,6 +44,10 @@ Each profile carries its own full key set — nothing is shared.
      the device code grant)
    - a TMDB API key at [themoviedb.org/settings/api](https://www.themoviedb.org/settings/api)
    - a Gemini API key at [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
+   - RPDB (rating-on-poster artwork) works out of the box — every profile is
+     pre-set with the generic free-tier key (`t0-free-rpdb`). Optionally paste
+     a personal key from [ratingposterdb.com](https://ratingposterdb.com/) for
+     higher tiers. Applied at serve time; changes need no rebuild.
 3. Paste the four keys into the profile card → **Save keys**.
 4. **Connect Trakt** → enter the PIN at trakt.tv/activate while signed in as
    that member's Trakt account. Tokens auto-refresh from then on.

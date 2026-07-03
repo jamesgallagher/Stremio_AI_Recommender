@@ -3,6 +3,10 @@
 const crypto = require('crypto');
 const store = require('./store');
 
+// RPDB's generic free-tier key — works for everyone, pre-filled on every new
+// profile. Replaceable per profile with a personal (paid-tier) key anytime.
+const DEFAULT_RPDB_KEY = 't0-free-rpdb';
+
 const DEFAULT_FILTERS = {
   min_rating: 7.0,
   max_age_years: 5, // recency window; 0 = no limit
@@ -19,6 +23,7 @@ function newProfile(name) {
       trakt_client_secret: '',
       tmdb_api_key: '',
       gemini_api_key: '',
+      rpdb_api_key: DEFAULT_RPDB_KEY, // rating-overlay posters; free key pre-set
     },
     trakt_auth: null, // { access_token, refresh_token, expires_at(ms) }
     filters: { ...DEFAULT_FILTERS },
@@ -27,7 +32,13 @@ function newProfile(name) {
 }
 
 function listProfiles() {
-  return store.loadProfiles().profiles;
+  const profiles = store.loadProfiles().profiles;
+  // Migration: profiles created before the RPDB field existed get the free
+  // key too (undefined = pre-feature; '' = explicitly cleared, respected).
+  for (const p of profiles) {
+    if (p.keys.rpdb_api_key === undefined) p.keys.rpdb_api_key = DEFAULT_RPDB_KEY;
+  }
+  return profiles;
 }
 
 function getProfile(id) {

@@ -117,7 +117,8 @@ function render(profiles) {
   const container = $('#profiles');
   container.innerHTML = profiles.map(p => {
     const installUrl = p.install_url;
-    const keysOk = Object.values(p.keys_set).every(Boolean);
+    // RPDB is optional — excluded from the required-keys gate
+    const keysOk = p.keys_set.trakt_client_id && p.keys_set.trakt_client_secret && p.keys_set.tmdb_api_key && p.keys_set.gemini_api_key;
     const traktKeysOk = p.keys_set.trakt_client_id && p.keys_set.trakt_client_secret;
     const badge = p.trakt_connected
       ? '<span class="badge ok">Trakt connected</span>'
@@ -161,7 +162,7 @@ function render(profiles) {
       </details>
 
       <details>
-        <summary>API keys — TMDB &amp; Gemini ${p.keys_set.tmdb_api_key && p.keys_set.gemini_api_key ? '✓' : '— required'}</summary>
+        <summary>API keys — TMDB, Gemini &amp; RPDB ${p.keys_set.tmdb_api_key && p.keys_set.gemini_api_key ? '✓' : '— required'}</summary>
         <div class="muted" style="margin-top:8px">Create each key while signed in as <b>${esc(p.name)}</b>'s account on that service.</div>
         <div class="cols">
           <div><label>TMDB API Key <span class="muted">(${p.keys_preview.tmdb_api_key || 'not set'})</span>
@@ -170,11 +171,16 @@ function render(profiles) {
           <div><label>Gemini API Key <span class="muted">(${p.keys_preview.gemini_api_key || 'not set'})</span>
               <a class="getkey" href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">get key ↗</a></label>
             <input type="password" data-key="gemini_api_key" placeholder="leave blank to keep"></div>
+          <div><label>RPDB API Key <span class="muted">(optional · ${p.keys_preview.rpdb_api_key || 'not set'})</span>
+              <a class="getkey" href="https://ratingposterdb.com/" target="_blank" rel="noopener">get key ↗</a></label>
+            <input type="password" data-key="rpdb_api_key" placeholder="leave blank to keep">
+            <div class="muted" style="font-size:11px;margin-top:3px">Pre-set with the free-tier key (t0-free-rpdb) — posters show ratings out of the box. Paste a personal key here to upgrade tiers. Applies immediately, no rebuild.</div></div>
         </div>
         <div style="margin-top:10px" class="row">
           <button onclick="saveKeys('${p.id}')">Save</button>
           <button class="ghost mini" onclick="testKey('${p.id}','tmdb',this)">Test TMDB</button><span class="tres" data-tres="tmdb"></span>
           <button class="ghost mini" onclick="testKey('${p.id}','gemini',this)">Test Gemini</button><span class="tres" data-tres="gemini"></span>
+          <button class="ghost mini" onclick="testKey('${p.id}','rpdb',this)">Test RPDB</button><span class="tres" data-tres="rpdb"></span>
         </div>
       </details>
 
