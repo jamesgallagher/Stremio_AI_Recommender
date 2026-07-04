@@ -147,15 +147,15 @@ async function buildCatalog(profile, type, log = console) {
   } else {
     log.log(`[rebuild] ${profile.name}/${type}: ${history.length} history titles — Gemini, target ${listSize}`);
     source = 'gemini';
-    const suggestedTitles = new Set(); // avoid re-suggesting across rounds
+    const suggestedTitles = new Set(); // everything Gemini returned this rebuild
     for (let round = 1; round <= MAX_GEMINI_ROUNDS && collected.length < listSize; round++) {
       const need = listSize - collected.length;
       const askCount = Math.min(40, Math.max(15, need * 2 + 5));
-      const excludeTitles = [
-        ...watched.titles,
-        ...collected.map((m) => m.name),
-        ...suggestedTitles,
-      ];
+      // Round 1: clean prompt (no avoid-list) for best taste-matching.
+      // Rounds 2+: avoid ONLY what was already suggested this rebuild —
+      // including rejects, so the top-up doesn't return the same rejects.
+      // Watched-history exclusion is enforced locally on IDs, not in the prompt.
+      const excludeTitles = [...suggestedTitles];
       const suggestions = await gemini.getSuggestions(
         keys.gemini_api_key, type, history, filters, excludeTitles, log, askCount
       );

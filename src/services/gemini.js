@@ -31,10 +31,14 @@ function buildPrompt(type, history, filters, excludeTitles, askCount = 25) {
   if (filters.age_limit > 0) {
     rules.push(`Every recommendation MUST be age-appropriate for a viewer aged ${filters.age_limit} or younger, with a Common Sense Media age rating of ${filters.age_limit}+ or lower. Family and children's ${kind} only — no exceptions.`);
   }
-  rules.push(`Do not include ${kind} I already watched.`);
+  rules.push(`Do not include the ${kind} listed above that I already watched.`);
 
+  // Exclusions here are ONLY titles Gemini already suggested in earlier
+  // rounds of this same rebuild (round 1 sends none). Watched-history
+  // enforcement is done locally on canonical IDs after TMDB resolution —
+  // never via the prompt.
   const excludeBlock = excludeTitles.length
-    ? `\nDo absolutely NOT include these titles (already watched or already suggested):\n- ${excludeTitles.slice(0, 150).join('\n- ')}`
+    ? `\nYou already suggested the following titles — do NOT suggest them again, suggest different ones:\n- ${excludeTitles.slice(0, 100).join('\n- ')}`
     : '';
 
   return `Based on the following ${kind} I recently watched:
@@ -90,6 +94,7 @@ async function getSuggestions(apiKey, type, history, filters, excludeTitles, log
     try {
       const result = await callModel(apiKey, model, prompt);
       log.log(`[gemini] ${type}: ${result.length} suggestions from ${model}`);
+      log.log(`[gemini] suggested: ${result.map((r) => `${r.title} (${r.year ?? '?'})`).join(', ')}`);
       return result;
     } catch (err) {
       lastError = err;
