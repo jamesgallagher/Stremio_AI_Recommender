@@ -307,6 +307,9 @@ router.post('/profiles/:id/rebuild', async (req, res) => {
   if (!profile.trakt_auth?.access_token) return res.status(400).json({ error: 'Connect Trakt first' });
   try {
     const results = await rebuild.rebuildProfile(profile);
+    if (results.skipped) {
+      return res.status(409).json({ error: 'A rebuild is already running for this profile — try again in a minute' });
+    }
     res.json({ results });
   } catch (err) {
     res.status(500).json({ error: err.message });

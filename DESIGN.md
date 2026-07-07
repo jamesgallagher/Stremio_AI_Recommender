@@ -141,6 +141,25 @@ authorization, key entry) and install-URL display/QR per profile.
 
 None — design is build-ready.
 
+## Implementation deviations (post-build, 2026-07)
+
+Where the built app deliberately differs from this design:
+
+- **Taste seed comes from `/sync/watched/*` (sorted by `last_watched_at`), not
+  `/sync/history/*`.** A fixed-size history window counts *plays*, so a binge
+  watcher's last 100 plays can collapse to 2–3 unique shows and misclassify a
+  heavy account as cold-start. The watched list gives the same recency signal
+  with no window, and it's already fetched for exclusion — 2 fewer Trakt calls.
+- **Client cache hints are 1 h / 12 h SWR, not 72 h / 24 h** — so serve-time
+  watched pruning and rebuilt lists reach clients quickly.
+- **Additions beyond this design** (see README): kids mode (strict Common
+  Sense age gate via MDBList), RPDB rating posters, per-profile list size,
+  rolling avoid-list for daily variety, hourly watched-set pruning with
+  `last_activities` change detection, admin login rate limiting, a per-profile
+  Diagnose tool, and `GEMINI_MODELS` override.
+- **Not built:** QR code for install URLs (Copy URL + `stremio://` deep link
+  cover the need); caching of failed TMDB resolutions.
+
 ## Decided
 
 - Trakt-only data source (no Plex/Netflix). One Trakt account = one profile.

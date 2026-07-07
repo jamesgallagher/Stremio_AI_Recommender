@@ -142,7 +142,7 @@ function render(profiles) {
         <div class="grow"></div>
         <button class="ghost" onclick="rebuildNow('${p.id}', this)" ${p.trakt_connected && !p.status.rebuilding ? '' : 'disabled'}>${p.status.rebuilding ? 'Rebuilding…' : 'Rebuild now'}</button>
         <button class="ghost" onclick="diagnose('${p.id}', this)" ${p.trakt_connected ? '' : 'disabled'} title="Check every listed title against your live Trakt watched history">Diagnose</button>
-        <button class="danger" onclick="delProfile('${p.id}', '${esc(p.name)}')">Delete</button>
+        <button class="danger" onclick="delProfile('${p.id}')">Delete</button>
       </div>
       <div class="status-line">
         ${catalogLine('🎬 Movies', p.status.movie)} &nbsp;·&nbsp; ${catalogLine('📺 Series', p.status.series)}
@@ -281,7 +281,10 @@ async function addProfile() {
   load();
 }
 
-async function delProfile(id, name) {
+async function delProfile(id) {
+  // Name read from the DOM, not interpolated into the onclick attribute —
+  // keeps profile names out of inline JS entirely.
+  const name = document.querySelector(`[data-id="${id}"] h2`)?.textContent || 'this profile';
   if (!confirm(`Delete profile "${name}"? Their install link stops working immediately.`)) return;
   await api('/profiles/' + id, { method: 'DELETE' });
   load();
