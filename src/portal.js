@@ -4,6 +4,7 @@ const express = require('express');
 const config = require('./config');
 const store = require('./store');
 const rebuild = require('./rebuild');
+const catalogs = require('./catalogs');
 const trakt = require('./services/trakt');
 const tmdb = require('./services/tmdb');
 const mdblistService = require('./services/mdblist');
@@ -29,6 +30,7 @@ function publicProfile(p, req) {
     install_url: `${baseUrl(req)}/addon/${p.token}/manifest.json`,
     external_url_set: !!normalizeExternal(process.env.EXTERNAL_URL),
     filters: p.filters,
+    catalogs: p.catalogs || {},
     keys_set: {
       trakt_client_id: !!p.keys.trakt_client_id,
       trakt_client_secret: !!p.keys.trakt_client_secret,
@@ -56,6 +58,13 @@ router.get('/genres', (req, res) => {
   res.json({ genres: Object.keys(tmdb.GENRE_ALIASES).sort() });
 });
 
+// Available extra-catalog definitions (static) for the portal's Catalogs section.
+router.get('/catalogs', (req, res) => {
+  res.json({
+    catalogs: catalogs.EXTRA_CATALOGS.map(({ id, type, name, min_imdb }) => ({ id, type, name, min_imdb })),
+  });
+});
+
 router.get('/profiles', (req, res) => {
   res.json({ profiles: config.listProfiles().map((p) => publicProfile(p, req)) });
 });
@@ -71,6 +80,7 @@ router.put('/profiles/:id', (req, res) => {
   const patch = {};
   if (req.body.name !== undefined) patch.name = req.body.name;
   if (req.body.filters) patch.filters = req.body.filters;
+  if (req.body.catalogs) patch.catalogs = req.body.catalogs;
   if (req.body.keys) {
     // Only overwrite keys that were actually provided (non-empty)
     patch.keys = {};
@@ -84,6 +94,17 @@ router.put('/profiles/:id', (req, res) => {
   }
   const profile = config.updateProfile(req.params.id, patch);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  // Rule: extra-catalog caches can be built "from the configure" — when the
+  // toggle set changes and any enabled catalog has no cache yet, build those
+  // in the background (extras only: never burns Gemini quota).
+  if (patch.catalogs && profile.keys.mdblist_api_key) {
+    const cache = store.loadCache(profile.id);
+    const missing = catalogs.enabledExtras(profile).filter((d) => !cache.extras?.[d.id]?.metas?.length);
+    if (missing.length) {
+      rebuild.rebuildProfile(profile, console, { ai: false, extras: true })
+        .catch((err) => console.error(`[extra] ${profile.name}: background build failed: ${err.message}`));
+    }
+  }
   res.json({ profile: publicProfile(profile, req) });
 });
 
@@ -304,7 +325,9 @@ router.get('/profiles/:id/diagnose', async (req, res) => {
 router.post('/profiles/:id/rebuild', async (req, res) => {
   const profile = config.getProfile(req.params.id);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
-  if (!profile.trakt_auth?.access_token) return res.status(400).json({ error: 'Connect Trakt first' });
+  if (!profile.trakt_auth?.access_token && !catalogs.enabledExtras(profile).length) {
+    return res.status(400).json({ error: 'Connect Trakt first' });
+  }
   try {
     const results = await rebuild.rebuildProfile(profile);
     if (results.skipped) {

@@ -44,6 +44,12 @@
   .genres label { display: flex; align-items: center; gap: 6px; margin: 0; font-size: 13px; color: var(--text);
     background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px; cursor: pointer; }
   .genres label:has(input:checked) { border-color: var(--err); color: var(--err); }
+  /* Catalog toggles reuse the genre grid but checked = enabled (positive) */
+  .cats { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 6px; margin-top: 6px; }
+  .cats label { display: flex; align-items: center; gap: 6px; margin: 0; font-size: 13px; color: var(--text);
+    background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px; cursor: pointer; }
+  .cats label:has(input:checked) { border-color: var(--ok); color: var(--ok); }
+  .cats label.locked { opacity: 0.7; cursor: default; }
   .install { background: var(--card2); border: 1px dashed var(--border); border-radius: 8px; padding: 10px; font-family: monospace; font-size: 12px; word-break: break-all; margin-top: 6px; }
   .muted { color: var(--muted); font-size: 12px; }
   .status-line { font-size: 12px; color: var(--muted); margin-top: 8px; }
@@ -83,6 +89,7 @@
 <script>
 const $ = (s, el = document) => el.querySelector(s);
 let GENRES = [];
+let CATALOG_DEFS = [];
 
 function toast(msg) {
   const t = $('#toast');
@@ -240,6 +247,21 @@ function render(profiles) {
       </details>
 
       <details>
+        <summary>Catalogs — AI + ${Object.values(p.catalogs || {}).filter(Boolean).length} extra</summary>
+        <div class="muted" style="margin-top:8px">The two AI catalogs are always on. Extra catalogs are curated MDBList lists: refreshed daily, fixed at 20 titles, and they <b>ignore watched status</b>. Popular charts are unfiltered; the rest drop titles rated below IMDb 6. Requires this profile's MDBList API key.</div>
+        <div class="cats">
+          <label class="locked"><input type="checkbox" checked disabled>Movies recommended for you</label>
+          <label class="locked"><input type="checkbox" checked disabled>Series recommended for you</label>
+          ${CATALOG_DEFS.map(c => `<label><input type="checkbox" data-catalog="${esc(c.id)}" ${p.catalogs && p.catalogs[c.id] ? 'checked' : ''}>${esc(c.name)}<span class="muted" style="font-size:11px">${c.type === 'series' ? 'series' : 'movies'}${c.min_imdb ? ' · IMDb ≥ ' + c.min_imdb : ''}</span></label>`).join('')}
+        </div>
+        ${Object.values(p.catalogs || {}).some(Boolean) && !p.keys_set.mdblist_api_key ? '<div style="color:var(--err);font-size:12px;margin-top:6px">⚠ Extra catalogs are enabled but no MDBList key is set — they cannot build until you add one (API keys section).</div>' : ''}
+        <div style="margin-top:10px" class="row">
+          <button onclick="saveCatalogs('${p.id}')">Save catalogs</button>
+          <span class="muted"> — newly enabled lists build in the background; they appear in Stremio/Nuvio after the app refreshes the addon manifest (or reinstall the addon)</span>
+        </div>
+      </details>
+
+      <details>
         <summary>Install in Stremio / Nuvio</summary>
         ${p.external_url_set ? '' : `<div style="color:var(--warn);font-size:12px;margin:6px 0">⚠ EXTERNAL_URL is not set — this link uses the address you opened this page from, which Stremio clients outside your network can't reach. Set the EXTERNAL_URL variable to your public hostname (e.g. your Cloudflare Tunnel URL).</div>`}
         <div class="install">${esc(installUrl)}</div>
@@ -269,6 +291,7 @@ function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&
 
 async function load() {
   if (!GENRES.length) GENRES = (await api('/genres')).genres;
+  if (!CATALOG_DEFS.length) CATALOG_DEFS = (await api('/catalogs')).catalogs;
   const { profiles } = await api('/profiles');
   render(profiles);
 }
@@ -328,6 +351,16 @@ async function saveFilters(id) {
   await api('/profiles/' + id, { method: 'PUT', body: { filters } });
   dirty = false;
   toast('Filters saved — applies on next rebuild');
+  load();
+}
+
+async function saveCatalogs(id) {
+  const card = document.querySelector(`[data-id="${id}"]`);
+  const catalogs = {};
+  card.querySelectorAll('[data-catalog]').forEach(i => { catalogs[i.dataset.catalog] = i.checked; });
+  await api('/profiles/' + id, { method: 'PUT', body: { catalogs } });
+  dirty = false;
+  toast('Catalogs saved — enabled lists build in the background');
   load();
 }
 

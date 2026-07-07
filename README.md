@@ -60,6 +60,26 @@ Each profile carries its own full key set — nothing is shared.
 First list generates within a minute or two (a "warming up" card shows until
 then). After that, lists refresh in the background roughly daily.
 
+## Extra catalogs (curated MDBList lists)
+
+Per profile, in the portal's **Catalogs** section: the two AI catalogs are
+always on; six optional catalogs can be toggled per profile, each appearing
+as its own catalog in Stremio/Nuvio:
+
+- **Popular Movies** / **Popular Series** — the JustWatch streaming charts
+  (list order, unfiltered, 20 titles).
+- **Christmas / Comedy / Action / Thriller Movies** — curated lists, 20
+  titles each; anything rated below **IMDb 6** is dropped and the list is
+  paged further until 20 titles are collected.
+
+Rules: extra catalogs **ignore watched status** (only the AI catalogs exclude
+what you've seen), refresh on the same daily cadence, are served from cache,
+and need the profile's **MDBList API key**. Newly enabled catalogs build in
+the background when you hit Save (or on first request); they show up in the
+app once it refreshes the addon manifest — reinstall the addon to force it.
+Kids-mode age limits still apply to extra catalogs — the Common Sense gate
+cannot be bypassed by toggling on a chart list.
+
 ## Kids mode (Common Sense age limit)
 
 Per profile: tick **Limit to age** in Filters and pick a tier (5+, 6+, 8+,

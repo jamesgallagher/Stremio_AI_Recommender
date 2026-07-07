@@ -79,6 +79,38 @@ ok('trakt: watched parse — ID sets + recency-ordered taste seed', () => {
   assert.deepStrictEqual(shows.recent, [{ title: 'Show', year: 2023 }]);
 });
 
+ok('catalogs: registry ids unique, types valid, popular unfiltered', () => {
+  const catalogs = require('../src/catalogs');
+  assert.strictEqual(catalogs.EXTRA_CATALOGS.length, 6);
+  const ids = catalogs.EXTRA_CATALOGS.map(d => d.id);
+  assert.strictEqual(new Set(ids).size, ids.length);
+  assert.ok(catalogs.EXTRA_CATALOGS.every(d => d.type === 'movie' || d.type === 'series'));
+  assert.strictEqual(catalogs.getExtra('mdb-popular-movies').min_imdb, 0); // popular: no rating gate
+  assert.strictEqual(catalogs.getExtra('mdb-action-movies').min_imdb, 6);
+  assert.strictEqual(catalogs.getExtra('nope'), null);
+  assert.deepStrictEqual(catalogs.enabledExtras({ catalogs: { 'mdb-action-movies': true } }).map(d => d.id), ['mdb-action-movies']);
+  assert.deepStrictEqual(catalogs.enabledExtras({}), []);
+});
+
+ok('store: swapExtra keeps AI catalogs untouched', () => {
+  store.swapCatalog('p5', 'movie', [{ id: 'tt1' }], 'gemini');
+  store.swapExtra('p5', 'mdb-action-movies', [{ id: 'tt2' }]);
+  const c = store.loadCache('p5');
+  assert.strictEqual(c.movie.metas[0].id, 'tt1');
+  assert.strictEqual(c.extras['mdb-action-movies'].metas[0].id, 'tt2');
+  assert.ok(c.extras['mdb-action-movies'].generated_at > 0);
+  store.deleteCache('p5');
+});
+
+ok('mdblist: IMDb rating parse from list items and media info', () => {
+  const { parseImdbRating } = require('../src/services/mdblist');
+  assert.strictEqual(parseImdbRating({ ratings: [{ source: 'imdb', value: 7.4 }] }), 7.4);
+  assert.strictEqual(parseImdbRating({ imdbrating: '6.1' }), 6.1);
+  assert.strictEqual(parseImdbRating({ ratings: [{ source: 'metacritic', value: 88 }] }), null);
+  assert.strictEqual(parseImdbRating({}), null);
+  assert.strictEqual(parseImdbRating(null), null);
+});
+
 ok('config: profile CRUD + filter clamping', () => {
   const p = config.addProfile('Test');
   assert.ok(p.token.length === 32);
@@ -91,6 +123,9 @@ ok('config: profile CRUD + filter clamping', () => {
   const p2 = config.getProfile(p.id);
   assert.strictEqual(p2.filters.min_rating, 0); // clamped
   assert.deepStrictEqual(p2.filters.excluded_genres, ['Horror']);
+  assert.deepStrictEqual(p2.catalogs, {}); // extra catalogs default off
+  config.updateProfile(p.id, { catalogs: { 'mdb-action-movies': true, 'bogus-id': true, 'mdb-popular-movies': false } });
+  assert.deepStrictEqual(config.getProfile(p.id).catalogs, { 'mdb-action-movies': true }); // unknown ids dropped, false omitted
   assert.ok(config.getProfileByToken(p.token));
   config.removeProfile(p.id);
   assert.strictEqual(config.getProfile(p.id), null);
@@ -304,12 +339,72 @@ async function httpTests() {
   assert.strictEqual(res.status, 400);
   console.log('  ✓ rebuild without Trakt auth rejected cleanly');
 
+  // ---- Extra catalogs (second profile keeps earlier assertions intact) ----
+  const defs = await (await fetch(`${BASE}/api/catalogs`)).json();
+  assert.strictEqual(defs.catalogs.length, 6);
+  assert.ok(defs.catalogs.some(c => c.id === 'mdb-popular-series' && c.type === 'series'));
+  console.log('  ✓ GET /api/catalogs lists extra-catalog definitions');
+
+  res = await fetch(`${BASE}/api/profiles`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'ExtraCats' }),
+  });
+  const p2 = (await res.json()).profile;
+
+  // Disabled extra catalog -> 404 even though the id is known
+  res = await fetch(`${BASE}/addon/${p2.token}/catalog/movie/mdb-action-movies.json`);
+  assert.strictEqual(res.status, 404);
+  console.log('  ✓ disabled extra catalog rejected');
+
+  // Enable two extras (no MDBList key set -> no background build/network)
+  res = await fetch(`${BASE}/api/profiles/${p2.id}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ catalogs: { 'mdb-action-movies': true, 'mdb-popular-series': true } }),
+  });
+  const p2u = (await res.json()).profile;
+  assert.deepStrictEqual(p2u.catalogs, { 'mdb-action-movies': true, 'mdb-popular-series': true });
+  console.log('  ✓ PUT /api/profiles/:id catalogs persisted');
+
+  // Manifest now advertises AI + enabled extras with correct types
+  const man2 = await (await fetch(`${BASE}/addon/${p2.token}/manifest.json`)).json();
+  assert.strictEqual(man2.catalogs.length, 4);
+  assert.deepStrictEqual(
+    man2.catalogs.map(c => c.id),
+    // AI first, then extras in registry order (stable regardless of toggle order)
+    ['ai-recs-movies', 'ai-recs-series', 'mdb-popular-series', 'mdb-action-movies']
+  );
+  assert.strictEqual(man2.catalogs.find(c => c.id === 'mdb-popular-series').type, 'series');
+  console.log('  ✓ manifest includes enabled extra catalogs');
+
+  // Enabled but not built yet -> warming card mentioning the MDBList key
+  let ecat = await (await fetch(`${BASE}/addon/${p2.token}/catalog/movie/mdb-action-movies.json`)).json();
+  assert.strictEqual(ecat.metas.length, 1);
+  assert.ok(ecat.metas[0].description.includes('MDBList'));
+  console.log('  ✓ unbuilt extra catalog serves setup card');
+
+  // Seeded extra catalog is served, and watched status does NOT prune it
+  store.swapExtra(p2.id, 'mdb-action-movies', [
+    { id: 'tt0111161', type: 'movie', name: 'Action Pick', poster: null, description: '', releaseInfo: '2020' },
+  ]);
+  store.saveWatched(p2.id, 'movie', { imdbIds: new Set(['tt0111161']), tmdbIds: new Set() });
+  ecat = await (await fetch(`${BASE}/addon/${p2.token}/catalog/movie/mdb-action-movies.json`)).json();
+  assert.strictEqual(ecat.metas.length, 1); // watched, but extras ignore watched status
+  assert.strictEqual(ecat.metas[0].id, 'tt0111161');
+  console.log('  ✓ extra catalog served from cache, watched status ignored');
+
+  // Wrong type for a known extra id -> 404
+  res = await fetch(`${BASE}/addon/${p2.token}/catalog/series/mdb-action-movies.json`);
+  assert.strictEqual(res.status, 404);
+  console.log('  ✓ extra catalog type mismatch rejected');
+
+  await fetch(`${BASE}/api/profiles/${p2.id}`, { method: 'DELETE' });
+
   // Portal page served
   const html = await (await fetch(`${BASE}/configure/`)).text();
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 16 http).`);
+  console.log(`\nAll checks passed (${passed} unit + 23 http).`);
   process.exit(0);
 }
 

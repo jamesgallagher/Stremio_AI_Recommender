@@ -5,9 +5,12 @@ const express = require('express');
 const config = require('./config');
 const store = require('./store');
 const rebuild = require('./rebuild');
+const catalogs = require('./catalogs');
 
 const router = express.Router({ mergeParams: true });
 
+// Always-on AI catalogs. Optional extras (per-profile toggles) live in
+// ./catalogs and are appended to the manifest dynamically.
 const CATALOGS = {
   'ai-recs-movies': { type: 'movie', name: 'Movies recommended for you' },
   'ai-recs-series': { type: 'series', name: 'Series recommended for you' },
@@ -37,6 +40,9 @@ function manifestFor(profile, baseUrl = '') {
     catalogs: [
       { type: 'movie', id: 'ai-recs-movies', name: CATALOGS['ai-recs-movies'].name, extra: [{ name: 'skip', isRequired: false }] },
       { type: 'series', id: 'ai-recs-series', name: CATALOGS['ai-recs-series'].name, extra: [{ name: 'skip', isRequired: false }] },
+      ...catalogs.enabledExtras(profile).map((d) => (
+        { type: d.type, id: d.id, name: d.name, extra: [{ name: 'skip', isRequired: false }] }
+      )),
     ],
     behaviorHints: { configurable: false, configurationRequired: false },
   };
@@ -70,8 +76,12 @@ router.get('/manifest.json', (req, res) => {
 // Matches /catalog/movie/ai-recs-movies.json and .../ai-recs-movies/skip=20.json
 router.get('/catalog/:type/:catalogId{/:extra}', (req, res) => {
   const catalogId = req.params.catalogId.replace(/\.json$/, '');
-  const catalog = CATALOGS[catalogId];
-  if (!catalog || catalog.type !== req.params.type) {
+  const profile = req.profile;
+
+  const aiCatalog = CATALOGS[catalogId];
+  const extraDef = !aiCatalog && catalogs.getExtra(catalogId);
+  const def = aiCatalog || extraDef;
+  if (!def || def.type !== req.params.type || (extraDef && !profile.catalogs?.[extraDef.id])) {
     return res.status(404).json({ error: 'Unknown catalog' });
   }
 
@@ -79,32 +89,37 @@ router.get('/catalog/:type/:catalogId{/:extra}', (req, res) => {
   const extra = (req.params.extra || '').replace(/\.json$/, '');
   const skip = parseInt((extra.match(/skip=(\d+)/) || [])[1] || '0', 10);
 
-  const profile = req.profile;
   rebuild.ensureFresh(profile); // SWR: fire-and-forget; this request serves cache
   rebuild.ensureExclusionsFresh(profile); // hourly watched-set refresh (background)
 
   const cache = store.loadCache(profile.id);
-  const entry = cache[catalog.type];
+  const entry = extraDef ? cache.extras?.[extraDef.id] : cache[def.type];
 
   if (!entry || !entry.metas.length) {
     // Nothing cached yet (first install / not onboarded) — friendly card, short client cache
-    const description = profile.trakt_auth?.access_token
-      ? 'Your recommendations are being generated — check back in a minute or two.'
-      : 'This profile has not connected Trakt yet. Open the configure portal to finish setup.';
-    return res.json({ metas: skip > 0 ? [] : [errorCard(catalog.type, description)], cacheMaxAge: 5 * 60 });
+    const description = extraDef
+      ? (profile.keys.mdblist_api_key
+        ? 'This list is being generated — check back in a minute or two.'
+        : 'This catalog needs an MDBList API key — add one in the configure portal.')
+      : (profile.trakt_auth?.access_token
+        ? 'Your recommendations are being generated — check back in a minute or two.'
+        : 'This profile has not connected Trakt yet. Open the configure portal to finish setup.');
+    return res.json({ metas: skip > 0 ? [] : [errorCard(def.type, description)], cacheMaxAge: 5 * 60 });
   }
 
-  // Serve-time watched pruning: never show something the watched snapshot
-  // says has been seen, even if the daily rebuild hasn't run yet. Union of
-  // both types — IMDb IDs are global, and Trakt/TMDB sometimes disagree on
-  // whether a title is a movie or a show.
-  const watchedImdb = new Set([
-    ...(cache.watched?.movie?.imdb || []),
-    ...(cache.watched?.series?.imdb || []),
-  ]);
-  const unwatched = entry.metas.filter((m) => !watchedImdb.has(m.id));
+  // Serve-time watched pruning — AI catalogs only (extra catalogs ignore
+  // watched status by design). Union of both types: IMDb IDs are global, and
+  // Trakt/TMDB sometimes disagree on whether a title is a movie or a show.
+  let served = entry.metas;
+  if (!extraDef) {
+    const watchedImdb = new Set([
+      ...(cache.watched?.movie?.imdb || []),
+      ...(cache.watched?.series?.imdb || []),
+    ]);
+    served = served.filter((m) => !watchedImdb.has(m.id));
+  }
 
-  const sliced = skip > 0 ? unwatched.slice(skip) : unwatched;
+  const sliced = skip > 0 ? served.slice(skip) : served;
   const metas = applyRpdb(sliced, profile.keys.rpdb_api_key);
   res.json({
     metas,

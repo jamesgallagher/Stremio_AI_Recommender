@@ -82,6 +82,15 @@ function pruneWatched(profileId, type, imdbIds) {
   return removed;
 }
 
+// Extra (MDBList-backed) catalog cache, keyed by catalog id. Same atomic-swap
+// discipline as the AI catalogs: only called on successful builds.
+function swapExtra(profileId, catalogId, metas) {
+  const cache = loadCache(profileId);
+  cache.extras = cache.extras || {};
+  cache.extras[catalogId] = { metas, generated_at: Date.now() };
+  writeJsonAtomic(cacheFile(profileId), cache);
+}
+
 // Record the Trakt last_activities timestamps that the current watched
 // snapshot corresponds to, so the hourly refresh can skip the full watched
 // downloads when nothing changed. Also bumps watched_synced_at.
@@ -138,6 +147,7 @@ module.exports = {
   saveProfiles,
   loadCache,
   swapCatalog,
+  swapExtra,
   saveWatched,
   pruneWatched,
   saveWatchedActivity,

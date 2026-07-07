@@ -2,6 +2,7 @@
 // Trakt client ID/secret + OAuth tokens, TMDB key, Gemini key.
 const crypto = require('crypto');
 const store = require('./store');
+const { EXTRA_CATALOGS } = require('./catalogs');
 
 // RPDB's generic free-tier key — works for everyone, pre-filled on every new
 // profile. Replaceable per profile with a personal (paid-tier) key anytime.
@@ -30,6 +31,7 @@ function newProfile(name) {
     },
     trakt_auth: null, // { access_token, refresh_token, expires_at(ms) }
     filters: { ...DEFAULT_FILTERS },
+    catalogs: {}, // extra-catalog toggles by id; absent/false = off. AI catalogs are always on.
     created_at: Date.now(),
   };
 }
@@ -43,6 +45,7 @@ function listProfiles() {
     if (p.keys.mdblist_api_key === undefined) p.keys.mdblist_api_key = '';
     if (p.filters.age_limit === undefined) p.filters.age_limit = 0;
     if (p.filters.list_size === undefined) p.filters.list_size = 20;
+    if (p.catalogs === undefined) p.catalogs = {};
   }
   return profiles;
 }
@@ -77,6 +80,14 @@ function updateProfile(id, patch) {
     if (Array.isArray(f.excluded_genres)) profile.filters.excluded_genres = f.excluded_genres.map(String);
     if (f.age_limit !== undefined) profile.filters.age_limit = Math.max(0, parseInt(f.age_limit, 10) || 0);
     if (f.list_size !== undefined) profile.filters.list_size = Math.min(50, Math.max(5, parseInt(f.list_size, 10) || 20));
+  }
+  if (patch.catalogs && typeof patch.catalogs === 'object') {
+    // Only known catalog ids, coerced to booleans — the toggle set is the
+    // whole payload, so unmentioned ids default to off.
+    profile.catalogs = {};
+    for (const def of EXTRA_CATALOGS) {
+      if (patch.catalogs[def.id]) profile.catalogs[def.id] = true;
+    }
   }
   if (patch.trakt_auth !== undefined) profile.trakt_auth = patch.trakt_auth;
   store.saveProfiles(data);

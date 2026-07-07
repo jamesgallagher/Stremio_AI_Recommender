@@ -16,8 +16,13 @@
 //   verified against Common Sense Media (via MDBList). No CSM rating => not
 //   listed. CSM only — no fallback to other rating systems. A broken MDBList
 //   lookup fails the rebuild (old list stays) rather than serving unverified.
+// - Extra catalogs (curated MDBList lists, per-profile toggles): built and
+//   swapped with the same discipline, but no watched exclusion and no taste
+//   input. Popular charts unfiltered; the rest gated on IMDb rating >= 6.
+//   The kids-mode CSM gate applies to extras too.
 const store = require('./store');
 const config = require('./config');
+const catalogs = require('./catalogs');
 const trakt = require('./services/trakt');
 const gemini = require('./services/gemini');
 const tmdb = require('./services/tmdb');
@@ -31,6 +36,9 @@ const DEFAULT_LIST_SIZE = 20;
 const MAX_GEMINI_ROUNDS = 4;
 const MAX_DISCOVER_PAGES = 10;
 const COLD_START_THRESHOLD = 3;
+const EXTRA_LIST_TARGET = 20; // extra catalogs are fixed at 20 titles
+const MAX_EXTRA_PAGES = 5;
+const EXTRA_PAGE_SIZE = 50;
 
 const locks = new Set(); // profile ids currently rebuilding
 const exclusionLocks = new Set(); // profile ids currently refreshing watched sets
@@ -220,49 +228,148 @@ async function buildCatalog(profile, type, watchedByType, log = console) {
   return { metas: cleanMetas(collected), source };
 }
 
-async function rebuildProfile(profile, log = console) {
+// Extra catalog: one curated MDBList list -> up to 20 metas. Popular charts
+// (min_imdb 0) serve list order as-is; rating-gated catalogs drop items whose
+// IMDb rating is below the bar and keep paging until filled. Watched status
+// is ignored by design. Kids-mode age limits still apply — a child profile
+// must never bypass the Common Sense gate via an extra catalog.
+async function buildExtraCatalog(profile, def, log = console) {
+  const key = profile.keys.mdblist_api_key;
+  if (!key) throw new Error('MDBList API key is required for extra catalogs');
+  const collected = [];
+  const seen = new Set();
+  for (let page = 0; page < MAX_EXTRA_PAGES && collected.length < EXTRA_LIST_TARGET; page++) {
+    const items = await mdblist.listItemsPage(key, def.user, def.slug, def.type, {
+      limit: EXTRA_PAGE_SIZE, offset: page * EXTRA_PAGE_SIZE, sort: def.sort,
+    });
+    if (!items.length) break;
+
+    // Batch-enrich items whose list entry lacks a poster or (when gated) a
+    // rating — one POST for the whole page instead of per-item lookups.
+    const needInfo = items.filter((i) => {
+      const id = i.imdb_id || i.ids?.imdb;
+      return id && (!i.poster || (def.min_imdb > 0 && mdblist.parseImdbRating(i) === null));
+    }).map((i) => i.imdb_id || i.ids?.imdb);
+    let infoMap = new Map();
+    if (needInfo.length) {
+      try {
+        infoMap = await mdblist.mediaInfoBatch(key, def.type, needInfo);
+      } catch (err) {
+        log.warn(`[extra] ${def.id}: batch enrich failed (${err.message}) — serving list data as-is`);
+      }
+    }
+
+    let pageMetas = [];
+    for (const item of items) {
+      const imdb = item.imdb_id || item.ids?.imdb;
+      if (!imdb || seen.has(imdb)) continue;
+      seen.add(imdb);
+      const info = infoMap.get(imdb);
+      const rating = mdblist.parseImdbRating(item) ?? mdblist.parseImdbRating(info);
+      // Unrated titles are kept — the gate only drops a rating that exists
+      // and is below the bar (same semantics as the AI min-rating filter).
+      if (def.min_imdb > 0 && rating !== null && rating < def.min_imdb) {
+        log.log(`[extra] ${def.id}: "${item.title}" IMDb ${rating} < ${def.min_imdb} — dropped`);
+        continue;
+      }
+      pageMetas.push({
+        id: imdb,
+        type: def.type,
+        name: item.title || info?.title || imdb,
+        poster: item.poster || info?.poster || null,
+        description: item.description || info?.description || '',
+        releaseInfo: String(item.release_year || info?.year || '') || null,
+        imdbRating: rating !== null ? rating.toFixed(1) : null,
+      });
+    }
+    pageMetas = await applyCsmGate(pageMetas, def.type, profile, log);
+    for (const m of pageMetas) {
+      if (collected.length >= EXTRA_LIST_TARGET) break;
+      collected.push(m);
+    }
+    log.log(`[extra] ${profile.name}/${def.id}: page ${page + 1} -> ${collected.length}/${EXTRA_LIST_TARGET}`);
+  }
+  return collected;
+}
+
+// AI catalogs (movie + series): Trakt-seeded, Gemini/discover, watched-excluded.
+async function buildAiCatalogs(profile, results, log) {
+  // Backfill the Trakt account name for profiles connected before we
+  // started recording it — surfaces wrong-account authorizations.
+  if (!profile.trakt_auth.username) {
+    try {
+      const username = await trakt.getAccountUsername(profile);
+      config.updateProfile(profile.id, { trakt_auth: { ...profile.trakt_auth, username } });
+      log.log(`[trakt] ${profile.name}: profile is authorized as Trakt user "${username}"`);
+    } catch { /* non-fatal */ }
+  }
+  // One watched fetch per rebuild, shared by both catalogs — snapshot for
+  // serve-time pruning, exclusion sets, and the taste seed. force: the full
+  // lists are needed even when nothing changed since the last snapshot.
+  let watchedByType;
+  try {
+    watchedByType = await syncWatched(profile, { force: true });
+  } catch (err) {
+    const error = `Trakt watched fetch failed: ${err.message} — kept previous lists`;
+    log.warn(`[rebuild] ${profile.name}: ${error}`);
+    results.movie = { ok: false, error };
+    results.series = { ok: false, error };
+    return;
+  }
+  for (const type of ['movie', 'series']) {
+    try {
+      const { metas, source } = await buildCatalog(profile, type, watchedByType, log);
+      if (metas.length >= MIN_METAS) {
+        store.swapCatalog(profile.id, type, metas, source); // atomic swap on success only
+        // Remember what was listed so future rebuilds steer Gemini away
+        // from repeating it (rolling, capped avoid-list).
+        store.addSuggestedHistory(profile.id, type, metas.map((m) => m.name));
+        results[type] = { ok: true, count: metas.length, source };
+        log.log(`[rebuild] ${profile.name}/${type}: swapped in ${metas.length} titles (${source})`);
+      } else {
+        results[type] = { ok: false, error: `only ${metas.length} usable titles (< ${MIN_METAS}) — kept previous list` };
+        log.warn(`[rebuild] ${profile.name}/${type}: ${results[type].error}`);
+      }
+    } catch (err) {
+      results[type] = { ok: false, error: err.message };
+      log.warn(`[rebuild] ${profile.name}/${type} failed: ${err.message} — kept previous list`);
+    }
+  }
+}
+
+// opts.ai / opts.extras scope the rebuild (both default on) so an extras-only
+// refresh never burns Gemini quota and vice versa.
+async function rebuildProfile(profile, log = console, opts = {}) {
   if (locks.has(profile.id)) return { skipped: 'locked' };
   locks.add(profile.id);
   const results = {};
   try {
     store.markAttempt(profile.id);
-    // Backfill the Trakt account name for profiles connected before we
-    // started recording it — surfaces wrong-account authorizations.
-    if (profile.trakt_auth?.access_token && !profile.trakt_auth.username) {
-      try {
-        const username = await trakt.getAccountUsername(profile);
-        config.updateProfile(profile.id, { trakt_auth: { ...profile.trakt_auth, username } });
-        log.log(`[trakt] ${profile.name}: profile is authorized as Trakt user "${username}"`);
-      } catch { /* non-fatal */ }
+    if (opts.ai !== false) {
+      if (profile.trakt_auth?.access_token) {
+        await buildAiCatalogs(profile, results, log);
+      } else {
+        const error = 'Trakt not connected — AI catalogs skipped';
+        results.movie = { ok: false, error };
+        results.series = { ok: false, error };
+      }
     }
-    // One watched fetch per rebuild, shared by both catalogs — snapshot for
-    // serve-time pruning, exclusion sets, and the taste seed. force: the full
-    // lists are needed even when nothing changed since the last snapshot.
-    let watchedByType;
-    try {
-      watchedByType = await syncWatched(profile, { force: true });
-    } catch (err) {
-      const error = `Trakt watched fetch failed: ${err.message} — kept previous lists`;
-      log.warn(`[rebuild] ${profile.name}: ${error}`);
-      return { movie: { ok: false, error }, series: { ok: false, error } };
-    }
-    for (const type of ['movie', 'series']) {
-      try {
-        const { metas, source } = await buildCatalog(profile, type, watchedByType, log);
-        if (metas.length >= MIN_METAS) {
-          store.swapCatalog(profile.id, type, metas, source); // atomic swap on success only
-          // Remember what was listed so future rebuilds steer Gemini away
-          // from repeating it (rolling, capped avoid-list).
-          store.addSuggestedHistory(profile.id, type, metas.map((m) => m.name));
-          results[type] = { ok: true, count: metas.length, source };
-          log.log(`[rebuild] ${profile.name}/${type}: swapped in ${metas.length} titles (${source})`);
-        } else {
-          results[type] = { ok: false, error: `only ${metas.length} usable titles (< ${MIN_METAS}) — kept previous list` };
-          log.warn(`[rebuild] ${profile.name}/${type}: ${results[type].error}`);
+    if (opts.extras !== false) {
+      for (const def of catalogs.enabledExtras(profile)) {
+        try {
+          const metas = await buildExtraCatalog(profile, def, log);
+          if (metas.length >= MIN_METAS) {
+            store.swapExtra(profile.id, def.id, metas);
+            results[def.id] = { ok: true, count: metas.length };
+            log.log(`[extra] ${profile.name}/${def.id}: swapped in ${metas.length} titles`);
+          } else {
+            results[def.id] = { ok: false, error: `only ${metas.length} usable titles (< ${MIN_METAS}) — kept previous list` };
+            log.warn(`[extra] ${profile.name}/${def.id}: ${results[def.id].error}`);
+          }
+        } catch (err) {
+          results[def.id] = { ok: false, error: err.message };
+          log.warn(`[extra] ${profile.name}/${def.id} failed: ${err.message} — kept previous list`);
         }
-      } catch (err) {
-        results[type] = { ok: false, error: err.message };
-        log.warn(`[rebuild] ${profile.name}/${type} failed: ${err.message} — kept previous list`);
       }
     }
   } finally {
@@ -271,15 +378,20 @@ async function rebuildProfile(profile, log = console) {
   return results;
 }
 
-// Fire-and-forget SWR trigger from the addon request path.
+// Fire-and-forget SWR trigger from the addon request path and the scheduler.
+// Scoped: only the stale halves (AI vs extras) are rebuilt, and each half is
+// skipped when its prerequisite key/auth is missing.
 function ensureFresh(profile, log = console) {
   const cache = store.loadCache(profile.id);
-  const stale = isStale(cache.movie) || isStale(cache.series);
-  if (!stale) return false;
+  const aiStale = (isStale(cache.movie) || isStale(cache.series))
+    && !!profile.trakt_auth?.access_token;
+  const extrasStale = !!profile.keys.mdblist_api_key
+    && catalogs.enabledExtras(profile).some((d) => isStale(cache.extras?.[d.id]));
+  if (!aiStale && !extrasStale) return false;
   if (locks.has(profile.id) || exclusionLocks.has(profile.id)) return false;
   if (Date.now() - (cache.last_attempt_at || 0) < BACKOFF_MS) return false;
-  if (!profile.trakt_auth?.access_token) return false;
-  rebuildProfile(profile, log).catch((err) => log.error(`[rebuild] unexpected: ${err.message}`));
+  rebuildProfile(profile, log, { ai: aiStale, extras: extrasStale })
+    .catch((err) => log.error(`[rebuild] unexpected: ${err.message}`));
   return true;
 }
 
@@ -320,6 +432,7 @@ module.exports = {
   ensureFresh,
   ensureExclusionsFresh,
   rebuildProfile,
+  buildExtraCatalog,
   status,
   applyHardFilters,
   applyCsmGate,

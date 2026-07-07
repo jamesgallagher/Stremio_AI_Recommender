@@ -74,10 +74,86 @@ async function commonSenseAges(apiKey, type, imdbIds, log = console) {
   return results;
 }
 
+// ---- List catalogs (extra-catalog feature) ----
+const API = 'https://api.mdblist.com';
+
+// One page of a list's items for one media type. The API returns
+// { movies: [], shows: [] }; items carry imdb_id/title/release_year and —
+// with append_to_response — poster/description/ratings when available.
+// Unknown sort values are retried without sort rather than failing the list.
+async function listItemsPage(apiKey, user, slug, type, { limit = 50, offset = 0, sort } = {}) {
+  const params = new URLSearchParams({
+    apikey: apiKey,
+    limit: String(limit),
+    offset: String(offset),
+    append_to_response: 'poster,description,ratings',
+  });
+  if (sort) {
+    params.set('sort', sort);
+    params.set('order', 'asc');
+  }
+  const url = `${API}/lists/${encodeURIComponent(user)}/${encodeURIComponent(slug)}/items?${params}`;
+  let data;
+  try {
+    data = await fetchJson(url);
+  } catch (err) {
+    if (!sort) throw err;
+    // sort vocabulary differs between site and API — fall back to list order
+    params.delete('sort');
+    params.delete('order');
+    data = await fetchJson(`${API}/lists/${encodeURIComponent(user)}/${encodeURIComponent(slug)}/items?${params}`);
+  }
+  if (Array.isArray(data)) return data; // older deployments: flat array
+  return data?.[type === 'series' ? 'shows' : 'movies'] || [];
+}
+
+// Batch media info (POST /imdb/{movie|show}) — fills in ratings/poster/
+// description for items whose list entry didn't carry them. Returns a Map
+// keyed by IMDb id.
+async function mediaInfoBatch(apiKey, type, imdbIds) {
+  if (!imdbIds.length) return new Map();
+  const mediaType = type === 'series' ? 'show' : 'movie';
+  const res = await fetch(`${API}/imdb/${mediaType}?apikey=${encodeURIComponent(apiKey)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'User-Agent': USER_AGENT },
+    body: JSON.stringify({ ids: imdbIds }),
+  });
+  if (!res.ok) {
+    const err = new Error(`MDBList batch lookup failed (${res.status})`);
+    err.status = res.status;
+    throw err;
+  }
+  const arr = await res.json();
+  const map = new Map();
+  for (const m of Array.isArray(arr) ? arr : []) {
+    const id = m?.ids?.imdb || m?.imdbid;
+    if (id) map.set(id, m);
+  }
+  return map;
+}
+
+// IMDb rating from either a list item (append_to_response=ratings) or a
+// media-info object. null = not rated / not present.
+function parseImdbRating(item) {
+  if (!item) return null;
+  const entry = (item.ratings || []).find((r) => r.source === 'imdb');
+  const v = entry?.value ?? item.imdbrating ?? item.imdb_rating;
+  const n = parseFloat(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 async function testKey(apiKey) {
   // A title guaranteed to exist; validates the key end-to-end.
   const age = await commonSenseAge(apiKey, 'movie', 'tt0111161');
   return { valid: true, sampleAge: age };
 }
 
-module.exports = { commonSenseAge, commonSenseAges, parseCommonSenseAge, testKey };
+module.exports = {
+  commonSenseAge,
+  commonSenseAges,
+  parseCommonSenseAge,
+  listItemsPage,
+  mediaInfoBatch,
+  parseImdbRating,
+  testKey,
+};
