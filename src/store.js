@@ -82,6 +82,45 @@ function pruneWatched(profileId, type, imdbIds) {
   return removed;
 }
 
+// Record the Trakt last_activities timestamps that the current watched
+// snapshot corresponds to, so the hourly refresh can skip the full watched
+// downloads when nothing changed. Also bumps watched_synced_at.
+function saveWatchedActivity(profileId, activity) {
+  const cache = loadCache(profileId);
+  cache.watched_activity = activity;
+  cache.watched_synced_at = Date.now();
+  writeJsonAtomic(cacheFile(profileId), cache);
+}
+
+// Bump watched_synced_at without touching the snapshot (change detection
+// said nothing was watched since last sync).
+function touchWatchedSync(profileId) {
+  const cache = loadCache(profileId);
+  cache.watched_synced_at = Date.now();
+  writeJsonAtomic(cacheFile(profileId), cache);
+}
+
+// Rolling per-type history of titles this profile has already been shown.
+// Fed into the Gemini prompt as an avoid-list so daily rebuilds don't keep
+// re-suggesting the same safe picks. Newest last, capped.
+const SUGGESTED_HISTORY_CAP = 150;
+
+function getSuggestedHistory(profileId, type) {
+  const cache = loadCache(profileId);
+  return cache.suggested?.[type] || [];
+}
+
+function addSuggestedHistory(profileId, type, titles) {
+  if (!titles.length) return;
+  const cache = loadCache(profileId);
+  cache.suggested = cache.suggested || {};
+  const merged = (cache.suggested[type] || [])
+    .filter((t) => !titles.includes(t)) // re-listed titles move to the newest end
+    .concat(titles);
+  cache.suggested[type] = merged.slice(-SUGGESTED_HISTORY_CAP);
+  writeJsonAtomic(cacheFile(profileId), cache);
+}
+
 function markAttempt(profileId) {
   const cache = loadCache(profileId);
   cache.last_attempt_at = Date.now();
@@ -101,6 +140,10 @@ module.exports = {
   swapCatalog,
   saveWatched,
   pruneWatched,
+  saveWatchedActivity,
+  touchWatchedSync,
+  getSuggestedHistory,
+  addSuggestedHistory,
   markAttempt,
   deleteCache,
 };

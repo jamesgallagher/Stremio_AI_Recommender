@@ -134,7 +134,7 @@ async function resolveTitle(apiKey, type, title, year, log = console) {
 // Cold-start path: no Gemini, just TMDB discover driven by the same profile
 // filters. One page per call — the rebuild pipeline walks pages until its
 // quota is filled (post-filtering can discard many results per page).
-async function discoverPage(apiKey, type, filters, page = 1, log = console) {
+async function discoverPage(apiKey, type, filters, page = 1, log = console, excludeTmdbIds = new Set()) {
   const endpoint = type === 'series' ? 'discover/tv' : 'discover/movie';
   const dateField = type === 'series' ? 'first_air_date' : 'primary_release_date';
   const params = {
@@ -155,17 +155,21 @@ async function discoverPage(apiKey, type, filters, page = 1, log = console) {
 
   const data = await get(apiKey, endpoint, params);
   if (page > (data.total_pages || 1)) return [];
-  const metas = [];
-  for (const item of data.results || []) {
+  // Skip known-watched titles by TMDB id BEFORE the per-item external_ids
+  // call (the main source of wasted lookups), then resolve the survivors in
+  // parallel — a page is at most 20 items.
+  const candidates = (data.results || []).filter((item) => !excludeTmdbIds.has(item.id));
+  const metas = await Promise.all(candidates.map(async (item) => {
     const extEndpoint = type === 'series' ? `tv/${item.id}/external_ids` : `movie/${item.id}/external_ids`;
     try {
       const ext = await get(apiKey, extEndpoint);
-      if (ext.imdb_id) metas.push(toMeta(item, type, ext.imdb_id));
+      return ext.imdb_id ? toMeta(item, type, ext.imdb_id) : null;
     } catch (err) {
       log.warn(`[tmdb] discover external_ids error: ${err.message}`);
+      return null;
     }
-  }
-  return metas;
+  }));
+  return metas.filter(Boolean);
 }
 
 module.exports = {

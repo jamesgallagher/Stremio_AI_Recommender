@@ -146,7 +146,7 @@ async function buildCatalog(profile, type, watchedByType, log = console) {
     log.log(`[rebuild] ${profile.name}/${type}: cold start (${history.length} history titles) — TMDB discover, target ${listSize}`);
     source = 'discover';
     for (let page = 1; page <= MAX_DISCOVER_PAGES && collected.length < listSize; page++) {
-      const pageMetas = await tmdb.discoverPage(keys.tmdb_api_key, type, filters, page, log);
+      const pageMetas = await tmdb.discoverPage(keys.tmdb_api_key, type, filters, page, log, watched.tmdbIds);
       if (!pageMetas.length) break;
       let usable = applyHardFilters(pageMetas, type, filters, watched, log, haveIds);
       usable = await applyCsmGate(usable, type, profile, log);
@@ -160,15 +160,18 @@ async function buildCatalog(profile, type, watchedByType, log = console) {
   } else {
     log.log(`[rebuild] ${profile.name}/${type}: ${history.length} history titles — Gemini, target ${listSize}`);
     source = 'gemini';
+    // Titles listed in previous rebuilds (newest first) — asked to be avoided
+    // so the daily list doesn't keep serving the same safe picks.
+    const priorTitles = store.getSuggestedHistory(profile.id, type).slice().reverse();
     const suggestedTitles = new Set(); // everything Gemini returned this rebuild
     for (let round = 1; round <= MAX_GEMINI_ROUNDS && collected.length < listSize; round++) {
       const need = listSize - collected.length;
       const askCount = Math.min(40, Math.max(15, need * 2 + 5));
-      // Round 1: clean prompt (no avoid-list) for best taste-matching.
-      // Rounds 2+: avoid ONLY what was already suggested this rebuild —
-      // including rejects, so the top-up doesn't return the same rejects.
-      // Watched-history exclusion is enforced locally on IDs, not in the prompt.
-      const excludeTitles = [...suggestedTitles];
+      // Avoid-list: this rebuild's suggestions first (including rejects, so
+      // top-up rounds don't return the same rejects), then recently-listed
+      // titles from earlier rebuilds. Watched-history exclusion is enforced
+      // locally on IDs, not in the prompt.
+      const excludeTitles = [...suggestedTitles, ...priorTitles];
       const suggestions = await gemini.getSuggestions(
         keys.gemini_api_key, type, history, filters, excludeTitles, log, askCount
       );
@@ -213,12 +216,17 @@ async function rebuildProfile(profile, log = console) {
     // serve-time pruning and the cross-type exclusion sets.
     let watchedByType;
     try {
+      // Activity timestamps are read BEFORE the watched lists: a play landing
+      // in between makes the snapshot look older than it is, so the next
+      // hourly check re-fetches — errors in the safe direction.
+      const activity = await trakt.getLastActivities(profile);
       watchedByType = {
         movie: await trakt.getWatchedSets(profile, 'movie'),
         series: await trakt.getWatchedSets(profile, 'series'),
       };
       store.saveWatched(profile.id, 'movie', watchedByType.movie);
       store.saveWatched(profile.id, 'series', watchedByType.series);
+      store.saveWatchedActivity(profile.id, activity);
     } catch (err) {
       const error = `Trakt watched fetch failed: ${err.message} — kept previous lists`;
       log.warn(`[rebuild] ${profile.name}: ${error}`);
@@ -229,6 +237,9 @@ async function rebuildProfile(profile, log = console) {
         const { metas, source } = await buildCatalog(profile, type, watchedByType, log);
         if (metas.length >= MIN_METAS) {
           store.swapCatalog(profile.id, type, metas, source); // atomic swap on success only
+          // Remember what was listed so future rebuilds steer Gemini away
+          // from repeating it (rolling, capped avoid-list).
+          store.addSuggestedHistory(profile.id, type, metas.map((m) => m.name));
           results[type] = { ok: true, count: metas.length, source };
           log.log(`[rebuild] ${profile.name}/${type}: swapped in ${metas.length} titles (${source})`);
         } else {
@@ -270,12 +281,21 @@ function ensureExclusionsFresh(profile, log = console) {
   exclusionLocks.add(profile.id);
   (async () => {
     try {
+      // Change detection first: one cheap last_activities call. If nothing
+      // was watched since the snapshot, skip the full watched downloads.
+      const activity = await trakt.getLastActivities(profile);
+      const prev = store.loadCache(profile.id).watched_activity;
+      if (prev && prev.movies === activity.movies && prev.episodes === activity.episodes) {
+        store.touchWatchedSync(profile.id);
+        return;
+      }
       const watchedByType = {
         movie: await trakt.getWatchedSets(profile, 'movie'),
         series: await trakt.getWatchedSets(profile, 'series'),
       };
       store.saveWatched(profile.id, 'movie', watchedByType.movie);
       store.saveWatched(profile.id, 'series', watchedByType.series);
+      store.saveWatchedActivity(profile.id, activity);
       const unionImdb = new Set([...watchedByType.movie.imdbIds, ...watchedByType.series.imdbIds]);
       for (const type of ['movie', 'series']) {
         const removed = store.pruneWatched(profile.id, type, unionImdb);

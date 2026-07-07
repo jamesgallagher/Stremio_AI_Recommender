@@ -173,6 +173,19 @@ async function getAccountUsername(profile) {
   return data?.user?.username || null;
 }
 
+// ---- Change detection ----
+// One cheap call that says when anything was last watched — lets callers
+// skip downloading the full watched lists (which grow with history) when
+// nothing has changed. Show watched-state derives from episode plays, so
+// `episodes.watched_at` is the signal for series.
+async function getLastActivities(profile) {
+  const data = await authedGet(profile, '/sync/last_activities');
+  return {
+    movies: data?.movies?.watched_at || null,
+    episodes: data?.episodes?.watched_at || null,
+  };
+}
+
 // ---- Exclusion: full watched state (canonical IDs + titles) ----
 // A show with ANY watched history is excluded, even if only partially watched.
 async function getWatchedSets(profile, type) {
@@ -197,6 +210,7 @@ module.exports = {
   refreshToken,
   getRecentHistory,
   getWatchedSets,
+  getLastActivities,
   getAccountUsername,
   baseHeaders,
   USER_AGENT,
