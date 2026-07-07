@@ -4,13 +4,18 @@
 const API = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 // Highest quality first; on 429/quota we fall through to the next.
-const FALLBACK_MODELS = [
+// Override with GEMINI_MODELS (comma-separated) when this list ages —
+// no image rebuild needed.
+const DEFAULT_MODELS = [
   'gemini-2.5-flash',
   'gemini-2.5-flash-lite',
   'gemini-2.0-flash-lite-001',
   'gemini-flash-lite-latest',
   'gemini-pro-latest',
 ];
+const FALLBACK_MODELS = (process.env.GEMINI_MODELS || '')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+if (!FALLBACK_MODELS.length) FALLBACK_MODELS.push(...DEFAULT_MODELS);
 
 function buildPrompt(type, history, filters, excludeTitles, askCount = 25) {
   const kind = type === 'series' ? 'TV series' : 'movies';
@@ -33,8 +38,8 @@ function buildPrompt(type, history, filters, excludeTitles, askCount = 25) {
   }
   rules.push(`Do not include the ${kind} listed above that I already watched.`);
 
-  // Exclusions here are ONLY titles Gemini already suggested in earlier
-  // rounds of this same rebuild (round 1 sends none). Watched-history
+  // Exclusions here are titles Gemini already suggested this rebuild plus
+  // recently-listed titles from earlier rebuilds (variety). Watched-history
   // enforcement is done locally on canonical IDs after TMDB resolution —
   // never via the prompt.
   const excludeBlock = excludeTitles.length
@@ -81,7 +86,26 @@ async function callModel(apiKey, model, prompt) {
   const res = await fetch(`${API}/${model}:generateContent?key=${apiKey}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      // Structured output: the API enforces the JSON shape, so responses
+      // can't come back fenced or wrapped in prose. parseJsonArray stays as
+      // a safety net (and for models that ignore the schema).
+      generationConfig: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: 'ARRAY',
+          items: {
+            type: 'OBJECT',
+            properties: {
+              title: { type: 'STRING' },
+              year: { type: 'INTEGER' },
+            },
+            required: ['title', 'year'],
+          },
+        },
+      },
+    }),
   });
   if (!res.ok) {
     const err = new Error(`Gemini ${model} failed (${res.status})`);
