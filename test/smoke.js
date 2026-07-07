@@ -61,6 +61,24 @@ ok('store: watched activity snapshot + touch', () => {
   store.deleteCache('p4');
 });
 
+ok('trakt: watched parse — ID sets + recency-ordered taste seed', () => {
+  const { parseWatchedItems } = require('../src/services/trakt');
+  const items = [
+    { last_watched_at: '2026-01-01T00:00:00Z', movie: { title: 'Old', year: 2000, ids: { imdb: 'tt1', tmdb: 1 } } },
+    { last_watched_at: '2026-06-01T00:00:00Z', movie: { title: 'New', year: 2024, ids: { imdb: 'tt2', tmdb: 2 } } },
+    { last_watched_at: '2026-03-01T00:00:00Z', movie: { title: 'Mid', year: 2020, ids: { tmdb: 3 } } }, // no imdb id
+    { movie: { title: 'NoIds' } }, // dropped entirely
+  ];
+  const w = parseWatchedItems(items, 'movie');
+  assert.deepStrictEqual([...w.imdbIds].sort(), ['tt1', 'tt2']);
+  assert.deepStrictEqual([...w.tmdbIds].sort(), [1, 2, 3]);
+  assert.deepStrictEqual(w.recent.map(r => r.title), ['New', 'Mid', 'Old']); // newest first
+  const shows = parseWatchedItems([
+    { last_watched_at: '2026-05-01T00:00:00Z', show: { title: 'Show', year: 2023, ids: { imdb: 'tt9', tmdb: 9 } } },
+  ], 'series');
+  assert.deepStrictEqual(shows.recent, [{ title: 'Show', year: 2023 }]);
+});
+
 ok('config: profile CRUD + filter clamping', () => {
   const p = config.addProfile('Test');
   assert.ok(p.token.length === 32);

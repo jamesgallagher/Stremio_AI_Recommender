@@ -122,21 +122,22 @@ app.listen(PORT, '0.0.0.0', () => {
     : '[auth] WARNING: admin portal is UNPROTECTED — set ADMIN_USER and ADMIN_PASSWORD');
 });
 
-// Scheduler: keep lists warm so nobody ever waits on a cold open.
-// Checks every profile hourly; rebuild.ensureFresh() is a no-op unless the
-// cache is actually past the 24h staleness threshold.
+// Scheduler: keep lists warm and pruned so nobody ever waits on a cold open.
+// Checks every profile hourly; ensureFresh() is a no-op unless the cache is
+// past the 24h staleness threshold, and ensureExclusionsFresh() costs one
+// last_activities call per profile when nothing new was watched.
 const TICK_MS = 60 * 60e3;
-setInterval(() => {
+function tick() {
   for (const profile of config.listProfiles()) {
     try {
       rebuild.ensureFresh(profile);
+      rebuild.ensureExclusionsFresh(profile);
     } catch (err) {
       console.error(`[scheduler] ${profile.name}: ${err.message}`);
     }
   }
-}, TICK_MS);
+}
+setInterval(tick, TICK_MS);
 
 // Also warm on boot (after a short delay so the container settles)
-setTimeout(() => {
-  for (const profile of config.listProfiles()) rebuild.ensureFresh(profile);
-}, 15e3);
+setTimeout(tick, 15e3);

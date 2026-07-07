@@ -17,6 +17,7 @@
 //   listed. CSM only — no fallback to other rating systems. A broken MDBList
 //   lookup fails the rebuild (old list stays) rather than serving unverified.
 const store = require('./store');
+const config = require('./config');
 const trakt = require('./services/trakt');
 const gemini = require('./services/gemini');
 const tmdb = require('./services/tmdb');
@@ -62,6 +63,29 @@ function exclusionSets(watchedByType, type) {
     imdbIds: new Set([...watchedByType.movie.imdbIds, ...watchedByType.series.imdbIds]),
     tmdbIds: watchedByType[type].tmdbIds,
   };
+}
+
+// Fetch the full watched state (both types) and persist the snapshot plus the
+// last_activities timestamps it corresponds to. With force=false the cheap
+// last_activities call runs first and null is returned when nothing was
+// watched since the stored snapshot (callers skip the expensive work).
+// Activity is read BEFORE the watched lists: a play landing in between makes
+// the snapshot look older than it is, so the next hourly check re-fetches —
+// errors in the safe direction.
+async function syncWatched(profile, { force = false } = {}) {
+  const activity = await trakt.getLastActivities(profile);
+  if (!force) {
+    const prev = store.loadCache(profile.id).watched_activity;
+    if (prev && prev.movies === activity.movies && prev.episodes === activity.episodes) return null;
+  }
+  const watchedByType = {
+    movie: await trakt.getWatchedSets(profile, 'movie'),
+    series: await trakt.getWatchedSets(profile, 'series'),
+  };
+  store.saveWatched(profile.id, 'movie', watchedByType.movie);
+  store.saveWatched(profile.id, 'series', watchedByType.series);
+  store.saveWatchedActivity(profile.id, activity);
+  return watchedByType;
 }
 
 // Hard post-resolution filter — the guarantee layer.
@@ -134,7 +158,7 @@ function cleanMetas(metas) {
 async function buildCatalog(profile, type, watchedByType, log = console) {
   const { keys, filters } = profile;
   const listSize = filters.list_size || DEFAULT_LIST_SIZE;
-  const history = await trakt.getRecentHistory(profile, type);
+  const history = watchedByType[type].recent; // taste seed: most recently watched titles
   const watched = exclusionSets(watchedByType, type);
 
   const collected = [];
@@ -207,26 +231,16 @@ async function rebuildProfile(profile, log = console) {
     if (profile.trakt_auth?.access_token && !profile.trakt_auth.username) {
       try {
         const username = await trakt.getAccountUsername(profile);
-        const config = require('./config');
         config.updateProfile(profile.id, { trakt_auth: { ...profile.trakt_auth, username } });
         log.log(`[trakt] ${profile.name}: profile is authorized as Trakt user "${username}"`);
       } catch { /* non-fatal */ }
     }
     // One watched fetch per rebuild, shared by both catalogs — snapshot for
-    // serve-time pruning and the cross-type exclusion sets.
+    // serve-time pruning, exclusion sets, and the taste seed. force: the full
+    // lists are needed even when nothing changed since the last snapshot.
     let watchedByType;
     try {
-      // Activity timestamps are read BEFORE the watched lists: a play landing
-      // in between makes the snapshot look older than it is, so the next
-      // hourly check re-fetches — errors in the safe direction.
-      const activity = await trakt.getLastActivities(profile);
-      watchedByType = {
-        movie: await trakt.getWatchedSets(profile, 'movie'),
-        series: await trakt.getWatchedSets(profile, 'series'),
-      };
-      store.saveWatched(profile.id, 'movie', watchedByType.movie);
-      store.saveWatched(profile.id, 'series', watchedByType.series);
-      store.saveWatchedActivity(profile.id, activity);
+      watchedByType = await syncWatched(profile, { force: true });
     } catch (err) {
       const error = `Trakt watched fetch failed: ${err.message} — kept previous lists`;
       log.warn(`[rebuild] ${profile.name}: ${error}`);
@@ -269,10 +283,10 @@ function ensureFresh(profile, log = console) {
   return true;
 }
 
-// Cheap hourly exclusion refresh: re-fetch ONLY the watched sets (2 Trakt
-// calls) and prune newly-watched titles from the cached lists in place, so
-// watched items disappear within the hour instead of waiting for the daily
-// rebuild. Never generates new recommendations.
+// Cheap hourly exclusion refresh: one last_activities call, and only when
+// something new was watched, re-fetch the watched sets and prune those titles
+// from the cached lists in place — watched items disappear within the hour
+// instead of waiting for the daily rebuild. Never generates recommendations.
 function ensureExclusionsFresh(profile, log = console) {
   const cache = store.loadCache(profile.id);
   if (Date.now() - (cache.watched_synced_at || 0) < WATCHED_REFRESH_MS) return false;
@@ -281,21 +295,11 @@ function ensureExclusionsFresh(profile, log = console) {
   exclusionLocks.add(profile.id);
   (async () => {
     try {
-      // Change detection first: one cheap last_activities call. If nothing
-      // was watched since the snapshot, skip the full watched downloads.
-      const activity = await trakt.getLastActivities(profile);
-      const prev = store.loadCache(profile.id).watched_activity;
-      if (prev && prev.movies === activity.movies && prev.episodes === activity.episodes) {
-        store.touchWatchedSync(profile.id);
+      const watchedByType = await syncWatched(profile);
+      if (!watchedByType) {
+        store.touchWatchedSync(profile.id); // nothing new watched — snapshot still valid
         return;
       }
-      const watchedByType = {
-        movie: await trakt.getWatchedSets(profile, 'movie'),
-        series: await trakt.getWatchedSets(profile, 'series'),
-      };
-      store.saveWatched(profile.id, 'movie', watchedByType.movie);
-      store.saveWatched(profile.id, 'series', watchedByType.series);
-      store.saveWatchedActivity(profile.id, activity);
       const unionImdb = new Set([...watchedByType.movie.imdbIds, ...watchedByType.series.imdbIds]);
       for (const type of ['movie', 'series']) {
         const removed = store.pruneWatched(profile.id, type, unionImdb);

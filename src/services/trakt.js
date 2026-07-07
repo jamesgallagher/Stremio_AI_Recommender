@@ -145,26 +145,6 @@ async function authedGet(profile, urlPath) {
   return res.json();
 }
 
-// ---- Taste signal: the last N unique watched titles (per type) ----
-const HISTORY_SEED_COUNT = 10;
-
-async function getRecentHistory(profile, type /* 'movie' | 'series' */) {
-  const endpoint = type === 'series' ? 'shows' : 'movies';
-  // history returns most-recent plays first; walk until we have N unique titles
-  const items = await authedGet(profile, `/sync/history/${endpoint}?limit=100`);
-  const seen = new Set();
-  const recent = [];
-  for (const item of items) {
-    const media = type === 'series' ? item.show : item.movie;
-    if (!media?.ids) continue;
-    if (seen.has(media.ids.trakt)) continue;
-    seen.add(media.ids.trakt);
-    recent.push({ title: media.title, year: media.year });
-    if (recent.length >= HISTORY_SEED_COUNT) break;
-  }
-  return recent;
-}
-
 // Which Trakt account does this profile's token actually belong to?
 // Surfaced in the portal so a profile authorized against the wrong family
 // member's account is immediately visible.
@@ -186,30 +166,46 @@ async function getLastActivities(profile) {
   };
 }
 
-// ---- Exclusion: full watched state (canonical IDs + titles) ----
+// ---- Exclusion + taste: full watched state (canonical IDs + recency) ----
 // A show with ANY watched history is excluded, even if only partially watched.
-async function getWatchedSets(profile, type) {
-  const endpoint = type === 'series' ? 'shows' : 'movies';
-  const items = await authedGet(profile, `/sync/watched/${endpoint}`);
+// `recent` (the N most recently watched titles) doubles as the taste seed.
+// It is derived from the watched list rather than /sync/history because a
+// fixed-size play window collapses to 2-3 unique shows for a binge watcher —
+// which used to misclassify heavy accounts as cold-start.
+const HISTORY_SEED_COUNT = 10;
+
+function parseWatchedItems(items, type) {
   const imdbIds = new Set();
   const tmdbIds = new Set();
-  const titles = [];
+  const withDates = [];
   for (const item of items) {
     const media = type === 'series' ? item.show : item.movie;
     if (!media?.ids) continue;
     if (media.ids.imdb) imdbIds.add(media.ids.imdb);
     if (media.ids.tmdb) tmdbIds.add(media.ids.tmdb);
-    titles.push(media.title);
+    withDates.push({ title: media.title, year: media.year, watched_at: item.last_watched_at || '' });
   }
-  return { imdbIds, tmdbIds, titles };
+  const recent = withDates
+    .sort((a, b) => (a.watched_at < b.watched_at ? 1 : -1)) // ISO-8601 sorts lexically
+    .slice(0, HISTORY_SEED_COUNT)
+    .map(({ title, year }) => ({ title, year }));
+  return { imdbIds, tmdbIds, recent };
+}
+
+async function getWatchedSets(profile, type) {
+  // noseasons: without it, every show arrives with its full season/episode
+  // play matrix — megabytes for a large account, none of it used here.
+  const endpoint = type === 'series' ? 'shows?extended=noseasons' : 'movies';
+  const items = await authedGet(profile, `/sync/watched/${endpoint}`);
+  return parseWatchedItems(items, type);
 }
 
 module.exports = {
   startDeviceFlow,
   pollDeviceToken,
   refreshToken,
-  getRecentHistory,
   getWatchedSets,
+  parseWatchedItems,
   getLastActivities,
   getAccountUsername,
   baseHeaders,
