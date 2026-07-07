@@ -95,6 +95,15 @@ unverified one.
   live Trakt watched list and flags every listed title against it. Items
   flagged `in_trakt_watched: false` are invisible to the addon until they land
   in Trakt history — verify at trakt.tv → your profile → History.
+- **Fresh picks daily:** each profile keeps a rolling history of recently
+  listed titles (last 150 per catalog) and asks Gemini to avoid them, so the
+  daily rebuild rotates in new recommendations instead of re-serving the same
+  safe picks. Heavily filtered profiles (narrow genres + high rating + short
+  recency window) may exhaust the pool and get shorter lists — relax a filter
+  if that happens.
+- **Cheap change detection:** the hourly watched-set refresh first asks Trakt
+  `last_activities` (one tiny call) and skips the full watched-history
+  download when nothing new was watched.
 - **Fill-to-quota:** each catalog targets its profile's list size (default
   20). The Gemini path runs extra suggestion rounds (expanding the exclusion
   list each time) and the discover path walks extra pages until the quota is
@@ -146,6 +155,7 @@ Docker tab → **Add Container** (or point a Compose stack at this repo's
 | `DATA_DIR` | No | `/data` | Storage location inside the container — leave as is |
 | `STALE_HOURS` | No | `24` | How old a cached list may get before a background rebuild |
 | `BACKOFF_MINUTES` | No | `30` | Wait after a failed rebuild before retrying |
+| `GEMINI_MODELS` | No | built-in list | Comma-separated model fallback chain (best first), e.g. `gemini-2.5-flash,gemini-2.5-flash-lite` — override when the built-in list ages |
 
 No API keys go in the template — Trakt/TMDB/Gemini keys are entered per
 profile in the web portal and stored in `/data/profiles.json`.

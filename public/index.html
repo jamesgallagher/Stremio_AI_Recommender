@@ -47,6 +47,8 @@
   .install { background: var(--card2); border: 1px dashed var(--border); border-radius: 8px; padding: 10px; font-family: monospace; font-size: 12px; word-break: break-all; margin-top: 6px; }
   .muted { color: var(--muted); font-size: 12px; }
   .status-line { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .diag { font-size: 12px; margin-top: 8px; background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; display: none; }
+  .diag div { margin: 2px 0; }
   .pin { font-size: 28px; letter-spacing: 6px; font-weight: 700; color: var(--accent); }
   .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   @media (max-width: 640px) { .cols { grid-template-columns: 1fr; } }
@@ -118,8 +120,11 @@ function render(profiles) {
   // Preserve which sections are open across re-renders (auto-refresh must
   // never yank the page out from under the user)
   const openMap = {};
+  const diagMap = {};
   container.querySelectorAll('.card[data-id]').forEach(card => {
     openMap[card.dataset.id] = [...card.querySelectorAll('details')].map(d => d.open);
+    const diag = card.querySelector('.diag');
+    if (diag && diag.style.display === 'block') diagMap[card.dataset.id] = diag.innerHTML;
   });
   container.innerHTML = profiles.map(p => {
     const installUrl = p.install_url;
@@ -136,11 +141,13 @@ function render(profiles) {
         <h2>${esc(p.name)}</h2> ${badge} ${rebuilding}
         <div class="grow"></div>
         <button class="ghost" onclick="rebuildNow('${p.id}', this)" ${p.trakt_connected && !p.status.rebuilding ? '' : 'disabled'}>${p.status.rebuilding ? 'Rebuilding…' : 'Rebuild now'}</button>
+        <button class="ghost" onclick="diagnose('${p.id}', this)" ${p.trakt_connected ? '' : 'disabled'} title="Check every listed title against your live Trakt watched history">Diagnose</button>
         <button class="danger" onclick="delProfile('${p.id}', '${esc(p.name)}')">Delete</button>
       </div>
       <div class="status-line">
         ${catalogLine('🎬 Movies', p.status.movie)} &nbsp;·&nbsp; ${catalogLine('📺 Series', p.status.series)}
       </div>
+      <div class="diag"></div>
 
       <details>
         <summary>Trakt — account & authorization ${p.trakt_connected ? '✓ connected' : (traktKeysOk ? '— ready to connect' : '— keys required')}</summary>
@@ -244,12 +251,17 @@ function render(profiles) {
       </details>
     </div>`;
   }).join('') || '<div class="card muted">No profiles yet — add one above.</div>';
-  // Restore open sections
+  // Restore open sections + diagnose results
   container.querySelectorAll('.card[data-id]').forEach(card => {
     (openMap[card.dataset.id] || []).forEach((wasOpen, i) => {
       const d = card.querySelectorAll('details')[i];
       if (d && wasOpen) d.open = true;
     });
+    if (diagMap[card.dataset.id]) {
+      const diag = card.querySelector('.diag');
+      diag.innerHTML = diagMap[card.dataset.id];
+      diag.style.display = 'block';
+    }
   });
 }
 
@@ -337,6 +349,29 @@ async function connectTrakt(id) {
 async function disconnectTrakt(id) {
   await api(`/profiles/${id}/trakt/disconnect`, { method: 'POST' });
   load();
+}
+
+async function diagnose(id, btn) {
+  const card = document.querySelector(`[data-id="${id}"]`);
+  const out = card.querySelector('.diag');
+  btn.disabled = true; btn.textContent = 'Checking…';
+  try {
+    const d = await api(`/profiles/${id}/diagnose`);
+    const lines = Object.entries(d.catalogs).map(([type, items]) => {
+      const flagged = items.filter(i => i.in_trakt_watched);
+      const label = type === 'movie' ? '🎬 Movies' : '📺 Series';
+      return `<div>${label}: ${items.length} listed, <b style="color:${flagged.length ? 'var(--err)' : 'var(--ok)'}">${flagged.length} flagged as watched on Trakt</b>${flagged.length ? ' — ' + flagged.map(i => esc(i.name)).join(', ') : ''}</div>`;
+    });
+    out.innerHTML = `
+      <div>Trakt account: <b>${esc(d.trakt_username || 'unknown')}</b> · ${d.watched_counts.movies} movies / ${d.watched_counts.shows} shows in watched history</div>
+      ${lines.join('')}
+      <div class="muted" style="margin-top:6px">Flagged = addon bug, please report. If your player shows a watched tick on a title that is NOT flagged here, that play never reached this Trakt account — check the player's Trakt integration and which account it's signed into.</div>`;
+    out.style.display = 'block';
+  } catch (err) {
+    out.textContent = 'Diagnose failed: ' + err.message;
+    out.style.display = 'block';
+  }
+  btn.disabled = false; btn.textContent = 'Diagnose';
 }
 
 async function rebuildNow(id, btn) {

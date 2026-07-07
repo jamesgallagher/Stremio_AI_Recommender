@@ -38,6 +38,29 @@ ok('store: pruneWatched drops listed titles atomically', () => {
   store.deleteCache('p2');
 });
 
+ok('store: suggested-history rolls, dedupes, and caps', () => {
+  store.addSuggestedHistory('p3', 'movie', ['A', 'B']);
+  store.addSuggestedHistory('p3', 'movie', ['B', 'C']); // B moves to newest end
+  assert.deepStrictEqual(store.getSuggestedHistory('p3', 'movie'), ['A', 'B', 'C']);
+  assert.deepStrictEqual(store.getSuggestedHistory('p3', 'series'), []);
+  store.addSuggestedHistory('p3', 'movie', Array.from({ length: 200 }, (_, i) => `T${i}`));
+  assert.strictEqual(store.getSuggestedHistory('p3', 'movie').length, 150); // capped
+  store.deleteCache('p3');
+});
+
+ok('store: watched activity snapshot + touch', () => {
+  store.saveWatchedActivity('p4', { movies: '2026-07-01T00:00:00Z', episodes: null });
+  const c = store.loadCache('p4');
+  assert.strictEqual(c.watched_activity.movies, '2026-07-01T00:00:00Z');
+  assert.ok(c.watched_synced_at > 0);
+  const before = c.watched_synced_at;
+  store.touchWatchedSync('p4');
+  const c2 = store.loadCache('p4');
+  assert.ok(c2.watched_synced_at >= before);
+  assert.strictEqual(c2.watched_activity.movies, '2026-07-01T00:00:00Z'); // untouched
+  store.deleteCache('p4');
+});
+
 ok('config: profile CRUD + filter clamping', () => {
   const p = config.addProfile('Test');
   assert.ok(p.token.length === 32);
