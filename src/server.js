@@ -56,13 +56,50 @@ function safeEqual(a, b) {
   return crypto.timingSafeEqual(ha, hb);
 }
 
+// Brute-force protection: per-IP failed-attempt window. In-memory (resets on
+// restart) — fine for a self-hosted admin portal. A successful login clears
+// the counter so a shared/NATed IP isn't locked out by one bad client.
+const AUTH_WINDOW_MS = 15 * 60e3;
+const AUTH_MAX_FAILURES = 20;
+const authFailures = new Map(); // ip -> { count, resetAt }
+
+function authBlocked(ip) {
+  const entry = authFailures.get(ip);
+  if (!entry) return false;
+  if (Date.now() > entry.resetAt) { authFailures.delete(ip); return false; }
+  return entry.count >= AUTH_MAX_FAILURES;
+}
+
+function recordAuthFailure(ip) {
+  const now = Date.now();
+  if (authFailures.size > 10000) { // scanner flood guard: drop expired entries
+    for (const [k, v] of authFailures) if (now > v.resetAt) authFailures.delete(k);
+  }
+  const entry = authFailures.get(ip);
+  if (!entry || now > entry.resetAt) {
+    authFailures.set(ip, { count: 1, resetAt: now + AUTH_WINDOW_MS });
+  } else {
+    entry.count++;
+    if (entry.count === AUTH_MAX_FAILURES) {
+      console.warn(`[auth] ${ip}: blocked for ${AUTH_WINDOW_MS / 60e3} min after ${entry.count} failed login attempts`);
+    }
+  }
+}
+
 function adminAuth(req, res, next) {
   if (!authEnabled) return next();
+  if (authBlocked(req.ip)) {
+    return res.status(429).send('Too many failed login attempts — try again later');
+  }
   const header = req.headers.authorization || '';
   if (header.startsWith('Basic ')) {
     const [user, ...rest] = Buffer.from(header.slice(6), 'base64').toString().split(':');
     const pass = rest.join(':');
-    if (safeEqual(user, ADMIN_USER) && safeEqual(pass, ADMIN_PASSWORD)) return next();
+    if (safeEqual(user, ADMIN_USER) && safeEqual(pass, ADMIN_PASSWORD)) {
+      authFailures.delete(req.ip);
+      return next();
+    }
+    recordAuthFailure(req.ip); // only count actual wrong credentials, not the initial challenge
   }
   res.setHeader('WWW-Authenticate', 'Basic realm="AI Recommender admin"');
   res.status(401).send('Authentication required');
