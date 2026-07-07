@@ -68,13 +68,18 @@ function saveWatched(profileId, type, sets) {
   writeJsonAtomic(cacheFile(profileId), cache);
 }
 
-// Replace a catalog's metas without touching generated_at/source (used when
-// pruning newly-watched titles between rebuilds).
-function replaceMetas(profileId, type, metas) {
+// Drop newly-watched titles from a catalog without touching generated_at/
+// source. Load-filter-write happens synchronously in one call, so a rebuild
+// finishing mid-refresh can never be clobbered with a stale meta list.
+// Returns the number of titles removed.
+function pruneWatched(profileId, type, imdbIds) {
   const cache = loadCache(profileId);
-  if (!cache[type]) return;
-  cache[type].metas = metas;
-  writeJsonAtomic(cacheFile(profileId), cache);
+  if (!cache[type]) return 0;
+  const before = cache[type].metas.length;
+  cache[type].metas = cache[type].metas.filter((m) => !imdbIds.has(m.id));
+  const removed = before - cache[type].metas.length;
+  if (removed > 0) writeJsonAtomic(cacheFile(profileId), cache);
+  return removed;
 }
 
 function markAttempt(profileId) {
@@ -95,7 +100,7 @@ module.exports = {
   loadCache,
   swapCatalog,
   saveWatched,
-  replaceMetas,
+  pruneWatched,
   markAttempt,
   deleteCache,
 };

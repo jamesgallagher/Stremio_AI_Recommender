@@ -2,6 +2,7 @@
 // the addon endpoints under /addon/:token are the only public surface.
 const express = require('express');
 const config = require('./config');
+const store = require('./store');
 const rebuild = require('./rebuild');
 const trakt = require('./services/trakt');
 const tmdb = require('./services/tmdb');
@@ -76,8 +77,10 @@ router.put('/profiles/:id', (req, res) => {
     for (const k of ['trakt_client_id', 'trakt_client_secret', 'tmdb_api_key', 'gemini_api_key', 'rpdb_api_key', 'mdblist_api_key']) {
       if (req.body.keys[k]) patch.keys[k] = String(req.body.keys[k]).trim();
     }
-    // Explicit clear for optional keys ('' disables RPDB again)
-    if (req.body.keys.rpdb_api_key === null) patch.keys.rpdb_api_key = '';
+    // Explicit clear for optional keys (null -> '' disables the feature)
+    for (const k of ['rpdb_api_key', 'mdblist_api_key']) {
+      if (req.body.keys[k] === null) patch.keys[k] = '';
+    }
   }
   const profile = config.updateProfile(req.params.id, patch);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
@@ -259,6 +262,42 @@ router.post('/profiles/:id/trakt/disconnect', (req, res) => {
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
   deviceFlows.delete(req.params.id);
   res.json({ ok: true });
+});
+
+// ---- Watched-exclusion diagnostics ----
+// Answers "why is a watched item still in my list?": fetches the LIVE Trakt
+// watched sets and flags every currently-listed title against them. Any item
+// flagged in_trakt_watched=true is a bug in this addon; an item the app shows
+// a watched tick for but is flagged false here was never scrobbled to Trakt
+// (app-side watched state or a different Trakt account).
+router.get('/profiles/:id/diagnose', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  if (!profile.trakt_auth?.access_token) return res.status(400).json({ error: 'Connect Trakt first' });
+  try {
+    const watched = {
+      movie: await trakt.getWatchedSets(profile, 'movie'),
+      series: await trakt.getWatchedSets(profile, 'series'),
+    };
+    const cache = store.loadCache(profile.id);
+    const catalogs = {};
+    for (const type of ['movie', 'series']) {
+      catalogs[type] = (cache[type]?.metas || []).map((m) => ({
+        id: m.id,
+        name: m.name,
+        in_trakt_watched: watched.movie.imdbIds.has(m.id) || watched.series.imdbIds.has(m.id),
+      }));
+    }
+    res.json({
+      trakt_username: profile.trakt_auth.username || null,
+      watched_counts: { movies: watched.movie.imdbIds.size, shows: watched.series.imdbIds.size },
+      watched_synced_at: cache.watched_synced_at || null,
+      catalogs,
+      note: 'in_trakt_watched=true should never happen (report it). A title your app ticks as watched but shows false here was not scrobbled to this Trakt account.',
+    });
+  } catch (err) {
+    res.status(502).json({ error: `Trakt lookup failed: ${err.message}` });
+  }
 });
 
 // ---- Rebuild now ----

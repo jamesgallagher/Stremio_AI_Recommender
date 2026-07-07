@@ -95,8 +95,13 @@ router.get('/catalog/:type/:catalogId{/:extra}', (req, res) => {
   }
 
   // Serve-time watched pruning: never show something the watched snapshot
-  // says has been seen, even if the daily rebuild hasn't run yet.
-  const watchedImdb = new Set(cache.watched?.[catalog.type]?.imdb || []);
+  // says has been seen, even if the daily rebuild hasn't run yet. Union of
+  // both types — IMDb IDs are global, and Trakt/TMDB sometimes disagree on
+  // whether a title is a movie or a show.
+  const watchedImdb = new Set([
+    ...(cache.watched?.movie?.imdb || []),
+    ...(cache.watched?.series?.imdb || []),
+  ]);
   const unwatched = entry.metas.filter((m) => !watchedImdb.has(m.id));
 
   const sliced = skip > 0 ? unwatched.slice(skip) : unwatched;

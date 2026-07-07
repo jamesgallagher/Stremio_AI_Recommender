@@ -60,7 +60,17 @@ function parseJsonArray(text) {
     .replace(/^```(?:json)?\s*/i, '')
     .replace(/\s*```\s*$/i, '')
     .trim();
-  const parsed = JSON.parse(cleaned);
+  let parsed;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (err) {
+    // Model wrapped the JSON in prose despite instructions — salvage the
+    // outermost [...] block before giving up on the round.
+    const start = cleaned.indexOf('[');
+    const end = cleaned.lastIndexOf(']');
+    if (start === -1 || end <= start) throw err;
+    parsed = JSON.parse(cleaned.slice(start, end + 1));
+  }
   if (!Array.isArray(parsed)) throw new Error('Gemini did not return a JSON array');
   return parsed
     .filter((x) => x && typeof x.title === 'string')

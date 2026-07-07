@@ -29,6 +29,15 @@ ok('store: atomic swap preserves other catalog type', () => {
   store.deleteCache('p1');
 });
 
+ok('store: pruneWatched drops listed titles atomically', () => {
+  store.swapCatalog('p2', 'movie', [{ id: 'tt1' }, { id: 'tt2' }, { id: 'tt3' }], 'gemini');
+  const removed = store.pruneWatched('p2', 'movie', new Set(['tt2', 'tt9']));
+  assert.strictEqual(removed, 1);
+  assert.deepStrictEqual(store.loadCache('p2').movie.metas.map(m => m.id), ['tt1', 'tt3']);
+  assert.strictEqual(store.pruneWatched('p2', 'series', new Set(['tt1'])), 0); // no series cache: no-op
+  store.deleteCache('p2');
+});
+
 ok('config: profile CRUD + filter clamping', () => {
   const p = config.addProfile('Test');
   assert.ok(p.token.length === 32);
@@ -113,6 +122,12 @@ ok('gemini: parses fenced + raw JSON output', () => {
   assert.deepStrictEqual(gemini.parseJsonArray(fenced), [{ title: 'Dune', year: 2021 }]);
   assert.deepStrictEqual(gemini.parseJsonArray('[{"title":"Heat","year":"1995"}]'), [{ title: 'Heat', year: 1995 }]);
   assert.throws(() => gemini.parseJsonArray('{"not":"array"}'));
+});
+
+ok('gemini: salvages JSON array wrapped in prose', () => {
+  const prose = 'Here are my picks:\n[{"title":"Heat","year":1995}]\nEnjoy!';
+  assert.deepStrictEqual(gemini.parseJsonArray(prose), [{ title: 'Heat', year: 1995 }]);
+  assert.throws(() => gemini.parseJsonArray('no json here at all'));
 });
 
 ok('baseurl: trailing slashes and missing schemes normalized', () => {
@@ -205,6 +220,19 @@ async function httpTests() {
   console.log('  ✓ serve-time watched pruning');
   store.saveWatched(profile.id, 'movie', { imdbIds: new Set(), tmdbIds: new Set() });
 
+  // Cross-type pruning: a title Trakt logged as a SHOW never shows in the
+  // movie catalog either (IMDb IDs are global; Trakt/TMDB types can disagree)
+  store.saveWatched(profile.id, 'series', { imdbIds: new Set(['tt0111161']), tmdbIds: new Set() });
+  cat = await (await fetch(`${BASE}/addon/${profile.token}/catalog/movie/ai-recs-movies.json`)).json();
+  assert.strictEqual(cat.metas.length, 0);
+  console.log('  ✓ cross-type serve-time pruning');
+  store.saveWatched(profile.id, 'series', { imdbIds: new Set(), tmdbIds: new Set() });
+
+  // Diagnose endpoint requires Trakt auth
+  res = await fetch(`${BASE}/api/profiles/${profile.id}/diagnose`);
+  assert.strictEqual(res.status, 400);
+  console.log('  ✓ diagnose without Trakt auth rejected cleanly');
+
   // Age-limit + list-size filters persist and clamp
   res = await fetch(`${BASE}/api/profiles/${profile.id}`, {
     method: 'PUT', headers: { 'Content-Type': 'application/json' },
@@ -240,7 +268,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 14 http).`);
+  console.log(`\nAll checks passed (${passed} unit + 16 http).`);
   process.exit(0);
 }
 

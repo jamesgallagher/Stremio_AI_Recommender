@@ -81,7 +81,24 @@ async function pollDeviceToken(profile, deviceCode) {
 }
 
 // ---- Token refresh ----
+// Trakt rotates refresh tokens: each one is single-use. Two concurrent
+// requests both deciding to refresh would race, and the loser's attempt
+// (with the now-consumed old token) can invalidate the profile's auth.
+// Serialize per profile: concurrent callers share one in-flight refresh.
+const refreshing = new Map(); // profile.id -> Promise<trakt_auth>
+
 async function refreshToken(profile) {
+  let inflight = refreshing.get(profile.id);
+  if (!inflight) {
+    inflight = doRefreshToken(profile).finally(() => refreshing.delete(profile.id));
+    refreshing.set(profile.id, inflight);
+  }
+  const trakt_auth = await inflight;
+  profile.trakt_auth = trakt_auth; // update this caller's profile object too
+  return trakt_auth;
+}
+
+async function doRefreshToken(profile) {
   const res = await fetch(`${API}/oauth/token`, {
     method: 'POST',
     headers: baseHeaders(profile.keys.trakt_client_id),
@@ -101,12 +118,12 @@ async function refreshToken(profile) {
   console.log(`[trakt] ${profile.name}: token refreshed`);
   const tok = await res.json();
   const trakt_auth = {
+    ...profile.trakt_auth, // keep username and any other recorded fields
     access_token: tok.access_token,
     refresh_token: tok.refresh_token,
     expires_at: Date.now() + (tok.expires_in || 7776000) * 1000,
   };
   config.updateProfile(profile.id, { trakt_auth });
-  profile.trakt_auth = trakt_auth;
   return trakt_auth;
 }
 

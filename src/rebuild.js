@@ -9,6 +9,9 @@
 // - Fill-to-quota: each catalog targets filters.list_size titles; the Gemini
 //   path runs extra rounds (expanding the exclusion list) until filled or
 //   rounds are exhausted; the discover path walks extra pages.
+// - Watched exclusion is cross-type on IMDb IDs: a title watched as a movie
+//   on Trakt can never appear in the series catalog (or vice versa), covering
+//   docs/miniseries that TMDB and Trakt classify differently.
 // - Age limit (kids mode): when filters.age_limit > 0, EVERY candidate is
 //   verified against Common Sense Media (via MDBList). No CSM rating => not
 //   listed. CSM only — no fallback to other rating systems. A broken MDBList
@@ -47,6 +50,17 @@ function status(profile) {
     last_attempt_at: cache.last_attempt_at || 0,
     rebuilding: locks.has(profile.id),
     stale: isStale(cache.movie) || isStale(cache.series),
+  };
+}
+
+// Cross-type watched exclusion sets. IMDb tt IDs are globally unique, so a
+// title Trakt logged as a movie but TMDB resolved as a series (docs and
+// miniseries flip type between the two databases) is still excluded. TMDB ids
+// stay per-type: movie id 550 and TV id 550 are different titles.
+function exclusionSets(watchedByType, type) {
+  return {
+    imdbIds: new Set([...watchedByType.movie.imdbIds, ...watchedByType.series.imdbIds]),
+    tmdbIds: watchedByType[type].tmdbIds,
   };
 }
 
@@ -117,12 +131,11 @@ function cleanMetas(metas) {
   return metas.map(({ _tmdb_id, _genre_ids, _vote_average, _vote_count, _release_date, ...meta }) => meta);
 }
 
-async function buildCatalog(profile, type, log = console) {
+async function buildCatalog(profile, type, watchedByType, log = console) {
   const { keys, filters } = profile;
   const listSize = filters.list_size || DEFAULT_LIST_SIZE;
   const history = await trakt.getRecentHistory(profile, type);
-  const watched = await trakt.getWatchedSets(profile, type);
-  store.saveWatched(profile.id, type, watched); // snapshot for serve-time pruning
+  const watched = exclusionSets(watchedByType, type);
 
   const collected = [];
   const haveIds = new Set();
@@ -196,9 +209,24 @@ async function rebuildProfile(profile, log = console) {
         log.log(`[trakt] ${profile.name}: profile is authorized as Trakt user "${username}"`);
       } catch { /* non-fatal */ }
     }
+    // One watched fetch per rebuild, shared by both catalogs — snapshot for
+    // serve-time pruning and the cross-type exclusion sets.
+    let watchedByType;
+    try {
+      watchedByType = {
+        movie: await trakt.getWatchedSets(profile, 'movie'),
+        series: await trakt.getWatchedSets(profile, 'series'),
+      };
+      store.saveWatched(profile.id, 'movie', watchedByType.movie);
+      store.saveWatched(profile.id, 'series', watchedByType.series);
+    } catch (err) {
+      const error = `Trakt watched fetch failed: ${err.message} — kept previous lists`;
+      log.warn(`[rebuild] ${profile.name}: ${error}`);
+      return { movie: { ok: false, error }, series: { ok: false, error } };
+    }
     for (const type of ['movie', 'series']) {
       try {
-        const { metas, source } = await buildCatalog(profile, type, log);
+        const { metas, source } = await buildCatalog(profile, type, watchedByType, log);
         if (metas.length >= MIN_METAS) {
           store.swapCatalog(profile.id, type, metas, source); // atomic swap on success only
           results[type] = { ok: true, count: metas.length, source };
@@ -223,7 +251,7 @@ function ensureFresh(profile, log = console) {
   const cache = store.loadCache(profile.id);
   const stale = isStale(cache.movie) || isStale(cache.series);
   if (!stale) return false;
-  if (locks.has(profile.id)) return false;
+  if (locks.has(profile.id) || exclusionLocks.has(profile.id)) return false;
   if (Date.now() - (cache.last_attempt_at || 0) < BACKOFF_MS) return false;
   if (!profile.trakt_auth?.access_token) return false;
   rebuildProfile(profile, log).catch((err) => log.error(`[rebuild] unexpected: ${err.message}`));
@@ -242,15 +270,17 @@ function ensureExclusionsFresh(profile, log = console) {
   exclusionLocks.add(profile.id);
   (async () => {
     try {
+      const watchedByType = {
+        movie: await trakt.getWatchedSets(profile, 'movie'),
+        series: await trakt.getWatchedSets(profile, 'series'),
+      };
+      store.saveWatched(profile.id, 'movie', watchedByType.movie);
+      store.saveWatched(profile.id, 'series', watchedByType.series);
+      const unionImdb = new Set([...watchedByType.movie.imdbIds, ...watchedByType.series.imdbIds]);
       for (const type of ['movie', 'series']) {
-        const entry = store.loadCache(profile.id)[type];
-        const watched = await trakt.getWatchedSets(profile, type);
-        store.saveWatched(profile.id, type, watched);
-        if (!entry) continue;
-        const kept = entry.metas.filter((m) => !watched.imdbIds.has(m.id));
-        if (kept.length < entry.metas.length) {
-          log.log(`[exclusions] ${profile.name}/${type}: pruned ${entry.metas.length - kept.length} newly-watched title(s)`);
-          store.replaceMetas(profile.id, type, kept);
+        const removed = store.pruneWatched(profile.id, type, unionImdb);
+        if (removed > 0) {
+          log.log(`[exclusions] ${profile.name}/${type}: pruned ${removed} newly-watched title(s)`);
         }
       }
     } catch (err) {

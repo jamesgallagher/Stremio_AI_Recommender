@@ -82,9 +82,19 @@ unverified one.
   exists, the next rebuild upgrades to personalized ("picked for you").
 - **De-dupe guarantee:** everything ever watched on Trakt (even one episode of
   a show) is excluded, matched on canonical IMDb/TMDB IDs after resolution —
-  not on title text. Between daily rebuilds, a cheap hourly watched-set
-  refresh prunes newly-watched titles from the served list, so items you just
-  watched disappear within the hour.
+  not on title text. IMDb matching is cross-type: a title Trakt logged as a
+  movie can't appear in the series catalog either. Between daily rebuilds, a
+  cheap hourly watched-set refresh prunes newly-watched titles from the served
+  list, so items you just watched disappear within the hour.
+- **"But I've watched that!" troubleshooting:** the addon can only exclude
+  what Trakt knows. If your player (Stremio/Nuvio) shows a watched tick on a
+  listed item, the tick usually comes from the app's *local* watched state —
+  the play was never scrobbled to Trakt (Trakt integration off, watched <80%,
+  or the app is signed into a different Trakt account than this profile).
+  Check with `GET /api/profiles/<id>/diagnose` (admin-authed): it fetches your
+  live Trakt watched list and flags every listed title against it. Items
+  flagged `in_trakt_watched: false` are invisible to the addon until they land
+  in Trakt history — verify at trakt.tv → your profile → History.
 - **Fill-to-quota:** each catalog targets its profile's list size (default
   20). The Gemini path runs extra suggestion rounds (expanding the exclusion
   list each time) and the discover path walks extra pages until the quota is
