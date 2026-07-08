@@ -70,10 +70,13 @@ always on; six optional catalogs can be toggled per profile, each appearing
 as its own catalog in Stremio/Nuvio:
 
 - **Popular Movies** / **Popular Series** — the JustWatch streaming charts
-  (list order, unfiltered, 20 titles).
+  (unfiltered, 20 titles).
 - **Christmas / Comedy / Action / Thriller Movies** — curated lists, 20
   titles each; anything rated below **IMDb 6** is dropped and the list is
   paged further until 20 titles are collected.
+
+Each extra catalog's 20 titles are **shuffled on every rebuild**, so the order
+looks fresh day to day and different titles rotate into the top slots.
 
 Rules: extra catalogs **ignore watched status** (only the AI catalogs exclude
 what you've seen), refresh on the same daily cadence, are served from cache,

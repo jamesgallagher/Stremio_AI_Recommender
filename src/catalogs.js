@@ -1,9 +1,11 @@
 // Optional extra catalogs backed by curated MDBList lists, toggleable per
 // profile in the portal's Catalogs section (the two AI catalogs are always
 // on and are not defined here). Rules (decided 2026-07-08):
-// - Popular charts serve list order unfiltered, max 20.
+// - Popular charts keep every item unfiltered, max 20.
 // - Rating-gated catalogs (min_imdb) drop items whose IMDb rating is below
 //   the bar and keep paging the list until 20 titles are collected.
+// - The final 20 are shuffled on each rebuild so the order looks fresh daily
+//   (see rebuild.buildExtraCatalog) rather than serving a fixed sequence.
 // - Watched status is deliberately ignored — only the AI catalogs exclude
 //   watched titles.
 // - Requires the profile's MDBList API key.

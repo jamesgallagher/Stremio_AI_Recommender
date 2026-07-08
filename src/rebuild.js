@@ -228,11 +228,24 @@ async function buildCatalog(profile, type, watchedByType, log = console) {
   return { metas: cleanMetas(collected), source };
 }
 
-// Extra catalog: one curated MDBList list -> up to 20 metas. Popular charts
-// (min_imdb 0) serve list order as-is; rating-gated catalogs drop items whose
-// IMDb rating is below the bar and keep paging until filled. Watched status
-// is ignored by design. Kids-mode age limits still apply — a child profile
-// must never bypass the Common Sense gate via an extra catalog.
+// Fisher-Yates shuffle (in place, returns the same array). Used to randomize
+// the order of extra catalogs on each rebuild so a static curated list looks
+// fresh day to day and rotates different titles into the highlighted top slots.
+function shuffle(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+// Extra catalog: one curated MDBList list -> up to 20 metas. Rating-gated
+// catalogs drop items whose IMDb rating is below the bar and keep paging until
+// filled; popular charts (min_imdb 0) keep every item. The final selection is
+// shuffled so the order looks fresh on each daily rebuild instead of serving
+// the same fixed sequence. Watched status is ignored by design. Kids-mode age
+// limits still apply — a child profile must never bypass the Common Sense gate
+// via an extra catalog.
 async function buildExtraCatalog(profile, def, log = console) {
   const key = profile.keys.mdblist_api_key;
   if (!key) throw new Error('MDBList API key is required for extra catalogs');
@@ -289,7 +302,7 @@ async function buildExtraCatalog(profile, def, log = console) {
     }
     log.log(`[extra] ${profile.name}/${def.id}: page ${page + 1} -> ${collected.length}/${EXTRA_LIST_TARGET}`);
   }
-  return collected;
+  return shuffle(collected); // randomize order so the daily list looks fresh
 }
 
 // AI catalogs (movie + series): Trakt-seeded, Gemini/discover, watched-excluded.

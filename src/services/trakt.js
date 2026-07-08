@@ -127,7 +127,10 @@ async function doRefreshToken(profile) {
   return trakt_auth;
 }
 
-async function authedGet(profile, urlPath) {
+// Authorized GET returning the raw Response (headers intact — pagination reads
+// the X-Pagination-* headers). Proactive refresh within 24h of expiry, plus one
+// reactive refresh + retry on a server-side 401.
+async function authedFetch(profile, urlPath) {
   if (!profile.trakt_auth?.access_token) {
     throw new Error('Trakt not authorized for this profile');
   }
@@ -141,8 +144,40 @@ async function authedGet(profile, urlPath) {
     await refreshToken(profile);
     res = await fetch(`${API}${urlPath}`, { headers: headers(profile) });
   }
+  return res;
+}
+
+async function authedGet(profile, urlPath) {
+  const res = await authedFetch(profile, urlPath);
   if (!res.ok) throw new Error(`Trakt GET ${urlPath} failed (${res.status})`);
   return res.json();
+}
+
+// Fetch EVERY page of a paginated Trakt endpoint and concatenate the items.
+// Trakt made /sync/watched/* pagination-mandatory on 2026-07-03: with no
+// params the response is now capped at the first 100 items, so an account with
+// more than 100 watched titles was silently truncated — watched titles beyond
+// the first page leaked back into recommendations. Walk pages until the last
+// one. limit=250 is Trakt's max for these endpoints. The stop condition is the
+// X-Pagination-Page-Count header, NOT a short page: Trakt warns a page may hold
+// fewer than the requested limit depending on `extended`, so a short page is
+// not a reliable end-of-list signal.
+const PAGE_LIMIT = 250;
+
+async function authedGetAll(profile, urlPath) {
+  const sep = urlPath.includes('?') ? '&' : '?';
+  const all = [];
+  let page = 1;
+  let pageCount = 1;
+  do {
+    const res = await authedFetch(profile, `${urlPath}${sep}page=${page}&limit=${PAGE_LIMIT}`);
+    if (!res.ok) throw new Error(`Trakt GET ${urlPath} failed (${res.status})`);
+    const items = await res.json();
+    if (Array.isArray(items)) all.push(...items);
+    pageCount = parseInt(res.headers.get('x-pagination-page-count') || '1', 10) || 1;
+    page += 1;
+  } while (page <= pageCount);
+  return all;
 }
 
 // Which Trakt account does this profile's token actually belong to?
@@ -195,8 +230,11 @@ function parseWatchedItems(items, type) {
 async function getWatchedSets(profile, type) {
   // noseasons: without it, every show arrives with its full season/episode
   // play matrix — megabytes for a large account, none of it used here.
+  // Paginated: /sync/watched/* returns only the first 100 items unpaged since
+  // Trakt's 2026-07-03 change, so walk every page to get the complete list —
+  // the exclusion sets must cover the ENTIRE watch history, not just page one.
   const endpoint = type === 'series' ? 'shows?extended=noseasons' : 'movies';
-  const items = await authedGet(profile, `/sync/watched/${endpoint}`);
+  const items = await authedGetAll(profile, `/sync/watched/${endpoint}`);
   return parseWatchedItems(items, type);
 }
 
