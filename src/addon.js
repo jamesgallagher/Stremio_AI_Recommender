@@ -6,6 +6,7 @@ const config = require('./config');
 const store = require('./store');
 const rebuild = require('./rebuild');
 const catalogs = require('./catalogs');
+const { version } = require('../package.json'); // single source of truth for the addon version
 
 const router = express.Router({ mergeParams: true });
 
@@ -30,7 +31,7 @@ function applyRpdb(metas, rpdbKey) {
 function manifestFor(profile, baseUrl = '') {
   return {
     id: `au.com.jscc.airecommender.${profile.id.substring(0, 8)}`,
-    version: '1.0.0',
+    version,
     name: `AI Recommender — ${profile.name}`,
     description: `Personalized movie & series recommendations for ${profile.name}, generated from Trakt watch history via Gemini.`,
     ...(baseUrl ? { logo: `${baseUrl}/logo.png` } : {}),

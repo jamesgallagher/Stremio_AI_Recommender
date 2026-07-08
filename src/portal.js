@@ -9,8 +9,14 @@ const trakt = require('./services/trakt');
 const tmdb = require('./services/tmdb');
 const mdblistService = require('./services/mdblist');
 
+const { version } = require('../package.json');
+
 const router = express.Router();
 router.use(express.json());
+
+router.get('/version', (req, res) => {
+  res.json({ version });
+});
 
 // In-flight device-flow sessions: profileId -> { user_code, verification_url, state, error }
 const deviceFlows = new Map();

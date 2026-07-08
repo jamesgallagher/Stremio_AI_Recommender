@@ -73,7 +73,7 @@
 <body>
 <div class="wrap">
   <h1><img src="logo.svg" alt="" class="brand">AI Recommender</h1>
-  <div class="sub">Admin portal — each section below manages one family member's addon: their keys, Trakt link, filters, and install URL.</div>
+  <div class="sub">Admin portal — each section below manages one family member's addon: their keys, Trakt link, filters, and install URL. <span id="ver"></span></div>
 
   <div class="card">
     <div class="row">
@@ -292,6 +292,7 @@ function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&
 async function load() {
   if (!GENRES.length) GENRES = (await api('/genres')).genres;
   if (!CATALOG_DEFS.length) CATALOG_DEFS = (await api('/catalogs')).catalogs;
+  if (!$('#ver').textContent) $('#ver').textContent = `· v${(await api('/version')).version}`;
   const { profiles } = await api('/profiles');
   render(profiles);
 }

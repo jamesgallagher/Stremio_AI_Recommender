@@ -250,6 +250,11 @@ async function httpTests() {
   assert.strictEqual(health.ok, true);
   console.log('  ✓ /health');
 
+  const pkgVersion = require('../package.json').version;
+  const ver = await (await fetch(`${BASE}/api/version`)).json();
+  assert.strictEqual(ver.version, pkgVersion);
+  console.log('  ✓ /api/version matches package.json');
+
   const genres = await (await fetch(`${BASE}/api/genres`)).json();
   assert.ok(genres.genres.includes('Horror') && genres.genres.includes('Kids'));
   console.log('  ✓ /api/genres');
@@ -265,6 +270,7 @@ async function httpTests() {
 
   // Manifest via install token
   const manifest = await (await fetch(`${BASE}/addon/${profile.token}/manifest.json`)).json();
+  assert.strictEqual(manifest.version, pkgVersion); // manifest version from package.json
   assert.strictEqual(manifest.catalogs.length, 2);
   assert.strictEqual(manifest.catalogs[0].name, 'Movies recommended for you');
   assert.strictEqual(manifest.catalogs[1].name, 'Series recommended for you');
@@ -417,7 +423,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 24 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 25 async/http).`);
   process.exit(0);
 }
 
