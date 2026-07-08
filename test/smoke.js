@@ -231,6 +231,19 @@ require('../src/server');
 const BASE = `http://localhost:${process.env.PORT}`;
 
 async function httpTests() {
+  // Async unit check: fully-cached CSM lookups must answer without network
+  // (the dummy key would fail loudly on any request).
+  const mdblist = require('../src/services/mdblist');
+  store.saveCsmCache({
+    'movie:tt50': { age: 8, at: Date.now() },
+    'movie:tt51': { age: null, at: Date.now() }, // unrated is cached too
+  });
+  const ages = await mdblist.commonSenseAges('dummy-key', 'movie', ['tt50', 'tt51']);
+  assert.strictEqual(ages.get('tt50'), 8);
+  assert.strictEqual(ages.get('tt51'), null);
+  store.saveCsmCache({});
+  console.log('  ✓ CSM disk cache answers without network');
+
   await new Promise(r => setTimeout(r, 400)); // let server bind
 
   const health = await (await fetch(`${BASE}/health`)).json();
@@ -404,7 +417,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 23 http).`);
+  console.log(`\nAll checks passed (${passed} unit + 24 async/http).`);
   process.exit(0);
 }
 

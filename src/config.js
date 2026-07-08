@@ -27,7 +27,7 @@ function newProfile(name) {
       tmdb_api_key: '',
       gemini_api_key: '',
       rpdb_api_key: DEFAULT_RPDB_KEY, // rating-overlay posters; free key pre-set
-      mdblist_api_key: '', // required only when an age limit is set (CSM lookups)
+      mdblist_api_key: '', // required: extra catalogs + Common Sense age checks
     },
     trakt_auth: null, // { access_token, refresh_token, expires_at(ms) }
     filters: { ...DEFAULT_FILTERS },

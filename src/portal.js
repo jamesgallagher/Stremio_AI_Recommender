@@ -177,7 +177,7 @@ async function testRpdb(profile) {
 
 async function testMdblist(profile) {
   const key = profile.keys.mdblist_api_key;
-  if (!key) return { ok: false, error: 'MDBList key not set (required only when an age limit is enabled)' };
+  if (!key) return { ok: false, error: 'MDBList key not set — required (extra catalogs + Common Sense age checks)' };
   try {
     const r = await mdblistService.testKey(key);
     return { ok: true, detail: `MDBList key valid (sample Common Sense lookup: ${r.sampleAge ? r.sampleAge + '+' : 'not rated'})` };

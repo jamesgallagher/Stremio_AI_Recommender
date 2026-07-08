@@ -130,6 +130,21 @@ function addSuggestedHistory(profileId, type, titles) {
   writeJsonAtomic(cacheFile(profileId), cache);
 }
 
+// ---- Global Common Sense rating cache ----
+// CSM ages are facts about titles, not per-profile data, and they rarely
+// change — shared across profiles so kids-mode refills don't re-hit MDBList
+// for the same titles every day. Entries: { "movie:tt123": { age, at } }
+// where age is a number or null (unrated — cached too; it's the repeat case).
+const CSM_FILE = path.join(CACHE_DIR, 'csm-ratings.json');
+
+function loadCsmCache() {
+  return readJson(CSM_FILE, {});
+}
+
+function saveCsmCache(entries) {
+  writeJsonAtomic(CSM_FILE, entries);
+}
+
 function markAttempt(profileId) {
   const cache = loadCache(profileId);
   cache.last_attempt_at = Date.now();
@@ -154,6 +169,8 @@ module.exports = {
   touchWatchedSync,
   getSuggestedHistory,
   addSuggestedHistory,
+  loadCsmCache,
+  saveCsmCache,
   markAttempt,
   deleteCache,
 };

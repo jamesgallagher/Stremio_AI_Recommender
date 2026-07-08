@@ -44,11 +44,14 @@ Each profile carries its own full key set — nothing is shared.
      the device code grant)
    - a TMDB API key at [themoviedb.org/settings/api](https://www.themoviedb.org/settings/api)
    - a Gemini API key at [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
+   - an MDBList API key at [mdblist.com/preferences](https://mdblist.com/preferences/)
+     (free; sign in → Preferences → API Access) — powers the extra catalogs
+     and Common Sense age checks
    - RPDB (rating-on-poster artwork) works out of the box — every profile is
      pre-set with the generic free-tier key (`t0-free-rpdb`). Optionally paste
      a personal key from [ratingposterdb.com](https://ratingposterdb.com/) for
      higher tiers. Applied at serve time; changes need no rebuild.
-3. Paste the four keys into the profile card → **Save keys**.
+3. Paste the keys into the profile card → **Save keys** (each has a Test button).
 4. **Connect Trakt** → enter the PIN at trakt.tv/activate while signed in as
    that member's Trakt account. Tokens auto-refresh from then on.
 5. Set filters if wanted (min rating, recency window, genre exclusions —
@@ -83,9 +86,10 @@ cannot be bypassed by toggling on a chart list.
 ## Kids mode (Common Sense age limit)
 
 Per profile: tick **Limit to age** in Filters and pick a tier (5+, 6+, 8+,
-10+, 12+, 13+, 15+ — granular at the younger end). Requires that profile's
-**MDBList API key** (free: sign in at mdblist.com → Preferences; 1,000
-requests/day, a rebuild uses a few dozen).
+10+, 12+, 13+, 15+ — granular at the younger end). Uses that profile's
+MDBList API key. Lookups are batched (one request per ~50 titles) and cached
+on disk for 30 days — including "not rated" results — so even refill-heavy
+kids rebuilds stay well inside the free tier's 1,000 requests/day.
 
 Strict by design: with an age limit set, **every** candidate title is checked
 against Common Sense Media (via MDBList) at rebuild time. Titles CSM hasn't

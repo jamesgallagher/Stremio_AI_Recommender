@@ -3,8 +3,11 @@
 // Common Sense rating at or below the limit. No rating -> not listed. We do
 // not fall back to MPAA/TMDB certifications or any other source.
 const { USER_AGENT } = require('./trakt');
+const store = require('../store');
 
 const NOT_RATED = null;
+const CSM_TTL_MS = 30 * 24 * 3600e3; // ratings are near-static; refresh monthly
+const BATCH_SIZE = 50;
 
 function parseCommonSenseAge(data) {
   // Field observed as `commonsense` (number, or string like "10+"); some
@@ -54,16 +57,54 @@ async function commonSenseAge(apiKey, type, imdbId) {
   }
 }
 
-// Look up many titles with limited concurrency (free tier: 1000 req/day —
-// a rebuild touches a few dozen, so the budget is fine).
+// Look up many titles cheaply, in three tiers (kids-mode refills can gate
+// hundreds of candidates per rebuild — free tier is 1000 req/day):
+// 1. Disk cache (30-day TTL, unrated results cached too): repeat rebuilds of
+//    mostly-unchanged lists cost near zero.
+// 2. Batch media-info POST (one call per 50 misses). If the batch response
+//    carries no Common Sense data at all across >= 5 titles, it is distrusted
+//    (endpoint variant without CSM fields) rather than mass-dropping titles.
+// 3. Per-title lookups for whatever is left. Transport/auth errors here still
+//    abort — an unverifiable list must not be served (strict, fail-closed).
 async function commonSenseAges(apiKey, type, imdbIds, log = console) {
   const results = new Map();
-  const queue = [...imdbIds];
+  const now = Date.now();
+  const prefix = type === 'series' ? 'show' : 'movie';
+  const cache = store.loadCsmCache();
+  const misses = [];
+  for (const id of imdbIds) {
+    const entry = cache[`${prefix}:${id}`];
+    if (entry && now - entry.at < CSM_TTL_MS) results.set(id, entry.age);
+    else misses.push(id);
+  }
+  if (!misses.length) return results;
+
+  const fetched = new Map();
+  try {
+    for (let i = 0; i < misses.length; i += BATCH_SIZE) {
+      const chunk = misses.slice(i, i + BATCH_SIZE);
+      const infoMap = await mediaInfoBatch(apiKey, type, chunk);
+      for (const id of chunk) {
+        const info = infoMap.get(id);
+        if (info) fetched.set(id, parseCommonSenseAge(info));
+      }
+    }
+    if (misses.length >= 5 && fetched.size && [...fetched.values()].every((v) => v === NOT_RATED)) {
+      log.warn('[csm] batch response carried no Common Sense data — falling back to per-title lookups');
+      fetched.clear();
+    }
+  } catch (err) {
+    log.warn(`[csm] batch lookup failed (${err.message}) — falling back to per-title lookups`);
+    fetched.clear();
+  }
+
+  const remaining = misses.filter((id) => !fetched.has(id));
+  const queue = [...remaining];
   const workers = Array.from({ length: 5 }, async () => {
     while (queue.length) {
       const id = queue.shift();
       try {
-        results.set(id, await commonSenseAge(apiKey, type, id));
+        fetched.set(id, await commonSenseAge(apiKey, type, id));
       } catch (err) {
         log.error(`[mdblist] lookup ${id} failed: ${err.message}`);
         throw err; // abort — an unverifiable list must not be served
@@ -71,6 +112,18 @@ async function commonSenseAges(apiKey, type, imdbIds, log = console) {
     }
   });
   await Promise.all(workers);
+
+  // Persist (reload first — another profile's gate may have written since),
+  // dropping expired entries so the file stays bounded.
+  const merged = store.loadCsmCache();
+  for (const [key, entry] of Object.entries(merged)) {
+    if (now - entry.at >= CSM_TTL_MS) delete merged[key];
+  }
+  for (const [id, age] of fetched) {
+    merged[`${prefix}:${id}`] = { age, at: now };
+    results.set(id, age);
+  }
+  store.saveCsmCache(merged);
   return results;
 }
 

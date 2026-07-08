@@ -136,7 +136,7 @@ function render(profiles) {
   container.innerHTML = profiles.map(p => {
     const installUrl = p.install_url;
     // RPDB is optional — excluded from the required-keys gate
-    const keysOk = p.keys_set.trakt_client_id && p.keys_set.trakt_client_secret && p.keys_set.tmdb_api_key && p.keys_set.gemini_api_key;
+    const keysOk = p.keys_set.trakt_client_id && p.keys_set.trakt_client_secret && p.keys_set.tmdb_api_key && p.keys_set.gemini_api_key && p.keys_set.mdblist_api_key;
     const traktKeysOk = p.keys_set.trakt_client_id && p.keys_set.trakt_client_secret;
     const badge = p.trakt_connected
       ? '<span class="badge ok">Trakt connected</span>'
@@ -183,7 +183,7 @@ function render(profiles) {
       </details>
 
       <details>
-        <summary>API keys — TMDB, Gemini &amp; RPDB ${p.keys_set.tmdb_api_key && p.keys_set.gemini_api_key ? '✓' : '— required'}</summary>
+        <summary>API keys — TMDB, Gemini, MDBList &amp; RPDB ${p.keys_set.tmdb_api_key && p.keys_set.gemini_api_key && p.keys_set.mdblist_api_key ? '✓' : '— required'}</summary>
         <div class="muted" style="margin-top:8px">Create each key while signed in as <b>${esc(p.name)}</b>'s account on that service.</div>
         <div class="cols">
           <div><label>TMDB API Key <span class="muted">(${p.keys_preview.tmdb_api_key || 'not set'})</span>
@@ -196,10 +196,10 @@ function render(profiles) {
               <a class="getkey" href="https://ratingposterdb.com/" target="_blank" rel="noopener">get key ↗</a></label>
             <input type="password" data-key="rpdb_api_key" placeholder="leave blank to keep">
             <div class="muted" style="font-size:11px;margin-top:3px">Pre-set with the free-tier key (t0-free-rpdb) — posters show ratings out of the box. Paste a personal key here to upgrade tiers. Applies immediately, no rebuild.</div></div>
-          <div><label>MDBList API Key <span class="muted">(for age limits · ${p.keys_preview.mdblist_api_key || 'not set'})</span>
+          <div><label>MDBList API Key <span class="muted">(${p.keys_preview.mdblist_api_key || 'not set'})</span>
               <a class="getkey" href="https://mdblist.com/preferences/" target="_blank" rel="noopener">get key ↗</a></label>
             <input type="password" data-key="mdblist_api_key" placeholder="leave blank to keep">
-            <div class="muted" style="font-size:11px;margin-top:3px">Required only when an age limit is set — used to verify every title's Common Sense Media age rating. Free key: sign in at mdblist.com → Preferences.</div></div>
+            <div class="muted" style="font-size:11px;margin-top:3px">Required — powers the extra catalogs and Common Sense age checks. Free key: sign in at mdblist.com → Preferences (1,000 requests/day; lookups are cached, so daily use is a fraction of that).</div></div>
         </div>
         <div style="margin-top:10px" class="row">
           <button onclick="saveKeys('${p.id}')">Save</button>
