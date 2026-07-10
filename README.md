@@ -82,7 +82,11 @@ Rules: extra catalogs **ignore watched status** (only the AI catalogs exclude
 what you've seen), refresh on the same daily cadence, are served from cache,
 and need the profile's **MDBList API key**. Newly enabled catalogs build in
 the background when you hit Save (or on first request); they show up in the
-app once it refreshes the addon manifest — reinstall the addon to force it.
+app once it refreshes the addon manifest. To force that without removing the
+addon: **Nuvio** re-fetches every installed manifest on launch, so fully quit
+and reopen the app (browser: reload the tab); **Stremio** updates an addon
+in place when you open its install URL again and press Install — same URL,
+nothing is removed, settings and ordering are kept.
 Kids-mode age limits still apply to extra catalogs — the Common Sense gate
 cannot be bypassed by toggling on a chart list.
 
