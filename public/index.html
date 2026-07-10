@@ -58,6 +58,8 @@
     display: flex; align-items: center; justify-content: center;
     background: transparent; border: 0; padding: 0; color: var(--muted); cursor: pointer; font-weight: 400; }
   .keyfield .eye:hover { background: transparent; color: var(--text); }
+  .keyrow { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+  .keyrow .keyfield { flex: 1; }
   .install { background: var(--card2); border: 1px dashed var(--border); border-radius: 8px; padding: 10px; font-family: monospace; font-size: 12px; word-break: break-all; margin-top: 6px; }
   .muted { color: var(--muted); font-size: 12px; }
   .status-line { font-size: 12px; color: var(--muted); margin-top: 8px; }
@@ -72,7 +74,8 @@
   .getkey { color: var(--accent); font-size: 11px; text-decoration: none; margin-left: 6px; }
   .getkey:hover { text-decoration: underline; }
   button.mini { padding: 4px 10px; font-size: 12px; }
-  .tres { font-size: 12px; margin-left: 8px; }
+  .tres { font-size: 12px; display: block; margin-top: 4px; }
+  .tres:empty { display: none; }
   .tres.ok { color: var(--ok); }
   .tres.err { color: var(--err); }
   .brand { width: 34px; height: 34px; vertical-align: middle; margin-right: 8px; border-radius: 8px; }
@@ -111,6 +114,17 @@ function keyField(dataKey, value) {
     <input type="password" data-key="${dataKey}" data-orig="${v}" value="${v}" placeholder="not set" autocomplete="off" spellcheck="false">
     <button type="button" class="eye" onclick="toggleKey(this)" title="Show / hide">${EYE_OFF}</button>
   </div>`;
+}
+
+// A key field (grows to fill) with an optional inline Test button; the test
+// result renders on its own line just below. Layout: label, then this row,
+// then any description text.
+function keyRow(id, dataKey, value, testService) {
+  const test = testService
+    ? `<button class="ghost mini" onclick="testKey('${id}','${testService}',this)">Test</button>`
+    : '';
+  const result = testService ? `<span class="tres" data-tres="${testService}"></span>` : '';
+  return `<div class="keyrow">${keyField(dataKey, value)}${test}</div>${result}`;
 }
 
 function toast(msg) {
@@ -184,14 +198,13 @@ function render(profiles) {
         <div class="keys-list">
           <div><label>Client ID
               <a class="getkey" href="https://app.trakt.tv/settings/advanced?mode=media" target="_blank" rel="noopener">get key ↗</a></label>
-            ${keyField('trakt_client_id', p.keys.trakt_client_id)}</div>
+            ${keyRow(p.id, 'trakt_client_id', p.keys.trakt_client_id)}</div>
           <div><label>Client Secret
               <a class="getkey" href="https://app.trakt.tv/settings/advanced?mode=media" target="_blank" rel="noopener">get key ↗</a></label>
-            ${keyField('trakt_client_secret', p.keys.trakt_client_secret)}</div>
+            ${keyRow(p.id, 'trakt_client_secret', p.keys.trakt_client_secret, 'trakt')}</div>
         </div>
-        <div style="margin-top:10px" class="row">
+        <div style="margin-top:10px">
           <button onclick="saveKeys('${p.id}')">Save</button>
-          <button class="ghost mini" onclick="testKey('${p.id}','trakt',this)">Test</button><span class="tres" data-tres="trakt"></span>
         </div>
         <div class="trakt-flow" style="margin-top:12px; padding-top:10px; border-top:1px solid var(--border)">
           ${p.trakt_connected
@@ -210,26 +223,22 @@ function render(profiles) {
         <div class="keys-list">
           <div><label>TMDB API Key
               <a class="getkey" href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">get key ↗</a></label>
-            ${keyField('tmdb_api_key', p.keys.tmdb_api_key)}
+            ${keyRow(p.id, 'tmdb_api_key', p.keys.tmdb_api_key, 'tmdb')}
             <div class="muted" style="font-size:11px;margin-top:3px">Accepts either a v3 API key or a v4 Read Access Token (Bearer) — same account, either works; the token keeps the key out of request URLs.</div></div>
           <div><label>Gemini API Key
               <a class="getkey" href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">get key ↗</a></label>
-            ${keyField('gemini_api_key', p.keys.gemini_api_key)}</div>
+            ${keyRow(p.id, 'gemini_api_key', p.keys.gemini_api_key, 'gemini')}</div>
           <div><label>MDBList API Key
               <a class="getkey" href="https://mdblist.com/preferences/" target="_blank" rel="noopener">get key ↗</a></label>
-            ${keyField('mdblist_api_key', p.keys.mdblist_api_key)}
+            ${keyRow(p.id, 'mdblist_api_key', p.keys.mdblist_api_key, 'mdblist')}
             <div class="muted" style="font-size:11px;margin-top:3px">Required — powers the extra catalogs and Common Sense age checks. Free key: sign in at mdblist.com → Preferences (1,000 requests/day; lookups are cached, so daily use is a fraction of that).</div></div>
           <div><label>RPDB API Key <span class="muted">(optional)</span>
               <a class="getkey" href="https://ratingposterdb.com/" target="_blank" rel="noopener">get key ↗</a></label>
-            ${keyField('rpdb_api_key', p.keys.rpdb_api_key)}
+            ${keyRow(p.id, 'rpdb_api_key', p.keys.rpdb_api_key, 'rpdb')}
             <div class="muted" style="font-size:11px;margin-top:3px">Pre-set with the free-tier key (t0-free-rpdb) — posters show ratings out of the box. Paste a personal key here to upgrade tiers. Applies immediately, no rebuild.</div></div>
         </div>
-        <div style="margin-top:10px" class="row">
+        <div style="margin-top:10px">
           <button onclick="saveKeys('${p.id}')">Save</button>
-          <button class="ghost mini" onclick="testKey('${p.id}','tmdb',this)">Test TMDB</button><span class="tres" data-tres="tmdb"></span>
-          <button class="ghost mini" onclick="testKey('${p.id}','gemini',this)">Test Gemini</button><span class="tres" data-tres="gemini"></span>
-          <button class="ghost mini" onclick="testKey('${p.id}','rpdb',this)">Test RPDB</button><span class="tres" data-tres="rpdb"></span>
-          <button class="ghost mini" onclick="testKey('${p.id}','mdblist',this)">Test MDBList</button><span class="tres" data-tres="mdblist"></span>
         </div>
       </details>
 
