@@ -458,16 +458,40 @@ async function diagnose(id, btn) {
 }
 
 async function rebuildNow(id, btn) {
-  // Standard async-action pattern: disable + progress label while running,
-  // transient result state on completion, then revert to the idle state.
+  // The endpoint returns 202 immediately (a rebuild runs for minutes — a
+  // response held open that long is killed by proxies like Cloudflare Tunnel,
+  // which faked "Rebuild failed" for builds that finished fine). Poll the
+  // server's rebuilding flag — an active check on the actual job — and read
+  // the per-catalog results once it completes.
   btn.disabled = true;
   btn.textContent = 'Rebuilding…';
   try {
-    const { results } = await api(`/profiles/${id}/rebuild`, { method: 'POST' });
-    const allOk = Object.values(results).every(r => r.ok);
-    const parts = Object.entries(results).map(([t, r]) => `${t}: ${r.ok ? r.count + ' titles ✓' : '✗ ' + r.error}`);
-    toast(parts.join(' · '));
-    btn.textContent = allOk ? '✓ Rebuilt' : '⚠ Partial — see message';
+    await api(`/profiles/${id}/rebuild`, { method: 'POST' }); // 202: job started
+    const deadline = Date.now() + 15 * 60e3;
+    let status = null;
+    let wait = 2000; // quick first check catches instant failures; then relax
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, wait));
+      wait = 5000;
+      const { profiles } = await api('/profiles');
+      const p = profiles.find(x => x.id === id);
+      if (!p) throw new Error('profile no longer exists');
+      status = p.status;
+      if (!status.rebuilding) break;
+    }
+    if (!status || status.rebuilding) {
+      throw new Error('still running after 15 min — check the container logs');
+    }
+    const results = status.last_results && status.last_results.results;
+    if (results) {
+      const allOk = Object.values(results).every(r => r.ok);
+      const parts = Object.entries(results).map(([t, r]) => `${t}: ${r.ok ? r.count + ' titles ✓' : '✗ ' + r.error}`);
+      toast(parts.join(' · '));
+      btn.textContent = allOk ? '✓ Rebuilt' : '⚠ Partial — see message';
+    } else {
+      toast('Rebuild finished');
+      btn.textContent = '✓ Rebuilt';
+    }
   } catch (err) {
     toast('Rebuild failed: ' + err.message);
     btn.textContent = '✗ Failed';

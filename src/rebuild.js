@@ -42,6 +42,15 @@ const EXTRA_PAGE_SIZE = 50;
 
 const locks = new Set(); // profile ids currently rebuilding
 const exclusionLocks = new Set(); // profile ids currently refreshing watched sets
+// Per-catalog outcome of each profile's most recent completed rebuild.
+// In-memory: the portal polls status.rebuilding after firing a rebuild (the
+// endpoint returns immediately — a response held open for a multi-minute
+// rebuild gets killed by proxies) and reads the results from here when done.
+const lastResults = new Map(); // profile id -> { results, finished_at }
+
+function isRebuilding(profileId) {
+  return locks.has(profileId);
+}
 
 function isStale(catalog) {
   return !catalog || Date.now() - (catalog.generated_at || 0) > STALE_MS;
@@ -59,6 +68,7 @@ function status(profile) {
     last_attempt_at: cache.last_attempt_at || 0,
     rebuilding: locks.has(profile.id),
     stale: isStale(cache.movie) || isStale(cache.series),
+    last_results: lastResults.get(profile.id) || null,
   };
 }
 
@@ -388,6 +398,7 @@ async function rebuildProfile(profile, log = console, opts = {}) {
   } finally {
     locks.delete(profile.id);
   }
+  lastResults.set(profile.id, { results, finished_at: Date.now() });
   return results;
 }
 
@@ -447,6 +458,7 @@ module.exports = {
   rebuildProfile,
   buildExtraCatalog,
   status,
+  isRebuilding,
   applyHardFilters,
   applyCsmGate,
   cleanMetas,

@@ -339,21 +339,23 @@ router.get('/profiles/:id/diagnose', async (req, res) => {
 });
 
 // ---- Rebuild now ----
-router.post('/profiles/:id/rebuild', async (req, res) => {
+// Fire-and-forget: a rebuild runs for minutes, and holding the HTTP response
+// open that long gets killed upstream (Cloudflare Tunnel caps origin responses
+// at ~100 s), so the portal reported failure for rebuilds that finished fine.
+// Start the job and answer 202 immediately; the portal polls status.rebuilding
+// and reads status.last_results once it flips false.
+router.post('/profiles/:id/rebuild', (req, res) => {
   const profile = config.getProfile(req.params.id);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
   if (!profile.trakt_auth?.access_token && !catalogs.enabledExtras(profile).length) {
     return res.status(400).json({ error: 'Connect Trakt first' });
   }
-  try {
-    const results = await rebuild.rebuildProfile(profile);
-    if (results.skipped) {
-      return res.status(409).json({ error: 'A rebuild is already running for this profile — try again in a minute' });
-    }
-    res.json({ results });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  if (rebuild.isRebuilding(profile.id)) {
+    return res.status(409).json({ error: 'A rebuild is already running for this profile — try again in a minute' });
   }
+  rebuild.rebuildProfile(profile)
+    .catch((err) => console.error(`[rebuild] ${profile.name}: ${err.message}`));
+  res.status(202).json({ started: true });
 });
 
 module.exports = { router };

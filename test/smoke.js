@@ -435,6 +435,26 @@ async function httpTests() {
   assert.strictEqual(res.status, 404);
   console.log('  ✓ extra catalog type mismatch rejected');
 
+  // Async rebuild: endpoint answers 202 immediately (no held-open response —
+  // proxies kill those), then status.rebuilding flips false and last_results
+  // carries the per-catalog outcomes. This profile has extras enabled but no
+  // keys, so the rebuild finishes instantly with recorded errors, no network.
+  res = await fetch(`${BASE}/api/profiles/${p2.id}/rebuild`, { method: 'POST' });
+  assert.strictEqual(res.status, 202);
+  assert.strictEqual((await res.json()).started, true);
+  let st = null;
+  for (let i = 0; i < 40; i++) {
+    await new Promise(r => setTimeout(r, 50));
+    const { profiles } = await (await fetch(`${BASE}/api/profiles`)).json();
+    st = profiles.find(p => p.id === p2.id).status;
+    if (!st.rebuilding && st.last_results) break;
+  }
+  assert.ok(st.last_results, 'last_results recorded after rebuild');
+  const lr = st.last_results.results;
+  assert.strictEqual(lr.movie.ok, false); // Trakt not connected
+  assert.ok(/MDBList/i.test(lr['mdb-action-movies'].error)); // extras need a key
+  console.log('  ✓ async rebuild: 202 + polled status carries results');
+
   await fetch(`${BASE}/api/profiles/${p2.id}`, { method: 'DELETE' });
 
   // Portal page served
@@ -442,7 +462,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 26 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 27 async/http).`);
   process.exit(0);
 }
 
