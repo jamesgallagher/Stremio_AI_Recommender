@@ -135,6 +135,9 @@ unverified one.
   20). The Gemini path runs extra suggestion rounds (expanding the exclusion
   list each time) and the discover path walks extra pages until the quota is
   filled or attempts are exhausted — heavy watchers still get full lists.
+- **Title logos:** catalog metas carry the title's transparent logo (TMDB),
+  so Stremio/Nuvio can show the logo-over-backdrop treatment. Fetched in the
+  same TMDB call as the IMDb ID — no extra requests.
 - **Full prompt logging:** every Gemini prompt is printed in the container
   log between PROMPT START/END markers for troubleshooting.
 - **Failure = stale, never empty:** if Gemini/TMDB/Trakt error out or return

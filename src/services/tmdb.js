@@ -80,13 +80,14 @@ async function get(apiKey, endpoint, params = {}) {
   return res.json();
 }
 
-function toMeta(item, type, imdbId) {
+function toMeta(item, type, imdbId, logo = null) {
   return {
     id: imdbId,
     type,
     name: type === 'series' ? item.name : item.title,
     poster: item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null,
     background: item.backdrop_path ? `https://image.tmdb.org/t/p/original${item.backdrop_path}` : null,
+    logo, // transparent title logo (TMDB) for the logo-over-art treatment; null if none
     description: item.overview || '',
     releaseInfo: (type === 'series' ? item.first_air_date : item.release_date)?.substring(0, 4) || null,
     imdbRating: item.vote_average ? item.vote_average.toFixed(1) : null,
@@ -97,6 +98,26 @@ function toMeta(item, type, imdbId) {
     _vote_count: item.vote_count || 0,
     _release_date: (type === 'series' ? item.first_air_date : item.release_date) || null,
   };
+}
+
+// Pick the best logo (transparent PNG) from a TMDB images.logos array —
+// English first, then whatever's available. w500 is ample for overlays.
+function pickLogo(logos) {
+  if (!Array.isArray(logos) || !logos.length) return null;
+  const chosen = logos.find((l) => l.iso_639_1 === 'en') || logos[0];
+  return chosen.file_path ? `https://image.tmdb.org/t/p/w500${chosen.file_path}` : null;
+}
+
+// Fetch the IMDb id AND a logo in one details call via append_to_response,
+// replacing what used to be a bare external_ids lookup — same request count,
+// now with the logo. include_image_language keeps the images payload small.
+async function fetchIdsAndLogo(apiKey, type, tmdbId) {
+  const base = type === 'series' ? `tv/${tmdbId}` : `movie/${tmdbId}`;
+  const data = await get(apiKey, base, {
+    append_to_response: 'external_ids,images',
+    include_image_language: 'en,null',
+  });
+  return { imdbId: data.external_ids?.imdb_id || null, logo: pickLogo(data.images?.logos) };
 }
 
 // Resolve a Gemini suggestion to a canonical TMDB item + IMDb tt ID.
@@ -118,13 +139,12 @@ async function resolveTitle(apiKey, type, title, year, log = console) {
       log.warn(`[tmdb] no match for "${title}" (${year ?? '?'}) — dropped`);
       return null;
     }
-    const extEndpoint = type === 'series' ? `tv/${item.id}/external_ids` : `movie/${item.id}/external_ids`;
-    const ext = await get(apiKey, extEndpoint);
-    if (!ext.imdb_id) {
+    const { imdbId, logo } = await fetchIdsAndLogo(apiKey, type, item.id);
+    if (!imdbId) {
       log.warn(`[tmdb] no imdb_id for "${title}" — dropped (Stremio needs tt IDs)`);
       return null;
     }
-    return toMeta(item, type, ext.imdb_id);
+    return toMeta(item, type, imdbId, logo);
   } catch (err) {
     log.warn(`[tmdb] resolve "${title}" error: ${err.message}`);
     return null;
@@ -160,12 +180,11 @@ async function discoverPage(apiKey, type, filters, page = 1, log = console, excl
   // parallel — a page is at most 20 items.
   const candidates = (data.results || []).filter((item) => !excludeTmdbIds.has(item.id));
   const metas = await Promise.all(candidates.map(async (item) => {
-    const extEndpoint = type === 'series' ? `tv/${item.id}/external_ids` : `movie/${item.id}/external_ids`;
     try {
-      const ext = await get(apiKey, extEndpoint);
-      return ext.imdb_id ? toMeta(item, type, ext.imdb_id) : null;
+      const { imdbId, logo } = await fetchIdsAndLogo(apiKey, type, item.id);
+      return imdbId ? toMeta(item, type, imdbId, logo) : null;
     } catch (err) {
-      log.warn(`[tmdb] discover external_ids error: ${err.message}`);
+      log.warn(`[tmdb] discover details/logo error: ${err.message}`);
       return null;
     }
   }));
@@ -179,4 +198,5 @@ module.exports = {
   excludedGenreIds,
   resolveTitle,
   discoverPage,
+  pickLogo,
 };

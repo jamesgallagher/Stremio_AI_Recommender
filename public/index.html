@@ -50,6 +50,14 @@
     background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px; cursor: pointer; }
   .cats label:has(input:checked) { border-color: var(--ok); color: var(--ok); }
   .cats label.locked { opacity: 0.7; cursor: default; }
+  /* One key per line, with a show/hide eye pinned inside the input */
+  .keys-list { display: flex; flex-direction: column; gap: 12px; margin-top: 4px; }
+  .keyfield { position: relative; }
+  .keyfield input { padding-right: 40px; }
+  .keyfield .eye { position: absolute; right: 4px; top: 4px; bottom: 4px; width: 32px;
+    display: flex; align-items: center; justify-content: center;
+    background: transparent; border: 0; padding: 0; color: var(--muted); cursor: pointer; font-weight: 400; }
+  .keyfield .eye:hover { background: transparent; color: var(--text); }
   .install { background: var(--card2); border: 1px dashed var(--border); border-radius: 8px; padding: 10px; font-family: monospace; font-size: 12px; word-break: break-all; margin-top: 6px; }
   .muted { color: var(--muted); font-size: 12px; }
   .status-line { font-size: 12px; color: var(--muted); margin-top: 8px; }
@@ -90,6 +98,20 @@
 const $ = (s, el = document) => el.querySelector(s);
 let GENRES = [];
 let CATALOG_DEFS = [];
+
+// Feather-style eye / eye-off icons for the key show/hide toggle.
+const EYE = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/></svg>';
+const EYE_OFF = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
+
+// A single key input: pre-filled with the saved value, hidden by default,
+// with a click-to-toggle eye. data-orig lets saveKeys send only real edits.
+function keyField(dataKey, value) {
+  const v = esc(value || '');
+  return `<div class="keyfield">
+    <input type="password" data-key="${dataKey}" data-orig="${v}" value="${v}" placeholder="not set" autocomplete="off" spellcheck="false">
+    <button type="button" class="eye" onclick="toggleKey(this)" title="Show / hide">${EYE_OFF}</button>
+  </div>`;
+}
 
 function toast(msg) {
   const t = $('#toast');
@@ -159,13 +181,13 @@ function render(profiles) {
       <details>
         <summary>Trakt — account & authorization ${p.trakt_connected ? '✓ connected' : (traktKeysOk ? '— ready to connect' : '— keys required')}</summary>
         <div class="muted" style="margin-top:8px">Steps: 1) create a Trakt API app while signed in as <b>${esc(p.name)}</b>'s Trakt account, 2) paste both values, 3) Save &amp; Test, 4) Connect.</div>
-        <div class="cols">
-          <div><label>Client ID <span class="muted">(${p.keys_preview.trakt_client_id || 'not set'})</span>
+        <div class="keys-list">
+          <div><label>Client ID
               <a class="getkey" href="https://app.trakt.tv/settings/advanced?mode=media" target="_blank" rel="noopener">get key ↗</a></label>
-            <input type="password" data-key="trakt_client_id" placeholder="leave blank to keep"></div>
-          <div><label>Client Secret <span class="muted">(${p.keys_preview.trakt_client_secret || 'not set'})</span>
+            ${keyField('trakt_client_id', p.keys.trakt_client_id)}</div>
+          <div><label>Client Secret
               <a class="getkey" href="https://app.trakt.tv/settings/advanced?mode=media" target="_blank" rel="noopener">get key ↗</a></label>
-            <input type="password" data-key="trakt_client_secret" placeholder="leave blank to keep"></div>
+            ${keyField('trakt_client_secret', p.keys.trakt_client_secret)}</div>
         </div>
         <div style="margin-top:10px" class="row">
           <button onclick="saveKeys('${p.id}')">Save</button>
@@ -185,21 +207,22 @@ function render(profiles) {
       <details>
         <summary>API keys — TMDB, Gemini, MDBList &amp; RPDB ${p.keys_set.tmdb_api_key && p.keys_set.gemini_api_key && p.keys_set.mdblist_api_key ? '✓' : '— required'}</summary>
         <div class="muted" style="margin-top:8px">Create each key while signed in as <b>${esc(p.name)}</b>'s account on that service.</div>
-        <div class="cols">
-          <div><label>TMDB API Key <span class="muted">(${p.keys_preview.tmdb_api_key || 'not set'})</span>
+        <div class="keys-list">
+          <div><label>TMDB API Key
               <a class="getkey" href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">get key ↗</a></label>
-            <input type="password" data-key="tmdb_api_key" placeholder="leave blank to keep"></div>
-          <div><label>Gemini API Key <span class="muted">(${p.keys_preview.gemini_api_key || 'not set'})</span>
+            ${keyField('tmdb_api_key', p.keys.tmdb_api_key)}
+            <div class="muted" style="font-size:11px;margin-top:3px">Accepts either a v3 API key or a v4 Read Access Token (Bearer) — same account, either works; the token keeps the key out of request URLs.</div></div>
+          <div><label>Gemini API Key
               <a class="getkey" href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">get key ↗</a></label>
-            <input type="password" data-key="gemini_api_key" placeholder="leave blank to keep"></div>
-          <div><label>RPDB API Key <span class="muted">(optional · ${p.keys_preview.rpdb_api_key || 'not set'})</span>
-              <a class="getkey" href="https://ratingposterdb.com/" target="_blank" rel="noopener">get key ↗</a></label>
-            <input type="password" data-key="rpdb_api_key" placeholder="leave blank to keep">
-            <div class="muted" style="font-size:11px;margin-top:3px">Pre-set with the free-tier key (t0-free-rpdb) — posters show ratings out of the box. Paste a personal key here to upgrade tiers. Applies immediately, no rebuild.</div></div>
-          <div><label>MDBList API Key <span class="muted">(${p.keys_preview.mdblist_api_key || 'not set'})</span>
+            ${keyField('gemini_api_key', p.keys.gemini_api_key)}</div>
+          <div><label>MDBList API Key
               <a class="getkey" href="https://mdblist.com/preferences/" target="_blank" rel="noopener">get key ↗</a></label>
-            <input type="password" data-key="mdblist_api_key" placeholder="leave blank to keep">
+            ${keyField('mdblist_api_key', p.keys.mdblist_api_key)}
             <div class="muted" style="font-size:11px;margin-top:3px">Required — powers the extra catalogs and Common Sense age checks. Free key: sign in at mdblist.com → Preferences (1,000 requests/day; lookups are cached, so daily use is a fraction of that).</div></div>
+          <div><label>RPDB API Key <span class="muted">(optional)</span>
+              <a class="getkey" href="https://ratingposterdb.com/" target="_blank" rel="noopener">get key ↗</a></label>
+            ${keyField('rpdb_api_key', p.keys.rpdb_api_key)}
+            <div class="muted" style="font-size:11px;margin-top:3px">Pre-set with the free-tier key (t0-free-rpdb) — posters show ratings out of the box. Paste a personal key here to upgrade tiers. Applies immediately, no rebuild.</div></div>
         </div>
         <div style="margin-top:10px" class="row">
           <button onclick="saveKeys('${p.id}')">Save</button>
@@ -289,6 +312,14 @@ function render(profiles) {
 
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
+// Persistent show/hide — click to reveal, click again to mask (not press-hold).
+function toggleKey(btn) {
+  const input = btn.parentElement.querySelector('input');
+  const reveal = input.type === 'password';
+  input.type = reveal ? 'text' : 'password';
+  btn.innerHTML = reveal ? EYE : EYE_OFF;
+}
+
 async function load() {
   if (!GENRES.length) GENRES = (await api('/genres')).genres;
   if (!CATALOG_DEFS.length) CATALOG_DEFS = (await api('/catalogs')).catalogs;
@@ -317,7 +348,13 @@ async function delProfile(id) {
 async function saveKeys(id, silent = false) {
   const card = document.querySelector(`[data-id="${id}"]`);
   const keys = {};
-  card.querySelectorAll('[data-key]').forEach(i => { if (i.value.trim()) keys[i.dataset.key] = i.value.trim(); });
+  // Send only genuinely edited fields — inputs are pre-filled with the saved
+  // value, so an untouched field must not be re-submitted, and clearing a
+  // field leaves the stored key intact (server ignores empty values).
+  card.querySelectorAll('[data-key]').forEach(i => {
+    const v = i.value.trim();
+    if (v !== (i.dataset.orig || '')) keys[i.dataset.key] = v;
+  });
   if (Object.keys(keys).length) await api('/profiles/' + id, { method: 'PUT', body: { keys } });
   if (!silent) { dirty = false; toast('Keys saved'); load(); }
 }

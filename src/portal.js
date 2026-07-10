@@ -37,6 +37,17 @@ function publicProfile(p, req) {
     external_url_set: !!normalizeExternal(process.env.EXTERNAL_URL),
     filters: p.filters,
     catalogs: p.catalogs || {},
+    // Full key values — returned only to the admin-authed portal so each key
+    // input can be pre-filled (with a show/hide toggle). This endpoint is
+    // behind adminAuth; the public /addon surface never sees these.
+    keys: {
+      trakt_client_id: p.keys.trakt_client_id || '',
+      trakt_client_secret: p.keys.trakt_client_secret || '',
+      tmdb_api_key: p.keys.tmdb_api_key || '',
+      gemini_api_key: p.keys.gemini_api_key || '',
+      rpdb_api_key: p.keys.rpdb_api_key || '',
+      mdblist_api_key: p.keys.mdblist_api_key || '',
+    },
     keys_set: {
       trakt_client_id: !!p.keys.trakt_client_id,
       trakt_client_secret: !!p.keys.trakt_client_secret,

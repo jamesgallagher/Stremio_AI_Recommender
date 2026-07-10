@@ -159,6 +159,9 @@ Where the built app deliberately differs from this design:
   Diagnose tool, and `GEMINI_MODELS` override.
 - **Not built:** QR code for install URLs (Copy URL + `stremio://` deep link
   cover the need); caching of failed TMDB resolutions.
+- **Title logos on metas** (shipped 2026-07): `toMeta` carries a TMDB logo,
+  fetched via `append_to_response=external_ids,images` folded into the existing
+  ID lookup (no extra requests), for the logo-over-art look in Stremio/Nuvio.
 
 ## Decided
 

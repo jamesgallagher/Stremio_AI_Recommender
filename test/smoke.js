@@ -217,6 +217,19 @@ ok('baseurl: trailing slashes and missing schemes normalized', () => {
   assert.strictEqual(normalizeExternal(undefined), '');
 });
 
+ok('tmdb: pickLogo prefers English, builds URL, handles empty', () => {
+  assert.strictEqual(
+    tmdb.pickLogo([{ iso_639_1: 'de', file_path: '/de.png' }, { iso_639_1: 'en', file_path: '/en.png' }]),
+    'https://image.tmdb.org/t/p/w500/en.png'
+  );
+  assert.strictEqual(
+    tmdb.pickLogo([{ iso_639_1: 'fr', file_path: '/fr.png' }]),
+    'https://image.tmdb.org/t/p/w500/fr.png' // no English — first available
+  );
+  assert.strictEqual(tmdb.pickLogo([]), null);
+  assert.strictEqual(tmdb.pickLogo(undefined), null);
+});
+
 ok('tmdb: genre aliases map across movie/tv vocabularies', () => {
   const movieIds = tmdb.excludedGenreIds(['Horror', 'Science Fiction'], 'movie');
   assert.ok(movieIds.has(27) && movieIds.has(878));
@@ -276,6 +289,12 @@ async function httpTests() {
   assert.strictEqual(manifest.catalogs[1].name, 'Series recommended for you');
   assert.ok(manifest.name.includes('SmokeTest'));
   console.log('  ✓ /addon/:token/manifest.json');
+
+  // Admin portal API exposes full key values (for pre-filled inputs)
+  const listed = (await (await fetch(`${BASE}/api/profiles`)).json()).profiles.find(pp => pp.id === profile.id);
+  assert.strictEqual(listed.keys.rpdb_api_key, 't0-free-rpdb'); // default pre-fill
+  assert.ok('tmdb_api_key' in listed.keys && 'mdblist_api_key' in listed.keys);
+  console.log('  ✓ profile API exposes full keys for portal pre-fill');
 
   // Unknown token -> 404
   res = await fetch(`${BASE}/addon/deadbeef/manifest.json`);
@@ -423,7 +442,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 25 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 26 async/http).`);
   process.exit(0);
 }
 
