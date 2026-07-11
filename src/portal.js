@@ -16,8 +16,19 @@ const { version } = require('../package.json');
 const router = express.Router();
 router.use(express.json());
 
+// Locked mode (SECRET_KEY missing/invalid but profiles.json holds sealed
+// secrets): refuse every mutating request so the on-disk ciphertext is never
+// overwritten. Reads still work (secrets read back blank). config.mutateProfiles
+// is the hard backstop; this gives a clean 423 instead of a 500.
+router.use((req, res, next) => {
+  if (req.method !== 'GET' && config.secretsLocked()) {
+    return res.status(423).json({ error: 'Secrets are locked — SECRET_KEY is missing or invalid. Restore the correct key on the server to make changes.' });
+  }
+  next();
+});
+
 router.get('/version', (req, res) => {
-  res.json({ version });
+  res.json({ version, secrets_locked: config.secretsLocked(), encryption_available: crypto.encryptionAvailable() });
 });
 
 // In-flight device-flow sessions: profileId -> { user_code, verification_url, state, error }
@@ -95,7 +106,9 @@ router.get('/catalogs', (req, res) => {
 });
 
 router.get('/profiles', (req, res) => {
-  res.json({ profiles: config.listProfiles().map((p) => publicProfile(p, req)) });
+  // listProfiles() refreshes the lock state, so read it after.
+  const profiles = config.listProfiles().map((p) => publicProfile(p, req));
+  res.json({ profiles, secrets_locked: config.secretsLocked() });
 });
 
 router.post('/profiles', (req, res) => {

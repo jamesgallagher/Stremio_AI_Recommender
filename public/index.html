@@ -86,6 +86,10 @@
   <h1><img src="logo.svg" alt="" class="brand">AI Recommender</h1>
   <div class="sub">Admin portal — each section below manages one family member's addon: their keys, Trakt link, filters, and install URL. <span id="ver"></span></div>
 
+  <div id="lockBanner" style="display:none;background:var(--err);color:#fff;padding:12px 14px;border-radius:8px;margin:10px 0;font-size:14px">
+    🔒 <b>Secrets are locked.</b> profiles.json holds encrypted secrets but <code>SECRET_KEY</code> is missing or wrong on the server, so API keys and Trakt tokens can't be read. Recommendations keep serving from cache, but <b>editing is disabled</b> until you restore the correct key. <b>Nothing was changed or lost</b> — set the right <code>SECRET_KEY</code> and restart.
+  </div>
+
   <div class="card">
     <div class="row">
       <input type="text" id="newName" class="grow" placeholder="New profile name (e.g. James)">
@@ -381,7 +385,8 @@ async function load() {
   if (!GENRES.length) GENRES = (await api('/genres')).genres;
   if (!CATALOG_DEFS.length) CATALOG_DEFS = (await api('/catalogs')).catalogs;
   if (!$('#ver').textContent) $('#ver').textContent = `· v${(await api('/version')).version}`;
-  const { profiles } = await api('/profiles');
+  const { profiles, secrets_locked } = await api('/profiles');
+  $('#lockBanner').style.display = secrets_locked ? 'block' : 'none';
   render(profiles);
 }
 

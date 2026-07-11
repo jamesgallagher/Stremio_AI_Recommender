@@ -2,7 +2,7 @@
 // genre mapping, and the HTTP surface with a seeded cache.
 process.env.DATA_DIR = require('os').tmpdir() + '/ai-rec-test-' + Date.now();
 process.env.PORT = '7311';
-process.env.SCROBBLE_KEY = process.env.SCROBBLE_KEY || 'test-scrobble-key-do-not-use-in-prod';
+process.env.SECRET_KEY = process.env.SECRET_KEY || 'test-secret-key-do-not-use-in-prod';
 
 const assert = require('assert');
 const store = require('../src/store');
@@ -251,6 +251,24 @@ ok('crypto: encrypt/decrypt roundtrip + tamper detection', () => {
   assert.throws(() => cr.decrypt(parts.join(':')));
 });
 
+ok('crypto: seal/unseal, marker, legacy plaintext passthrough', () => {
+  const cr = require('../src/services/crypto');
+  const sealed = cr.seal('tt-api-key');
+  assert.ok(cr.isSealed(sealed) && sealed.startsWith('enc::') && !sealed.includes('tt-api-key'));
+  assert.strictEqual(cr.unseal(sealed), 'tt-api-key');
+  // legacy plaintext (no marker) passes through untouched
+  assert.strictEqual(cr.unseal('plain-key'), 'plain-key');
+  assert.strictEqual(cr.isSealed('plain-key'), false);
+  // empty stays empty; seal is idempotent
+  assert.strictEqual(cr.seal(''), '');
+  assert.strictEqual(cr.seal(sealed), sealed);
+  // wrong key can't unseal (GCM auth) -> throws so callers can lock
+  const orig = process.env.SECRET_KEY;
+  process.env.SECRET_KEY = 'a-different-key';
+  assert.throws(() => cr.unseal(sealed));
+  process.env.SECRET_KEY = orig;
+});
+
 ok('scrobble: computeDelta excludes already-on-Trakt, groups episodes', () => {
   const { computeDelta } = require('../src/services/scrobble');
   const items = [
@@ -284,6 +302,35 @@ ok('config: scrobble defaults, migration, provider whitelist', () => {
   assert.strictEqual(p2.scrobble.nuvio_profile_index, 3); // coerced to int
   config.updateProfile(p.id, { scrobble: { provider: 'bogus' } }); // unknown provider ignored
   assert.strictEqual(config.getProfile(p.id).scrobble.provider, 'stremio');
+  config.removeProfile(p.id);
+});
+
+ok('config: secrets sealed on disk, plaintext in memory, locked mode recovers', () => {
+  const fs = require('fs'); const path = require('path');
+  const file = path.join(process.env.DATA_DIR, 'profiles.json');
+  const p = config.addProfile('SecretsTest');
+  config.updateProfile(p.id, { keys: { tmdb_api_key: 'plain-tmdb-123', gemini_api_key: 'plain-gem-456' } });
+  // On disk: sealed (enc::), plaintext never written
+  const raw = fs.readFileSync(file, 'utf8');
+  assert.ok(!raw.includes('plain-tmdb-123') && !raw.includes('plain-gem-456'), 'plaintext must not hit disk');
+  const onDisk = JSON.parse(raw).profiles.find((x) => x.id === p.id);
+  assert.ok(onDisk.keys.tmdb_api_key.startsWith('enc::'), 'stored key is sealed');
+  assert.strictEqual(onDisk.token, config.getProfile(p.id).token); // install token left plaintext
+  // In memory: plaintext
+  assert.strictEqual(config.getProfile(p.id).keys.tmdb_api_key, 'plain-tmdb-123');
+
+  // Locked mode: wrong key -> secrets blank, lock flagged, writes refused, disk intact
+  const orig = process.env.SECRET_KEY;
+  const cipher = onDisk.keys.tmdb_api_key;
+  process.env.SECRET_KEY = 'a-completely-different-key';
+  assert.strictEqual(config.getProfile(p.id).keys.tmdb_api_key, '', 'secret blanked under wrong key');
+  assert.strictEqual(config.secretsLocked(), true);
+  assert.throws(() => config.updateProfile(p.id, { name: 'nope' }), /locked/i);
+  assert.strictEqual(fs.readFileSync(file, 'utf8').includes(cipher), true, 'ciphertext preserved on disk');
+  // Restore key -> full recovery
+  process.env.SECRET_KEY = orig;
+  assert.strictEqual(config.getProfile(p.id).keys.tmdb_api_key, 'plain-tmdb-123');
+  assert.strictEqual(config.secretsLocked(), false);
   config.removeProfile(p.id);
 });
 

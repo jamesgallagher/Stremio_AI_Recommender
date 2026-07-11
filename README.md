@@ -110,7 +110,7 @@ watched items disappear from recommendations within the hour.
   to that profile's own Trakt token — one Nuvio login shared across profiles is
   fine, because each binds to a specific Nuvio profile. Picking the wrong Nuvio
   profile would mix in someone else's history, so the picker is explicit.
-- **Passwords are encrypted at rest** (AES-256-GCM) with the `SCROBBLE_KEY`
+- **Passwords are encrypted at rest** (AES-256-GCM) with the `SECRET_KEY`
   env var — never plaintext, and refused entirely if that key isn't set.
 - **Fail-closed.** Any provider/Trakt error logs a warning and changes nothing.
 - **Stremio series (v1):** the last-watched episode is scrobbled — enough to
@@ -119,6 +119,32 @@ watched items disappear from recommendations within the hour.
   one account maps straight to the recommender profile.
 - Uses the apps' own sync backends (undocumented); overridable via
   `NUVIO_API_URL` / `NUVIO_ANON_KEY` / `STREMIO_API_URL` if they ever change.
+
+## Encryption at rest
+
+Set `SECRET_KEY` (any long random string) and **every stored secret is encrypted
+at rest** with AES-256-GCM: all per-profile API keys, the Trakt OAuth tokens, and
+Auto-scrobble passwords. Only `profiles.json` on disk is encrypted — everything in
+the running app stays plaintext, so there's no behaviour change. The profile
+install token is deliberately left plaintext (it's a capability URL that has to be
+served and is already in your install links).
+
+- **Transparent + automatic.** On the first start after you set `SECRET_KEY`,
+  existing plaintext secrets are encrypted in place. Nothing else to do.
+- **Keep the key off `/data`.** Set it as a container environment variable, not
+  in a file on the mapped volume — that's what makes a leaked `profiles.json`
+  backup worthless without the key.
+- **Back the key up** (password manager). If you lose it, the encrypted secrets
+  can't be recovered — you'd re-enter API keys and re-authorize Trakt per profile.
+- **Locked mode (fail-safe).** If the file holds encrypted secrets but the key is
+  missing or wrong at start-up, the addon enters **locked mode**: it keeps serving
+  cached recommendations, but refuses all profile edits and shows a red banner —
+  so it can never overwrite the encrypted data. Restore the correct key and
+  restart to recover fully, with no data loss.
+
+Losing or changing the key is the one real risk — it doesn't touch your
+Nuvio/Stremio/Trakt data, but a mismatched key means re-setting up the addon's
+own keys. This is a helper addon, so worst case is re-entry, never lost history.
 
 ## Kids mode (Common Sense age limit)
 
@@ -220,7 +246,7 @@ Docker tab → **Add Container** (or point a Compose stack at this repo's
 | `STALE_HOURS` | No | `24` | How old a cached list may get before a background rebuild |
 | `BACKOFF_MINUTES` | No | `30` | Wait after a failed rebuild before retrying |
 | `GEMINI_MODELS` | No | built-in list | Comma-separated model fallback chain (best first), e.g. `gemini-2.5-flash,gemini-2.5-flash-lite` — override when the built-in list ages |
-| `SCROBBLE_KEY` | Only for Auto scrobble | — | Secret used to encrypt stored Nuvio/Stremio account passwords (AES-256-GCM). Any long random string. Without it, Auto scrobble can test credentials but refuses to save a password (never stores plaintext). Keep it out of the `/data` volume so a leaked backup can't decrypt the passwords |
+| `SECRET_KEY` | Recommended | — | Encrypts **all** stored secrets at rest — every profile's API keys, Trakt OAuth tokens, and Auto-scrobble passwords (AES-256-GCM). Any long random string. When set, existing plaintext secrets are encrypted in place on the next start. Without it, secrets are stored in plaintext (and a scrobble password can't be saved). Keep it **out of the `/data` volume** so a leaked backup can't decrypt anything, and **back it up** — see [Encryption at rest](#encryption-at-rest). (`SCROBBLE_KEY` is still accepted as a legacy alias.) |
 
 No API keys go in the template — Trakt/TMDB/Gemini keys are entered per
 profile in the web portal and stored in `/data/profiles.json`.
@@ -250,7 +276,7 @@ manifest point somewhere Stremio clients can actually reach. Then:
 | `BACKOFF_MINUTES` | 30 | retry backoff after failed rebuild |
 | `ADMIN_USER` | — | admin portal username (Basic Auth) |
 | `ADMIN_PASSWORD` | — | admin portal password; portal is unprotected if either is unset |
-| `SCROBBLE_KEY` | — | encrypts stored Auto-scrobble passwords; required to save one (see Auto scrobble) |
+| `SECRET_KEY` | — | encrypts all stored secrets at rest (API keys, Trakt tokens, scrobble passwords); `SCROBBLE_KEY` accepted as alias |
 
 ## Credits
 

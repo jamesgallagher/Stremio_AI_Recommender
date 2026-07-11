@@ -20,4 +20,4 @@ services:
       - ADMIN_PASSWORD=change-me    # if either is unset, the portal is unprotected
       # - STALE_HOURS=24        # cache staleness threshold
       # - BACKOFF_MINUTES=30    # retry backoff after a failed rebuild
-      # - SCROBBLE_KEY=change-me-to-a-long-random-string  # required to save Auto-scrobble passwords (encrypts them)
+      # - SECRET_KEY=change-me-to-a-long-random-string  # encrypts all stored secrets at rest (API keys, Trakt tokens, scrobble passwords)

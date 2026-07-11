@@ -8,6 +8,7 @@ const addon = require('./addon');
 const portal = require('./portal');
 
 store.ensureDirs();
+config.migrateSecrets(); // encrypt plaintext secrets at rest if SECRET_KEY is set (or report state)
 
 const app = express();
 app.disable('x-powered-by');
