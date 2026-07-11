@@ -106,12 +106,19 @@ let CATALOG_DEFS = [];
 const EYE = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/></svg>';
 const EYE_OFF = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
 
+// Password managers (Bitwarden/LastPass/1Password) otherwise pop their autofill
+// menu on every masked field — and because the profile list re-renders every
+// 30s, they re-trigger constantly. These aren't log-in-to-this-site fields
+// (they're API keys / stored provider passwords), so tell the extensions to
+// skip them. Spread onto every masked input on the page.
+const IGNORE_PW_MANAGERS = 'data-bwignore data-lpignore="true" data-1p-ignore data-form-type="other"';
+
 // A single key input: pre-filled with the saved value, hidden by default,
 // with a click-to-toggle eye. data-orig lets saveKeys send only real edits.
 function keyField(dataKey, value) {
   const v = esc(value || '');
   return `<div class="keyfield">
-    <input type="password" data-key="${dataKey}" data-orig="${v}" value="${v}" placeholder="not set" autocomplete="off" spellcheck="false">
+    <input type="password" data-key="${dataKey}" data-orig="${v}" value="${v}" placeholder="not set" autocomplete="off" spellcheck="false" ${IGNORE_PW_MANAGERS}>
     <button type="button" class="eye" onclick="toggleKey(this)" title="Show / hide">${EYE_OFF}</button>
   </div>`;
 }
@@ -307,12 +314,12 @@ function render(profiles) {
               <option value="stremio" ${p.scrobble.provider === 'stremio' ? 'selected' : ''}>Stremio</option>
             </select></div>
           <div><label>Account email</label>
-            <input type="email" data-scrobble="email" value="${esc(p.scrobble.email)}" placeholder="name@example.com" autocomplete="off" spellcheck="false"></div>
+            <input type="email" data-scrobble="email" value="${esc(p.scrobble.email)}" placeholder="name@example.com" autocomplete="off" spellcheck="false" ${IGNORE_PW_MANAGERS}></div>
         </div>
         <label style="margin-top:10px">Account password</label>
         <div class="keyrow">
           <div class="keyfield">
-            <input type="password" data-scrobble="password" value="" placeholder="${p.scrobble.password_set ? '•••••••• saved — blank keeps it' : 'not set'}" autocomplete="off" spellcheck="false">
+            <input type="password" data-scrobble="password" value="" placeholder="${p.scrobble.password_set ? '•••••••• saved — blank keeps it' : 'not set'}" autocomplete="off" spellcheck="false" ${IGNORE_PW_MANAGERS}>
             <button type="button" class="eye" onclick="toggleKey(this)" title="Show / hide">${EYE_OFF}</button>
           </div>
           <button class="ghost mini" onclick="testScrobble('${p.id}', this)">Test</button>
