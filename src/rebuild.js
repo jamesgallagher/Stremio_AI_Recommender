@@ -173,26 +173,6 @@ function cleanMetas(metas) {
   return metas.map(({ _tmdb_id, _genre_ids, _vote_average, _vote_count, _release_date, ...meta }) => meta);
 }
 
-// Fill `collected` toward the profile's list size from TMDB discover (same
-// filters, watched-excluded), page by page. Used for cold start AND to top up
-// a short Gemini list. Mutates collected/haveIds in place.
-async function fillFromDiscover(profile, type, watched, collected, haveIds, log) {
-  const { keys, filters } = profile;
-  const listSize = filters.list_size || DEFAULT_LIST_SIZE;
-  for (let page = 1; page <= MAX_DISCOVER_PAGES && collected.length < listSize; page++) {
-    const pageMetas = await tmdb.discoverPage(keys.tmdb_api_key, type, filters, page, log, watched.tmdbIds);
-    if (!pageMetas.length) break;
-    let usable = applyHardFilters(pageMetas, type, filters, watched, log, haveIds);
-    usable = await applyCsmGate(usable, type, profile, log);
-    for (const m of usable) {
-      if (collected.length >= listSize) break;
-      collected.push(m);
-      haveIds.add(m.id);
-    }
-    log.log(`[rebuild] ${profile.name}/${type}: discover page ${page} -> ${collected.length}/${listSize}`);
-  }
-}
-
 async function buildCatalog(profile, type, watchedByType, log = console) {
   const { keys, filters } = profile;
   const listSize = filters.list_size || DEFAULT_LIST_SIZE;
@@ -207,7 +187,18 @@ async function buildCatalog(profile, type, watchedByType, log = console) {
     // Cold start: TMDB discover with the same filters, page by page until full
     log.log(`[rebuild] ${profile.name}/${type}: cold start (${history.length} history titles) — TMDB discover, target ${listSize}`);
     source = 'discover';
-    await fillFromDiscover(profile, type, watched, collected, haveIds, log);
+    for (let page = 1; page <= MAX_DISCOVER_PAGES && collected.length < listSize; page++) {
+      const pageMetas = await tmdb.discoverPage(keys.tmdb_api_key, type, filters, page, log, watched.tmdbIds);
+      if (!pageMetas.length) break;
+      let usable = applyHardFilters(pageMetas, type, filters, watched, log, haveIds);
+      usable = await applyCsmGate(usable, type, profile, log);
+      for (const m of usable) {
+        if (collected.length >= listSize) break;
+        collected.push(m);
+        haveIds.add(m.id);
+      }
+      log.log(`[rebuild] ${profile.name}/${type}: discover page ${page} -> ${collected.length}/${listSize}`);
+    }
   } else {
     log.log(`[rebuild] ${profile.name}/${type}: ${history.length} history titles — Gemini, target ${listSize}`);
     source = 'gemini';
@@ -238,15 +229,6 @@ async function buildCatalog(profile, type, watchedByType, log = console) {
         haveIds.add(m.id);
       }
       log.log(`[rebuild] ${profile.name}/${type}: round ${round} -> ${collected.length}/${listSize}`);
-    }
-    // Gemini pool exhausted before quota — common for heavy watchers now that
-    // the FULL watched history is excluded (pre-v2.1.0 the 100-item cap let
-    // watched titles leak in and pad the list). Top up the remaining slots from
-    // TMDB discover: still watched-excluded and filter-respecting, so the list
-    // fills instead of coming up short.
-    if (collected.length < listSize && keys.tmdb_api_key) {
-      log.log(`[rebuild] ${profile.name}/${type}: Gemini filled ${collected.length}/${listSize} — topping up from TMDB discover`);
-      await fillFromDiscover(profile, type, watched, collected, haveIds, log);
     }
   }
 
