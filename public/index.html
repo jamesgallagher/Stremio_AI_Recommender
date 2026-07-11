@@ -294,6 +294,47 @@ function render(profiles) {
       </details>
 
       <details>
+        <summary>Auto scrobble ${p.scrobble.enabled ? '✓ ' + p.scrobble.provider + (p.scrobble.provider === 'nuvio' && p.scrobble.nuvio_profile_name ? ' · ' + esc(p.scrobble.nuvio_profile_name) : '') : '— off'}</summary>
+        <div class="muted" style="margin-top:8px">Mirror <b>${esc(p.name)}</b>'s <b>Nuvio</b> or <b>Stremio</b> watched history into their Trakt account hourly — so marks made in the app reach Trakt even if the app's own Trakt session silently drops. Per account, kept isolated from other profiles.</div>
+        ${p.scrobble.encryption_available ? '' : '<div style="color:var(--err);font-size:12px;margin-top:6px">⚠ SCROBBLE_KEY is not set on the server — you can test credentials but not save a password. Set the SCROBBLE_KEY environment variable (any long random string) on the container, then reload.</div>'}
+        <label style="margin-top:10px;display:flex;align-items:center;gap:8px;color:var(--text);font-size:14px">
+          <input type="checkbox" data-scrobble="enabled" ${p.scrobble.enabled ? 'checked' : ''}> Auto-scrobble watched content to Trakt
+        </label>
+        <div class="cols" style="margin-top:10px">
+          <div><label>Source app</label>
+            <select data-scrobble="provider" onchange="onScrobbleProvider('${p.id}')">
+              <option value="nuvio" ${p.scrobble.provider === 'nuvio' ? 'selected' : ''}>Nuvio</option>
+              <option value="stremio" ${p.scrobble.provider === 'stremio' ? 'selected' : ''}>Stremio</option>
+            </select></div>
+          <div><label>Account email</label>
+            <input type="email" data-scrobble="email" value="${esc(p.scrobble.email)}" placeholder="name@example.com" autocomplete="off" spellcheck="false"></div>
+        </div>
+        <label style="margin-top:10px">Account password</label>
+        <div class="keyrow">
+          <div class="keyfield">
+            <input type="password" data-scrobble="password" value="" placeholder="${p.scrobble.password_set ? '•••••••• saved — blank keeps it' : 'not set'}" autocomplete="off" spellcheck="false">
+            <button type="button" class="eye" onclick="toggleKey(this)" title="Show / hide">${EYE_OFF}</button>
+          </div>
+          <button class="ghost mini" onclick="testScrobble('${p.id}', this)">Test</button>
+        </div>
+        <span class="tres" data-tres="scrobble"></span>
+        <div class="scrobble-profile" style="margin-top:10px;${p.scrobble.provider === 'nuvio' ? '' : 'display:none'}">
+          <label>Which Nuvio profile</label>
+          <select data-scrobble="nuvio_profile">
+            ${p.scrobble.nuvio_profile_index != null
+              ? `<option value="${p.scrobble.nuvio_profile_index}" selected>${esc(p.scrobble.nuvio_profile_name || ('Profile ' + p.scrobble.nuvio_profile_index))}</option>`
+              : '<option value="">— Test to load profiles —</option>'}
+          </select>
+          <div class="muted" style="font-size:11px;margin-top:3px">One Nuvio login can hold several people. Pick the one whose history feeds <b>${esc(p.name)}</b>'s recommendations — <b>choosing the wrong profile mixes another person's watch history in</b>.</div>
+        </div>
+        <div style="margin-top:12px" class="row">
+          <button onclick="saveScrobble('${p.id}')">Save</button>
+          ${p.scrobble.enabled && p.trakt_connected ? `<button class="ghost" onclick="syncScrobble('${p.id}', this)">Sync now</button>` : ''}
+          <span class="muted"> — runs hourly; needs Trakt connected above</span>
+        </div>
+      </details>
+
+      <details>
         <summary>Install in Stremio / Nuvio</summary>
         ${p.external_url_set ? '' : `<div style="color:var(--warn);font-size:12px;margin:6px 0">⚠ EXTERNAL_URL is not set — this link uses the address you opened this page from, which Stremio clients outside your network can't reach. Set the EXTERNAL_URL variable to your public hostname (e.g. your Cloudflare Tunnel URL).</div>`}
         <div class="install">${esc(installUrl)}</div>
@@ -409,6 +450,83 @@ async function saveCatalogs(id) {
   dirty = false;
   toast('Catalogs saved — enabled lists build in the background');
   load();
+}
+
+// ---- Auto scrobble ----
+function onScrobbleProvider(id) {
+  const card = document.querySelector(`[data-id="${id}"]`);
+  const prov = card.querySelector('[data-scrobble=provider]').value;
+  const pf = card.querySelector('.scrobble-profile');
+  if (pf) pf.style.display = prov === 'nuvio' ? '' : 'none';
+}
+
+async function testScrobble(id, btn) {
+  const card = document.querySelector(`[data-id="${id}"]`);
+  const out = card.querySelector('[data-tres=scrobble]');
+  const provider = card.querySelector('[data-scrobble=provider]').value;
+  const email = card.querySelector('[data-scrobble=email]').value.trim();
+  const password = card.querySelector('[data-scrobble=password]').value;
+  btn.disabled = true;
+  out.className = 'tres'; out.textContent = 'testing…';
+  try {
+    const r = await api(`/profiles/${id}/scrobble/test`, { method: 'POST', body: { provider, email, password } });
+    if (!r.ok) { out.className = 'tres err'; out.textContent = '✗ ' + r.error; }
+    else if (provider === 'nuvio') {
+      const sel = card.querySelector('[data-scrobble=nuvio_profile]');
+      const prev = sel.value;
+      sel.innerHTML = r.profiles.map(pr => `<option value="${pr.index}">${esc(pr.name)}</option>`).join('')
+        || '<option value="">(no profiles found)</option>';
+      if (r.profiles.some(pr => String(pr.index) === prev)) sel.value = prev;
+      out.className = 'tres ok'; out.textContent = `✓ Logged in — ${r.profiles.length} profile(s); pick one below, then Save`;
+    } else {
+      out.className = 'tres ok'; out.textContent = `✓ Logged in — ${r.watched_count} watched items found`;
+    }
+  } catch (err) {
+    out.className = 'tres err'; out.textContent = '✗ ' + err.message;
+  }
+  btn.disabled = false;
+}
+
+async function saveScrobble(id) {
+  const card = document.querySelector(`[data-id="${id}"]`);
+  const provider = card.querySelector('[data-scrobble=provider]').value;
+  const scrobble = {
+    enabled: card.querySelector('[data-scrobble=enabled]').checked,
+    provider,
+    email: card.querySelector('[data-scrobble=email]').value.trim(),
+  };
+  const password = card.querySelector('[data-scrobble=password]').value;
+  if (password) scrobble.password = password; // only send when actually typed
+  if (provider === 'nuvio') {
+    const sel = card.querySelector('[data-scrobble=nuvio_profile]');
+    if (sel.value !== '') {
+      scrobble.nuvio_profile_index = parseInt(sel.value, 10);
+      scrobble.nuvio_profile_name = sel.options[sel.selectedIndex]?.textContent || '';
+    }
+  }
+  try {
+    await api('/profiles/' + id, { method: 'PUT', body: { scrobble } });
+    dirty = false;
+    toast('Auto-scrobble saved');
+    load();
+  } catch (err) {
+    toast('Save failed: ' + err.message);
+  }
+}
+
+async function syncScrobble(id, btn) {
+  btn.disabled = true;
+  const orig = btn.textContent;
+  btn.textContent = 'Syncing…';
+  try {
+    const { result } = await api(`/profiles/${id}/scrobble/sync`, { method: 'POST' });
+    if (result.skipped) toast('Sync skipped: ' + result.skipped);
+    else toast(`Scrobbled ${result.added.movies} movie(s) + ${result.added.episodes} episode(s) to Trakt`);
+  } catch (err) {
+    toast('Sync failed: ' + err.message);
+  }
+  btn.disabled = false;
+  btn.textContent = orig;
 }
 
 async function connectTrakt(id) {

@@ -126,10 +126,15 @@ app.listen(PORT, '0.0.0.0', () => {
 // Checks every profile hourly; ensureFresh() is a no-op unless the cache is
 // past the 24h staleness threshold, and ensureExclusionsFresh() costs one
 // last_activities call per profile when nothing new was watched.
+// ensureSynced() mirrors the profile's Nuvio/Stremio watched history into Trakt
+// first (when auto-scrobble is configured), so the exclusion refresh in the
+// same tick picks up whatever it just pushed.
+const scrobble = require('./services/scrobble');
 const TICK_MS = 60 * 60e3;
 function tick() {
   for (const profile of config.listProfiles()) {
     try {
+      scrobble.ensureSynced(profile);
       rebuild.ensureFresh(profile);
       rebuild.ensureExclusionsFresh(profile);
     } catch (err) {

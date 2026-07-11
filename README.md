@@ -90,6 +90,36 @@ nothing is removed, settings and ordering are kept.
 Kids-mode age limits still apply to extra catalogs — the Common Sense gate
 cannot be bypassed by toggling on a chart list.
 
+## Auto scrobble (Nuvio / Stremio → Trakt)
+
+Optional, per profile. Mirrors a person's **Nuvio** or **Stremio** watched
+history into their Trakt account hourly — so "mark as watched" and plays made
+in the app reach Trakt even when the app's own Trakt session silently drops
+(a real failure mode: both apps swallow Trakt write errors, so watched titles
+drift out of Trakt and leak back into recommendations).
+
+Set it up in the profile's **Auto scrobble** section: pick the source app,
+enter that person's **account email + password**, hit **Test** (for Nuvio this
+lists the account's profiles — pick which one feeds this recommender profile),
+then **Save** and tick the enable box. The reconcile runs on the hourly tick:
+it pulls the app's watched list, diffs against what Trakt already has, and
+pushes only the missing plays using this profile's own Trakt token — so newly
+watched items disappear from recommendations within the hour.
+
+- **Per account, isolated.** Credentials are stored per profile and pushed only
+  to that profile's own Trakt token — one Nuvio login shared across profiles is
+  fine, because each binds to a specific Nuvio profile. Picking the wrong Nuvio
+  profile would mix in someone else's history, so the picker is explicit.
+- **Passwords are encrypted at rest** (AES-256-GCM) with the `SCROBBLE_KEY`
+  env var — never plaintext, and refused entirely if that key isn't set.
+- **Fail-closed.** Any provider/Trakt error logs a warning and changes nothing.
+- **Stremio series (v1):** the last-watched episode is scrobbled — enough to
+  register the show in Trakt history and exclude it from recommendations.
+  Nuvio scrobbles full per-episode history. Stremio has no sub-profiles, so its
+  one account maps straight to the recommender profile.
+- Uses the apps' own sync backends (undocumented); overridable via
+  `NUVIO_API_URL` / `NUVIO_ANON_KEY` / `STREMIO_API_URL` if they ever change.
+
 ## Kids mode (Common Sense age limit)
 
 Per profile: tick **Limit to age** in Filters and pick a tier (5+, 6+, 8+,
@@ -190,6 +220,7 @@ Docker tab → **Add Container** (or point a Compose stack at this repo's
 | `STALE_HOURS` | No | `24` | How old a cached list may get before a background rebuild |
 | `BACKOFF_MINUTES` | No | `30` | Wait after a failed rebuild before retrying |
 | `GEMINI_MODELS` | No | built-in list | Comma-separated model fallback chain (best first), e.g. `gemini-2.5-flash,gemini-2.5-flash-lite` — override when the built-in list ages |
+| `SCROBBLE_KEY` | Only for Auto scrobble | — | Secret used to encrypt stored Nuvio/Stremio account passwords (AES-256-GCM). Any long random string. Without it, Auto scrobble can test credentials but refuses to save a password (never stores plaintext). Keep it out of the `/data` volume so a leaked backup can't decrypt the passwords |
 
 No API keys go in the template — Trakt/TMDB/Gemini keys are entered per
 profile in the web portal and stored in `/data/profiles.json`.
@@ -219,6 +250,7 @@ manifest point somewhere Stremio clients can actually reach. Then:
 | `BACKOFF_MINUTES` | 30 | retry backoff after failed rebuild |
 | `ADMIN_USER` | — | admin portal username (Basic Auth) |
 | `ADMIN_PASSWORD` | — | admin portal password; portal is unprotected if either is unset |
+| `SCROBBLE_KEY` | — | encrypts stored Auto-scrobble passwords; required to save one (see Auto scrobble) |
 
 ## Credits
 

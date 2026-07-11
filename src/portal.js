@@ -8,6 +8,8 @@ const catalogs = require('./catalogs');
 const trakt = require('./services/trakt');
 const tmdb = require('./services/tmdb');
 const mdblistService = require('./services/mdblist');
+const scrobble = require('./services/scrobble');
+const crypto = require('./services/crypto');
 
 const { version } = require('../package.json');
 
@@ -67,6 +69,16 @@ function publicProfile(p, req) {
     trakt_connected: !!p.trakt_auth?.access_token,
     trakt_expires_at: p.trakt_auth?.expires_at || null,
     trakt_username: p.trakt_auth?.username || null,
+    // Auto-scrobble config — password is never returned, only whether it's set.
+    scrobble: {
+      enabled: !!p.scrobble?.enabled,
+      provider: p.scrobble?.provider || 'nuvio',
+      email: p.scrobble?.email || '',
+      password_set: !!p.scrobble?.password_enc,
+      nuvio_profile_index: p.scrobble?.nuvio_profile_index ?? null,
+      nuvio_profile_name: p.scrobble?.nuvio_profile_name || '',
+      encryption_available: crypto.encryptionAvailable(),
+    },
     status: rebuild.status(p),
   };
 }
@@ -107,6 +119,32 @@ router.put('/profiles/:id', (req, res) => {
     // Explicit clear for optional keys (null -> '' disables the feature)
     for (const k of ['rpdb_api_key', 'mdblist_api_key']) {
       if (req.body.keys[k] === null) patch.keys[k] = '';
+    }
+  }
+  if (req.body.scrobble && typeof req.body.scrobble === 'object') {
+    const s = req.body.scrobble;
+    patch.scrobble = {};
+    if (s.enabled !== undefined) patch.scrobble.enabled = !!s.enabled;
+    if (s.provider !== undefined) patch.scrobble.provider = s.provider;
+    if (s.email !== undefined) patch.scrobble.email = s.email;
+    if (s.nuvio_profile_index !== undefined) patch.scrobble.nuvio_profile_index = s.nuvio_profile_index;
+    if (s.nuvio_profile_name !== undefined) patch.scrobble.nuvio_profile_name = s.nuvio_profile_name;
+    // Password: encrypt a provided value; null clears it. Storing a password
+    // requires SCROBBLE_KEY — refuse rather than risk plaintext.
+    if (s.password === null) {
+      patch.scrobble.password_enc = '';
+    } else if (s.password) {
+      if (!crypto.encryptionAvailable()) {
+        return res.status(400).json({ error: 'SCROBBLE_KEY is not set on the server — cannot store the password securely. Set it in the container environment first.' });
+      }
+      patch.scrobble.password_enc = crypto.encrypt(String(s.password));
+    }
+    // Guard: don't let a profile be enabled without a usable credential.
+    const willHavePassword = patch.scrobble.password_enc !== undefined
+      ? !!patch.scrobble.password_enc
+      : !!config.getProfile(req.params.id)?.scrobble?.password_enc;
+    if (patch.scrobble.enabled && !willHavePassword) {
+      return res.status(400).json({ error: 'Set and test the account password before enabling auto-scrobble' });
     }
   }
   const profile = config.updateProfile(req.params.id, patch);
@@ -356,6 +394,46 @@ router.post('/profiles/:id/rebuild', (req, res) => {
   rebuild.rebuildProfile(profile)
     .catch((err) => console.error(`[rebuild] ${profile.name}: ${err.message}`));
   res.status(202).json({ started: true });
+});
+
+// ---- Auto-scrobble ----
+// Test the provider credentials. Accepts an unsaved password (from the form)
+// or falls back to the stored one. For Nuvio returns the selectable profile
+// list so the UI can bind this profile to a Nuvio household member.
+router.post('/profiles/:id/scrobble/test', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  const provider = req.body?.provider || profile.scrobble?.provider || 'nuvio';
+  const email = (req.body?.email ?? profile.scrobble?.email ?? '').trim();
+  const password = req.body?.password || '';
+  const passwordEnc = profile.scrobble?.password_enc || '';
+  if (password && !crypto.encryptionAvailable()) {
+    // Not fatal for a test (we don't store it here), but warn the operator early.
+    console.warn('[scrobble] test run while SCROBBLE_KEY is unset — the password cannot be saved until it is set');
+  }
+  try {
+    const result = await scrobble.testCredentials({ provider, email, password, passwordEnc });
+    console.log(`[scrobble] ${profile.name}/${provider}: test OK`);
+    res.json(result);
+  } catch (err) {
+    console.warn(`[scrobble] ${profile.name}/${provider}: test failed — ${err.message}`);
+    res.json({ ok: false, error: err.message });
+  }
+});
+
+// Run a scrobble reconcile now (manual trigger). Fire-and-forget: the pull +
+// Trakt push can take a while, same reasoning as Rebuild now.
+router.post('/profiles/:id/scrobble/sync', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  if (!profile.scrobble?.enabled) return res.status(400).json({ error: 'Auto-scrobble is not enabled for this profile' });
+  if (!profile.trakt_auth?.access_token) return res.status(400).json({ error: 'Connect Trakt first' });
+  try {
+    const result = await scrobble.syncProfile(profile);
+    res.json({ result });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
 });
 
 module.exports = { router };

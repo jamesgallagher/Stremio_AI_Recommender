@@ -32,9 +32,24 @@ function newProfile(name) {
     trakt_auth: null, // { access_token, refresh_token, expires_at(ms) }
     filters: { ...DEFAULT_FILTERS },
     catalogs: {}, // extra-catalog toggles by id; absent/false = off. AI catalogs are always on.
+    scrobble: { ...DEFAULT_SCROBBLE },
     created_at: Date.now(),
   };
 }
+
+// Auto-scrobble: mirror this profile's Nuvio/Stremio watched history into
+// Trakt. Per profile (no cross-account leakage). password_enc is AES-GCM (see
+// services/crypto) — never plaintext. nuvio_profile_index picks which Nuvio
+// household profile to read (Stremio has no sub-profiles).
+const DEFAULT_SCROBBLE = {
+  enabled: false,
+  provider: 'nuvio', // 'nuvio' | 'stremio'
+  email: '',
+  password_enc: '', // AES-256-GCM blob; '' = unset
+  nuvio_profile_index: null,
+  nuvio_profile_name: '',
+};
+const SCROBBLE_PROVIDERS = ['nuvio', 'stremio'];
 
 function listProfiles() {
   const profiles = store.loadProfiles().profiles;
@@ -46,6 +61,7 @@ function listProfiles() {
     if (p.filters.age_limit === undefined) p.filters.age_limit = 0;
     if (p.filters.list_size === undefined) p.filters.list_size = 20;
     if (p.catalogs === undefined) p.catalogs = {};
+    if (p.scrobble === undefined) p.scrobble = { ...DEFAULT_SCROBBLE };
   }
   return profiles;
 }
@@ -90,6 +106,20 @@ function updateProfile(id, patch) {
     }
   }
   if (patch.trakt_auth !== undefined) profile.trakt_auth = patch.trakt_auth;
+  if (patch.scrobble && typeof patch.scrobble === 'object') {
+    const s = patch.scrobble;
+    if (!profile.scrobble) profile.scrobble = { ...DEFAULT_SCROBBLE };
+    const sc = profile.scrobble;
+    if (s.enabled !== undefined) sc.enabled = !!s.enabled;
+    if (s.provider !== undefined && SCROBBLE_PROVIDERS.includes(s.provider)) sc.provider = s.provider;
+    if (s.email !== undefined) sc.email = String(s.email).trim();
+    // password_enc is written already-encrypted by the portal layer; '' clears it.
+    if (s.password_enc !== undefined) sc.password_enc = String(s.password_enc);
+    if (s.nuvio_profile_index !== undefined) {
+      sc.nuvio_profile_index = s.nuvio_profile_index === null ? null : (parseInt(s.nuvio_profile_index, 10) || null);
+    }
+    if (s.nuvio_profile_name !== undefined) sc.nuvio_profile_name = String(s.nuvio_profile_name);
+  }
   store.saveProfiles(data);
   return profile;
 }

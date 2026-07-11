@@ -130,7 +130,7 @@ async function doRefreshToken(profile) {
 // Authorized GET returning the raw Response (headers intact — pagination reads
 // the X-Pagination-* headers). Proactive refresh within 24h of expiry, plus one
 // reactive refresh + retry on a server-side 401.
-async function authedFetch(profile, urlPath) {
+async function authedFetch(profile, urlPath, options = {}) {
   if (!profile.trakt_auth?.access_token) {
     throw new Error('Trakt not authorized for this profile');
   }
@@ -138,11 +138,14 @@ async function authedFetch(profile, urlPath) {
   if (profile.trakt_auth.expires_at && profile.trakt_auth.expires_at - Date.now() < 24 * 3600e3) {
     await refreshToken(profile);
   }
-  let res = await fetch(`${API}${urlPath}`, { headers: headers(profile) });
+  // headers(profile) is recomputed per attempt so the retry picks up the
+  // refreshed token.
+  const send = () => fetch(`${API}${urlPath}`, { ...options, headers: headers(profile) });
+  let res = await send();
   if (res.status === 401) {
     // Token invalidated server-side — try one refresh, then re-request
     await refreshToken(profile);
-    res = await fetch(`${API}${urlPath}`, { headers: headers(profile) });
+    res = await send();
   }
   return res;
 }
@@ -227,6 +230,45 @@ function parseWatchedItems(items, type) {
   return { imdbIds, tmdbIds, recent };
 }
 
+// ---- Auto-scrobble support: read current history, push a delta ----
+// The scrobble sync needs Trakt's existing state to avoid re-adding plays.
+// Movies: the set of watched IMDb ids. Episodes: keys "imdb:season:episode"
+// (needs extended=progress — the season/episode matrix is no longer returned
+// by default since Trakt's 2026-07 change).
+async function getWatchedMovieImdbIds(profile) {
+  const items = await authedGetAll(profile, '/sync/watched/movies');
+  const ids = new Set();
+  for (const w of items) if (w.movie?.ids?.imdb) ids.add(w.movie.ids.imdb);
+  return ids;
+}
+
+async function getWatchedEpisodeKeys(profile) {
+  const items = await authedGetAll(profile, '/sync/watched/shows?extended=progress');
+  const keys = new Set();
+  for (const w of items) {
+    const imdb = w.show?.ids?.imdb;
+    if (!imdb) continue;
+    for (const s of w.seasons || []) {
+      for (const e of s.episodes || []) keys.add(`${imdb}:${s.number}:${e.number}`);
+    }
+  }
+  return keys;
+}
+
+// Add plays to history. body = { movies: [...], shows: [...] } in Trakt's
+// /sync/history shape. Returns the parsed response (added/not_found counts).
+async function addToHistory(profile, body) {
+  const res = await authedFetch(profile, '/sync/history', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = (await res.text().catch(() => '')).slice(0, 200);
+    throw new Error(`Trakt add-to-history failed (${res.status})${text ? `: ${text}` : ''}`);
+  }
+  return res.json();
+}
+
 async function getWatchedSets(profile, type) {
   // noseasons: without it, every show arrives with its full season/episode
   // play matrix — megabytes for a large account, none of it used here.
@@ -246,6 +288,9 @@ module.exports = {
   parseWatchedItems,
   getLastActivities,
   getAccountUsername,
+  getWatchedMovieImdbIds,
+  getWatchedEpisodeKeys,
+  addToHistory,
   baseHeaders,
   USER_AGENT,
 };

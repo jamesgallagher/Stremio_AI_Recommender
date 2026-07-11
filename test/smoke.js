@@ -2,6 +2,7 @@
 // genre mapping, and the HTTP surface with a seeded cache.
 process.env.DATA_DIR = require('os').tmpdir() + '/ai-rec-test-' + Date.now();
 process.env.PORT = '7311';
+process.env.SCROBBLE_KEY = process.env.SCROBBLE_KEY || 'test-scrobble-key-do-not-use-in-prod';
 
 const assert = require('assert');
 const store = require('../src/store');
@@ -238,6 +239,54 @@ ok('tmdb: genre aliases map across movie/tv vocabularies', () => {
   assert.strictEqual(tmdb.excludedGenreIds(['Horror'], 'series').size, 0); // no TV horror genre
 });
 
+ok('crypto: encrypt/decrypt roundtrip + tamper detection', () => {
+  const cr = require('../src/services/crypto');
+  assert.ok(cr.encryptionAvailable());
+  const blob = cr.encrypt('hunter2');
+  assert.ok(blob.startsWith('v1:') && !blob.includes('hunter2'));
+  assert.strictEqual(cr.decrypt(blob), 'hunter2');
+  // GCM auth tag must reject tampered ciphertext
+  const parts = blob.split(':');
+  parts[3] = Buffer.from('tampered-ciphertext').toString('base64');
+  assert.throws(() => cr.decrypt(parts.join(':')));
+});
+
+ok('scrobble: computeDelta excludes already-on-Trakt, groups episodes', () => {
+  const { computeDelta } = require('../src/services/scrobble');
+  const items = [
+    { type: 'movie', imdbId: 'tt1', watchedAtMs: 1700000000000 }, // already watched -> dropped
+    { type: 'movie', imdbId: 'tt2', watchedAtMs: 0 },             // new, no date
+    { type: 'movie', imdbId: 'tt3', watchedAtMs: 1700000000000 }, // new, dated
+    { type: 'series', imdbId: 'tt9', season: 1, episode: 2 },     // already watched -> dropped
+    { type: 'series', imdbId: 'tt9', season: 1, episode: 3 },     // new
+  ];
+  const body = computeDelta(items, new Set(['tt1']), new Set(['tt9:1:2']));
+  assert.deepStrictEqual(body.movies.map(m => m.ids.imdb).sort(), ['tt2', 'tt3']);
+  assert.strictEqual(body.movies.find(m => m.ids.imdb === 'tt2').watched_at, undefined); // 0 omitted
+  assert.ok(body.movies.find(m => m.ids.imdb === 'tt3').watched_at.startsWith('20')); // ISO present
+  assert.strictEqual(body.shows.length, 1);
+  assert.strictEqual(body.shows[0].ids.imdb, 'tt9');
+  assert.deepStrictEqual(body.shows[0].seasons[0].episodes.map(e => e.number), [3]);
+  // nothing missing -> null
+  assert.strictEqual(computeDelta(items, new Set(['tt1', 'tt2', 'tt3']), new Set(['tt9:1:2', 'tt9:1:3'])), null);
+});
+
+ok('config: scrobble defaults, migration, provider whitelist', () => {
+  const p = config.addProfile('ScrobbleCfg');
+  assert.strictEqual(p.scrobble.enabled, false);
+  assert.strictEqual(p.scrobble.provider, 'nuvio');
+  assert.strictEqual(p.scrobble.password_enc, '');
+  config.updateProfile(p.id, { scrobble: { enabled: true, provider: 'stremio', email: 'a@b.c', password_enc: 'v1:x:y:z', nuvio_profile_index: '3', nuvio_profile_name: 'Kid' } });
+  const p2 = config.getProfile(p.id);
+  assert.strictEqual(p2.scrobble.enabled, true);
+  assert.strictEqual(p2.scrobble.provider, 'stremio');
+  assert.strictEqual(p2.scrobble.email, 'a@b.c');
+  assert.strictEqual(p2.scrobble.nuvio_profile_index, 3); // coerced to int
+  config.updateProfile(p.id, { scrobble: { provider: 'bogus' } }); // unknown provider ignored
+  assert.strictEqual(config.getProfile(p.id).scrobble.provider, 'stremio');
+  config.removeProfile(p.id);
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');
@@ -457,12 +506,36 @@ async function httpTests() {
 
   await fetch(`${BASE}/api/profiles/${p2.id}`, { method: 'DELETE' });
 
+  // Auto-scrobble: saving a password encrypts it (never round-trips plaintext),
+  // and password_set is exposed without the value.
+  res = await fetch(`${BASE}/api/profiles/${profile.id}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ scrobble: { provider: 'stremio', email: 'm@ex.com', password: 'secret-pw' } }),
+  });
+  const sc = (await res.json()).profile.scrobble;
+  assert.strictEqual(sc.provider, 'stremio');
+  assert.strictEqual(sc.email, 'm@ex.com');
+  assert.strictEqual(sc.password_set, true);
+  assert.strictEqual(sc.password, undefined); // password never returned
+  // Stored value is ciphertext, not the plaintext
+  const raw = require('fs').readFileSync(require('path').join(process.env.DATA_DIR, 'profiles.json'), 'utf8');
+  assert.ok(!raw.includes('secret-pw') && raw.includes('v1:'));
+  console.log('  ✓ scrobble password stored encrypted, never returned');
+
+  // Enabling without a usable credential is rejected
+  res = await fetch(`${BASE}/api/profiles/${profile.id}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ scrobble: { enabled: true, password: null } }), // clears pw + enables
+  });
+  assert.strictEqual(res.status, 400);
+  console.log('  ✓ scrobble enable without credentials rejected');
+
   // Portal page served
   const html = await (await fetch(`${BASE}/configure/`)).text();
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 27 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 29 async/http).`);
   process.exit(0);
 }
 
