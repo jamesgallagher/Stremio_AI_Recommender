@@ -1,7 +1,7 @@
 # AI Recommender — Stremio/Nuvio addon
 
 Self-hosted, per-family-profile movie & series recommendations. Trakt watch
-history → Gemini → TMDB resolution, served from a disk-backed cache that
+history → Groq → TMDB resolution, served from a disk-backed cache that
 refreshes in the background (stale-while-revalidate, 24 h threshold).
 
 Every catalog open is instant — Stremio only ever reads the pre-computed cache.
@@ -43,7 +43,7 @@ Each profile carries its own full key set — nothing is shared.
      → Client ID + Secret (redirect URI: `urn:ietf:wg:oauth:2.0:oob`, enable
      the device code grant)
    - a TMDB API key at [themoviedb.org/settings/api](https://www.themoviedb.org/settings/api)
-   - a Gemini API key at [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
+   - a Groq API key at [console.groq.com/keys](https://console.groq.com/keys) (free tier)
    - an MDBList API key at [mdblist.com/preferences](https://mdblist.com/preferences/)
      (free; sign in → Preferences → API Access) — powers the extra catalogs
      and Common Sense age checks
@@ -157,7 +157,7 @@ kids rebuilds stay well inside the free tier's 1,000 requests/day.
 Strict by design: with an age limit set, **every** candidate title is checked
 against Common Sense Media (via MDBList) at rebuild time. Titles CSM hasn't
 rated are never listed — there is no fallback to MPAA/TMDB certifications or
-any other rating system. The Gemini prompt is also steered toward
+any other rating system. The Groq prompt is also steered toward
 age-appropriate content, but the CSM check is the enforcement. If MDBList
 lookups fail mid-rebuild, the previous list is kept rather than serving an
 unverified one.
@@ -165,7 +165,7 @@ unverified one.
 ## Behavior notes
 
 - **Cold start:** with fewer than 3 watched titles, the list comes from TMDB
-  discover ("popular picks") using the same filters — no Gemini. Once history
+  discover ("popular picks") using the same filters — no Groq. Once history
   exists, the next rebuild upgrades to personalized ("picked for you").
 - **De-dupe guarantee:** everything ever watched on Trakt (even one episode of
   a show) is excluded, matched on canonical IMDb/TMDB IDs after resolution —
@@ -183,7 +183,7 @@ unverified one.
   flagged `in_trakt_watched: false` are invisible to the addon until they land
   in Trakt history — verify at trakt.tv → your profile → History.
 - **Fresh picks daily:** each profile keeps a rolling history of recently
-  listed titles (last 150 per catalog) and asks Gemini to avoid them, so the
+  listed titles (last 150 per catalog) and asks Groq to avoid them, so the
   daily rebuild rotates in new recommendations instead of re-serving the same
   safe picks. Heavily filtered profiles (narrow genres + high rating + short
   recency window) may exhaust the pool and get shorter lists — relax a filter
@@ -192,18 +192,18 @@ unverified one.
   `last_activities` (one tiny call) and skips the full watched-history
   download when nothing new was watched.
 - **Fill-to-quota:** each catalog targets its profile's list size (default
-  20). The Gemini path runs extra suggestion rounds (expanding the exclusion
+  20). The Groq path runs extra suggestion rounds (expanding the exclusion
   list each time) and the discover path walks extra pages until the quota is
   filled or attempts are exhausted — heavy watchers still get full lists.
 - **Title logos:** catalog metas carry the title's transparent logo (TMDB),
   so Stremio/Nuvio can show the logo-over-backdrop treatment. Fetched in the
   same TMDB call as the IMDb ID — no extra requests.
-- **Full prompt logging:** every Gemini prompt is printed in the container
+- **Full prompt logging:** every Groq prompt is printed in the container
   log between PROMPT START/END markers for troubleshooting.
-- **Failure = stale, never empty:** if Gemini/TMDB/Trakt error out or return
+- **Failure = stale, never empty:** if Groq/TMDB/Trakt error out or return
   too few usable titles (<5), the previous list stays live and a 30 min
   backoff prevents API hammering.
-- **Filters are enforced**, not suggested: Gemini is instructed, TMDB discover
+- **Filters are enforced**, not suggested: Groq is instructed, TMDB discover
   is parameterized, and a final hard filter checks resolved rating, release
   date, and genre IDs.
 
@@ -245,10 +245,10 @@ Docker tab → **Add Container** (or point a Compose stack at this repo's
 | `DATA_DIR` | No | `/data` | Storage location inside the container — leave as is |
 | `STALE_HOURS` | No | `24` | How old a cached list may get before a background rebuild |
 | `BACKOFF_MINUTES` | No | `30` | Wait after a failed rebuild before retrying |
-| `GEMINI_MODELS` | No | built-in list | Comma-separated model fallback chain (best first), e.g. `gemini-2.5-flash,gemini-2.5-flash-lite` — override when the built-in list ages |
+| `GROQ_MODELS` | No | built-in list | Comma-separated Groq model fallback chain (best first), e.g. `llama-3.3-70b-versatile,openai/gpt-oss-120b` — override when the built-in list ages |
 | `SECRET_KEY` | Recommended | — | Encrypts **all** stored secrets at rest — every profile's API keys, Trakt OAuth tokens, and Auto-scrobble passwords (AES-256-GCM). Any long random string. When set, existing plaintext secrets are encrypted in place on the next start. Without it, secrets are stored in plaintext (and a scrobble password can't be saved). Keep it **out of the `/data` volume** so a leaked backup can't decrypt anything, and **back it up** — see [Encryption at rest](#encryption-at-rest). (`SCROBBLE_KEY` is still accepted as a legacy alias.) |
 
-No API keys go in the template — Trakt/TMDB/Gemini keys are entered per
+No API keys go in the template — Trakt/TMDB/Groq keys are entered per
 profile in the web portal and stored in `/data/profiles.json`.
 
 After starting: open `http://<unraid-ip>:7000/configure/`, log in with the
@@ -280,7 +280,7 @@ manifest point somewhere Stremio clients can actually reach. Then:
 
 ## Credits
 
-Prompt constraints, Gemini model-fallback chain, and TMDB resolution fallback
+Prompt constraints, the model-fallback chain, and TMDB resolution fallback
 adapted from [rocsx/stremiorecomendacion](https://github.com/rocsx/stremiorecomendacion)
 (snapshot in `reference/`), restructured from serverless live-generation to a
 long-running cached service.

@@ -38,7 +38,7 @@ function saveProfiles(data) {
 
 // ---- Per-profile recommendation cache ----
 // Shape: {
-//   movie:  { metas: [], generated_at: ms, source: 'gemini'|'discover' },
+//   movie:  { metas: [], generated_at: ms, source: 'llm'|'discover' },
 //   series: { metas: [], generated_at: ms, source: ... },
 //   last_attempt_at: ms   // last rebuild attempt (success or failure), for backoff
 // }
@@ -110,7 +110,7 @@ function touchWatchedSync(profileId) {
 }
 
 // Rolling per-type history of titles this profile has already been shown.
-// Fed into the Gemini prompt as an avoid-list so daily rebuilds don't keep
+// Fed into the LLM prompt as an avoid-list so daily rebuilds don't keep
 // re-suggesting the same safe picks. Newest last, capped.
 const SUGGESTED_HISTORY_CAP = 150;
 

@@ -1,5 +1,5 @@
 // Profile management. All keys are per profile (decided 2026-07-03):
-// Trakt client ID/secret + OAuth tokens, TMDB key, Gemini key.
+// Trakt client ID/secret + OAuth tokens, TMDB key, Groq (LLM) key.
 //
 // Secrets at rest (v2.5.0): every API key and Trakt OAuth token is sealed with
 // AES-256-GCM when SECRET_KEY is set (see services/crypto). Transparent — the
@@ -44,7 +44,7 @@ const SCROBBLE_PROVIDERS = ['nuvio', 'stremio'];
 
 // Secret fields sealed at rest. The scrobble password_enc is already its own
 // AES blob and the install token is deliberately excluded (see header).
-const SECRET_KEY_FIELDS = ['trakt_client_id', 'trakt_client_secret', 'tmdb_api_key', 'gemini_api_key', 'rpdb_api_key', 'mdblist_api_key'];
+const SECRET_KEY_FIELDS = ['trakt_client_id', 'trakt_client_secret', 'tmdb_api_key', 'groq_api_key', 'rpdb_api_key', 'mdblist_api_key'];
 const SECRET_TOKEN_FIELDS = ['access_token', 'refresh_token'];
 
 let locked = false;
@@ -61,7 +61,7 @@ function newProfile(name) {
       trakt_client_id: '',
       trakt_client_secret: '',
       tmdb_api_key: '',
-      gemini_api_key: '',
+      groq_api_key: '',
       rpdb_api_key: DEFAULT_RPDB_KEY, // rating-overlay posters; free key pre-set
       mdblist_api_key: '', // required: extra catalogs + Common Sense age checks
     },
@@ -77,6 +77,10 @@ function newProfile(name) {
 function applyMigrations(p) {
   if (p.keys.rpdb_api_key === undefined) p.keys.rpdb_api_key = DEFAULT_RPDB_KEY;
   if (p.keys.mdblist_api_key === undefined) p.keys.mdblist_api_key = '';
+  // Gemini -> Groq (LLM provider switch): the old key is useless for Groq, so
+  // it's dropped rather than carried over. Users paste a Groq key.
+  if (p.keys.groq_api_key === undefined) p.keys.groq_api_key = '';
+  if (p.keys.gemini_api_key !== undefined) delete p.keys.gemini_api_key;
   if (p.filters.age_limit === undefined) p.filters.age_limit = 0;
   if (p.filters.list_size === undefined) p.filters.list_size = 20;
   if (p.catalogs === undefined) p.catalogs = {};

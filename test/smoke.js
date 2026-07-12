@@ -8,7 +8,7 @@ const assert = require('assert');
 const store = require('../src/store');
 const config = require('../src/config');
 const rebuild = require('../src/rebuild');
-const gemini = require('../src/services/gemini');
+const groq = require('../src/services/groq');
 const tmdb = require('../src/services/tmdb');
 
 let passed = 0;
@@ -21,7 +21,7 @@ function ok(name, fn) {
 console.log('unit:');
 
 ok('store: atomic swap preserves other catalog type', () => {
-  store.swapCatalog('p1', 'movie', [{ id: 'tt1' }], 'gemini');
+  store.swapCatalog('p1', 'movie', [{ id: 'tt1' }], 'llm');
   store.swapCatalog('p1', 'series', [{ id: 'tt2' }], 'discover');
   const c = store.loadCache('p1');
   assert.strictEqual(c.movie.metas[0].id, 'tt1');
@@ -31,7 +31,7 @@ ok('store: atomic swap preserves other catalog type', () => {
 });
 
 ok('store: pruneWatched drops listed titles atomically', () => {
-  store.swapCatalog('p2', 'movie', [{ id: 'tt1' }, { id: 'tt2' }, { id: 'tt3' }], 'gemini');
+  store.swapCatalog('p2', 'movie', [{ id: 'tt1' }, { id: 'tt2' }, { id: 'tt3' }], 'llm');
   const removed = store.pruneWatched('p2', 'movie', new Set(['tt2', 'tt9']));
   assert.strictEqual(removed, 1);
   assert.deepStrictEqual(store.loadCache('p2').movie.metas.map(m => m.id), ['tt1', 'tt3']);
@@ -94,7 +94,7 @@ ok('catalogs: registry ids unique, types valid, popular unfiltered', () => {
 });
 
 ok('store: swapExtra keeps AI catalogs untouched', () => {
-  store.swapCatalog('p5', 'movie', [{ id: 'tt1' }], 'gemini');
+  store.swapCatalog('p5', 'movie', [{ id: 'tt1' }], 'llm');
   store.swapExtra('p5', 'mdb-action-movies', [{ id: 'tt2' }]);
   const c = store.loadCache('p5');
   assert.strictEqual(c.movie.metas[0].id, 'tt1');
@@ -165,21 +165,21 @@ ok('filters: cleanMetas strips internal fields', () => {
   assert.deepStrictEqual(Object.keys(out[0]).sort(), ['id', 'name']);
 });
 
-ok('gemini: prompt includes per-profile constraints', () => {
-  const p = gemini.buildPrompt('movie', [{ title: 'Heat', year: 1995 }],
+ok('groq: prompt includes per-profile constraints', () => {
+  const p = groq.buildPrompt('movie', [{ title: 'Heat', year: 1995 }],
     { min_rating: 7.5, max_age_years: 10, excluded_genres: ['Horror', 'War'] }, ['Alien']);
   assert.ok(p.includes('7.5 or higher'));
   assert.ok(p.includes('last 10 years'));
   assert.ok(p.includes('NEVER recommend anything in these genres: Horror, War'));
   assert.ok(p.includes('Alien'));
-  const p2 = gemini.buildPrompt('series', [{ title: 'Bluey', year: 2018 }],
+  const p2 = groq.buildPrompt('series', [{ title: 'Bluey', year: 2018 }],
     { min_rating: 0, max_age_years: 0, excluded_genres: [] }, []);
   assert.ok(!p2.includes('or higher'));
   assert.ok(!p2.includes('last '));
 });
 
-ok('gemini: age-limited prompt demands Common Sense compliance', () => {
-  const p = gemini.buildPrompt('movie', [{ title: 'Bluey', year: 2018 }],
+ok('groq: age-limited prompt demands Common Sense compliance', () => {
+  const p = groq.buildPrompt('movie', [{ title: 'Bluey', year: 2018 }],
     { min_rating: 0, max_age_years: 0, excluded_genres: [], age_limit: 8 }, [], 30);
   assert.ok(p.includes('Common Sense Media age rating of 8+'));
   assert.ok(p.includes('Recommend 30 movies'));
@@ -194,17 +194,19 @@ ok('mdblist: Common Sense age parsing (strict, CSM only)', () => {
   assert.strictEqual(parseCommonSenseAge({}), null);
 });
 
-ok('gemini: parses fenced + raw JSON output', () => {
+ok('groq: parses fenced + raw JSON output', () => {
   const fenced = '```json\n[{"title":"Dune","year":2021}]\n```';
-  assert.deepStrictEqual(gemini.parseJsonArray(fenced), [{ title: 'Dune', year: 2021 }]);
-  assert.deepStrictEqual(gemini.parseJsonArray('[{"title":"Heat","year":"1995"}]'), [{ title: 'Heat', year: 1995 }]);
-  assert.throws(() => gemini.parseJsonArray('{"not":"array"}'));
+  assert.deepStrictEqual(groq.parseJsonArray(fenced), [{ title: 'Dune', year: 2021 }]);
+  assert.deepStrictEqual(groq.parseJsonArray('[{"title":"Heat","year":"1995"}]'), [{ title: 'Heat', year: 1995 }]);
+  assert.throws(() => groq.parseJsonArray('{"not":"array"}'));
 });
 
-ok('gemini: salvages JSON array wrapped in prose', () => {
+ok('groq: salvages arrays from prose and json-mode object wrappers', () => {
   const prose = 'Here are my picks:\n[{"title":"Heat","year":1995}]\nEnjoy!';
-  assert.deepStrictEqual(gemini.parseJsonArray(prose), [{ title: 'Heat', year: 1995 }]);
-  assert.throws(() => gemini.parseJsonArray('no json here at all'));
+  assert.deepStrictEqual(groq.parseJsonArray(prose), [{ title: 'Heat', year: 1995 }]);
+  // Some models (json mode) wrap the array in an object — take the array value
+  assert.deepStrictEqual(groq.parseJsonArray('{"recommendations":[{"title":"Dune","year":2021}]}'), [{ title: 'Dune', year: 2021 }]);
+  assert.throws(() => groq.parseJsonArray('no json here at all'));
 });
 
 ok('baseurl: trailing slashes and missing schemes normalized', () => {
@@ -309,10 +311,10 @@ ok('config: secrets sealed on disk, plaintext in memory, locked mode recovers', 
   const fs = require('fs'); const path = require('path');
   const file = path.join(process.env.DATA_DIR, 'profiles.json');
   const p = config.addProfile('SecretsTest');
-  config.updateProfile(p.id, { keys: { tmdb_api_key: 'plain-tmdb-123', gemini_api_key: 'plain-gem-456' } });
+  config.updateProfile(p.id, { keys: { tmdb_api_key: 'plain-tmdb-123', groq_api_key: 'plain-groq-456' } });
   // On disk: sealed (enc::), plaintext never written
   const raw = fs.readFileSync(file, 'utf8');
-  assert.ok(!raw.includes('plain-tmdb-123') && !raw.includes('plain-gem-456'), 'plaintext must not hit disk');
+  assert.ok(!raw.includes('plain-tmdb-123') && !raw.includes('plain-groq-456'), 'plaintext must not hit disk');
   const onDisk = JSON.parse(raw).profiles.find((x) => x.id === p.id);
   assert.ok(onDisk.keys.tmdb_api_key.startsWith('enc::'), 'stored key is sealed');
   assert.strictEqual(onDisk.token, config.getProfile(p.id).token); // install token left plaintext
@@ -407,7 +409,7 @@ async function httpTests() {
   // Seed cache, then catalog serves it instantly
   store.swapCatalog(profile.id, 'movie', [
     { id: 'tt0111161', type: 'movie', name: 'Test Movie', poster: null, description: '', releaseInfo: '2024' },
-  ], 'gemini');
+  ], 'llm');
   cat = await (await fetch(`${BASE}/addon/${profile.token}/catalog/movie/ai-recs-movies.json`)).json();
   assert.strictEqual(cat.metas[0].id, 'tt0111161');
   assert.strictEqual(cat.cacheMaxAge, 3600); // short hint so pruned lists appear fast

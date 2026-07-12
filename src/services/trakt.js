@@ -210,7 +210,7 @@ async function getLastActivities(profile) {
 // It is derived from the watched list rather than /sync/history because a
 // fixed-size play window collapses to 2-3 unique shows for a binge watcher —
 // which used to misclassify heavy accounts as cold-start.
-const HISTORY_SEED_COUNT = 10;
+const HISTORY_SEED_COUNT = 20;
 
 function parseWatchedItems(items, type) {
   const imdbIds = new Set();

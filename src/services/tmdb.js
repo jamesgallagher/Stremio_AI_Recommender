@@ -1,4 +1,4 @@
-// TMDB: title resolution (Gemini suggestions -> canonical IDs + IMDb tt IDs),
+// TMDB: title resolution (LLM suggestions -> canonical IDs + IMDb tt IDs),
 // cold-start discover path, and the official genre vocabulary.
 // Resolution fallback logic adapted from the reference addon:
 // search with year -> retry without year -> external_ids for imdb_id -> drop if absent.
@@ -120,7 +120,7 @@ async function fetchIdsAndLogo(apiKey, type, tmdbId) {
   return { imdbId: data.external_ids?.imdb_id || null, logo: pickLogo(data.images?.logos) };
 }
 
-// Resolve a Gemini suggestion to a canonical TMDB item + IMDb tt ID.
+// Resolve a LLM suggestion to a canonical TMDB item + IMDb tt ID.
 // Returns meta or null (unresolvable suggestions are dropped).
 async function resolveTitle(apiKey, type, title, year, log = console) {
   const endpoint = type === 'series' ? 'search/tv' : 'search/movie';
@@ -130,7 +130,7 @@ async function resolveTitle(apiKey, type, title, year, log = console) {
       query: title, language: 'en-US',
       ...(year ? { [yearParam]: year } : {}),
     });
-    // Gemini sometimes reports the wrong year (season vs. premiere) — retry without it
+    // LLM sometimes reports the wrong year (season vs. premiere) — retry without it
     if (!data.results?.length && year) {
       data = await get(apiKey, endpoint, { query: title, language: 'en-US' });
     }
@@ -151,7 +151,7 @@ async function resolveTitle(apiKey, type, title, year, log = console) {
   }
 }
 
-// Cold-start path: no Gemini, just TMDB discover driven by the same profile
+// Cold-start path: no LLM, just TMDB discover driven by the same profile
 // filters. One page per call — the rebuild pipeline walks pages until its
 // quota is filled (post-filtering can discard many results per page).
 async function discoverPage(apiKey, type, filters, page = 1, log = console, excludeTmdbIds = new Set()) {

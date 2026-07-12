@@ -6,7 +6,7 @@
 // - Backoff: failed attempts set last_attempt_at; no retry within BACKOFF_MS.
 // - Failure never purges cache: each catalog type is atomically swapped only on
 //   success with >= MIN_METAS usable titles.
-// - Fill-to-quota: each catalog targets filters.list_size titles; the Gemini
+// - Fill-to-quota: each catalog targets filters.list_size titles; the LLM
 //   path runs extra rounds (expanding the exclusion list) until filled or
 //   rounds are exhausted; the discover path walks extra pages.
 // - Watched exclusion is cross-type on IMDb IDs: a title watched as a movie
@@ -24,7 +24,7 @@ const store = require('./store');
 const config = require('./config');
 const catalogs = require('./catalogs');
 const trakt = require('./services/trakt');
-const gemini = require('./services/gemini');
+const llm = require('./services/groq');
 const tmdb = require('./services/tmdb');
 const mdblist = require('./services/mdblist');
 
@@ -33,7 +33,7 @@ const BACKOFF_MS = (parseInt(process.env.BACKOFF_MINUTES, 10) || 30) * 60e3;
 const WATCHED_REFRESH_MS = 60 * 60e3; // exclusion-only refresh cadence
 const MIN_METAS = 5;
 const DEFAULT_LIST_SIZE = 20;
-const MAX_GEMINI_ROUNDS = 4;
+const MAX_LLM_ROUNDS = 4;
 const MAX_DISCOVER_PAGES = 10;
 const COLD_START_THRESHOLD = 3;
 const EXTRA_LIST_TARGET = 20; // extra catalogs are fixed at 20 titles
@@ -200,13 +200,13 @@ async function buildCatalog(profile, type, watchedByType, log = console) {
       log.log(`[rebuild] ${profile.name}/${type}: discover page ${page} -> ${collected.length}/${listSize}`);
     }
   } else {
-    log.log(`[rebuild] ${profile.name}/${type}: ${history.length} history titles — Gemini, target ${listSize}`);
-    source = 'gemini';
+    log.log(`[rebuild] ${profile.name}/${type}: ${history.length} history titles — LLM, target ${listSize}`);
+    source = 'llm';
     // Titles listed in previous rebuilds (newest first) — asked to be avoided
     // so the daily list doesn't keep serving the same safe picks.
     const priorTitles = store.getSuggestedHistory(profile.id, type).slice().reverse();
-    const suggestedTitles = new Set(); // everything Gemini returned this rebuild
-    for (let round = 1; round <= MAX_GEMINI_ROUNDS && collected.length < listSize; round++) {
+    const suggestedTitles = new Set(); // everything LLM returned this rebuild
+    for (let round = 1; round <= MAX_LLM_ROUNDS && collected.length < listSize; round++) {
       const need = listSize - collected.length;
       const askCount = Math.min(40, Math.max(15, need * 2 + 5));
       // Avoid-list: this rebuild's suggestions first (including rejects, so
@@ -214,8 +214,8 @@ async function buildCatalog(profile, type, watchedByType, log = console) {
       // titles from earlier rebuilds. Watched-history exclusion is enforced
       // locally on IDs, not in the prompt.
       const excludeTitles = [...suggestedTitles, ...priorTitles];
-      const suggestions = await gemini.getSuggestions(
-        keys.gemini_api_key, type, history, filters, excludeTitles, log, askCount
+      const suggestions = await llm.getSuggestions(
+        keys.groq_api_key, type, history, filters, excludeTitles, log, askCount
       );
       suggestions.forEach((s) => suggestedTitles.add(s.title));
       const resolved = await Promise.all(
@@ -315,7 +315,7 @@ async function buildExtraCatalog(profile, def, log = console) {
   return shuffle(collected); // randomize order so the daily list looks fresh
 }
 
-// AI catalogs (movie + series): Trakt-seeded, Gemini/discover, watched-excluded.
+// AI catalogs (movie + series): Trakt-seeded, LLM/discover, watched-excluded.
 async function buildAiCatalogs(profile, results, log) {
   // Backfill the Trakt account name for profiles connected before we
   // started recording it — surfaces wrong-account authorizations.
@@ -344,7 +344,7 @@ async function buildAiCatalogs(profile, results, log) {
       const { metas, source } = await buildCatalog(profile, type, watchedByType, log);
       if (metas.length >= MIN_METAS) {
         store.swapCatalog(profile.id, type, metas, source); // atomic swap on success only
-        // Remember what was listed so future rebuilds steer Gemini away
+        // Remember what was listed so future rebuilds steer LLM away
         // from repeating it (rolling, capped avoid-list).
         store.addSuggestedHistory(profile.id, type, metas.map((m) => m.name));
         results[type] = { ok: true, count: metas.length, source };
@@ -361,7 +361,7 @@ async function buildAiCatalogs(profile, results, log) {
 }
 
 // opts.ai / opts.extras scope the rebuild (both default on) so an extras-only
-// refresh never burns Gemini quota and vice versa.
+// refresh never burns LLM quota and vice versa.
 async function rebuildProfile(profile, log = console, opts = {}) {
   if (locks.has(profile.id)) return { skipped: 'locked' };
   locks.add(profile.id);

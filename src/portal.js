@@ -57,7 +57,7 @@ function publicProfile(p, req) {
       trakt_client_id: p.keys.trakt_client_id || '',
       trakt_client_secret: p.keys.trakt_client_secret || '',
       tmdb_api_key: p.keys.tmdb_api_key || '',
-      gemini_api_key: p.keys.gemini_api_key || '',
+      groq_api_key: p.keys.groq_api_key || '',
       rpdb_api_key: p.keys.rpdb_api_key || '',
       mdblist_api_key: p.keys.mdblist_api_key || '',
     },
@@ -65,7 +65,7 @@ function publicProfile(p, req) {
       trakt_client_id: !!p.keys.trakt_client_id,
       trakt_client_secret: !!p.keys.trakt_client_secret,
       tmdb_api_key: !!p.keys.tmdb_api_key,
-      gemini_api_key: !!p.keys.gemini_api_key,
+      groq_api_key: !!p.keys.groq_api_key,
       rpdb_api_key: !!p.keys.rpdb_api_key,
       mdblist_api_key: !!p.keys.mdblist_api_key,
     },
@@ -73,7 +73,7 @@ function publicProfile(p, req) {
       trakt_client_id: redactKey(p.keys.trakt_client_id),
       trakt_client_secret: redactKey(p.keys.trakt_client_secret),
       tmdb_api_key: redactKey(p.keys.tmdb_api_key),
-      gemini_api_key: redactKey(p.keys.gemini_api_key),
+      groq_api_key: redactKey(p.keys.groq_api_key),
       rpdb_api_key: redactKey(p.keys.rpdb_api_key),
       mdblist_api_key: redactKey(p.keys.mdblist_api_key),
     },
@@ -126,7 +126,7 @@ router.put('/profiles/:id', (req, res) => {
   if (req.body.keys) {
     // Only overwrite keys that were actually provided (non-empty)
     patch.keys = {};
-    for (const k of ['trakt_client_id', 'trakt_client_secret', 'tmdb_api_key', 'gemini_api_key', 'rpdb_api_key', 'mdblist_api_key']) {
+    for (const k of ['trakt_client_id', 'trakt_client_secret', 'tmdb_api_key', 'groq_api_key', 'rpdb_api_key', 'mdblist_api_key']) {
       if (req.body.keys[k]) patch.keys[k] = String(req.body.keys[k]).trim();
     }
     // Explicit clear for optional keys (null -> '' disables the feature)
@@ -164,7 +164,7 @@ router.put('/profiles/:id', (req, res) => {
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
   // Rule: extra-catalog caches can be built "from the configure" — when the
   // toggle set changes and any enabled catalog has no cache yet, build those
-  // in the background (extras only: never burns Gemini quota).
+  // in the background (extras only: never burns LLM quota).
   if (patch.catalogs && profile.keys.mdblist_api_key) {
     const cache = store.loadCache(profile.id);
     const missing = catalogs.enabledExtras(profile).filter((d) => !cache.extras?.[d.id]?.metas?.length);
@@ -224,13 +224,15 @@ async function testTmdb(profile) {
   return { ok: false, error: `Invalid TMDB key (${res.status})` };
 }
 
-async function testGemini(profile) {
-  const key = profile.keys.gemini_api_key;
-  if (!key) return { ok: false, error: 'Gemini key not set' };
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(key)}`);
-  if (res.ok) return { ok: true, detail: 'Gemini key valid' };
-  if (res.status === 429) return { ok: true, detail: 'Key valid, but free-tier quota is currently exhausted' };
-  return { ok: false, error: `Invalid Gemini key (${res.status})` };
+async function testGroq(profile) {
+  const key = profile.keys.groq_api_key;
+  if (!key) return { ok: false, error: 'Groq key not set' };
+  const res = await fetch('https://api.groq.com/openai/v1/models', {
+    headers: { Authorization: `Bearer ${key}`, 'User-Agent': trakt.USER_AGENT },
+  });
+  if (res.ok) return { ok: true, detail: 'Groq key valid' };
+  if (res.status === 429) return { ok: true, detail: 'Key valid, but free-tier rate limit is currently exhausted' };
+  return { ok: false, error: `Invalid Groq key (${res.status})` };
 }
 
 async function testRpdb(profile) {
@@ -254,7 +256,7 @@ async function testMdblist(profile) {
   }
 }
 
-const TESTERS = { trakt: testTrakt, tmdb: testTmdb, gemini: testGemini, rpdb: testRpdb, mdblist: testMdblist };
+const TESTERS = { trakt: testTrakt, tmdb: testTmdb, groq: testGroq, rpdb: testRpdb, mdblist: testMdblist };
 
 router.post('/profiles/:id/test/:service', async (req, res) => {
   const profile = config.getProfile(req.params.id);

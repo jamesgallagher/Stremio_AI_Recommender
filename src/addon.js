@@ -1,5 +1,5 @@
 // Stremio addon endpoints — deliberately thin. Reads pre-computed cache only;
-// never calls Trakt/Gemini/TMDB in the request path. Stale cache triggers a
+// never calls Trakt/LLM/TMDB in the request path. Stale cache triggers a
 // background rebuild (fire-and-forget) via rebuild.ensureFresh.
 const express = require('express');
 const config = require('./config');
@@ -33,7 +33,7 @@ function manifestFor(profile, baseUrl = '') {
     id: `au.com.jscc.airecommender.${profile.id.substring(0, 8)}`,
     version,
     name: `AI Recommender — ${profile.name}`,
-    description: `Personalized movie & series recommendations for ${profile.name}, generated from Trakt watch history via Gemini.`,
+    description: `Personalized movie & series recommendations for ${profile.name}, generated from Trakt watch history via AI.`,
     ...(baseUrl ? { logo: `${baseUrl}/logo.png` } : {}),
     types: ['movie', 'series'],
     idPrefixes: ['tt'],

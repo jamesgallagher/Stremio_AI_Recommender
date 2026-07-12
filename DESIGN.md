@@ -145,6 +145,12 @@ None — design is build-ready.
 
 Where the built app deliberately differs from this design:
 
+- **LLM provider is Groq, not Gemini** (2026-07). Switched to Groq's free-tier
+  OpenAI-compatible Chat Completions API (`services/groq.js`), primary model
+  `llama-3.3-70b-versatile` with a fallback chain (override via `GROQ_MODELS`).
+  The per-profile `gemini_api_key` field migrated to `groq_api_key` (the old
+  key is dropped — useless for Groq); the internal catalog source label
+  `'gemini'` became `'llm'`. Taste seed raised from 10 to 20 recent titles.
 - **Taste seed comes from `/sync/watched/*` (sorted by `last_watched_at`), not
   `/sync/history/*`.** A fixed-size history window counts *plays*, so a binge
   watcher's last 100 plays can collapse to 2–3 unique shows and misclassify a
@@ -156,7 +162,7 @@ Where the built app deliberately differs from this design:
   Sense age gate via MDBList), RPDB rating posters, per-profile list size,
   rolling avoid-list for daily variety, hourly watched-set pruning with
   `last_activities` change detection, admin login rate limiting, a per-profile
-  Diagnose tool, and `GEMINI_MODELS` override.
+  Diagnose tool, and `GROQ_MODELS` override.
 - **Not built:** QR code for install URLs (Copy URL + `stremio://` deep link
   cover the need); caching of failed TMDB resolutions.
 - **Title logos on metas** (shipped 2026-07): `toMeta` carries a TMDB logo,
