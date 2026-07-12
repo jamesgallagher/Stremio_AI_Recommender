@@ -147,7 +147,8 @@ Where the built app deliberately differs from this design:
 
 - **LLM provider is Groq, not Gemini** (2026-07). Switched to Groq's free-tier
   OpenAI-compatible Chat Completions API (`services/groq.js`), primary model
-  `llama-3.3-70b-versatile` with a fallback chain (override via `GROQ_MODELS`).
+  `openai/gpt-oss-120b` (quality-first) with a fallback chain (override via
+  `GROQ_MODELS`).
   The per-profile `gemini_api_key` field migrated to `groq_api_key` (the old
   key is dropped — useless for Groq); the internal catalog source label
   `'gemini'` became `'llm'`. Taste seed raised from 10 to 20 recent titles.

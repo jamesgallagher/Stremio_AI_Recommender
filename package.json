@@ -1,6 +1,6 @@
 {
   "name": "ai-recommender",
-  "version": "2.6.0",
+  "version": "2.6.1",
   "description": "Self-hosted Stremio/Nuvio AI recommendation addon — Trakt history + Groq LLM + TMDB, per-family-profile",
   "main": "src/server.js",
   "scripts": {

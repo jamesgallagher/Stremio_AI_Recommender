@@ -239,7 +239,7 @@ function render(profiles) {
           <div><label>Groq API Key
               <a class="getkey" href="https://console.groq.com/keys" target="_blank" rel="noopener">get key ↗</a></label>
             ${keyRow(p.id, 'groq_api_key', p.keys.groq_api_key, 'groq')}
-            <div class="muted" style="font-size:11px;margin-top:3px">Free tier at console.groq.com — powers the AI recommendations. Model: llama-3.3-70b (override with the GROQ_MODELS env var).</div></div>
+            <div class="muted" style="font-size:11px;margin-top:3px">Free tier at console.groq.com — powers the AI recommendations. Model: openai/gpt-oss-120b (override with the GROQ_MODELS env var).</div></div>
           <div><label>MDBList API Key
               <a class="getkey" href="https://mdblist.com/preferences/" target="_blank" rel="noopener">get key ↗</a></label>
             ${keyRow(p.id, 'mdblist_api_key', p.keys.mdblist_api_key, 'mdblist')}

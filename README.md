@@ -245,7 +245,7 @@ Docker tab → **Add Container** (or point a Compose stack at this repo's
 | `DATA_DIR` | No | `/data` | Storage location inside the container — leave as is |
 | `STALE_HOURS` | No | `24` | How old a cached list may get before a background rebuild |
 | `BACKOFF_MINUTES` | No | `30` | Wait after a failed rebuild before retrying |
-| `GROQ_MODELS` | No | built-in list | Comma-separated Groq model fallback chain (best first), e.g. `llama-3.3-70b-versatile,openai/gpt-oss-120b` — override when the built-in list ages |
+| `GROQ_MODELS` | No | built-in list | Comma-separated Groq model fallback chain (best first), e.g. `openai/gpt-oss-120b,llama-3.3-70b-versatile` — override when the built-in list ages |
 | `SECRET_KEY` | Recommended | — | Encrypts **all** stored secrets at rest — every profile's API keys, Trakt OAuth tokens, and Auto-scrobble passwords (AES-256-GCM). Any long random string. When set, existing plaintext secrets are encrypted in place on the next start. Without it, secrets are stored in plaintext (and a scrobble password can't be saved). Keep it **out of the `/data` volume** so a leaked backup can't decrypt anything, and **back it up** — see [Encryption at rest](#encryption-at-rest). (`SCROBBLE_KEY` is still accepted as a legacy alias.) |
 
 No API keys go in the template — Trakt/TMDB/Groq keys are entered per

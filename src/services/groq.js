@@ -4,17 +4,17 @@
 // parameterized per profile.
 const API = 'https://api.groq.com/openai/v1/chat/completions';
 
-// Best-quality first; on 429/rate-limit we fall through to the next.
-// Override with GROQ_MODELS (comma-separated) when this list ages.
-//  - llama-3.3-70b-versatile: Groq's flagship general model — strong film/TV
-//    knowledge, reliable JSON, the most rate-limit headroom. Primary.
-//  - openai/gpt-oss-120b: highest-quality picks, but slower (spends reasoning
-//    tokens) and tighter free-tier limits. First fallback.
-//  - gpt-oss-20b / llama-3.1-8b-instant: fast, lighter fallbacks for when the
-//    bigger models are rate-limited.
+// Quality first: a recommender should favour the best recommendations over
+// throughput. The fallback chain only triggers on 429/error, so preferring the
+// heavier model costs nothing while it's available. Override with GROQ_MODELS.
+//  - openai/gpt-oss-120b: highest-quality, most sophisticated taste-matching
+//    (spends reasoning tokens, tighter free-tier limits). Primary.
+//  - llama-3.3-70b-versatile: strong and fast with the most rate-limit
+//    headroom — the fallback when gpt-oss-120b is throttled.
+//  - gpt-oss-20b / llama-3.1-8b-instant: lighter last-resort fallbacks.
 const DEFAULT_MODELS = [
-  'llama-3.3-70b-versatile',
   'openai/gpt-oss-120b',
+  'llama-3.3-70b-versatile',
   'openai/gpt-oss-20b',
   'llama-3.1-8b-instant',
 ];
@@ -129,17 +129,32 @@ async function callModel(apiKey, model, prompt) {
 async function getSuggestions(apiKey, type, history, filters, excludeTitles, log = console, askCount = 25) {
   const prompt = buildPrompt(type, history, filters, excludeTitles, askCount);
   log.log(`[groq] full prompt for ${type}:\n----- PROMPT START -----\n${prompt}\n----- PROMPT END -----`);
+  const primary = FALLBACK_MODELS[0];
   let lastError = null;
-  for (const model of FALLBACK_MODELS) {
+  for (let i = 0; i < FALLBACK_MODELS.length; i++) {
+    const model = FALLBACK_MODELS[i];
     try {
       const result = await callModel(apiKey, model, prompt);
-      log.log(`[groq] ${type}: ${result.length} suggestions from ${model}`);
+      // Make backup-model usage obvious in the logs: the primary succeeding is
+      // routine (info); a fallback serving is notable (warn) — it means the
+      // primary was rate-limited/errored above.
+      if (i === 0) {
+        log.log(`[groq] ${type}: ${result.length} suggestions from PRIMARY model ${model}`);
+      } else {
+        log.warn(`[groq] ${type}: ⚠ served by BACKUP model "${model}" — primary "${primary}" was unavailable (see rate-limit/error above). ${result.length} suggestions.`);
+      }
       log.log(`[groq] suggested: ${result.map((r) => `${r.title} (${r.year ?? '?'})`).join(', ')}`);
       return result;
     } catch (err) {
       lastError = err;
-      const rate = err.status === 429 || /rate.?limit|quota/i.test(err.message);
-      log.warn(`[groq] ${model} ${rate ? 'rate-limited' : `error: ${err.message}`} — trying next model`);
+      const rate = err.status === 429 || /rate.?limit|quota|free.?tier|too many requests/i.test(err.message);
+      const next = FALLBACK_MODELS[i + 1];
+      const tail = next ? `falling back to backup model "${next}"` : 'no backup models left — this rebuild will fail';
+      if (rate) {
+        log.warn(`[groq] ⚠ FREE-TIER RATE LIMIT hit on "${model}" (HTTP 429) — ${tail}`);
+      } else {
+        log.warn(`[groq] "${model}" failed (${err.message}) — ${tail}`);
+      }
       continue;
     }
   }
