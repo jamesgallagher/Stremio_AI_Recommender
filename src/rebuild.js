@@ -6,9 +6,10 @@
 // - Backoff: failed attempts set last_attempt_at; no retry within BACKOFF_MS.
 // - Failure never purges cache: each catalog type is atomically swapped only on
 //   success with >= MIN_METAS usable titles.
-// - Fill-to-quota: each catalog targets filters.list_size titles; the LLM
-//   path runs extra rounds (expanding the exclusion list) until filled or
-//   rounds are exhausted; the discover path walks extra pages.
+// - Inverted pipeline (Phase 1): code builds a filtered candidate pool (TMDB
+//   discover + recommendations/similar, IMDb-rated, exclusion-subtracted) and
+//   the LLM ranks it by ID in ONE call. Top list_size displayed + equal bench.
+// - Bench backfills the displayed list when items are watched (free, no LLM).
 // - Watched exclusion is cross-type on IMDb IDs: a title watched as a movie
 //   on Trakt can never appear in the series catalog (or vice versa), covering
 //   docs/miniseries that TMDB and Trakt classify differently.
@@ -33,9 +34,11 @@ const BACKOFF_MS = (parseInt(process.env.BACKOFF_MINUTES, 10) || 30) * 60e3;
 const WATCHED_REFRESH_MS = 60 * 60e3; // exclusion-only refresh cadence
 const MIN_METAS = 5;
 const DEFAULT_LIST_SIZE = 20;
-const MAX_LLM_ROUNDS = 4;
-const MAX_DISCOVER_PAGES = 10;
 const COLD_START_THRESHOLD = 3;
+const DEFAULT_BENCH_SIZE = 20;   // hidden reserve, same size as the displayed list
+const POOL_TRIM = 120;           // candidates sent to the ranker (token budget)
+const ENRICH_CAP = 150;          // cap on candidates we pay TMDB external_ids for
+const DISCOVER_PAGES = 3;        // discover pages fetched for the raw pool
 const EXTRA_LIST_TARGET = 20; // extra catalogs are fixed at 20 titles
 const MAX_EXTRA_PAGES = 5;
 const EXTRA_PAGE_SIZE = 50;
@@ -173,69 +176,153 @@ function cleanMetas(metas) {
   return metas.map(({ _tmdb_id, _genre_ids, _vote_average, _vote_count, _release_date, ...meta }) => meta);
 }
 
-async function buildCatalog(profile, type, watchedByType, log = console) {
+// Enriched taste profile: last-N unique watched titles annotated with genres +
+// a one-line overview (so recent/unknown titles still steer ranking), plus the
+// viewer's most-watched genres as ballast against a recent binge.
+async function buildTasteProfile(profile, type, recent, log) {
+  const enriched = await Promise.all(recent.map(async (h) => {
+    if (!h.tmdb_id) return { title: h.title, year: h.year, genres: [], overview: '' };
+    try {
+      const d = await tmdb.detailsForSeed(profile.keys.tmdb_api_key, type, h.tmdb_id);
+      return { title: h.title, year: h.year, genres: d.genres, overview: d.overview };
+    } catch (err) {
+      log.warn(`[rebuild] seed enrich ${h.tmdb_id} failed: ${err.message}`);
+      return { title: h.title, year: h.year, genres: [], overview: '' };
+    }
+  }));
+  const freq = {};
+  for (const h of enriched) for (const g of h.genres) freq[g] = (freq[g] || 0) + 1;
+  const topGenres = Object.entries(freq).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([g]) => g);
+  return { recent: enriched, topGenres };
+}
+
+// Cheap raw filters on a TMDB item (recency, excluded genres, vote-count floor).
+// The rating floor is enforced later — the IMDb source needs enrichment first.
+function rawPasses(item, type, filters) {
+  if (filters.max_age_years > 0) {
+    const d = type === 'series' ? item.first_air_date : item.release_date;
+    if (d) {
+      const cutoff = new Date();
+      cutoff.setFullYear(cutoff.getFullYear() - filters.max_age_years);
+      if (new Date(d) < cutoff) return false;
+    }
+  }
+  const ex = tmdb.excludedGenreIds(filters.excluded_genres, type);
+  if (ex.size && (item.genre_ids || []).some((g) => ex.has(g))) return false;
+  const vcFloor = filters.vote_count_floor ?? (type === 'series' ? 100 : 200);
+  if ((item.vote_count || 0) < vcFloor) return false;
+  return true;
+}
+
+// Build the candidate pool: discover + recommendations/similar -> dedupe ->
+// raw filters -> popularity pre-trim -> enrich (imdb id + logo) -> exclude
+// watched -> rating gate. Returns enriched metas (internal _fields intact).
+async function buildPool(profile, type, watched, seedTmdbIds, log) {
   const { keys, filters } = profile;
+  const raw = await tmdb.discoverRaw(keys.tmdb_api_key, type, filters, { pages: DISCOVER_PAGES });
+  if (seedTmdbIds.length) {
+    raw.push(...await tmdb.similarAndRecommended(keys.tmdb_api_key, type, seedTmdbIds, log));
+  }
+  // Dedupe by TMDB id, drop watched-by-tmdb, apply cheap raw filters.
+  const byTmdb = new Map();
+  for (const item of raw) {
+    if (!item?.id || watched.tmdbIds.has(item.id) || byTmdb.has(item.id)) continue;
+    if (rawPasses(item, type, filters)) byTmdb.set(item.id, item);
+  }
+  // Pre-rank by popularity, cap the number we pay external_ids for, enrich.
+  const ranked = [...byTmdb.values()]
+    .sort((a, b) => (b.popularity || 0) - (a.popularity || 0))
+    .slice(0, ENRICH_CAP);
+  let metas = (await Promise.all(ranked.map((item) => tmdb.enrichCandidate(keys.tmdb_api_key, type, item, log)))).filter(Boolean);
+  // Exclude watched by IMDb (cross-type) + dedupe by IMDb id.
+  const seen = new Set();
+  metas = metas.filter((m) => {
+    if (watched.imdbIds.has(m.id) || seen.has(m.id)) return false;
+    seen.add(m.id);
+    return true;
+  });
+  // Rating gate: IMDb (via MDBList) or TMDB. Unrated titles are kept — they are
+  // not "below the bar" (same semantics as the extra-catalog gate).
+  const useImdb = (filters.rating_source || 'imdb') === 'imdb' && !!keys.mdblist_api_key;
+  if (filters.min_rating > 0 && useImdb) {
+    const ratings = await mdblist.imdbRatings(keys.mdblist_api_key, type, metas.map((m) => m.id), log);
+    metas = metas.filter((m) => {
+      const r = ratings.get(m.id);
+      if (r === null || r === undefined) return true;
+      m._imdb_rating = r;
+      m.imdbRating = r.toFixed(1);
+      return r >= filters.min_rating;
+    });
+  } else if (filters.min_rating > 0) {
+    metas = metas.filter((m) => !(m._vote_average > 0 && m._vote_average < filters.min_rating));
+  }
+  return metas;
+}
+
+// Trim a pool to `cap` by genre overlap with the viewer's taste (then rating),
+// keeping the most on-taste candidates within the ranking token budget.
+function trimByGenreOverlap(pool, tasteGenres, type, cap) {
+  if (pool.length <= cap) return pool;
+  const want = new Set(tasteGenres);
+  return pool
+    .map((m) => {
+      const names = tmdb.genreNames(m._genre_ids, type);
+      const overlap = names.reduce((n, g) => n + (want.has(g) ? 1 : 0), 0);
+      return { m, overlap, rating: m._imdb_rating ?? m._vote_average ?? 0 };
+    })
+    .sort((a, b) => b.overlap - a.overlap || b.rating - a.rating)
+    .slice(0, cap)
+    .map((s) => s.m);
+}
+
+// One catalog (movie|series): pool -> CSM gate -> trim 120 -> shuffle -> ONE
+// ranking call -> split into displayed (top list_size) + bench. Cold start, or
+// a pool no larger than the display list, skips the LLM and serves by rating.
+async function buildCatalog(profile, type, watchedByType, log = console) {
+  const { filters } = profile;
   const listSize = filters.list_size || DEFAULT_LIST_SIZE;
-  const history = watchedByType[type].recent; // taste seed: most recently watched titles
+  const recent = watchedByType[type].recent;
   const watched = exclusionSets(watchedByType, type);
+  const seedTmdbIds = recent.slice(0, filters.pool_seed_count || 5).map((h) => h.tmdb_id).filter(Boolean);
 
-  const collected = [];
-  const haveIds = new Set();
-  let source;
-
-  if (history.length < COLD_START_THRESHOLD) {
-    // Cold start: TMDB discover with the same filters, page by page until full
-    log.log(`[rebuild] ${profile.name}/${type}: cold start (${history.length} history titles) — TMDB discover, target ${listSize}`);
-    source = 'discover';
-    for (let page = 1; page <= MAX_DISCOVER_PAGES && collected.length < listSize; page++) {
-      const pageMetas = await tmdb.discoverPage(keys.tmdb_api_key, type, filters, page, log, watched.tmdbIds);
-      if (!pageMetas.length) break;
-      let usable = applyHardFilters(pageMetas, type, filters, watched, log, haveIds);
-      usable = await applyCsmGate(usable, type, profile, log);
-      for (const m of usable) {
-        if (collected.length >= listSize) break;
-        collected.push(m);
-        haveIds.add(m.id);
-      }
-      log.log(`[rebuild] ${profile.name}/${type}: discover page ${page} -> ${collected.length}/${listSize}`);
-    }
-  } else {
-    log.log(`[rebuild] ${profile.name}/${type}: ${history.length} history titles — LLM, target ${listSize}`);
-    source = 'llm';
-    // Titles listed in previous rebuilds (newest first) — asked to be avoided
-    // so the daily list doesn't keep serving the same safe picks.
-    const priorTitles = store.getSuggestedHistory(profile.id, type).slice().reverse();
-    const suggestedTitles = new Set(); // everything LLM returned this rebuild
-    for (let round = 1; round <= MAX_LLM_ROUNDS && collected.length < listSize; round++) {
-      const need = listSize - collected.length;
-      const askCount = Math.min(40, Math.max(15, need * 2 + 5));
-      // Avoid-list: this rebuild's suggestions first (including rejects, so
-      // top-up rounds don't return the same rejects), then recently-listed
-      // titles from earlier rebuilds. Watched-history exclusion is enforced
-      // locally on IDs, not in the prompt.
-      const excludeTitles = [...suggestedTitles, ...priorTitles];
-      const suggestions = await llm.getSuggestions(
-        keys.groq_api_key, type, history, filters, excludeTitles, log, askCount
-      );
-      suggestions.forEach((s) => suggestedTitles.add(s.title));
-      const resolved = await Promise.all(
-        suggestions.map((s) => tmdb.resolveTitle(keys.tmdb_api_key, type, s.title, s.year, log))
-      );
-      let usable = applyHardFilters(resolved, type, filters, watched, log, haveIds);
-      usable = await applyCsmGate(usable, type, profile, log);
-      for (const m of usable) {
-        if (collected.length >= listSize) break;
-        collected.push(m);
-        haveIds.add(m.id);
-      }
-      log.log(`[rebuild] ${profile.name}/${type}: round ${round} -> ${collected.length}/${listSize}`);
-    }
+  let pool = await buildPool(profile, type, watched, seedTmdbIds, log);
+  pool = await applyCsmGate(pool, type, profile, log);
+  log.log(`[rebuild] ${profile.name}/${type}: pool ${pool.length} after filters/exclusions`);
+  if (pool.length < MIN_METAS) {
+    log.warn(`[rebuild] ${profile.name}/${type}: pool only ${pool.length} — over-constrained profile`);
   }
 
-  if (collected.length < listSize) {
-    log.warn(`[rebuild] ${profile.name}/${type}: could not fully fill quota (${collected.length}/${listSize}) after all rounds`);
+  const splitOut = (metas, source) => {
+    const all = cleanMetas(metas);
+    return { displayed: all.slice(0, listSize), bench: all.slice(listSize, listSize + DEFAULT_BENCH_SIZE), source };
+  };
+
+  // Cold start / thin pool: no useful ranking to do — serve pool by rating.
+  if (recent.length < COLD_START_THRESHOLD || pool.length <= listSize) {
+    const why = recent.length < COLD_START_THRESHOLD ? `cold start (${recent.length} history)` : 'pool <= list size';
+    log.log(`[rebuild] ${profile.name}/${type}: ${why} — serving pool by rating, no LLM`);
+    pool.sort((a, b) => (b._imdb_rating ?? b._vote_average ?? 0) - (a._imdb_rating ?? a._vote_average ?? 0));
+    return splitOut(pool, 'discover');
   }
-  return { metas: cleanMetas(collected), source };
+
+  // Rank: enrich taste, trim to the token budget, shuffle (position bias), rank.
+  const taste = await buildTasteProfile(profile, type, recent, log);
+  const seedGenres = [...new Set(taste.recent.flatMap((h) => h.genres))];
+  const trimmed = shuffle(trimByGenreOverlap(pool, seedGenres, type, POOL_TRIM));
+  const byId = new Map(trimmed.map((m) => [m.id, m]));
+  const candidates = trimmed.map((m) => ({
+    id: m.id,
+    title: m.name,
+    year: m.releaseInfo ? Number(m.releaseInfo) : null,
+    genres: tmdb.genreNames(m._genre_ids, type),
+    rating: m._imdb_rating ?? m._vote_average ?? null,
+  }));
+  const ranked = await llm.rankCandidates(
+    profile.keys.groq_api_key, type, taste, candidates, log,
+    listSize + DEFAULT_BENCH_SIZE, Math.min(listSize, trimmed.length),
+  );
+  const ordered = ranked.map((r) => byId.get(r.id)).filter(Boolean);
+  return splitOut(ordered, 'llm');
 }
 
 // Fisher-Yates shuffle (in place, returns the same array). Used to randomize
@@ -339,18 +426,16 @@ async function buildAiCatalogs(profile, results, log) {
     results.series = { ok: false, error };
     return;
   }
+  const listSize = profile.filters.list_size || DEFAULT_LIST_SIZE;
   for (const type of ['movie', 'series']) {
     try {
-      const { metas, source } = await buildCatalog(profile, type, watchedByType, log);
-      if (metas.length >= MIN_METAS) {
-        store.swapCatalog(profile.id, type, metas, source); // atomic swap on success only
-        // Remember what was listed so future rebuilds steer LLM away
-        // from repeating it (rolling, capped avoid-list).
-        store.addSuggestedHistory(profile.id, type, metas.map((m) => m.name));
-        results[type] = { ok: true, count: metas.length, source };
-        log.log(`[rebuild] ${profile.name}/${type}: swapped in ${metas.length} titles (${source})`);
+      const { displayed, bench, source } = await buildCatalog(profile, type, watchedByType, log);
+      if (displayed.length >= MIN_METAS) {
+        store.swapCatalog(profile.id, type, displayed, bench, source, listSize); // atomic swap on success only
+        results[type] = { ok: true, count: displayed.length, bench: bench.length, source };
+        log.log(`[rebuild] ${profile.name}/${type}: swapped in ${displayed.length} + ${bench.length} bench (${source})`);
       } else {
-        results[type] = { ok: false, error: `only ${metas.length} usable titles (< ${MIN_METAS}) — kept previous list` };
+        results[type] = { ok: false, error: `only ${displayed.length} usable titles (< ${MIN_METAS}) — kept previous list` };
         log.warn(`[rebuild] ${profile.name}/${type}: ${results[type].error}`);
       }
     } catch (err) {
@@ -462,6 +547,8 @@ module.exports = {
   applyHardFilters,
   applyCsmGate,
   cleanMetas,
+  rawPasses,
+  trimByGenreOverlap,
   isStale,
   STALE_MS,
   MIN_METAS,

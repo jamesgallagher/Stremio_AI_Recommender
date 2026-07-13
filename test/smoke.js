@@ -21,8 +21,8 @@ function ok(name, fn) {
 console.log('unit:');
 
 ok('store: atomic swap preserves other catalog type', () => {
-  store.swapCatalog('p1', 'movie', [{ id: 'tt1' }], 'llm');
-  store.swapCatalog('p1', 'series', [{ id: 'tt2' }], 'discover');
+  store.swapCatalog('p1', 'movie', [{ id: 'tt1' }], [], 'llm');
+  store.swapCatalog('p1', 'series', [{ id: 'tt2' }], [], 'discover');
   const c = store.loadCache('p1');
   assert.strictEqual(c.movie.metas[0].id, 'tt1');
   assert.strictEqual(c.series.metas[0].id, 'tt2');
@@ -30,23 +30,17 @@ ok('store: atomic swap preserves other catalog type', () => {
   store.deleteCache('p1');
 });
 
-ok('store: pruneWatched drops listed titles atomically', () => {
-  store.swapCatalog('p2', 'movie', [{ id: 'tt1' }, { id: 'tt2' }, { id: 'tt3' }], 'llm');
+ok('store: pruneWatched removes watched + backfills displayed from bench', () => {
+  // display_size 3 + one bench item: watching a displayed title promotes bench.
+  store.swapCatalog('p2', 'movie',
+    [{ id: 'tt1' }, { id: 'tt2' }, { id: 'tt3' }], [{ id: 'tt4' }], 'llm', 3);
   const removed = store.pruneWatched('p2', 'movie', new Set(['tt2', 'tt9']));
   assert.strictEqual(removed, 1);
-  assert.deepStrictEqual(store.loadCache('p2').movie.metas.map(m => m.id), ['tt1', 'tt3']);
+  const c = store.loadCache('p2');
+  assert.deepStrictEqual(c.movie.metas.map(m => m.id), ['tt1', 'tt3', 'tt4']); // bench promoted in
+  assert.strictEqual(c.movie.bench.length, 0);
   assert.strictEqual(store.pruneWatched('p2', 'series', new Set(['tt1'])), 0); // no series cache: no-op
   store.deleteCache('p2');
-});
-
-ok('store: suggested-history rolls, dedupes, and caps', () => {
-  store.addSuggestedHistory('p3', 'movie', ['A', 'B']);
-  store.addSuggestedHistory('p3', 'movie', ['B', 'C']); // B moves to newest end
-  assert.deepStrictEqual(store.getSuggestedHistory('p3', 'movie'), ['A', 'B', 'C']);
-  assert.deepStrictEqual(store.getSuggestedHistory('p3', 'series'), []);
-  store.addSuggestedHistory('p3', 'movie', Array.from({ length: 200 }, (_, i) => `T${i}`));
-  assert.strictEqual(store.getSuggestedHistory('p3', 'movie').length, 150); // capped
-  store.deleteCache('p3');
 });
 
 ok('store: watched activity snapshot + touch', () => {
@@ -74,10 +68,11 @@ ok('trakt: watched parse — ID sets + recency-ordered taste seed', () => {
   assert.deepStrictEqual([...w.imdbIds].sort(), ['tt1', 'tt2']);
   assert.deepStrictEqual([...w.tmdbIds].sort(), [1, 2, 3]);
   assert.deepStrictEqual(w.recent.map(r => r.title), ['New', 'Mid', 'Old']); // newest first
+  assert.strictEqual(w.recent[0].tmdb_id, 2); // seed carries ids for enrichment
   const shows = parseWatchedItems([
     { last_watched_at: '2026-05-01T00:00:00Z', show: { title: 'Show', year: 2023, ids: { imdb: 'tt9', tmdb: 9 } } },
   ], 'series');
-  assert.deepStrictEqual(shows.recent, [{ title: 'Show', year: 2023 }]);
+  assert.deepStrictEqual(shows.recent, [{ title: 'Show', year: 2023, tmdb_id: 9, imdb_id: 'tt9' }]);
 });
 
 ok('catalogs: registry ids unique, types valid, popular unfiltered', () => {
@@ -94,7 +89,7 @@ ok('catalogs: registry ids unique, types valid, popular unfiltered', () => {
 });
 
 ok('store: swapExtra keeps AI catalogs untouched', () => {
-  store.swapCatalog('p5', 'movie', [{ id: 'tt1' }], 'llm');
+  store.swapCatalog('p5', 'movie', [{ id: 'tt1' }], [], 'llm');
   store.swapExtra('p5', 'mdb-action-movies', [{ id: 'tt2' }]);
   const c = store.loadCache('p5');
   assert.strictEqual(c.movie.metas[0].id, 'tt1');
@@ -165,24 +160,14 @@ ok('filters: cleanMetas strips internal fields', () => {
   assert.deepStrictEqual(Object.keys(out[0]).sort(), ['id', 'name']);
 });
 
-ok('groq: prompt includes per-profile constraints', () => {
-  const p = groq.buildPrompt('movie', [{ title: 'Heat', year: 1995 }],
-    { min_rating: 7.5, max_age_years: 10, excluded_genres: ['Horror', 'War'] }, ['Alien']);
-  assert.ok(p.includes('7.5 or higher'));
-  assert.ok(p.includes('last 10 years'));
-  assert.ok(p.includes('NEVER recommend anything in these genres: Horror, War'));
-  assert.ok(p.includes('Alien'));
-  const p2 = groq.buildPrompt('series', [{ title: 'Bluey', year: 2018 }],
-    { min_rating: 0, max_age_years: 0, excluded_genres: [] }, []);
-  assert.ok(!p2.includes('or higher'));
-  assert.ok(!p2.includes('last '));
-});
-
-ok('groq: age-limited prompt demands Common Sense compliance', () => {
-  const p = groq.buildPrompt('movie', [{ title: 'Bluey', year: 2018 }],
-    { min_rating: 0, max_age_years: 0, excluded_genres: [], age_limit: 8 }, [], 30);
-  assert.ok(p.includes('Common Sense Media age rating of 8+'));
-  assert.ok(p.includes('Recommend 30 movies'));
+ok('groq: rank prompt carries taste + candidates + no-filter instruction', () => {
+  const taste = { recent: [{ title: 'Heat', year: 1995, genres: ['Crime'], overview: 'Cops vs crew.' }], topGenres: ['Crime'] };
+  const cands = [{ id: 'tt1', title: 'Sicario', year: 2015, genres: ['Crime'], rating: 7.6 }];
+  const p = groq.buildRankPrompt('movie', taste, cands, 40);
+  assert.ok(p.includes('Heat'));
+  assert.ok(p.includes('tt1') && p.includes('Sicario'));
+  assert.ok(/do NOT reject/i.test(p)); // the model must not re-filter
+  assert.ok(p.includes('40'));
 });
 
 ok('mdblist: Common Sense age parsing (strict, CSM only)', () => {
@@ -194,19 +179,41 @@ ok('mdblist: Common Sense age parsing (strict, CSM only)', () => {
   assert.strictEqual(parseCommonSenseAge({}), null);
 });
 
-ok('groq: parses fenced + raw JSON output', () => {
-  const fenced = '```json\n[{"title":"Dune","year":2021}]\n```';
-  assert.deepStrictEqual(groq.parseJsonArray(fenced), [{ title: 'Dune', year: 2021 }]);
-  assert.deepStrictEqual(groq.parseJsonArray('[{"title":"Heat","year":"1995"}]'), [{ title: 'Heat', year: 1995 }]);
-  assert.throws(() => groq.parseJsonArray('{"not":"array"}'));
+ok('groq: parseRanking validates ids, dedupes, tolerates wrappers', () => {
+  const valid = new Set(['tt1', 'tt2', 'tt3']);
+  assert.deepStrictEqual(
+    groq.parseRanking('[{"id":"tt1","score":90},{"id":"tt2","score":80}]', valid),
+    [{ id: 'tt1', score: 90 }, { id: 'tt2', score: 80 }]);
+  // hallucinated id (tt9) dropped, duplicate tt1 dropped, object wrapper unwrapped
+  assert.deepStrictEqual(
+    groq.parseRanking('{"results":[{"id":"tt9","score":99},{"id":"tt1","score":50},{"id":"tt1","score":40}]}', valid),
+    [{ id: 'tt1', score: 50 }]);
+  // fenced + prose salvage
+  assert.deepStrictEqual(
+    groq.parseRanking('```json\n[{"id":"tt3","score":70}]\n```', valid),
+    [{ id: 'tt3', score: 70 }]);
+  assert.throws(() => groq.parseRanking('not json at all', valid));
 });
 
-ok('groq: salvages arrays from prose and json-mode object wrappers', () => {
-  const prose = 'Here are my picks:\n[{"title":"Heat","year":1995}]\nEnjoy!';
-  assert.deepStrictEqual(groq.parseJsonArray(prose), [{ title: 'Heat', year: 1995 }]);
-  // Some models (json mode) wrap the array in an object — take the array value
-  assert.deepStrictEqual(groq.parseJsonArray('{"recommendations":[{"title":"Dune","year":2021}]}'), [{ title: 'Dune', year: 2021 }]);
-  assert.throws(() => groq.parseJsonArray('no json here at all'));
+ok('rebuild: rawPasses enforces recency, genre, vote-count', () => {
+  const y = new Date().getFullYear();
+  const base = { vote_count: 5000, genre_ids: [18], release_date: `${y}-01-01` };
+  const filters = { max_age_years: 5, excluded_genres: ['Horror'], vote_count_floor: 1000 };
+  assert.strictEqual(rebuild.rawPasses(base, 'movie', filters), true);
+  assert.strictEqual(rebuild.rawPasses({ ...base, vote_count: 100 }, 'movie', filters), false); // below vote floor
+  assert.strictEqual(rebuild.rawPasses({ ...base, release_date: '1990-01-01' }, 'movie', filters), false); // too old
+  assert.strictEqual(rebuild.rawPasses({ ...base, genre_ids: [27] }, 'movie', filters), false); // horror excluded
+});
+
+ok('rebuild: trimByGenreOverlap keeps on-taste candidates', () => {
+  // movie genre ids: Crime 80, Drama 18, Comedy 35
+  const pool = [
+    { id: 'a', _genre_ids: [80, 18], _vote_average: 7 }, // 2 overlap
+    { id: 'b', _genre_ids: [35], _vote_average: 9 },      // 0 overlap (dropped despite high rating)
+    { id: 'c', _genre_ids: [18], _vote_average: 6 },      // 1 overlap
+  ];
+  const out = rebuild.trimByGenreOverlap(pool, ['Crime', 'Drama'], 'movie', 2);
+  assert.deepStrictEqual(out.map(m => m.id), ['a', 'c']);
 });
 
 ok('baseurl: trailing slashes and missing schemes normalized', () => {
@@ -409,7 +416,7 @@ async function httpTests() {
   // Seed cache, then catalog serves it instantly
   store.swapCatalog(profile.id, 'movie', [
     { id: 'tt0111161', type: 'movie', name: 'Test Movie', poster: null, description: '', releaseInfo: '2024' },
-  ], 'llm');
+  ], [], 'llm');
   cat = await (await fetch(`${BASE}/addon/${profile.token}/catalog/movie/ai-recs-movies.json`)).json();
   assert.strictEqual(cat.metas[0].id, 'tt0111161');
   assert.strictEqual(cat.cacheMaxAge, 3600); // short hint so pruned lists appear fast

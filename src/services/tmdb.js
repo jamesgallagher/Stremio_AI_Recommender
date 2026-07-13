@@ -1,7 +1,7 @@
-// TMDB: title resolution (LLM suggestions -> canonical IDs + IMDb tt IDs),
-// cold-start discover path, and the official genre vocabulary.
-// Resolution fallback logic adapted from the reference addon:
-// search with year -> retry without year -> external_ids for imdb_id -> drop if absent.
+// TMDB: candidate-pool generation (discover + recommendations/similar),
+// per-candidate enrichment (external_ids -> IMDb tt id, + logo), taste-seed
+// details, and the official genre vocabulary. Phase 1 (inverted pipeline):
+// code builds the pool here; the LLM only ranks it. No title search/resolution.
 const API = 'https://api.themoviedb.org/3';
 
 const MOVIE_GENRES = {
@@ -59,6 +59,15 @@ function excludedGenreIds(excludedNames, type /* 'movie' | 'series' */) {
     }
   }
   return ids;
+}
+
+// Reverse maps (genre id -> name) for turning TMDB genre_ids into names for the
+// ranking prompt.
+const MOVIE_GENRE_NAMES = Object.fromEntries(Object.entries(MOVIE_GENRES).map(([n, id]) => [id, n]));
+const TV_GENRE_NAMES = Object.fromEntries(Object.entries(TV_GENRES).map(([n, id]) => [id, n]));
+function genreNames(genreIds, type) {
+  const rev = type === 'series' ? TV_GENRE_NAMES : MOVIE_GENRE_NAMES;
+  return (genreIds || []).map((id) => rev[id]).filter(Boolean);
 }
 
 function authHeaders(apiKey) {
@@ -120,51 +129,31 @@ async function fetchIdsAndLogo(apiKey, type, tmdbId) {
   return { imdbId: data.external_ids?.imdb_id || null, logo: pickLogo(data.images?.logos) };
 }
 
-// Resolve a LLM suggestion to a canonical TMDB item + IMDb tt ID.
-// Returns meta or null (unresolvable suggestions are dropped).
-async function resolveTitle(apiKey, type, title, year, log = console) {
-  const endpoint = type === 'series' ? 'search/tv' : 'search/movie';
-  const yearParam = type === 'series' ? 'first_air_date_year' : 'year';
-  try {
-    let data = await get(apiKey, endpoint, {
-      query: title, language: 'en-US',
-      ...(year ? { [yearParam]: year } : {}),
-    });
-    // LLM sometimes reports the wrong year (season vs. premiere) — retry without it
-    if (!data.results?.length && year) {
-      data = await get(apiKey, endpoint, { query: title, language: 'en-US' });
-    }
-    const item = data.results?.[0];
-    if (!item) {
-      log.warn(`[tmdb] no match for "${title}" (${year ?? '?'}) — dropped`);
-      return null;
-    }
-    const { imdbId, logo } = await fetchIdsAndLogo(apiKey, type, item.id);
-    if (!imdbId) {
-      log.warn(`[tmdb] no imdb_id for "${title}" — dropped (Stremio needs tt IDs)`);
-      return null;
-    }
-    return toMeta(item, type, imdbId, logo);
-  } catch (err) {
-    log.warn(`[tmdb] resolve "${title}" error: ${err.message}`);
-    return null;
-  }
+// Taste-seed enrichment: genres + one-line overview for a history item by TMDB
+// id. Lets recent/unknown titles still steer ranking.
+async function detailsForSeed(apiKey, type, tmdbId) {
+  const base = type === 'series' ? `tv/${tmdbId}` : `movie/${tmdbId}`;
+  const data = await get(apiKey, base, { language: 'en-US' });
+  return { genres: (data.genres || []).map((g) => g.name), overview: data.overview || '' };
 }
 
-// Cold-start path: no LLM, just TMDB discover driven by the same profile
-// filters. One page per call — the rebuild pipeline walks pages until its
-// quota is filled (post-filtering can discard many results per page).
-async function discoverPage(apiKey, type, filters, page = 1, log = console, excludeTmdbIds = new Set()) {
+// Bulk raw candidates from TMDB Discover — NO per-item external_ids (cheap;
+// enrichment happens later, only for survivors). vote_count / recency / genre
+// are exact; the rating floor is applied loosely here for the imdb source (the
+// precise IMDb gate runs after enrichment, since it needs the imdb id).
+async function discoverRaw(apiKey, type, filters, { pages = 3 } = {}) {
   const endpoint = type === 'series' ? 'discover/tv' : 'discover/movie';
   const dateField = type === 'series' ? 'first_air_date' : 'primary_release_date';
   const params = {
     language: 'en-US',
     sort_by: 'popularity.desc',
-    'vote_average.gte': filters.min_rating || 0,
-    'vote_count.gte': type === 'series' ? 100 : 200, // avoid obscure high-rated titles
+    'vote_count.gte': filters.vote_count_floor ?? (type === 'series' ? 100 : 200),
     include_adult: false,
-    page,
   };
+  const tmdbFloor = (filters.rating_source || 'imdb') === 'imdb'
+    ? Math.max(0, (filters.min_rating || 0) - 1.0) // TMDB audience scores run ~1 below IMDb
+    : (filters.min_rating || 0);
+  if (tmdbFloor > 0) params['vote_average.gte'] = tmdbFloor;
   if (filters.max_age_years > 0) {
     const from = new Date();
     from.setFullYear(from.getFullYear() - filters.max_age_years);
@@ -173,22 +162,42 @@ async function discoverPage(apiKey, type, filters, page = 1, log = console, excl
   const excludeIds = excludedGenreIds(filters.excluded_genres, type);
   if (excludeIds.size) params.without_genres = [...excludeIds].join(',');
 
-  const data = await get(apiKey, endpoint, params);
-  if (page > (data.total_pages || 1)) return [];
-  // Skip known-watched titles by TMDB id BEFORE the per-item external_ids
-  // call (the main source of wasted lookups), then resolve the survivors in
-  // parallel — a page is at most 20 items.
-  const candidates = (data.results || []).filter((item) => !excludeTmdbIds.has(item.id));
-  const metas = await Promise.all(candidates.map(async (item) => {
+  const out = [];
+  for (let page = 1; page <= pages; page++) {
+    const data = await get(apiKey, endpoint, { ...params, page });
+    for (const item of data.results || []) out.push(item);
+    if (page >= (data.total_pages || 1)) break;
+  }
+  return out;
+}
+
+// Personalized raw candidates: /recommendations + /similar for each seed TMDB
+// id (top history titles). Surfaces the long tail that filter-only Discover
+// misses. Same item shape as discover.
+async function similarAndRecommended(apiKey, type, tmdbIds, log = console) {
+  const base = type === 'series' ? 'tv' : 'movie';
+  const out = [];
+  await Promise.all(tmdbIds.flatMap((id) => ['recommendations', 'similar'].map(async (kind) => {
     try {
-      const { imdbId, logo } = await fetchIdsAndLogo(apiKey, type, item.id);
-      return imdbId ? toMeta(item, type, imdbId, logo) : null;
+      const data = await get(apiKey, `${base}/${id}/${kind}`, { language: 'en-US', page: 1 });
+      for (const item of data.results || []) out.push(item);
     } catch (err) {
-      log.warn(`[tmdb] discover details/logo error: ${err.message}`);
-      return null;
+      log.warn(`[tmdb] ${kind} for ${id} failed: ${err.message}`);
     }
-  }));
-  return metas.filter(Boolean);
+  })));
+  return out;
+}
+
+// Enrich a raw TMDB item into a full meta (external_ids -> tt id, + logo).
+// Returns null when there's no IMDb id (Stremio needs tt ids).
+async function enrichCandidate(apiKey, type, item, log = console) {
+  try {
+    const { imdbId, logo } = await fetchIdsAndLogo(apiKey, type, item.id);
+    return imdbId ? toMeta(item, type, imdbId, logo) : null;
+  } catch (err) {
+    log.warn(`[tmdb] enrich ${item.id} failed: ${err.message}`);
+    return null;
+  }
 }
 
 module.exports = {
@@ -196,7 +205,10 @@ module.exports = {
   TV_GENRES,
   GENRE_ALIASES,
   excludedGenreIds,
-  resolveTitle,
-  discoverPage,
+  genreNames,
+  detailsForSeed,
+  discoverRaw,
+  similarAndRecommended,
+  enrichCandidate,
   pickLogo,
 };

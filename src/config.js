@@ -22,10 +22,13 @@ const DEFAULT_RPDB_KEY = 't0-free-rpdb';
 
 const DEFAULT_FILTERS = {
   min_rating: 7.0,
+  rating_source: 'imdb', // 'imdb' (via MDBList) | 'tmdb' — TMDB scores run ~1 lower
+  vote_count_floor: 1000, // noise gate; a high rating on few votes is meaningless
   max_age_years: 5, // recency window; 0 = no limit
   excluded_genres: [], // TMDB genre names, e.g. ["Horror", "War"]
   age_limit: 0, // Common Sense age gate; 0 = off. >0 requires an MDBList key
-  list_size: 20, // fill-to-quota target per catalog
+  list_size: 20, // displayed titles per catalog (+ an equal-sized hidden bench)
+  pool_seed_count: 5, // history titles used to seed TMDB recommendations/similar
 };
 
 // Auto-scrobble: mirror this profile's Nuvio/Stremio watched history into
@@ -83,6 +86,9 @@ function applyMigrations(p) {
   if (p.keys.gemini_api_key !== undefined) delete p.keys.gemini_api_key;
   if (p.filters.age_limit === undefined) p.filters.age_limit = 0;
   if (p.filters.list_size === undefined) p.filters.list_size = 20;
+  if (p.filters.rating_source === undefined) p.filters.rating_source = 'imdb';
+  if (p.filters.vote_count_floor === undefined) p.filters.vote_count_floor = 1000;
+  if (p.filters.pool_seed_count === undefined) p.filters.pool_seed_count = 5;
   if (p.catalogs === undefined) p.catalogs = {};
   if (p.scrobble === undefined) p.scrobble = { ...DEFAULT_SCROBBLE };
 }
@@ -176,6 +182,9 @@ function updateProfile(id, patch) {
       if (Array.isArray(f.excluded_genres)) profile.filters.excluded_genres = f.excluded_genres.map(String);
       if (f.age_limit !== undefined) profile.filters.age_limit = Math.max(0, parseInt(f.age_limit, 10) || 0);
       if (f.list_size !== undefined) profile.filters.list_size = Math.min(50, Math.max(5, parseInt(f.list_size, 10) || 20));
+      if (f.rating_source !== undefined) profile.filters.rating_source = f.rating_source === 'tmdb' ? 'tmdb' : 'imdb';
+      if (f.vote_count_floor !== undefined) profile.filters.vote_count_floor = Math.max(0, parseInt(f.vote_count_floor, 10) || 0);
+      if (f.pool_seed_count !== undefined) profile.filters.pool_seed_count = Math.min(10, Math.max(1, parseInt(f.pool_seed_count, 10) || 5));
     }
     if (patch.catalogs && typeof patch.catalogs === 'object') {
       // Only known catalog ids, coerced to booleans — the toggle set is the

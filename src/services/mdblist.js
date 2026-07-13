@@ -195,6 +195,25 @@ function parseImdbRating(item) {
   return Number.isFinite(n) ? n : null;
 }
 
+// IMDb ratings for many imdb ids, batched (POST /imdb/{movie|show}, ~50/call).
+// Returns Map<imdbId, number|null>. A failed batch yields null for that chunk
+// (treated as unrated -> kept, matching the pipeline's "unrated is not below
+// the bar" semantics) rather than dropping titles on a transient error.
+async function imdbRatings(apiKey, type, imdbIds, log = console) {
+  const out = new Map();
+  for (let i = 0; i < imdbIds.length; i += BATCH_SIZE) {
+    const chunk = imdbIds.slice(i, i + BATCH_SIZE);
+    try {
+      const infoMap = await mediaInfoBatch(apiKey, type, chunk);
+      for (const id of chunk) out.set(id, parseImdbRating(infoMap.get(id)));
+    } catch (err) {
+      log.warn(`[mdblist] imdb ratings batch failed (${err.message}) — treating chunk as unrated`);
+      for (const id of chunk) out.set(id, null);
+    }
+  }
+  return out;
+}
+
 async function testKey(apiKey) {
   // A title guaranteed to exist; validates the key end-to-end.
   const age = await commonSenseAge(apiKey, 'movie', 'tt0111161');
@@ -208,5 +227,6 @@ module.exports = {
   listItemsPage,
   mediaInfoBatch,
   parseImdbRating,
+  imdbRatings,
   testKey,
 };

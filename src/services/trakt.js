@@ -221,12 +221,18 @@ function parseWatchedItems(items, type) {
     if (!media?.ids) continue;
     if (media.ids.imdb) imdbIds.add(media.ids.imdb);
     if (media.ids.tmdb) tmdbIds.add(media.ids.tmdb);
-    withDates.push({ title: media.title, year: media.year, watched_at: item.last_watched_at || '' });
+    withDates.push({
+      title: media.title,
+      year: media.year,
+      tmdb_id: media.ids.tmdb || null,
+      imdb_id: media.ids.imdb || null,
+      watched_at: item.last_watched_at || '',
+    });
   }
   const recent = withDates
     .sort((a, b) => (a.watched_at < b.watched_at ? 1 : -1)) // ISO-8601 sorts lexically
     .slice(0, HISTORY_SEED_COUNT)
-    .map(({ title, year }) => ({ title, year }));
+    .map(({ title, year, tmdb_id, imdb_id }) => ({ title, year, tmdb_id, imdb_id }));
   return { imdbIds, tmdbIds, recent };
 }
 

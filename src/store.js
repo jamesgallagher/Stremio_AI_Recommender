@@ -38,10 +38,14 @@ function saveProfiles(data) {
 
 // ---- Per-profile recommendation cache ----
 // Shape: {
-//   movie:  { metas: [], generated_at: ms, source: 'llm'|'discover' },
-//   series: { metas: [], generated_at: ms, source: ... },
+//   movie:  { metas: [<displayed>], bench: [<reserve>], display_size, generated_at, source: 'llm'|'discover' },
+//   series: { ... },
 //   last_attempt_at: ms   // last rebuild attempt (success or failure), for backoff
 // }
+// `metas` is the DISPLAYED list the addon serves; `bench` is a hidden reserve
+// that backfills `metas` when displayed items are watched (free, no rebuild).
+const DEFAULT_DISPLAY_SIZE = 20;
+
 function cacheFile(profileId) {
   return path.join(CACHE_DIR, `${profileId}.json`);
 }
@@ -50,11 +54,12 @@ function loadCache(profileId) {
   return readJson(cacheFile(profileId), { movie: null, series: null, last_attempt_at: 0 });
 }
 
-// Atomic swap of a single catalog type. Old data for the other type is preserved.
-// Never called on failure — a failed rebuild leaves the previous list untouched.
-function swapCatalog(profileId, type, metas, source) {
+// Atomic swap of a single catalog type (displayed + bench). Old data for the
+// other type is preserved. Never called on failure — a failed rebuild leaves
+// the previous list untouched.
+function swapCatalog(profileId, type, metas, bench = [], source, displaySize = DEFAULT_DISPLAY_SIZE) {
   const cache = loadCache(profileId);
-  cache[type] = { metas, generated_at: Date.now(), source };
+  cache[type] = { metas, bench, display_size: displaySize, generated_at: Date.now(), source };
   writeJsonAtomic(cacheFile(profileId), cache);
 }
 
@@ -68,17 +73,23 @@ function saveWatched(profileId, type, sets) {
   writeJsonAtomic(cacheFile(profileId), cache);
 }
 
-// Drop newly-watched titles from a catalog without touching generated_at/
-// source. Load-filter-write happens synchronously in one call, so a rebuild
-// finishing mid-refresh can never be clobbered with a stale meta list.
-// Returns the number of titles removed.
+// Drop newly-watched titles from a catalog's displayed list AND bench, then
+// backfill the displayed list from the bench up to its display_size — free
+// promote-on-watch, no LLM. Synchronous load-filter-write, so a rebuild
+// finishing mid-refresh can't be clobbered. Returns how many displayed titles
+// were removed (for logging).
 function pruneWatched(profileId, type, imdbIds) {
   const cache = loadCache(profileId);
-  if (!cache[type]) return 0;
-  const before = cache[type].metas.length;
-  cache[type].metas = cache[type].metas.filter((m) => !imdbIds.has(m.id));
-  const removed = before - cache[type].metas.length;
-  if (removed > 0) writeJsonAtomic(cacheFile(profileId), cache);
+  const entry = cache[type];
+  if (!entry) return 0;
+  const displayBefore = entry.metas.length;
+  const totalBefore = displayBefore + (entry.bench?.length || 0);
+  entry.metas = entry.metas.filter((m) => !imdbIds.has(m.id));
+  entry.bench = (entry.bench || []).filter((m) => !imdbIds.has(m.id));
+  const removed = displayBefore - entry.metas.length;
+  const target = entry.display_size || DEFAULT_DISPLAY_SIZE;
+  while (entry.metas.length < target && entry.bench.length) entry.metas.push(entry.bench.shift());
+  if (entry.metas.length + entry.bench.length !== totalBefore) writeJsonAtomic(cacheFile(profileId), cache);
   return removed;
 }
 
@@ -106,27 +117,6 @@ function saveWatchedActivity(profileId, activity) {
 function touchWatchedSync(profileId) {
   const cache = loadCache(profileId);
   cache.watched_synced_at = Date.now();
-  writeJsonAtomic(cacheFile(profileId), cache);
-}
-
-// Rolling per-type history of titles this profile has already been shown.
-// Fed into the LLM prompt as an avoid-list so daily rebuilds don't keep
-// re-suggesting the same safe picks. Newest last, capped.
-const SUGGESTED_HISTORY_CAP = 150;
-
-function getSuggestedHistory(profileId, type) {
-  const cache = loadCache(profileId);
-  return cache.suggested?.[type] || [];
-}
-
-function addSuggestedHistory(profileId, type, titles) {
-  if (!titles.length) return;
-  const cache = loadCache(profileId);
-  cache.suggested = cache.suggested || {};
-  const merged = (cache.suggested[type] || [])
-    .filter((t) => !titles.includes(t)) // re-listed titles move to the newest end
-    .concat(titles);
-  cache.suggested[type] = merged.slice(-SUGGESTED_HISTORY_CAP);
   writeJsonAtomic(cacheFile(profileId), cache);
 }
 
@@ -167,8 +157,6 @@ module.exports = {
   pruneWatched,
   saveWatchedActivity,
   touchWatchedSync,
-  getSuggestedHistory,
-  addSuggestedHistory,
   loadCsmCache,
   saveCsmCache,
   markAttempt,

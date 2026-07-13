@@ -1,20 +1,20 @@
-// LLM recommendation generation via Groq (OpenAI-compatible Chat Completions).
-// Groq's API is a drop-in for OpenAI's /chat/completions. Prompt structure and
-// the 429 model-fallback chain are preserved from the original design,
-// parameterized per profile.
+// LLM taste-RANKING via Groq (OpenAI-compatible Chat Completions).
+// Phase 1 inversion: the LLM never generates titles from memory. Code builds a
+// pre-approved candidate pool; the model only ranks those candidates (by ID)
+// against the viewer's taste. Ranking-over-supplied-data is robust even on the
+// weaker fallback model, and it cannot hallucinate a title it wasn't handed.
 const API = 'https://api.groq.com/openai/v1/chat/completions';
 
-// Quality first: a recommender should favour the best recommendations over
-// throughput. The fallback chain only triggers on 429/error, so preferring the
-// heavier model costs nothing while it's available. Override with GROQ_MODELS.
-//  - openai/gpt-oss-120b: highest-quality, most sophisticated taste-matching
-//    (spends reasoning tokens, tighter free-tier limits). Primary.
-//  - llama-3.3-70b-versatile: strong and fast with the most rate-limit
-//    headroom — the fallback when gpt-oss-120b is throttled.
-//  - gpt-oss-20b / llama-3.1-8b-instant: lighter last-resort fallbacks.
+// Model order for the RANKING task (quality = the model that reliably produces
+// good rankings). llama-3.3-70b-versatile is primary: it ranks a 120-candidate
+// pool cleanly and fast. openai/gpt-oss-120b — great for open-ended generation —
+// empirically returns EMPTY content / 400 json_validate / 413 on this payload
+// at free-tier limits (it burns the token budget on hidden reasoning), so it is
+// only a fallback here. The chain fires on 429/error/invalid output. Override
+// with GROQ_MODELS.
 const DEFAULT_MODELS = [
-  'openai/gpt-oss-120b',
   'llama-3.3-70b-versatile',
+  'openai/gpt-oss-120b',
   'openai/gpt-oss-20b',
   'llama-3.1-8b-instant',
 ];
@@ -22,94 +22,81 @@ const FALLBACK_MODELS = (process.env.GROQ_MODELS || '')
   .split(',').map((s) => s.trim()).filter(Boolean);
 if (!FALLBACK_MODELS.length) FALLBACK_MODELS.push(...DEFAULT_MODELS);
 
-function buildPrompt(type, history, filters, excludeTitles, askCount = 25) {
+// Build the ranking prompt. Candidates are compact (id/title/year/genres/rating,
+// no overviews — token budget); the taste seed carries genres + overviews since
+// that's where recent/unknown titles actually gain meaning.
+function buildRankPrompt(type, taste, candidates, count) {
   const kind = type === 'series' ? 'TV series' : 'movies';
-  const historyText = history.map((m) => `${m.title} (${m.year})`).join(', ');
-
-  const rules = [];
-  rules.push('Only recommend well-known titles that are easy to find in databases like IMDB/TMDB.');
-  rules.push('Prioritize critically acclaimed, high-quality productions over pure popularity to avoid low-rated content.');
-  if (filters.min_rating > 0) {
-    rules.push(`ONLY recommend ${kind} with a TMDB/IMDB audience rating of ${filters.min_rating.toFixed(1)} or higher.`);
-  }
-  if (filters.max_age_years > 0) {
-    rules.push(`ONLY recommend ${kind} released in the last ${filters.max_age_years} years.`);
-  }
-  if (filters.excluded_genres.length > 0) {
-    rules.push(`NEVER recommend anything in these genres: ${filters.excluded_genres.join(', ')}.`);
-  }
-  if (filters.age_limit > 0) {
-    rules.push(`Every recommendation MUST be age-appropriate for a viewer aged ${filters.age_limit} or younger, with a Common Sense Media age rating of ${filters.age_limit}+ or lower. Family and children's ${kind} only — no exceptions.`);
-  }
-  rules.push(`Do not include the ${kind} listed above that I already watched.`);
-
-  // Exclusions here are titles already suggested this rebuild plus recently-
-  // listed titles from earlier rebuilds (variety). Watched-history enforcement
-  // is done locally on canonical IDs after TMDB resolution — never via the prompt.
-  const excludeBlock = excludeTitles.length
-    ? `\nYou already suggested the following titles — do NOT suggest them again, suggest different ones:\n- ${excludeTitles.slice(0, 100).join('\n- ')}`
+  const hist = taste.recent.map((h) => {
+    const g = h.genres?.length ? ` [${h.genres.join(', ')}]` : '';
+    const o = h.overview ? ` — ${h.overview}` : '';
+    return `- ${h.title} (${h.year ?? '?'})${g}${o}`;
+  }).join('\n');
+  const pref = taste.topGenres?.length
+    ? `\n\nTheir most-watched genres overall: ${taste.topGenres.join(', ')}. Weight toward these so a recent binge doesn't dominate.`
     : '';
+  const cand = candidates.map((c) => JSON.stringify({
+    id: c.id, title: c.title, year: c.year, genres: c.genres, rating: c.rating,
+  })).join('\n');
 
-  return `Based on the following ${kind} I recently watched:
-${historyText}
+  return `This viewer recently watched these ${kind} (most recent first):
+${hist}${pref}
 
-Recommend ${askCount} ${kind} I might like. Consider similar themes, genres, actors, and creators.
-CRITICAL RULES YOU MUST FOLLOW:
-${rules.map((r, i) => `${i + 1}. ${r}`).join('\n')}${excludeBlock}
+Below are ${candidates.length} pre-approved candidate ${kind}. Every one ALREADY satisfies all of the viewer's hard constraints (rating, recency, genre, age) — do NOT reject or filter any for those reasons. Your only job is to rank them by how well they match this viewer's taste.
 
-Output ONLY a JSON array of objects. No markdown, no explanations, just the raw JSON. Each object must have exactly two properties:
-- "title": The title in English (string)
-- "year": The release year (number)
-Example: [{"title": "Severance", "year": 2022}, {"title": "The Last of Us", "year": 2023}]`;
+Candidates (one JSON object per line):
+${cand}
+
+Return the ${count} best taste matches as a JSON array of objects, each with exactly:
+- "id": the candidate id, copied verbatim (never invent one)
+- "score": integer 0-100 taste match
+Use the full score range; do not cluster on multiples of 5. Output ONLY the JSON array, no prose.
+Example: [{"id":"tt1234567","score":91},{"id":"tt7654321","score":78}]`;
 }
 
-// Tolerant parse: accepts a bare JSON array, a fenced array, an array wrapped
-// in prose, OR an object that wraps the array under some key (json-mode models
-// like llama return {"recommendations": [...]}). Returns [{title, year}].
-function parseJsonArray(text) {
-  const cleaned = text
-    .trim()
-    .replace(/^```(?:json)?\s*/i, '')
-    .replace(/\s*```\s*$/i, '')
-    .trim();
+// Parse a ranking response into validated [{id, score}]. Tolerates fenced JSON,
+// prose-wrapped arrays, and json-mode object wrappers ({"results":[...]}).
+// Drops any id not in validIds (hallucination guard) and de-dupes.
+function parseRanking(text, validIds) {
+  const cleaned = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim();
   let parsed;
   try {
     parsed = JSON.parse(cleaned);
   } catch (err) {
-    // Salvage the outermost array (preferred) or object block from prose.
-    const aStart = cleaned.indexOf('[');
-    const aEnd = cleaned.lastIndexOf(']');
-    const oStart = cleaned.indexOf('{');
-    const oEnd = cleaned.lastIndexOf('}');
-    let block = null;
-    if (aStart !== -1 && aEnd > aStart) block = cleaned.slice(aStart, aEnd + 1);
-    else if (oStart !== -1 && oEnd > oStart) block = cleaned.slice(oStart, oEnd + 1);
-    if (!block) throw err;
-    parsed = JSON.parse(block);
+    const a = cleaned.indexOf('[');
+    const b = cleaned.lastIndexOf(']');
+    if (a === -1 || b <= a) throw err;
+    parsed = JSON.parse(cleaned.slice(a, b + 1));
   }
   const arr = Array.isArray(parsed)
     ? parsed
     : (parsed && typeof parsed === 'object' ? Object.values(parsed).find(Array.isArray) : null);
   if (!Array.isArray(arr)) throw new Error('LLM did not return a JSON array');
-  return arr
-    .filter((x) => x && typeof x.title === 'string')
-    .map((x) => ({ title: x.title, year: Number(x.year) || null }));
+  const seen = new Set();
+  const out = [];
+  for (const x of arr) {
+    if (!x || typeof x.id !== 'string') continue;
+    if (validIds && !validIds.has(x.id)) continue; // never trust an id we didn't supply
+    if (seen.has(x.id)) continue;
+    seen.add(x.id);
+    const score = Number(x.score);
+    out.push({ id: x.id, score: Number.isFinite(score) ? score : 0 });
+  }
+  return out;
 }
 
-async function callModel(apiKey, model, prompt) {
+async function callRankModel(apiKey, model, prompt) {
   const res = await fetch(API, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
     body: JSON.stringify({
       model,
       messages: [
-        { role: 'system', content: 'You are a film and TV recommendation engine. Reply with raw JSON only — no markdown, no commentary.' },
+        { role: 'system', content: 'You are a film and TV recommendation ranker. Rank ONLY the candidates supplied; reply with raw JSON only.' },
         { role: 'user', content: prompt },
       ],
-      temperature: 0.8, // some variety between rebuilds without going off-taste
+      temperature: 0.4, // ranking is a judgement task — lower temp = steadier ordering
+      response_format: { type: 'json_object' },
     }),
   });
   if (!res.ok) {
@@ -121,44 +108,41 @@ async function callModel(apiKey, model, prompt) {
   const data = await res.json();
   const text = data.choices?.[0]?.message?.content || '';
   if (!text) throw new Error(`Groq ${model} returned empty response`);
-  return parseJsonArray(text);
+  return text;
 }
 
-// Returns [{title, year}] suggestions — treated as suggestions, not ground truth.
-// Every title must still resolve against TMDB before it can appear in a catalog.
-async function getSuggestions(apiKey, type, history, filters, excludeTitles, log = console, askCount = 25) {
-  const prompt = buildPrompt(type, history, filters, excludeTitles, askCount);
-  log.log(`[groq] full prompt for ${type}:\n----- PROMPT START -----\n${prompt}\n----- PROMPT END -----`);
+// Rank a candidate pool → validated [{id, score}] (top `count`), requiring at
+// least `minCount` valid ids. Walks the model fallback chain on rate-limit /
+// error / invalid output, logging free-tier fallback clearly for diagnosis.
+async function rankCandidates(apiKey, type, taste, candidates, log = console, count = 40, minCount = 20) {
+  const validIds = new Set(candidates.map((c) => c.id));
+  const prompt = buildRankPrompt(type, taste, candidates, count);
+  log.log(`[groq] ranking ${candidates.length} ${type} candidates -> top ${count} (min ${minCount})`);
   const primary = FALLBACK_MODELS[0];
   let lastError = null;
   for (let i = 0; i < FALLBACK_MODELS.length; i++) {
     const model = FALLBACK_MODELS[i];
     try {
-      const result = await callModel(apiKey, model, prompt);
-      // Make backup-model usage obvious in the logs: the primary succeeding is
-      // routine (info); a fallback serving is notable (warn) — it means the
-      // primary was rate-limited/errored above.
+      const text = await callRankModel(apiKey, model, prompt);
+      const ranked = parseRanking(text, validIds);
+      if (ranked.length < minCount) throw new Error(`only ${ranked.length} valid ranked ids (< ${minCount})`);
       if (i === 0) {
-        log.log(`[groq] ${type}: ${result.length} suggestions from PRIMARY model ${model}`);
+        log.log(`[groq] ${type}: ranked ${ranked.length} by PRIMARY model ${model}`);
       } else {
-        log.warn(`[groq] ${type}: ⚠ served by BACKUP model "${model}" — primary "${primary}" was unavailable (see rate-limit/error above). ${result.length} suggestions.`);
+        log.warn(`[groq] ${type}: ⚠ ranked by BACKUP model "${model}" — primary "${primary}" was unavailable (see above). ${ranked.length} items.`);
       }
-      log.log(`[groq] suggested: ${result.map((r) => `${r.title} (${r.year ?? '?'})`).join(', ')}`);
-      return result;
+      return ranked;
     } catch (err) {
       lastError = err;
       const rate = err.status === 429 || /rate.?limit|quota|free.?tier|too many requests/i.test(err.message);
       const next = FALLBACK_MODELS[i + 1];
       const tail = next ? `falling back to backup model "${next}"` : 'no backup models left — this rebuild will fail';
-      if (rate) {
-        log.warn(`[groq] ⚠ FREE-TIER RATE LIMIT hit on "${model}" (HTTP 429) — ${tail}`);
-      } else {
-        log.warn(`[groq] "${model}" failed (${err.message}) — ${tail}`);
-      }
+      if (rate) log.warn(`[groq] ⚠ FREE-TIER RATE LIMIT hit on "${model}" (HTTP 429) — ${tail}`);
+      else log.warn(`[groq] "${model}" ranking failed (${err.message}) — ${tail}`);
       continue;
     }
   }
   throw lastError || new Error('All Groq models failed');
 }
 
-module.exports = { getSuggestions, buildPrompt, parseJsonArray, FALLBACK_MODELS };
+module.exports = { rankCandidates, buildRankPrompt, parseRanking, FALLBACK_MODELS };

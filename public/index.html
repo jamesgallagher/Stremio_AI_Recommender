@@ -239,7 +239,7 @@ function render(profiles) {
           <div><label>Groq API Key
               <a class="getkey" href="https://console.groq.com/keys" target="_blank" rel="noopener">get key ↗</a></label>
             ${keyRow(p.id, 'groq_api_key', p.keys.groq_api_key, 'groq')}
-            <div class="muted" style="font-size:11px;margin-top:3px">Free tier at console.groq.com — powers the AI recommendations. Model: openai/gpt-oss-120b (override with the GROQ_MODELS env var).</div></div>
+            <div class="muted" style="font-size:11px;margin-top:3px">Free tier at console.groq.com — powers the AI ranking. Model: llama-3.3-70b-versatile (override with the GROQ_MODELS env var).</div></div>
           <div><label>MDBList API Key
               <a class="getkey" href="https://mdblist.com/preferences/" target="_blank" rel="noopener">get key ↗</a></label>
             ${keyRow(p.id, 'mdblist_api_key', p.keys.mdblist_api_key, 'mdblist')}
@@ -261,6 +261,16 @@ function render(profiles) {
             <select data-filter="min_rating">
               ${[0,5,5.5,6,6.5,7,7.5,8,8.5,9].map(v => `<option value="${v}" ${v === p.filters.min_rating ? 'selected' : ''}>${v === 0 ? 'No minimum' : '≥ ' + v.toFixed(1)}</option>`).join('')}
             </select></div>
+          <div><label>Rating source</label>
+            <select data-filter="rating_source">
+              ${[['imdb','IMDb (via MDBList)'],['tmdb','TMDB audience']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.rating_source || 'imdb') ? 'selected' : ''}>${l}</option>`).join('')}
+            </select>
+            <div class="muted" style="font-size:11px;margin-top:3px">IMDb recommended — TMDB scores run ~1 point lower. IMDb needs the MDBList key.</div></div>
+          <div><label>Minimum vote count</label>
+            <select data-filter="vote_count_floor">
+              ${[[0,'No minimum'],[250,'250+'],[500,'500+'],[1000,'1,000+'],[2500,'2,500+'],[5000,'5,000+']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.vote_count_floor ?? 1000) ? 'selected' : ''}>${l}</option>`).join('')}
+            </select>
+            <div class="muted" style="font-size:11px;margin-top:3px">Noise gate — a high rating on very few votes is meaningless. Lower it to surface niche gems.</div></div>
           <div><label>Released within</label>
             <select data-filter="max_age_years">
               ${[[1,'1 year'],[2,'2 years'],[5,'5 years'],[10,'10 years'],[20,'20 years'],[0,'No limit']].map(([v,l]) => `<option value="${v}" ${v === p.filters.max_age_years ? 'selected' : ''}>${l}</option>`).join('')}
@@ -444,6 +454,8 @@ async function saveFilters(id) {
   const ageOn = card.querySelector('[data-filter=age_limit_on]').checked;
   const filters = {
     min_rating: parseFloat(card.querySelector('[data-filter=min_rating]').value),
+    rating_source: card.querySelector('[data-filter=rating_source]').value,
+    vote_count_floor: parseInt(card.querySelector('[data-filter=vote_count_floor]').value, 10),
     max_age_years: parseInt(card.querySelector('[data-filter=max_age_years]').value, 10),
     list_size: parseInt(card.querySelector('[data-filter=list_size]').value, 10),
     age_limit: ageOn ? parseInt(card.querySelector('[data-filter=age_limit]').value, 10) : 0,
