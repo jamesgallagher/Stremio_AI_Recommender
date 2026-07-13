@@ -35,7 +35,7 @@ const WATCHED_REFRESH_MS = 60 * 60e3; // exclusion-only refresh cadence
 const MIN_METAS = 5;
 const DEFAULT_LIST_SIZE = 20;
 const COLD_START_THRESHOLD = 3;
-const DEFAULT_BENCH_SIZE = 20;   // hidden reserve, same size as the displayed list
+// Bench (hidden reserve) is always the same size as the displayed list.
 const POOL_TRIM = 120;           // candidates sent to the ranker (token budget)
 const ENRICH_CAP = 150;          // cap on candidates we pay TMDB external_ids for
 const DISCOVER_PAGES = 3;        // discover pages fetched for the raw pool
@@ -109,40 +109,6 @@ async function syncWatched(profile, { force = false } = {}) {
   return watchedByType;
 }
 
-// Hard post-resolution filter — the guarantee layer.
-// Dedupe on canonical IDs against full watch history, then rating/recency/genre.
-function applyHardFilters(metas, type, filters, watched, log = console, alreadyHave = new Set()) {
-  const excludeGenreIds = tmdb.excludedGenreIds(filters.excluded_genres, type);
-  const cutoff = filters.max_age_years > 0
-    ? new Date(new Date().setFullYear(new Date().getFullYear() - filters.max_age_years))
-    : null;
-  const seen = new Set(alreadyHave);
-  const out = [];
-  for (const meta of metas) {
-    if (!meta) continue;
-    if (seen.has(meta.id)) continue;
-    if (watched.imdbIds.has(meta.id) || watched.tmdbIds.has(meta._tmdb_id)) {
-      log.log(`[filter] "${meta.name}" already watched — dropped`);
-      continue;
-    }
-    if (filters.min_rating > 0 && meta._vote_average > 0 && meta._vote_average < filters.min_rating) {
-      log.log(`[filter] "${meta.name}" rating ${meta._vote_average} < ${filters.min_rating} — dropped`);
-      continue;
-    }
-    if (cutoff && meta._release_date && new Date(meta._release_date) < cutoff) {
-      log.log(`[filter] "${meta.name}" (${meta._release_date}) outside recency window — dropped`);
-      continue;
-    }
-    if (meta._genre_ids.some((g) => excludeGenreIds.has(g))) {
-      log.log(`[filter] "${meta.name}" in excluded genre — dropped`);
-      continue;
-    }
-    seen.add(meta.id);
-    out.push(meta);
-  }
-  return out;
-}
-
 // Kids-mode gate: strict Common Sense verification via MDBList.
 // Every candidate is looked up; unrated titles are dropped, full stop.
 async function applyCsmGate(metas, type, profile, log = console) {
@@ -173,7 +139,7 @@ async function applyCsmGate(metas, type, profile, log = console) {
 
 // Strip internal fields before the metas are served to Stremio.
 function cleanMetas(metas) {
-  return metas.map(({ _tmdb_id, _genre_ids, _vote_average, _vote_count, _release_date, ...meta }) => meta);
+  return metas.map(({ _tmdb_id, _genre_ids, _vote_average, _vote_count, _release_date, _imdb_rating, ...meta }) => meta);
 }
 
 // Enriched taste profile: last-N unique watched titles annotated with genres +
@@ -209,8 +175,7 @@ function rawPasses(item, type, filters) {
   }
   const ex = tmdb.excludedGenreIds(filters.excluded_genres, type);
   if (ex.size && (item.genre_ids || []).some((g) => ex.has(g))) return false;
-  const vcFloor = filters.vote_count_floor ?? (type === 'series' ? 100 : 200);
-  if ((item.vote_count || 0) < vcFloor) return false;
+  if ((item.vote_count || 0) < tmdb.voteFloor(filters, type)) return false;
   return true;
 }
 
@@ -219,21 +184,39 @@ function rawPasses(item, type, filters) {
 // watched -> rating gate. Returns enriched metas (internal _fields intact).
 async function buildPool(profile, type, watched, seedTmdbIds, log) {
   const { keys, filters } = profile;
-  const raw = await tmdb.discoverRaw(keys.tmdb_api_key, type, filters, { pages: DISCOVER_PAGES });
-  if (seedTmdbIds.length) {
-    raw.push(...await tmdb.similarAndRecommended(keys.tmdb_api_key, type, seedTmdbIds, log));
-  }
+  // Personalized candidates FIRST into the dedupe map so they keep their flag
+  // when discover offers the same title.
+  const personal = seedTmdbIds.length
+    ? await tmdb.similarAndRecommended(keys.tmdb_api_key, type, seedTmdbIds, log) : [];
+  for (const item of personal) if (item) item._personal = true;
+  const raw = [
+    ...personal,
+    ...await tmdb.discoverRaw(keys.tmdb_api_key, type, filters, { pages: DISCOVER_PAGES }),
+  ];
   // Dedupe by TMDB id, drop watched-by-tmdb, apply cheap raw filters.
   const byTmdb = new Map();
   for (const item of raw) {
     if (!item?.id || watched.tmdbIds.has(item.id) || byTmdb.has(item.id)) continue;
     if (rawPasses(item, type, filters)) byTmdb.set(item.id, item);
   }
-  // Pre-rank by popularity, cap the number we pay external_ids for, enrich.
-  const ranked = [...byTmdb.values()]
-    .sort((a, b) => (b.popularity || 0) - (a.popularity || 0))
-    .slice(0, ENRICH_CAP);
-  let metas = (await Promise.all(ranked.map((item) => tmdb.enrichCandidate(keys.tmdb_api_key, type, item, log)))).filter(Boolean);
+  // Cap what we pay external_ids for. Personalized (similar/recommended)
+  // candidates get priority — they're the long-tail taste matches this pool
+  // exists for; a popularity-only cut would hand the cap to discover's
+  // blockbusters every time. Within each bucket, popularity orders.
+  const byPop = (a, b) => (b.popularity || 0) - (a.popularity || 0);
+  const all = [...byTmdb.values()];
+  const ranked = [
+    ...all.filter((i) => i._personal).sort(byPop),
+    ...all.filter((i) => !i._personal).sort(byPop),
+  ].slice(0, ENRICH_CAP);
+  log.log(`[rebuild] ${profile.name}/${type}: raw pool ${all.length} (${all.filter((i) => i._personal).length} personalized) -> enriching ${ranked.length}`);
+  // Enrich in chunks — a single 150-wide parallel burst risks TMDB throttling.
+  const enriched = [];
+  for (let i = 0; i < ranked.length; i += 25) {
+    const chunk = ranked.slice(i, i + 25);
+    enriched.push(...await Promise.all(chunk.map((item) => tmdb.enrichCandidate(keys.tmdb_api_key, type, item, log))));
+  }
+  let metas = enriched.filter(Boolean);
   // Exclude watched by IMDb (cross-type) + dedupe by IMDb id.
   const seen = new Set();
   metas = metas.filter((m) => {
@@ -294,7 +277,7 @@ async function buildCatalog(profile, type, watchedByType, log = console) {
 
   const splitOut = (metas, source) => {
     const all = cleanMetas(metas);
-    return { displayed: all.slice(0, listSize), bench: all.slice(listSize, listSize + DEFAULT_BENCH_SIZE), source };
+    return { displayed: all.slice(0, listSize), bench: all.slice(listSize, listSize * 2), source };
   };
 
   // Cold start / thin pool: no useful ranking to do — serve pool by rating.
@@ -317,9 +300,12 @@ async function buildCatalog(profile, type, watchedByType, log = console) {
     genres: tmdb.genreNames(m._genre_ids, type),
     rating: m._imdb_rating ?? m._vote_average ?? null,
   }));
+  // Ask for display + bench, clamped to the pool size — asking for more than
+  // exist invites the model to invent ids (which validation would drop,
+  // needlessly burning the retry/fallback chain).
   const ranked = await llm.rankCandidates(
     profile.keys.groq_api_key, type, taste, candidates, log,
-    listSize + DEFAULT_BENCH_SIZE, Math.min(listSize, trimmed.length),
+    Math.min(listSize * 2, trimmed.length), Math.min(listSize, trimmed.length),
   );
   const ordered = ranked.map((r) => byId.get(r.id)).filter(Boolean);
   return splitOut(ordered, 'llm');
@@ -544,7 +530,6 @@ module.exports = {
   buildExtraCatalog,
   status,
   isRebuilding,
-  applyHardFilters,
   applyCsmGate,
   cleanMetas,
   rawPasses,

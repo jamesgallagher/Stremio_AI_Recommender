@@ -117,6 +117,7 @@ async function callRankModel(apiKey, model, prompt) {
 async function rankCandidates(apiKey, type, taste, candidates, log = console, count = 40, minCount = 20) {
   const validIds = new Set(candidates.map((c) => c.id));
   const prompt = buildRankPrompt(type, taste, candidates, count);
+  log.log(`[groq] full ranking prompt for ${type}:\n----- PROMPT START -----\n${prompt}\n----- PROMPT END -----`);
   log.log(`[groq] ranking ${candidates.length} ${type} candidates -> top ${count} (min ${minCount})`);
   const primary = FALLBACK_MODELS[0];
   let lastError = null;

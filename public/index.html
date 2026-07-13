@@ -270,7 +270,7 @@ function render(profiles) {
             <select data-filter="vote_count_floor">
               ${[[0,'No minimum'],[250,'250+'],[500,'500+'],[1000,'1,000+'],[2500,'2,500+'],[5000,'5,000+']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.vote_count_floor ?? 1000) ? 'selected' : ''}>${l}</option>`).join('')}
             </select>
-            <div class="muted" style="font-size:11px;margin-top:3px">Noise gate — a high rating on very few votes is meaningless. Lower it to surface niche gems.</div></div>
+            <div class="muted" style="font-size:11px;margin-top:3px">Noise gate — a high rating on very few votes is meaningless. Lower it to surface niche gems. Series automatically use ⅕ of this (TV vote counts run far lower).</div></div>
           <div><label>Released within</label>
             <select data-filter="max_age_years">
               ${[[1,'1 year'],[2,'2 years'],[5,'5 years'],[10,'10 years'],[20,'20 years'],[0,'No limit']].map(([v,l]) => `<option value="${v}" ${v === p.filters.max_age_years ? 'selected' : ''}>${l}</option>`).join('')}

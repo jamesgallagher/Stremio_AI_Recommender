@@ -127,37 +127,17 @@ ok('config: profile CRUD + filter clamping', () => {
   assert.strictEqual(config.getProfile(p.id), null);
 });
 
-ok('filters: watched dedupe on canonical IDs', () => {
-  const metas = [
-    { id: 'tt001', name: 'Seen (imdb)', _tmdb_id: 1, _genre_ids: [], _vote_average: 8, _release_date: '2024-01-01' },
-    { id: 'tt002', name: 'Seen (tmdb)', _tmdb_id: 2, _genre_ids: [], _vote_average: 8, _release_date: '2024-01-01' },
-    { id: 'tt003', name: 'Fresh', _tmdb_id: 3, _genre_ids: [], _vote_average: 8, _release_date: '2024-01-01' },
-    { id: 'tt003', name: 'Fresh dup', _tmdb_id: 3, _genre_ids: [], _vote_average: 8, _release_date: '2024-01-01' },
-  ];
-  const watched = { imdbIds: new Set(['tt001']), tmdbIds: new Set([2]) };
-  const out = rebuild.applyHardFilters(metas, 'movie',
-    { min_rating: 0, max_age_years: 0, excluded_genres: [] }, watched, { log() {}, warn() {} });
-  assert.deepStrictEqual(out.map(m => m.name), ['Fresh']);
-});
-
-ok('filters: rating, recency, genre exclusion enforced', () => {
-  const y = new Date().getFullYear();
-  const metas = [
-    { id: 'tt1', name: 'LowRated', _tmdb_id: 1, _genre_ids: [18], _vote_average: 6.4, _release_date: `${y}-01-01` },
-    { id: 'tt2', name: 'TooOld', _tmdb_id: 2, _genre_ids: [18], _vote_average: 8, _release_date: '1999-01-01' },
-    { id: 'tt3', name: 'Scary', _tmdb_id: 3, _genre_ids: [27, 18], _vote_average: 8, _release_date: `${y}-01-01` },
-    { id: 'tt4', name: 'Keeper', _tmdb_id: 4, _genre_ids: [18], _vote_average: 8, _release_date: `${y}-01-01` },
-    { id: 'tt5', name: 'Unrated OK', _tmdb_id: 5, _genre_ids: [18], _vote_average: 0, _release_date: `${y}-01-01` },
-  ];
-  const out = rebuild.applyHardFilters(metas, 'movie',
-    { min_rating: 7, max_age_years: 5, excluded_genres: ['Horror'] },
-    { imdbIds: new Set(), tmdbIds: new Set() }, { log() {}, warn() {} });
-  assert.deepStrictEqual(out.map(m => m.name), ['Keeper', 'Unrated OK']);
-});
-
-ok('filters: cleanMetas strips internal fields', () => {
-  const out = rebuild.cleanMetas([{ id: 'tt1', name: 'X', _tmdb_id: 9, _genre_ids: [1], _vote_average: 8, _vote_count: 10, _release_date: '2024-01-01' }]);
+ok('filters: cleanMetas strips internal fields (incl. _imdb_rating)', () => {
+  const out = rebuild.cleanMetas([{ id: 'tt1', name: 'X', _tmdb_id: 9, _genre_ids: [1], _vote_average: 8, _vote_count: 10, _release_date: '2024-01-01', _imdb_rating: 7.7 }]);
   assert.deepStrictEqual(Object.keys(out[0]).sort(), ['id', 'name']);
+});
+
+ok('tmdb: voteFloor scales the series floor down', () => {
+  const tmdbSvc = require('../src/services/tmdb');
+  assert.strictEqual(tmdbSvc.voteFloor({ vote_count_floor: 1000 }, 'movie'), 1000);
+  assert.strictEqual(tmdbSvc.voteFloor({ vote_count_floor: 1000 }, 'series'), 200); // TV vote counts run ~5x lower
+  assert.strictEqual(tmdbSvc.voteFloor({ vote_count_floor: 0 }, 'series'), 0); // explicit 0 respected
+  assert.strictEqual(tmdbSvc.voteFloor({}, 'movie'), 200); // legacy defaults when unset
 });
 
 ok('groq: rank prompt carries taste + candidates + no-filter instruction', () => {

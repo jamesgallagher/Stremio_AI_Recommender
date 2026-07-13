@@ -129,6 +129,14 @@ async function fetchIdsAndLogo(apiKey, type, tmdbId) {
   return { imdbId: data.external_ids?.imdb_id || null, logo: pickLogo(data.images?.logos) };
 }
 
+// Effective vote-count floor per media type. TMDB TV vote counts run roughly
+// 5-10x lower than movies (a hit show peaks where a mid-tier movie starts), so
+// a floor tuned for movies would starve the series pool — series use 1/5.
+function voteFloor(filters, type) {
+  const base = filters.vote_count_floor ?? (type === 'series' ? 100 : 200);
+  return type === 'series' ? Math.round(base / 5) : base;
+}
+
 // Taste-seed enrichment: genres + one-line overview for a history item by TMDB
 // id. Lets recent/unknown titles still steer ranking.
 async function detailsForSeed(apiKey, type, tmdbId) {
@@ -147,7 +155,7 @@ async function discoverRaw(apiKey, type, filters, { pages = 3 } = {}) {
   const params = {
     language: 'en-US',
     sort_by: 'popularity.desc',
-    'vote_count.gte': filters.vote_count_floor ?? (type === 'series' ? 100 : 200),
+    'vote_count.gte': voteFloor(filters, type),
     include_adult: false,
   };
   const tmdbFloor = (filters.rating_source || 'imdb') === 'imdb'
@@ -206,6 +214,7 @@ module.exports = {
   GENRE_ALIASES,
   excludedGenreIds,
   genreNames,
+  voteFloor,
   detailsForSeed,
   discoverRaw,
   similarAndRecommended,
