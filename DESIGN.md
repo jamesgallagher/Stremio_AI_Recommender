@@ -141,6 +141,34 @@ authorization, key entry) and install-URL display/QR per profile.
 
 None — design is build-ready.
 
+## v3.0.0-beta — inverted pipeline (branch `v3-phase1` ONLY)
+
+Everything in this section applies to the beta branch, not the stable v2 line.
+Authoritative plan + locked decisions: `docs/phase1-plan.md`.
+
+- **Architecture inverted:** code builds a deterministic candidate pool (TMDB
+  discover + `/recommendations`/`/similar` seeded from history, hard-filtered
+  server-side, exclusion-subtracted by ID); the LLM's only job is ONE ranking
+  call over ~120 pre-approved candidates, returning scored IDs. This replaces
+  the v2 generate-then-filter loop (which lost ~70% of suggestions post-filter
+  and burned retry rounds).
+- **Groq key is a hard requirement** (decided 2026-07-13): no key → the AI
+  catalogs do not run at all (cold start included) — the profile is
+  effectively disabled until a key is added. Surfaced in the portal badge,
+  rebuild results, and the in-app setup card.
+- **Rating source: IMDb by default** (MDBList batch), per-profile
+  configurable; vote-count floor default 1000 (series use 1/5 — TMDB TV vote
+  counts run far lower).
+- **Bench:** each list stores an equal-sized hidden reserve; watched items are
+  pruned and backfilled from the bench with no LLM call.
+- **Ranking model:** `llama-3.3-70b-versatile` primary — `gpt-oss-120b`
+  empirically fails this payload on the free tier (empty/400/413); fallback
+  only.
+- **Kids-mode CSM gate, extra catalogs, auto-scrobble, RPDB, encryption:**
+  unchanged from v2.
+- Release discipline: tagged `beta v3.0.0`, published without moving
+  `:latest` (stable stays v2.6.x).
+
 ## Implementation deviations (post-build, 2026-07)
 
 Where the built app deliberately differs from this design:

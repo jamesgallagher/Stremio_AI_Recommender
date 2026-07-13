@@ -390,6 +390,16 @@ async function buildExtraCatalog(profile, def, log = console) {
 
 // AI catalogs (movie + series): Trakt-seeded, LLM/discover, watched-excluded.
 async function buildAiCatalogs(profile, results, log) {
+  // Hard requirement: no Groq key, no run — the AI catalogs are disabled
+  // entirely (including the cold-start path) until a key is added. Checked
+  // before any network work.
+  if (!profile.keys.groq_api_key) {
+    const error = 'Groq API key missing — AI catalogs are disabled until one is added';
+    log.warn(`[rebuild] ${profile.name}: ${error}`);
+    results.movie = { ok: false, error };
+    results.series = { ok: false, error };
+    return;
+  }
   // Backfill the Trakt account name for profiles connected before we
   // started recording it — surfaces wrong-account authorizations.
   if (!profile.trakt_auth.username) {
@@ -479,7 +489,8 @@ async function rebuildProfile(profile, log = console, opts = {}) {
 function ensureFresh(profile, log = console) {
   const cache = store.loadCache(profile.id);
   const aiStale = (isStale(cache.movie) || isStale(cache.series))
-    && !!profile.trakt_auth?.access_token;
+    && !!profile.trakt_auth?.access_token
+    && !!profile.keys.groq_api_key; // hard requirement: no Groq key, no AI rebuilds
   const extrasStale = !!profile.keys.mdblist_api_key
     && catalogs.enabledExtras(profile).some((d) => isStale(cache.extras?.[d.id]));
   if (!aiStale && !extrasStale) return false;

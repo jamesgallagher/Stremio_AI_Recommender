@@ -342,6 +342,19 @@ async function httpTests() {
   store.saveCsmCache({});
   console.log('  ✓ CSM disk cache answers without network');
 
+  // Hard requirement: no Groq key -> AI catalogs are disabled before any
+  // network call (fake trakt_auth would explode if Trakt were contacted).
+  const rebuildMod = require('../src/rebuild');
+  const noGroq = {
+    id: 'no-groq-test', name: 'NoGroq', keys: {},
+    trakt_auth: { access_token: 'fake' }, filters: {}, catalogs: {},
+  };
+  const res0 = await rebuildMod.rebuildProfile(noGroq, { log() {}, warn() {}, error() {} }, { extras: false });
+  assert.ok(res0.movie.error.includes('Groq API key missing'));
+  assert.ok(res0.series.error.includes('disabled'));
+  store.deleteCache('no-groq-test');
+  console.log('  ✓ missing Groq key disables AI catalogs (no network)');
+
   await new Promise(r => setTimeout(r, 400)); // let server bind
 
   const health = await (await fetch(`${BASE}/health`)).json();
@@ -571,7 +584,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 29 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 30 async/http).`);
   process.exit(0);
 }
 

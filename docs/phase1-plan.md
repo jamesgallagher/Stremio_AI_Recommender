@@ -13,6 +13,7 @@ v3.0 "Personalised Recommender Pipeline" spec.
 | 2 | Kids age gate | **Keep CSM** (MDBList `commonsense`) as the v1 gate; certification deferred |
 | 3 | Ranking pool cap | **120** candidates sent to the LLM |
 | 4 | Bench | **20** (store top 40, display 20, promote-on-watch) |
+| 5 | Groq key | **Hard requirement** (2026-07-13): no key → AI catalogs do not run at all (incl. cold start); profile effectively disabled until a key is added |
 
 ## Scope
 

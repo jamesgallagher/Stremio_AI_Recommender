@@ -102,9 +102,11 @@ router.get('/catalog/:type/:catalogId{/:extra}', (req, res) => {
       ? (profile.keys.mdblist_api_key
         ? 'This list is being generated — check back in a minute or two.'
         : 'This catalog needs an MDBList API key — add one in the configure portal.')
-      : (profile.trakt_auth?.access_token
-        ? 'Your recommendations are being generated — check back in a minute or two.'
-        : 'This profile has not connected Trakt yet. Open the configure portal to finish setup.');
+      : (!profile.trakt_auth?.access_token
+        ? 'This profile has not connected Trakt yet. Open the configure portal to finish setup.'
+        : (!profile.keys.groq_api_key
+          ? 'This profile has no Groq API key — AI recommendations are disabled until one is added in the configure portal.'
+          : 'Your recommendations are being generated — check back in a minute or two.'));
     return res.json({ metas: skip > 0 ? [] : [errorCard(def.type, description)], cacheMaxAge: 5 * 60 });
   }
 
