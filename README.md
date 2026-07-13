@@ -10,8 +10,8 @@ Rebuilds happen in the background and never purge a good list on failure.
 > ## ⚠ v3.0.0-beta — inverted pipeline (THIS BRANCH ONLY)
 >
 > Everything in this block applies to the `v3-phase1` beta, published as
-> `:3.0.0-beta` — the stable `:latest` image (v2.6.x) is unaffected. Full
-> design + decisions: [docs/phase1-plan.md](docs/phase1-plan.md).
+> `:3.0.0-beta` (also `:beta`) — the stable `:latest` image (v2.6.x) is
+> unaffected. Full design + decisions: [docs/phase1-plan.md](docs/phase1-plan.md).
 >
 > - **Code generates candidates, the LLM only ranks.** The AI catalogs are
 >   built from a filtered TMDB pool (discover + recommendations/similar seeded

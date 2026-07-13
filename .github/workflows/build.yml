@@ -34,16 +34,21 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Tagging strategy:
-      #   push to main        -> :latest  (+ :sha-<commit> for traceability)
-      #   push git tag v1.2.3 -> :1.2.3, :1.2, :1  (+ :latest)
-      # So you always run :latest, and can pin to a version later by
-      # pushing a tag: git tag v1.0.0 && git push origin v1.0.0
+      #   push to main               -> :latest  (+ :sha-<commit>)
+      #   push git tag v1.2.3        -> :1.2.3, :1.2, :1  (+ :latest via latest=auto)
+      #   push git tag v3.0.0-beta   -> :3.0.0-beta + :beta ONLY.
+      # Prerelease tags are safe by construction: metadata-action's
+      # latest=auto skips prereleases, and the {{major}}.{{minor}}/{{major}}
+      # semver patterns are not generated for prereleases either — so a beta
+      # tag can never move :latest / :3 / :2.x. Branch pushes (non-main)
+      # trigger nothing.
       - uses: docker/metadata-action@v5
         id: meta
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=beta,enable=${{ contains(github.ref, '-beta') }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
