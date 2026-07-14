@@ -127,9 +127,20 @@ ok('config: profile CRUD + filter clamping', () => {
   assert.strictEqual(config.getProfile(p.id), null);
 });
 
-ok('filters: cleanMetas strips internal fields (incl. _imdb_rating)', () => {
-  const out = rebuild.cleanMetas([{ id: 'tt1', name: 'X', _tmdb_id: 9, _genre_ids: [1], _vote_average: 8, _vote_count: 10, _release_date: '2024-01-01', _imdb_rating: 7.7 }]);
+ok('filters: cleanMetas strips internal fields (incl. _imdb_rating, _original_language)', () => {
+  const out = rebuild.cleanMetas([{ id: 'tt1', name: 'X', _tmdb_id: 9, _genre_ids: [1], _vote_average: 8, _vote_count: 10, _release_date: '2024-01-01', _imdb_rating: 7.7, _original_language: 'ja' }]);
   assert.deepStrictEqual(Object.keys(out[0]).sort(), ['id', 'name']);
+});
+
+ok('tmdb: effectiveGenres splits Japanese animation into "Anime"', () => {
+  const tmdbSvc = require('../src/services/tmdb');
+  assert.deepStrictEqual(
+    tmdbSvc.effectiveGenres(['Animation', 'Action & Adventure'], 'ja'),
+    ['Anime', 'Action & Adventure']);
+  assert.deepStrictEqual(
+    tmdbSvc.effectiveGenres(['Animation', 'Family'], 'en'),
+    ['Animation', 'Family']); // Pixar-style stays Animation
+  assert.deepStrictEqual(tmdbSvc.effectiveGenres(['Drama'], 'ja'), ['Drama']); // no Animation tag: untouched
 });
 
 ok('tmdb: voteFloor scales the series floor down', () => {
@@ -208,6 +219,22 @@ ok('rebuild: distribution guard caps niche genres in the displayed list', () => 
   const thin = rebuild.pickDisplayedByDistribution(
     [{ id: 'x1', _genre_ids: [16] }, { id: 'x2', _genre_ids: [16] }], freq, 4, 'movie', 2);
   assert.strictEqual(thin.displayed.length, 2);
+});
+
+ok('rebuild: guard treats anime and family animation as separate genres', () => {
+  // History: Pixar-style Animation 2/4 (e.g. Elemental, Turning Red) — no Anime.
+  const freq = { Animation: 2, Drama: 2 };
+  const ranked = [
+    { id: 'anime1', _genre_ids: [16], _original_language: 'ja' }, // Anime cap: max(1, 0) = 1
+    { id: 'anime2', _genre_ids: [16], _original_language: 'ja' }, // deferred — anime seat NOT bought by Pixar watches
+    { id: 'pixar1', _genre_ids: [16], _original_language: 'en' }, // Animation cap 2
+    { id: 'pixar2', _genre_ids: [16], _original_language: 'en' },
+    { id: 'd1', _genre_ids: [18] },
+    { id: 'd2', _genre_ids: [18] },
+  ];
+  const { displayed, rest } = rebuild.pickDisplayedByDistribution(ranked, freq, 4, 'movie', 4);
+  assert.deepStrictEqual(displayed.map(m => m.id), ['anime1', 'pixar1', 'pixar2', 'd1']);
+  assert.deepStrictEqual(rest.map(m => m.id), ['anime2', 'd2']);
 });
 
 ok('rebuild: trimByGenreWeight favours frequent history genres', () => {

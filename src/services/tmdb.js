@@ -102,6 +102,7 @@ function toMeta(item, type, imdbId, logo = null) {
     imdbRating: item.vote_average ? item.vote_average.toFixed(1) : null,
     // internal fields for filtering; stripped before serving
     _tmdb_id: item.id,
+    _original_language: item.original_language || null,
     _genre_ids: item.genre_ids || [],
     _vote_average: item.vote_average || 0,
     _vote_count: item.vote_count || 0,
@@ -129,6 +130,17 @@ async function fetchIdsAndLogo(apiKey, type, tmdbId) {
   return { imdbId: data.external_ids?.imdb_id || null, logo: pickLogo(data.images?.logos) };
 }
 
+// TMDB's "Animation" genre lumps Pixar-style family animation and Japanese
+// anime into one bucket — a couple of family-animation watches would otherwise
+// buy anime a seat in the distribution guard (and vice versa). Japanese-
+// language animation is surfaced as its own pseudo-genre "Anime" everywhere
+// genres are compared: taste distribution, candidate genres, primary-genre
+// guard.
+function effectiveGenres(names, originalLanguage) {
+  if (originalLanguage !== 'ja' || !names.includes('Animation')) return names;
+  return names.map((g) => (g === 'Animation' ? 'Anime' : g));
+}
+
 // Effective vote-count floor per media type. TMDB TV vote counts run roughly
 // 5-10x lower than movies (a hit show peaks where a mid-tier movie starts), so
 // a floor tuned for movies would starve the series pool — series use 1/5.
@@ -138,18 +150,20 @@ function voteFloor(filters, type) {
 }
 
 // Taste-seed enrichment: genres + one-line overview for a history item by TMDB
-// id. Lets recent/unknown titles still steer ranking.
+// id. Lets recent/unknown titles still steer ranking. Genres are effective
+// genres (Japanese animation reported as "Anime").
 async function detailsForSeed(apiKey, type, tmdbId) {
   const base = type === 'series' ? `tv/${tmdbId}` : `movie/${tmdbId}`;
   const data = await get(apiKey, base, { language: 'en-US' });
-  return { genres: (data.genres || []).map((g) => g.name), overview: data.overview || '' };
+  const names = (data.genres || []).map((g) => g.name);
+  return { genres: effectiveGenres(names, data.original_language), overview: data.overview || '' };
 }
 
 // Bulk raw candidates from TMDB Discover — NO per-item external_ids (cheap;
 // enrichment happens later, only for survivors). vote_count / recency / genre
 // are exact; the rating floor is applied loosely here for the imdb source (the
 // precise IMDb gate runs after enrichment, since it needs the imdb id).
-async function discoverRaw(apiKey, type, filters, { pages = 3 } = {}) {
+async function discoverRaw(apiKey, type, filters, { fromPage = 1, pages = 3 } = {}) {
   const endpoint = type === 'series' ? 'discover/tv' : 'discover/movie';
   const dateField = type === 'series' ? 'first_air_date' : 'primary_release_date';
   const params = {
@@ -171,7 +185,7 @@ async function discoverRaw(apiKey, type, filters, { pages = 3 } = {}) {
   if (excludeIds.size) params.without_genres = [...excludeIds].join(',');
 
   const out = [];
-  for (let page = 1; page <= pages; page++) {
+  for (let page = fromPage; page < fromPage + pages; page++) {
     const data = await get(apiKey, endpoint, { ...params, page });
     for (const item of data.results || []) out.push(item);
     if (page >= (data.total_pages || 1)) break;
@@ -188,13 +202,13 @@ async function discoverRaw(apiKey, type, filters, { pages = 3 } = {}) {
 // fairness mechanism. Same item shape as discover.
 const SEED_BUCKET_CAP = 16;
 
-async function similarAndRecommended(apiKey, type, tmdbIds, log = console) {
+async function similarAndRecommended(apiKey, type, tmdbIds, log = console, page = 1) {
   const base = type === 'series' ? 'tv' : 'movie';
   const buckets = await Promise.all(tmdbIds.map(async (id) => {
     const bucket = [];
     await Promise.all(['recommendations', 'similar'].map(async (kind) => {
       try {
-        const data = await get(apiKey, `${base}/${id}/${kind}`, { language: 'en-US', page: 1 });
+        const data = await get(apiKey, `${base}/${id}/${kind}`, { language: 'en-US', page });
         for (const item of data.results || []) bucket.push(item);
       } catch (err) {
         log.warn(`[tmdb] ${kind} for ${id} failed: ${err.message}`);
@@ -227,6 +241,7 @@ module.exports = {
   GENRE_ALIASES,
   excludedGenreIds,
   genreNames,
+  effectiveGenres,
   voteFloor,
   detailsForSeed,
   discoverRaw,

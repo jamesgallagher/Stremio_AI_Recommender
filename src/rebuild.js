@@ -37,8 +37,10 @@ const DEFAULT_LIST_SIZE = 20;
 const COLD_START_THRESHOLD = 3;
 // Bench (hidden reserve) is always the same size as the displayed list.
 const POOL_TRIM = 120;           // candidates sent to the ranker (token budget)
-const ENRICH_CAP = 150;          // cap on candidates we pay TMDB external_ids for
-const DISCOVER_PAGES = 5;        // discover pages fetched for the raw pool
+const ENRICH_CAP = 150;          // cap on candidates we pay TMDB external_ids for (per pass)
+const DISCOVER_PAGES = 5;        // discover pages fetched for the raw pool (first pass)
+const DEEP_EXTRA_PAGES = 5;      // extra discover pages when the pool comes up short
+const POOL_MIN_FACTOR = 3;       // deepen when pool < 3x list size (ranking needs choice)
 const EXTRA_LIST_TARGET = 20; // extra catalogs are fixed at 20 titles
 const MAX_EXTRA_PAGES = 5;
 const EXTRA_PAGE_SIZE = 50;
@@ -139,7 +141,14 @@ async function applyCsmGate(metas, type, profile, log = console) {
 
 // Strip internal fields before the metas are served to Stremio.
 function cleanMetas(metas) {
-  return metas.map(({ _tmdb_id, _genre_ids, _vote_average, _vote_count, _release_date, _imdb_rating, ...meta }) => meta);
+  return metas.map(({ _tmdb_id, _genre_ids, _vote_average, _vote_count, _release_date, _imdb_rating, _original_language, ...meta }) => meta);
+}
+
+// Effective genre names for a candidate meta — Japanese animation surfaces as
+// its own "Anime" pseudo-genre so Pixar-style family watches can't buy anime
+// a seat in the distribution guard (and vice versa).
+function metaGenres(m, type) {
+  return tmdb.effectiveGenres(tmdb.genreNames(m._genre_ids, type), m._original_language);
 }
 
 // Enriched taste profile: last-N unique watched titles annotated with genres +
@@ -182,67 +191,90 @@ function rawPasses(item, type, filters) {
 // Build the candidate pool: discover + recommendations/similar -> dedupe ->
 // raw filters -> popularity pre-trim -> enrich (imdb id + logo) -> exclude
 // watched -> rating gate. Returns enriched metas (internal _fields intact).
-async function buildPool(profile, type, watched, seedTmdbIds, log) {
+async function buildPool(profile, type, watched, seedTmdbIds, listSize, log) {
   const { keys, filters } = profile;
-  // Personalized candidates FIRST into the dedupe map so they keep their flag
-  // when discover offers the same title.
-  const personal = seedTmdbIds.length
-    ? await tmdb.similarAndRecommended(keys.tmdb_api_key, type, seedTmdbIds, log) : [];
-  for (const item of personal) if (item) item._personal = true;
-  const raw = [
-    ...personal,
-    ...await tmdb.discoverRaw(keys.tmdb_api_key, type, filters, { pages: DISCOVER_PAGES }),
+  const target = POOL_MIN_FACTOR * listSize; // ranking needs real choice
+  const triedTmdb = new Set(); // everything already collected — never re-enriched
+  const haveImdb = new Set();
+  const pool = [];
+
+  // Adaptive depth: pass 1 is the normal fetch; pass 2 runs ONLY when heavy
+  // exclusions/filters leave the pool under target (a well-watched profile
+  // exhausts the popular slice fast) and digs further down the popularity
+  // tail plus page 2 of every seed's similar/recommendations.
+  const passes = [
+    { fromPage: 1, pages: DISCOVER_PAGES, seedPage: 1 },
+    { fromPage: DISCOVER_PAGES + 1, pages: DEEP_EXTRA_PAGES, seedPage: 2 },
   ];
-  // Dedupe by TMDB id, drop watched-by-tmdb, apply cheap raw filters.
-  const byTmdb = new Map();
-  for (const item of raw) {
-    if (!item?.id || watched.tmdbIds.has(item.id) || byTmdb.has(item.id)) continue;
-    if (rawPasses(item, type, filters)) byTmdb.set(item.id, item);
-  }
-  // Cap what we pay external_ids for. Personalized (similar/recommended)
-  // candidates get priority — they're the long-tail taste matches this pool
-  // exists for; a popularity-only cut would hand the cap to discover's
-  // blockbusters every time. The personalized slice keeps its round-robin
-  // per-seed order (fairness across seeds — re-sorting by popularity would
-  // put TMDB's anime-heavy chart-toppers back on top); discover fills the
-  // remainder by popularity.
-  const byPop = (a, b) => (b.popularity || 0) - (a.popularity || 0);
-  const all = [...byTmdb.values()];
-  const ranked = [
-    ...all.filter((i) => i._personal),
-    ...all.filter((i) => !i._personal).sort(byPop),
-  ].slice(0, ENRICH_CAP);
-  log.log(`[rebuild] ${profile.name}/${type}: raw pool ${all.length} (${all.filter((i) => i._personal).length} personalized) -> enriching ${ranked.length}`);
-  // Enrich in chunks — a single 150-wide parallel burst risks TMDB throttling.
-  const enriched = [];
-  for (let i = 0; i < ranked.length; i += 25) {
-    const chunk = ranked.slice(i, i + 25);
-    enriched.push(...await Promise.all(chunk.map((item) => tmdb.enrichCandidate(keys.tmdb_api_key, type, item, log))));
-  }
-  let metas = enriched.filter(Boolean);
-  // Exclude watched by IMDb (cross-type) + dedupe by IMDb id.
-  const seen = new Set();
-  metas = metas.filter((m) => {
-    if (watched.imdbIds.has(m.id) || seen.has(m.id)) return false;
-    seen.add(m.id);
-    return true;
-  });
-  // Rating gate: IMDb (via MDBList) or TMDB. Unrated titles are kept — they are
-  // not "below the bar" (same semantics as the extra-catalog gate).
-  const useImdb = (filters.rating_source || 'imdb') === 'imdb' && !!keys.mdblist_api_key;
-  if (filters.min_rating > 0 && useImdb) {
-    const ratings = await mdblist.imdbRatings(keys.mdblist_api_key, type, metas.map((m) => m.id), log);
+  for (let p = 0; p < passes.length; p++) {
+    if (p > 0) {
+      if (pool.length >= target) break;
+      log.log(`[rebuild] ${profile.name}/${type}: pool ${pool.length} < target ${target} — deepening (discover pages ${passes[p].fromPage}+, seed page ${passes[p].seedPage})`);
+    }
+    // Personalized candidates FIRST into the dedupe map so they keep their
+    // flag when discover offers the same title.
+    const personal = seedTmdbIds.length
+      ? await tmdb.similarAndRecommended(keys.tmdb_api_key, type, seedTmdbIds, log, passes[p].seedPage) : [];
+    for (const item of personal) if (item) item._personal = true;
+    const raw = [
+      ...personal,
+      ...await tmdb.discoverRaw(keys.tmdb_api_key, type, filters, { fromPage: passes[p].fromPage, pages: passes[p].pages }),
+    ];
+    // Dedupe by TMDB id (across passes), drop watched-by-tmdb, apply raw filters.
+    const byTmdb = new Map();
+    for (const item of raw) {
+      if (!item?.id || watched.tmdbIds.has(item.id) || triedTmdb.has(item.id) || byTmdb.has(item.id)) continue;
+      if (rawPasses(item, type, filters)) byTmdb.set(item.id, item);
+    }
+    for (const id of byTmdb.keys()) triedTmdb.add(id);
+    // Cap what we pay external_ids for. Personalized (similar/recommended)
+    // candidates get priority — they're the long-tail taste matches this pool
+    // exists for; a popularity-only cut would hand the cap to discover's
+    // blockbusters every time. The personalized slice keeps its round-robin
+    // per-seed order (fairness across seeds — re-sorting by popularity would
+    // put TMDB's anime-heavy chart-toppers back on top); discover fills the
+    // remainder by popularity.
+    const byPop = (a, b) => (b.popularity || 0) - (a.popularity || 0);
+    const all = [...byTmdb.values()];
+    const ranked = [
+      ...all.filter((i) => i._personal),
+      ...all.filter((i) => !i._personal).sort(byPop),
+    ].slice(0, ENRICH_CAP);
+    log.log(`[rebuild] ${profile.name}/${type}: raw pool ${all.length} (${all.filter((i) => i._personal).length} personalized) -> enriching ${ranked.length}`);
+    // Enrich in chunks — a wide parallel burst risks TMDB throttling.
+    const enriched = [];
+    for (let i = 0; i < ranked.length; i += 25) {
+      const chunk = ranked.slice(i, i + 25);
+      enriched.push(...await Promise.all(chunk.map((item) => tmdb.enrichCandidate(keys.tmdb_api_key, type, item, log))));
+    }
+    let metas = enriched.filter(Boolean);
+    // Exclude watched by IMDb (cross-type) + dedupe by IMDb id across passes.
     metas = metas.filter((m) => {
-      const r = ratings.get(m.id);
-      if (r === null || r === undefined) return true;
-      m._imdb_rating = r;
-      m.imdbRating = r.toFixed(1);
-      return r >= filters.min_rating;
+      if (watched.imdbIds.has(m.id) || haveImdb.has(m.id)) return false;
+      haveImdb.add(m.id);
+      return true;
     });
-  } else if (filters.min_rating > 0) {
-    metas = metas.filter((m) => !(m._vote_average > 0 && m._vote_average < filters.min_rating));
+    // Rating gate: IMDb (via MDBList) or TMDB. Unrated titles are kept — they
+    // are not "below the bar" (same semantics as the extra-catalog gate).
+    const useImdb = (filters.rating_source || 'imdb') === 'imdb' && !!keys.mdblist_api_key;
+    if (filters.min_rating > 0 && useImdb) {
+      const ratings = await mdblist.imdbRatings(keys.mdblist_api_key, type, metas.map((m) => m.id), log);
+      metas = metas.filter((m) => {
+        const r = ratings.get(m.id);
+        if (r === null || r === undefined) return true;
+        m._imdb_rating = r;
+        m.imdbRating = r.toFixed(1);
+        return r >= filters.min_rating;
+      });
+    } else if (filters.min_rating > 0) {
+      metas = metas.filter((m) => !(m._vote_average > 0 && m._vote_average < filters.min_rating));
+    }
+    pool.push(...metas);
   }
-  return metas;
+  if (pool.length < target) {
+    log.warn(`[rebuild] ${profile.name}/${type}: over-constrained profile — pool ${pool.length} after deepening (target ${target}). Consider widening the recency window, lowering min rating, or reducing the vote floor.`);
+  }
+  return pool;
 }
 
 // Trim a pool to `cap`, weighting candidates by how OFTEN their genres appear
@@ -253,7 +285,7 @@ function trimByGenreWeight(pool, genreFreq, type, cap) {
   if (pool.length <= cap) return pool;
   return pool
     .map((m) => {
-      const names = tmdb.genreNames(m._genre_ids, type);
+      const names = metaGenres(m, type);
       const weight = names.reduce((n, g) => n + (genreFreq[g] || 0), 0);
       return { m, weight, rating: m._imdb_rating ?? m._vote_average ?? 0 };
     })
@@ -278,7 +310,7 @@ function pickDisplayedByDistribution(orderedMetas, genreFreq, historyCount, type
   const deferred = [];
   for (const m of orderedMetas) {
     if (displayed.length >= listSize) { deferred.push(m); continue; }
-    const primary = tmdb.genreNames(m._genre_ids, type)[0] || 'Unknown';
+    const primary = metaGenres(m, type)[0] || 'Unknown';
     const cap = Math.max(1, Math.round(listSize * (genreFreq[primary] || 0) / historyCount));
     if ((counts[primary] || 0) >= cap) { deferred.push(m); continue; }
     counts[primary] = (counts[primary] || 0) + 1;
@@ -299,7 +331,7 @@ async function buildCatalog(profile, type, watchedByType, log = console) {
   const watched = exclusionSets(watchedByType, type);
   const seedTmdbIds = recent.slice(0, filters.pool_seed_count || 5).map((h) => h.tmdb_id).filter(Boolean);
 
-  let pool = await buildPool(profile, type, watched, seedTmdbIds, log);
+  let pool = await buildPool(profile, type, watched, seedTmdbIds, listSize, log);
   pool = await applyCsmGate(pool, type, profile, log);
   log.log(`[rebuild] ${profile.name}/${type}: pool ${pool.length} after filters/exclusions`);
   if (pool.length < MIN_METAS) {
@@ -329,7 +361,7 @@ async function buildCatalog(profile, type, watchedByType, log = console) {
     id: m.id,
     title: m.name,
     year: m.releaseInfo ? Number(m.releaseInfo) : null,
-    genres: tmdb.genreNames(m._genre_ids, type),
+    genres: metaGenres(m, type), // "Anime" distinct from "Animation" here too
     rating: m._imdb_rating ?? m._vote_average ?? null,
   }));
   // Ask for display + bench, clamped to the pool size — asking for more than
