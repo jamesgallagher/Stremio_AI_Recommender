@@ -181,18 +181,31 @@ async function discoverRaw(apiKey, type, filters, { pages = 3 } = {}) {
 
 // Personalized raw candidates: /recommendations + /similar for each seed TMDB
 // id (top history titles). Surfaces the long tail that filter-only Discover
-// misses. Same item shape as discover.
+// misses. Per-seed FAIRNESS: each seed's results are capped and the buckets
+// are round-robin interleaved, so one outlier seed (e.g. a single anime in an
+// otherwise drama-heavy history) cannot flood the personalized slice —
+// downstream dedupe/caps keep first occurrences, making interleave order the
+// fairness mechanism. Same item shape as discover.
+const SEED_BUCKET_CAP = 16;
+
 async function similarAndRecommended(apiKey, type, tmdbIds, log = console) {
   const base = type === 'series' ? 'tv' : 'movie';
+  const buckets = await Promise.all(tmdbIds.map(async (id) => {
+    const bucket = [];
+    await Promise.all(['recommendations', 'similar'].map(async (kind) => {
+      try {
+        const data = await get(apiKey, `${base}/${id}/${kind}`, { language: 'en-US', page: 1 });
+        for (const item of data.results || []) bucket.push(item);
+      } catch (err) {
+        log.warn(`[tmdb] ${kind} for ${id} failed: ${err.message}`);
+      }
+    }));
+    return bucket.slice(0, SEED_BUCKET_CAP);
+  }));
   const out = [];
-  await Promise.all(tmdbIds.flatMap((id) => ['recommendations', 'similar'].map(async (kind) => {
-    try {
-      const data = await get(apiKey, `${base}/${id}/${kind}`, { language: 'en-US', page: 1 });
-      for (const item of data.results || []) out.push(item);
-    } catch (err) {
-      log.warn(`[tmdb] ${kind} for ${id} failed: ${err.message}`);
-    }
-  })));
+  for (let i = 0; buckets.some((b) => i < b.length); i++) {
+    for (const b of buckets) if (i < b.length) out.push(b[i]);
+  }
   return out;
 }
 

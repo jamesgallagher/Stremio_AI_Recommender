@@ -140,13 +140,18 @@ ok('tmdb: voteFloor scales the series floor down', () => {
   assert.strictEqual(tmdbSvc.voteFloor({}, 'movie'), 200); // legacy defaults when unset
 });
 
-ok('groq: rank prompt carries taste + candidates + no-filter instruction', () => {
-  const taste = { recent: [{ title: 'Heat', year: 1995, genres: ['Crime'], overview: 'Cops vs crew.' }], topGenres: ['Crime'] };
+ok('groq: rank prompt carries taste, distribution, candidates, no-filter rule', () => {
+  const taste = {
+    recent: [{ title: 'Heat', year: 1995, genres: ['Crime'], overview: 'Cops vs crew.' }],
+    genreFreq: { Crime: 1 },
+  };
   const cands = [{ id: 'tt1', title: 'Sicario', year: 2015, genres: ['Crime'], rating: 7.6 }];
   const p = groq.buildRankPrompt('movie', taste, cands, 40);
   assert.ok(p.includes('Heat'));
   assert.ok(p.includes('tt1') && p.includes('Sicario'));
   assert.ok(/do NOT reject/i.test(p)); // the model must not re-filter
+  assert.ok(p.includes('Crime 1/1')); // genre distribution with counts
+  assert.ok(/MIRROR this distribution/.test(p)); // anti-over-indexing rule
   assert.ok(p.includes('40'));
 });
 
@@ -185,14 +190,36 @@ ok('rebuild: rawPasses enforces recency, genre, vote-count', () => {
   assert.strictEqual(rebuild.rawPasses({ ...base, genre_ids: [27] }, 'movie', filters), false); // horror excluded
 });
 
-ok('rebuild: trimByGenreOverlap keeps on-taste candidates', () => {
-  // movie genre ids: Crime 80, Drama 18, Comedy 35
-  const pool = [
-    { id: 'a', _genre_ids: [80, 18], _vote_average: 7 }, // 2 overlap
-    { id: 'b', _genre_ids: [35], _vote_average: 9 },      // 0 overlap (dropped despite high rating)
-    { id: 'c', _genre_ids: [18], _vote_average: 6 },      // 1 overlap
+ok('rebuild: distribution guard caps niche genres in the displayed list', () => {
+  // movie genre ids: Animation 16, Drama 18. History: Drama 3/4, Animation 1/4.
+  const freq = { Drama: 3, Animation: 1 };
+  const ranked = [
+    { id: 'a1', _genre_ids: [16] }, // anime, ranked 1st — allowed (cap 1)
+    { id: 'a2', _genre_ids: [16] }, // anime, ranked 2nd — deferred to bench
+    { id: 'd1', _genre_ids: [18] },
+    { id: 'd2', _genre_ids: [18] },
+    { id: 'd3', _genre_ids: [18] },
+    { id: 'd4', _genre_ids: [18] },
   ];
-  const out = rebuild.trimByGenreOverlap(pool, ['Crime', 'Drama'], 'movie', 2);
+  const { displayed, rest } = rebuild.pickDisplayedByDistribution(ranked, freq, 4, 'movie', 4);
+  assert.deepStrictEqual(displayed.map(m => m.id), ['a1', 'd1', 'd2', 'd3']);
+  assert.deepStrictEqual(rest.map(m => m.id), ['a2', 'd4']); // capped item leads the bench
+  // Short supply: caps relax via backfill so the list still fills
+  const thin = rebuild.pickDisplayedByDistribution(
+    [{ id: 'x1', _genre_ids: [16] }, { id: 'x2', _genre_ids: [16] }], freq, 4, 'movie', 2);
+  assert.strictEqual(thin.displayed.length, 2);
+});
+
+ok('rebuild: trimByGenreWeight favours frequent history genres', () => {
+  // movie genre ids: Crime 80, Drama 18, Comedy 35, Animation 16
+  const freq = { Drama: 12, Crime: 6, Animation: 1 }; // one anime watched != anime viewer
+  const pool = [
+    { id: 'a', _genre_ids: [80, 18], _vote_average: 7 },  // weight 18
+    { id: 'b', _genre_ids: [16], _vote_average: 9 },       // weight 1 (high rating can't save it)
+    { id: 'c', _genre_ids: [18], _vote_average: 6 },       // weight 12
+    { id: 'd', _genre_ids: [35], _vote_average: 9 },       // weight 0
+  ];
+  const out = rebuild.trimByGenreWeight(pool, freq, 'movie', 2);
   assert.deepStrictEqual(out.map(m => m.id), ['a', 'c']);
 });
 

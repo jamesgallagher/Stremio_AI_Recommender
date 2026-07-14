@@ -32,8 +32,17 @@ function buildRankPrompt(type, taste, candidates, count) {
     const o = h.overview ? ` — ${h.overview}` : '';
     return `- ${h.title} (${h.year ?? '?'})${g}${o}`;
   }).join('\n');
-  const pref = taste.topGenres?.length
-    ? `\n\nTheir most-watched genres overall: ${taste.topGenres.join(', ')}. Weight toward these so a recent binge doesn't dominate.`
+  // Genre DISTRIBUTION with counts, not just a top-genres list: the ranker
+  // must see that one niche watch (e.g. a single anime) is 1/20 of the taste,
+  // not a theme — and that taste fit outranks raw rating.
+  const total = taste.recent.length;
+  const dist = Object.entries(taste.genreFreq || {})
+    .sort((a, b) => b[1] - a[1])
+    .map(([g, n]) => `${g} ${n}/${total}`)
+    .join(', ');
+  const pref = dist
+    ? `\n\nTheir genre distribution across these ${total} titles: ${dist}.
+Your top ranks should MIRROR this distribution. A genre appearing once or twice is an occasional watch, not a theme — do not over-recommend a niche (e.g. anime/animation) because of a single watched title; such genres deserve at most a proportional share of the top ranks. Taste fit outranks rating: a well-matched 7.4 beats an off-taste 8.8.`
     : '';
   const cand = candidates.map((c) => JSON.stringify({
     id: c.id, title: c.title, year: c.year, genres: c.genres, rating: c.rating,
@@ -50,7 +59,7 @@ ${cand}
 Return the ${count} best taste matches as a JSON array of objects, each with exactly:
 - "id": the candidate id, copied verbatim (never invent one)
 - "score": integer 0-100 taste match
-Use the full score range; do not cluster on multiples of 5. Output ONLY the JSON array, no prose.
+Score each candidate INDEPENDENTLY on taste fit — equally good fits may share a score. Never assign scores by list position; the candidate order is random. Output ONLY the JSON array, no prose.
 Example: [{"id":"tt1234567","score":91},{"id":"tt7654321","score":78}]`;
 }
 
@@ -127,6 +136,10 @@ async function rankCandidates(apiKey, type, taste, candidates, log = console, co
       const text = await callRankModel(apiKey, model, prompt);
       const ranked = parseRanking(text, validIds);
       if (ranked.length < minCount) throw new Error(`only ${ranked.length} valid ranked ids (< ${minCount})`);
+      // Order by OUR sort of the scores, not the model's emission order —
+      // models drift into emitting list-position order; the scores are the
+      // signal. Stable sort keeps model order within score ties.
+      ranked.sort((a, b) => b.score - a.score);
       if (i === 0) {
         log.log(`[groq] ${type}: ranked ${ranked.length} by PRIMARY model ${model}`);
       } else {

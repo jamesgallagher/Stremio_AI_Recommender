@@ -38,7 +38,7 @@ const COLD_START_THRESHOLD = 3;
 // Bench (hidden reserve) is always the same size as the displayed list.
 const POOL_TRIM = 120;           // candidates sent to the ranker (token budget)
 const ENRICH_CAP = 150;          // cap on candidates we pay TMDB external_ids for
-const DISCOVER_PAGES = 3;        // discover pages fetched for the raw pool
+const DISCOVER_PAGES = 5;        // discover pages fetched for the raw pool
 const EXTRA_LIST_TARGET = 20; // extra catalogs are fixed at 20 titles
 const MAX_EXTRA_PAGES = 5;
 const EXTRA_PAGE_SIZE = 50;
@@ -159,7 +159,7 @@ async function buildTasteProfile(profile, type, recent, log) {
   const freq = {};
   for (const h of enriched) for (const g of h.genres) freq[g] = (freq[g] || 0) + 1;
   const topGenres = Object.entries(freq).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([g]) => g);
-  return { recent: enriched, topGenres };
+  return { recent: enriched, topGenres, genreFreq: freq };
 }
 
 // Cheap raw filters on a TMDB item (recency, excluded genres, vote-count floor).
@@ -202,11 +202,14 @@ async function buildPool(profile, type, watched, seedTmdbIds, log) {
   // Cap what we pay external_ids for. Personalized (similar/recommended)
   // candidates get priority — they're the long-tail taste matches this pool
   // exists for; a popularity-only cut would hand the cap to discover's
-  // blockbusters every time. Within each bucket, popularity orders.
+  // blockbusters every time. The personalized slice keeps its round-robin
+  // per-seed order (fairness across seeds — re-sorting by popularity would
+  // put TMDB's anime-heavy chart-toppers back on top); discover fills the
+  // remainder by popularity.
   const byPop = (a, b) => (b.popularity || 0) - (a.popularity || 0);
   const all = [...byTmdb.values()];
   const ranked = [
-    ...all.filter((i) => i._personal).sort(byPop),
+    ...all.filter((i) => i._personal),
     ...all.filter((i) => !i._personal).sort(byPop),
   ].slice(0, ENRICH_CAP);
   log.log(`[rebuild] ${profile.name}/${type}: raw pool ${all.length} (${all.filter((i) => i._personal).length} personalized) -> enriching ${ranked.length}`);
@@ -242,20 +245,48 @@ async function buildPool(profile, type, watched, seedTmdbIds, log) {
   return metas;
 }
 
-// Trim a pool to `cap` by genre overlap with the viewer's taste (then rating),
-// keeping the most on-taste candidates within the ranking token budget.
-function trimByGenreOverlap(pool, tasteGenres, type, cap) {
+// Trim a pool to `cap`, weighting candidates by how OFTEN their genres appear
+// in the viewer's history (then rating). Frequency-weighted, not binary: Drama
+// watched 12/20 outweighs Animation watched once, so a single niche title in
+// the history can't buy its whole genre a large share of the ranking budget.
+function trimByGenreWeight(pool, genreFreq, type, cap) {
   if (pool.length <= cap) return pool;
-  const want = new Set(tasteGenres);
   return pool
     .map((m) => {
       const names = tmdb.genreNames(m._genre_ids, type);
-      const overlap = names.reduce((n, g) => n + (want.has(g) ? 1 : 0), 0);
-      return { m, overlap, rating: m._imdb_rating ?? m._vote_average ?? 0 };
+      const weight = names.reduce((n, g) => n + (genreFreq[g] || 0), 0);
+      return { m, weight, rating: m._imdb_rating ?? m._vote_average ?? 0 };
     })
-    .sort((a, b) => b.overlap - a.overlap || b.rating - a.rating)
+    .sort((a, b) => b.weight - a.weight || b.rating - a.rating)
     .slice(0, cap)
     .map((s) => s.m);
+}
+
+// Deterministic distribution guard — "code filters, LLM ranks" applied to
+// genre balance. Fill the displayed list in ranked order, but cap each
+// PRIMARY genre at its share of the viewer's history (min 1 slot, so a new
+// genre can still surface). LLM rankings drift toward whatever dominates the
+// pool (e.g. TMDB's anime-heavy TV charts); this guarantees the displayed
+// list mirrors the taste distribution no matter what the model does.
+// Capped-out items are NOT dropped — they lead the bench.
+function pickDisplayedByDistribution(orderedMetas, genreFreq, historyCount, type, listSize) {
+  if (!historyCount) {
+    return { displayed: orderedMetas.slice(0, listSize), rest: orderedMetas.slice(listSize) };
+  }
+  const counts = {};
+  const displayed = [];
+  const deferred = [];
+  for (const m of orderedMetas) {
+    if (displayed.length >= listSize) { deferred.push(m); continue; }
+    const primary = tmdb.genreNames(m._genre_ids, type)[0] || 'Unknown';
+    const cap = Math.max(1, Math.round(listSize * (genreFreq[primary] || 0) / historyCount));
+    if ((counts[primary] || 0) >= cap) { deferred.push(m); continue; }
+    counts[primary] = (counts[primary] || 0) + 1;
+    displayed.push(m);
+  }
+  // If the caps left the list short, backfill from the deferred in rank order.
+  while (displayed.length < listSize && deferred.length) displayed.push(deferred.shift());
+  return { displayed, rest: deferred };
 }
 
 // One catalog (movie|series): pool -> CSM gate -> trim 120 -> shuffle -> ONE
@@ -285,13 +316,14 @@ async function buildCatalog(profile, type, watchedByType, log = console) {
     const why = recent.length < COLD_START_THRESHOLD ? `cold start (${recent.length} history)` : 'pool <= list size';
     log.log(`[rebuild] ${profile.name}/${type}: ${why} — serving pool by rating, no LLM`);
     pool.sort((a, b) => (b._imdb_rating ?? b._vote_average ?? 0) - (a._imdb_rating ?? a._vote_average ?? 0));
-    return splitOut(pool, 'discover');
+    const out = splitOut(pool, 'discover');
+    log.log(`[rebuild] ${profile.name}/${type}: displayed (${out.displayed.length}): ${out.displayed.map((m) => m.name).join(', ')}`);
+    return out;
   }
 
   // Rank: enrich taste, trim to the token budget, shuffle (position bias), rank.
   const taste = await buildTasteProfile(profile, type, recent, log);
-  const seedGenres = [...new Set(taste.recent.flatMap((h) => h.genres))];
-  const trimmed = shuffle(trimByGenreOverlap(pool, seedGenres, type, POOL_TRIM));
+  const trimmed = shuffle(trimByGenreWeight(pool, taste.genreFreq, type, POOL_TRIM));
   const byId = new Map(trimmed.map((m) => [m.id, m]));
   const candidates = trimmed.map((m) => ({
     id: m.id,
@@ -307,8 +339,19 @@ async function buildCatalog(profile, type, watchedByType, log = console) {
     profile.keys.groq_api_key, type, taste, candidates, log,
     Math.min(listSize * 2, trimmed.length), Math.min(listSize, trimmed.length),
   );
+  const scoreById = new Map(ranked.map((r) => [r.id, r.score]));
   const ordered = ranked.map((r) => byId.get(r.id)).filter(Boolean);
-  return splitOut(ordered, 'llm');
+  // Distribution guard: displayed list mirrors the history's genre shares.
+  const balanced = pickDisplayedByDistribution(ordered, taste.genreFreq, taste.recent.length, type, listSize);
+  const out = {
+    displayed: cleanMetas(balanced.displayed),
+    bench: cleanMetas(balanced.rest.slice(0, listSize)),
+    source: 'llm',
+  };
+  // Outcome logging — what actually got displayed, with scores. The prompt
+  // alone can't tell you what the ranker chose; this line can.
+  log.log(`[rebuild] ${profile.name}/${type}: displayed (${out.displayed.length}, ${balanced.rest.length} deferred/bench): ${out.displayed.map((m) => `${m.name} [${scoreById.get(m.id)}]`).join(', ')}`);
+  return out;
 }
 
 // Fisher-Yates shuffle (in place, returns the same array). Used to randomize
@@ -544,7 +587,8 @@ module.exports = {
   applyCsmGate,
   cleanMetas,
   rawPasses,
-  trimByGenreOverlap,
+  trimByGenreWeight,
+  pickDisplayedByDistribution,
   isStale,
   STALE_MS,
   MIN_METAS,
