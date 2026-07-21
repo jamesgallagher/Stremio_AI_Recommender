@@ -290,6 +290,45 @@ async function getWatchedSets(profile, type) {
   return parseWatchedItems(items, type);
 }
 
+// ---- Personalized recommendations: the v4 engine ----
+// GET /recommendations/{movies|shows} — Trakt's collaborative filtering over
+// the user's entire history. Watched titles are excluded by Trakt itself;
+// ignore_watchlisted keeps the AI rows from duplicating the Watch Later
+// catalog. The API takes NO filter params (the website's filter bar is a
+// site/VIP feature) — rating/status/genre filters are applied locally by the
+// caller on the extended=full objects. limit max is 100, no pagination.
+function parseRecommendations(items, type) {
+  return (Array.isArray(items) ? items : [])
+    .map((it) => {
+      // Items are bare movie/show objects; tolerate wrapped shapes too.
+      const media = (type === 'series' ? it.show : it.movie) || it;
+      if (!media?.ids || !media.title) return null;
+      return {
+        title: media.title,
+        year: media.year || null,
+        tmdb_id: media.ids.tmdb || null,
+        imdb_id: media.ids.imdb || null,
+        rating: typeof media.rating === 'number' ? media.rating : null, // Trakt 0-10
+        votes: media.votes || 0,
+        genres: media.genres || [], // Trakt slugs, e.g. 'science-fiction', 'anime'
+        status: media.status || null, // shows: 'returning series'|'canceled'|... movies: 'released'|...
+        certification: media.certification || null,
+        language: media.language || null,
+        overview: media.overview || '',
+      };
+    })
+    .filter(Boolean);
+}
+
+async function getRecommendations(profile, type, limit = 100) {
+  const endpoint = type === 'series' ? 'shows' : 'movies';
+  const items = await authedGet(
+    profile,
+    `/recommendations/${endpoint}?limit=${limit}&ignore_collected=false&ignore_watchlisted=true&extended=full`,
+  );
+  return parseRecommendations(items, type);
+}
+
 // ---- Watch Later: the user's Trakt watchlist ----
 // The built-in list Stremio/Nuvio's long-press "add to watchlist" writes to
 // (app.trakt.tv/users/me/start-watching). Rank-ordered (the user's own order
@@ -320,6 +359,8 @@ module.exports = {
   refreshToken,
   getWatchedSets,
   getWatchlist,
+  getRecommendations,
+  parseRecommendations,
   parseWatchedItems,
   getLastActivities,
   getAccountUsername,

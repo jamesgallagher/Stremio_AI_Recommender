@@ -75,6 +75,26 @@ ok('trakt: watched parse — ID sets + recency-ordered taste seed', () => {
   assert.deepStrictEqual(shows.recent, [{ title: 'Show', year: 2023, tmdb_id: 9, imdb_id: 'tt9' }]);
 });
 
+ok('trakt: recommendations parse — fields, wrapped shapes, dropped junk', () => {
+  const { parseRecommendations } = require('../src/services/trakt');
+  const raw = [
+    { title: 'Dune', year: 2021, ids: { tmdb: 438631, imdb: 'tt1160419' }, rating: 7.7, votes: 32000, genres: ['science-fiction', 'adventure'], status: 'released', certification: 'PG-13', language: 'en', overview: 'Spice.' },
+    { show: { title: 'Silo', year: 2023, ids: { tmdb: 125988, imdb: 'tt14688458' }, rating: 7.8, votes: 9000, genres: ['drama'], status: 'returning series' } }, // wrapped shape
+    { title: 'NoIds' }, // dropped
+  ];
+  const movies = parseRecommendations(raw, 'movie');
+  assert.strictEqual(movies.length, 1); // wrapped show not a movie; NoIds dropped
+  assert.deepStrictEqual(movies[0], {
+    title: 'Dune', year: 2021, tmdb_id: 438631, imdb_id: 'tt1160419', rating: 7.7,
+    votes: 32000, genres: ['science-fiction', 'adventure'], status: 'released',
+    certification: 'PG-13', language: 'en', overview: 'Spice.',
+  });
+  const shows = parseRecommendations([raw[1]], 'series');
+  assert.strictEqual(shows[0].title, 'Silo');
+  assert.strictEqual(shows[0].status, 'returning series');
+  assert.strictEqual(shows[0].overview, ''); // absent fields default sanely
+});
+
 ok('catalogs: registry, defaults, and per-source requirements', () => {
   const catalogs = require('../src/catalogs');
   assert.strictEqual(catalogs.EXTRA_CATALOGS.length, 8);
