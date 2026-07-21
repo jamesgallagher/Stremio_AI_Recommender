@@ -1,17 +1,15 @@
-// LLM taste-RANKING via Groq (OpenAI-compatible Chat Completions).
-// Phase 1 inversion: the LLM never generates titles from memory. Code builds a
-// pre-approved candidate pool; the model only ranks those candidates (by ID)
-// against the viewer's taste. Ranking-over-supplied-data is robust even on the
-// weaker fallback model, and it cannot hallucinate a title it wasn't handed.
+// LLM age GOALKEEPER via Groq (OpenAI-compatible Chat Completions).
+// v4: the LLM no longer generates or ranks recommendations — Trakt's own
+// engine does that. The one remaining LLM job is a defence-in-depth age check
+// for kids profiles (age_limit > 0): given the already-CSM-gated list, veto
+// anything unsuitable for the age under Australian (ACB) standards.
+// REMOVE-ONLY by construction: it can veto titles, never rescue ones CSM
+// dropped, and a missing verdict keeps the title (CSM stays the primary gate).
 const API = 'https://api.groq.com/openai/v1/chat/completions';
 
-// Model order for the RANKING task (quality = the model that reliably produces
-// good rankings). llama-3.3-70b-versatile is primary: it ranks a 120-candidate
-// pool cleanly and fast. openai/gpt-oss-120b — great for open-ended generation —
-// empirically returns EMPTY content / 400 json_validate / 413 on this payload
-// at free-tier limits (it burns the token budget on hidden reasoning), so it is
-// only a fallback here. The chain fires on 429/error/invalid output. Override
-// with GROQ_MODELS.
+// Model order (override with GROQ_MODELS). llama-3.3-70b-versatile is primary:
+// reliable structured output on list-sized payloads at free-tier limits;
+// gpt-oss-120b burns its budget on hidden reasoning there, so fallback only.
 const DEFAULT_MODELS = [
   'llama-3.3-70b-versatile',
   'openai/gpt-oss-120b',
@@ -22,51 +20,34 @@ const FALLBACK_MODELS = (process.env.GROQ_MODELS || '')
   .split(',').map((s) => s.trim()).filter(Boolean);
 if (!FALLBACK_MODELS.length) FALLBACK_MODELS.push(...DEFAULT_MODELS);
 
-// Build the ranking prompt. Candidates are compact (id/title/year/genres/rating,
-// no overviews — token budget); the taste seed carries genres + overviews since
-// that's where recent/unknown titles actually gain meaning.
-function buildRankPrompt(type, taste, candidates, count) {
+function buildAgePrompt(type, ageLimit, titles) {
   const kind = type === 'series' ? 'TV series' : 'movies';
-  const hist = taste.recent.map((h) => {
-    const g = h.genres?.length ? ` [${h.genres.join(', ')}]` : '';
-    const o = h.overview ? ` — ${h.overview}` : '';
-    return `- ${h.title} (${h.year ?? '?'})${g}${o}`;
-  }).join('\n');
-  // Genre DISTRIBUTION with counts, not just a top-genres list: the ranker
-  // must see that one niche watch (e.g. a single anime) is 1/20 of the taste,
-  // not a theme — and that taste fit outranks raw rating.
-  const total = taste.recent.length;
-  const dist = Object.entries(taste.genreFreq || {})
-    .sort((a, b) => b[1] - a[1])
-    .map(([g, n]) => `${g} ${n}/${total}`)
-    .join(', ');
-  const pref = dist
-    ? `\n\nTheir genre distribution across these ${total} titles: ${dist}.
-Your top ranks should MIRROR this distribution. A genre appearing once or twice is an occasional watch, not a theme — do not over-recommend a niche (e.g. anime/animation) because of a single watched title; such genres deserve at most a proportional share of the top ranks. Taste fit outranks rating: a well-matched 7.4 beats an off-taste 8.8.`
-    : '';
-  const cand = candidates.map((c) => JSON.stringify({
-    id: c.id, title: c.title, year: c.year, genres: c.genres, rating: c.rating,
+  const lines = titles.map((t) => JSON.stringify({
+    id: t.id,
+    title: t.title,
+    year: t.year || undefined,
+    genres: t.genres && t.genres.length ? t.genres : undefined,
+    certification: t.certification || undefined,
+    overview: t.overview ? String(t.overview).slice(0, 160) : undefined,
   })).join('\n');
 
-  return `This viewer recently watched these ${kind} (most recent first):
-${hist}${pref}
-
-Below are ${candidates.length} pre-approved candidate ${kind}. Every one ALREADY satisfies all of the viewer's hard constraints (rating, recency, genre, age) — do NOT reject or filter any for those reasons. Your only job is to rank them by how well they match this viewer's taste.
+  return `You are reviewing ${kind} for a child aged ${ageLimit} in Australia.
+For EACH candidate below, decide whether it is suitable for a ${ageLimit}-year-old to watch, judged against Australian classification standards (ACB) and common-sense parental judgement. Err on the side of exclusion: if in doubt, mark it not OK.
 
 Candidates (one JSON object per line):
-${cand}
+${lines}
 
-Return the ${count} best taste matches as a JSON array of objects, each with exactly:
+Return a JSON array with one object PER candidate, each with exactly:
 - "id": the candidate id, copied verbatim (never invent one)
-- "score": integer 0-100 taste match
-Score each candidate INDEPENDENTLY on taste fit — equally good fits may share a score. Never assign scores by list position; the candidate order is random. Output ONLY the JSON array, no prose.
-Example: [{"id":"tt1234567","score":91},{"id":"tt7654321","score":78}]`;
+- "ok": true if suitable for a ${ageLimit}-year-old, false if not
+Output ONLY the JSON array, no prose.
+Example: [{"id":"tt1234567","ok":true},{"id":"tt7654321","ok":false}]`;
 }
 
-// Parse a ranking response into validated [{id, score}]. Tolerates fenced JSON,
-// prose-wrapped arrays, and json-mode object wrappers ({"results":[...]}).
-// Drops any id not in validIds (hallucination guard) and de-dupes.
-function parseRanking(text, validIds) {
+// Parse verdicts into Map<id, boolean>. Tolerates fenced JSON, prose-wrapped
+// arrays, and json-mode object wrappers. Ids not in validIds are dropped
+// (hallucination guard); duplicates keep the first verdict.
+function parseVerdicts(text, validIds) {
   const cleaned = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim();
   let parsed;
   try {
@@ -81,30 +62,27 @@ function parseRanking(text, validIds) {
     ? parsed
     : (parsed && typeof parsed === 'object' ? Object.values(parsed).find(Array.isArray) : null);
   if (!Array.isArray(arr)) throw new Error('LLM did not return a JSON array');
-  const seen = new Set();
-  const out = [];
+  const out = new Map();
   for (const x of arr) {
     if (!x || typeof x.id !== 'string') continue;
-    if (validIds && !validIds.has(x.id)) continue; // never trust an id we didn't supply
-    if (seen.has(x.id)) continue;
-    seen.add(x.id);
-    const score = Number(x.score);
-    out.push({ id: x.id, score: Number.isFinite(score) ? score : 0 });
+    if (validIds && !validIds.has(x.id)) continue;
+    if (out.has(x.id)) continue;
+    out.set(x.id, x.ok === true);
   }
   return out;
 }
 
-async function callRankModel(apiKey, model, prompt) {
+async function callModel(apiKey, model, prompt) {
   const res = await fetch(API, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
     body: JSON.stringify({
       model,
       messages: [
-        { role: 'system', content: 'You are a film and TV recommendation ranker. Rank ONLY the candidates supplied; reply with raw JSON only.' },
+        { role: 'system', content: 'You are a strict parental-guidance reviewer for Australian audiences. Reply with raw JSON only.' },
         { role: 'user', content: prompt },
       ],
-      temperature: 0.4, // ranking is a judgement task — lower temp = steadier ordering
+      temperature: 0.2, // judgement task — steady verdicts
       response_format: { type: 'json_object' },
     }),
   });
@@ -120,43 +98,46 @@ async function callRankModel(apiKey, model, prompt) {
   return text;
 }
 
-// Rank a candidate pool → validated [{id, score}] (top `count`), requiring at
-// least `minCount` valid ids. Walks the model fallback chain on rate-limit /
-// error / invalid output, logging free-tier fallback clearly for diagnosis.
-async function rankCandidates(apiKey, type, taste, candidates, log = console, count = 40, minCount = 20) {
-  const validIds = new Set(candidates.map((c) => c.id));
-  const prompt = buildRankPrompt(type, taste, candidates, count);
-  log.log(`[groq] full ranking prompt for ${type}:\n----- PROMPT START -----\n${prompt}\n----- PROMPT END -----`);
-  log.log(`[groq] ranking ${candidates.length} ${type} candidates -> top ${count} (min ${minCount})`);
+// Run the age gate over `titles` ([{id,title,year,genres,certification,
+// overview}]). Returns the Set of VETOED ids. Requires verdicts for >= 60% of
+// the list (else retry/fallback); throws when every model fails — kids-mode
+// callers treat that like a broken CSM lookup: keep the previous list rather
+// than serve an unverified one.
+async function ageGate(apiKey, type, ageLimit, titles, log = console) {
+  if (!titles.length) return new Set();
+  const validIds = new Set(titles.map((t) => t.id));
+  const prompt = buildAgePrompt(type, ageLimit, titles);
+  log.log(`[groq] full age-gate prompt for ${type}:\n----- PROMPT START -----\n${prompt}\n----- PROMPT END -----`);
+  const minVerdicts = Math.ceil(titles.length * 0.6);
   const primary = FALLBACK_MODELS[0];
   let lastError = null;
   for (let i = 0; i < FALLBACK_MODELS.length; i++) {
     const model = FALLBACK_MODELS[i];
     try {
-      const text = await callRankModel(apiKey, model, prompt);
-      const ranked = parseRanking(text, validIds);
-      if (ranked.length < minCount) throw new Error(`only ${ranked.length} valid ranked ids (< ${minCount})`);
-      // Order by OUR sort of the scores, not the model's emission order —
-      // models drift into emitting list-position order; the scores are the
-      // signal. Stable sort keeps model order within score ties.
-      ranked.sort((a, b) => b.score - a.score);
+      const verdicts = parseVerdicts(await callModel(apiKey, model, prompt), validIds);
+      if (verdicts.size < minVerdicts) throw new Error(`only ${verdicts.size}/${titles.length} verdicts`);
+      const vetoed = new Set([...verdicts.entries()].filter(([, ok]) => !ok).map(([id]) => id));
       if (i === 0) {
-        log.log(`[groq] ${type}: ranked ${ranked.length} by PRIMARY model ${model}`);
+        log.log(`[groq] ${type}: age gate by PRIMARY model ${model} — ${vetoed.size} of ${titles.length} vetoed`);
       } else {
-        log.warn(`[groq] ${type}: ⚠ ranked by BACKUP model "${model}" — primary "${primary}" was unavailable (see above). ${ranked.length} items.`);
+        log.warn(`[groq] ${type}: ⚠ age gate by BACKUP model "${model}" — primary "${primary}" was unavailable (see above). ${vetoed.size} of ${titles.length} vetoed.`);
       }
-      return ranked;
+      if (vetoed.size) {
+        const names = titles.filter((t) => vetoed.has(t.id)).map((t) => t.title).join(', ');
+        log.log(`[groq] ${type}: age-gate vetoed: ${names}`);
+      }
+      return vetoed;
     } catch (err) {
       lastError = err;
       const rate = err.status === 429 || /rate.?limit|quota|free.?tier|too many requests/i.test(err.message);
       const next = FALLBACK_MODELS[i + 1];
       const tail = next ? `falling back to backup model "${next}"` : 'no backup models left — this rebuild will fail';
       if (rate) log.warn(`[groq] ⚠ FREE-TIER RATE LIMIT hit on "${model}" (HTTP 429) — ${tail}`);
-      else log.warn(`[groq] "${model}" ranking failed (${err.message}) — ${tail}`);
+      else log.warn(`[groq] "${model}" age gate failed (${err.message}) — ${tail}`);
       continue;
     }
   }
   throw lastError || new Error('All Groq models failed');
 }
 
-module.exports = { rankCandidates, buildRankPrompt, parseRanking, FALLBACK_MODELS };
+module.exports = { ageGate, buildAgePrompt, parseVerdicts, FALLBACK_MODELS };

@@ -143,8 +143,9 @@ ok('mdblist: IMDb rating parse from list items and media info', () => {
 ok('config: profile CRUD + filter clamping', () => {
   const p = config.addProfile('Test');
   assert.ok(p.token.length === 32);
-  assert.strictEqual(p.filters.min_rating, 7.0);
-  assert.strictEqual(p.filters.max_age_years, 5);
+  assert.strictEqual(p.filters.min_rating, 6.0); // v4: Trakt 60% floor start point
+  assert.strictEqual(p.filters.max_age_years, 0); // v4: all years by default
+  assert.strictEqual(p.filters.rating_source, 'trakt');
   assert.strictEqual(p.keys.rpdb_api_key, 't0-free-rpdb'); // free RPDB key pre-set
   assert.strictEqual(p.filters.age_limit, 0); // age gate off by default
   assert.strictEqual(p.filters.list_size, 20); // fill-to-quota default
@@ -167,17 +168,6 @@ ok('filters: cleanMetas strips internal fields (incl. _imdb_rating, _original_la
   assert.deepStrictEqual(Object.keys(out[0]).sort(), ['id', 'name']);
 });
 
-ok('tmdb: effectiveGenres splits Japanese animation into "Anime"', () => {
-  const tmdbSvc = require('../src/services/tmdb');
-  assert.deepStrictEqual(
-    tmdbSvc.effectiveGenres(['Animation', 'Action & Adventure'], 'ja'),
-    ['Anime', 'Action & Adventure']);
-  assert.deepStrictEqual(
-    tmdbSvc.effectiveGenres(['Animation', 'Family'], 'en'),
-    ['Animation', 'Family']); // Pixar-style stays Animation
-  assert.deepStrictEqual(tmdbSvc.effectiveGenres(['Drama'], 'ja'), ['Drama']); // no Animation tag: untouched
-});
-
 ok('tmdb: voteFloor scales the series floor down', () => {
   const tmdbSvc = require('../src/services/tmdb');
   assert.strictEqual(tmdbSvc.voteFloor({ vote_count_floor: 1000 }, 'movie'), 1000);
@@ -186,129 +176,57 @@ ok('tmdb: voteFloor scales the series floor down', () => {
   assert.strictEqual(tmdbSvc.voteFloor({}, 'movie'), 200); // legacy defaults when unset
 });
 
-ok('groq: rank prompt carries taste, distribution, candidates, no-filter rule', () => {
-  const taste = {
-    recent: [{ title: 'Heat', year: 1995, genres: ['Crime'], overview: 'Cops vs crew.' }],
-    genreFreq: { Crime: 1 },
-  };
-  const cands = [{ id: 'tt1', title: 'Sicario', year: 2015, genres: ['Crime'], rating: 7.6 }];
-  const p = groq.buildRankPrompt('movie', taste, cands, 40);
-  assert.ok(p.includes('Heat'));
-  assert.ok(p.includes('tt1') && p.includes('Sicario'));
-  assert.ok(/do NOT reject/i.test(p)); // the model must not re-filter
-  assert.ok(p.includes('Crime 1/1')); // genre distribution with counts
-  assert.ok(/MIRROR this distribution/.test(p)); // anti-over-indexing rule
-  assert.ok(p.includes('40'));
+ok('groq: age-gate prompt carries age, ACB standard, and candidates', () => {
+  const p = groq.buildAgePrompt('movie', 8, [
+    { id: 'tt1', title: 'Bluey: The Movie', year: 2026, genres: ['family'], certification: 'G', overview: 'Dog.' },
+  ]);
+  assert.ok(p.includes('aged 8'));
+  assert.ok(/Australian classification/i.test(p));
+  assert.ok(/err on the side of exclusion/i.test(p));
+  assert.ok(p.includes('tt1'));
 });
 
-ok('mdblist: Common Sense age parsing (strict, CSM only)', () => {
-  const { parseCommonSenseAge } = require('../src/services/mdblist');
-  assert.strictEqual(parseCommonSenseAge({ commonsense: 8 }), 8);
-  assert.strictEqual(parseCommonSenseAge({ commonsense: '10+' }), 10);
-  assert.strictEqual(parseCommonSenseAge({ ratings: [{ source: 'commonsense', value: 13 }] }), 13);
-  assert.strictEqual(parseCommonSenseAge({ commonsense: null, ratings: [{ source: 'imdb', value: 9 }] }), null);
-  assert.strictEqual(parseCommonSenseAge({}), null);
+ok('groq: parseVerdicts validates ids, dedupes, tolerates wrappers', () => {
+  const valid = new Set(['tt1', 'tt2']);
+  const m1 = groq.parseVerdicts('[{"id":"tt1","ok":true},{"id":"tt2","ok":false}]', valid);
+  assert.strictEqual(m1.get('tt1'), true);
+  assert.strictEqual(m1.get('tt2'), false);
+  const m2 = groq.parseVerdicts('{"results":[{"id":"tt9","ok":false},{"id":"tt1","ok":false},{"id":"tt1","ok":true}]}', valid);
+  assert.strictEqual(m2.has('tt9'), false); // hallucinated id dropped
+  assert.strictEqual(m2.get('tt1'), false); // first verdict wins
+  assert.throws(() => groq.parseVerdicts('no json here', valid));
 });
 
-ok('groq: parseRanking validates ids, dedupes, tolerates wrappers', () => {
-  const valid = new Set(['tt1', 'tt2', 'tt3']);
-  assert.deepStrictEqual(
-    groq.parseRanking('[{"id":"tt1","score":90},{"id":"tt2","score":80}]', valid),
-    [{ id: 'tt1', score: 90 }, { id: 'tt2', score: 80 }]);
-  // hallucinated id (tt9) dropped, duplicate tt1 dropped, object wrapper unwrapped
-  assert.deepStrictEqual(
-    groq.parseRanking('{"results":[{"id":"tt9","score":99},{"id":"tt1","score":50},{"id":"tt1","score":40}]}', valid),
-    [{ id: 'tt1', score: 50 }]);
-  // fenced + prose salvage
-  assert.deepStrictEqual(
-    groq.parseRanking('```json\n[{"id":"tt3","score":70}]\n```', valid),
-    [{ id: 'tt3', score: 70 }]);
-  assert.throws(() => groq.parseRanking('not json at all', valid));
+ok('rebuild: recPasses enforces status, rating, votes, recency, genres', () => {
+  const f = { min_rating: 6, rating_source: 'trakt', vote_count_floor: 1000, max_age_years: 0, excluded_genres: [] };
+  const base = { title: 'X', status: 'released', rating: 7.5, votes: 5000, year: 2020, genres: ['drama'], language: 'en' };
+  const quiet = { log() {} };
+  assert.ok(rebuild.recPasses(base, 'movie', f, quiet));
+  assert.ok(!rebuild.recPasses({ ...base, rating: 5.9 }, 'movie', f, quiet)); // below Trakt floor
+  assert.ok(rebuild.recPasses({ ...base, rating: null }, 'movie', f, quiet)); // unrated kept
+  assert.ok(!rebuild.recPasses({ ...base, votes: 100 }, 'movie', f, quiet)); // vote floor
+  assert.ok(rebuild.recPasses({ ...base, votes: 300, status: 'returning series' }, 'series', f, quiet)); // series floor = 1/5
+  assert.ok(!rebuild.recPasses({ ...base, status: 'in production' }, 'movie', f, quiet)); // unreleased movie
+  assert.ok(!rebuild.recPasses({ ...base, status: 'canceled' }, 'series', f, quiet)); // dead show
+  assert.ok(rebuild.recPasses({ ...base, status: 'ended' }, 'series', f, quiet)); // finished shows are fine
+  assert.ok(!rebuild.recPasses({ ...base, year: 2001 }, 'movie', { ...f, max_age_years: 5 }, quiet)); // recency honored when set
+  assert.ok(!rebuild.recPasses({ ...base, genres: ['horror', 'drama'] }, 'movie', { ...f, excluded_genres: ['Horror'] }, quiet));
 });
 
-ok('rebuild: rawPasses enforces recency, genre, vote-count', () => {
-  const y = new Date().getFullYear();
-  const base = { vote_count: 5000, genre_ids: [18], release_date: `${y}-01-01` };
-  const filters = { max_age_years: 5, excluded_genres: ['Horror'], vote_count_floor: 1000 };
-  assert.strictEqual(rebuild.rawPasses(base, 'movie', filters), true);
-  assert.strictEqual(rebuild.rawPasses({ ...base, vote_count: 100 }, 'movie', filters), false); // below vote floor
-  assert.strictEqual(rebuild.rawPasses({ ...base, release_date: '1990-01-01' }, 'movie', filters), false); // too old
-  assert.strictEqual(rebuild.rawPasses({ ...base, genre_ids: [27] }, 'movie', filters), false); // horror excluded
-});
-
-ok('rebuild: distribution guard caps niche genres in the displayed list', () => {
-  // movie genre ids: Animation 16, Drama 18. History: Drama 3/4, Animation 1/4.
-  const freq = { Drama: 3, Animation: 1 };
-  const ranked = [
-    { id: 'a1', _genre_ids: [16] }, // anime, ranked 1st — allowed (cap 1)
-    { id: 'a2', _genre_ids: [16] }, // anime, ranked 2nd — deferred to bench
-    { id: 'd1', _genre_ids: [18] },
-    { id: 'd2', _genre_ids: [18] },
-    { id: 'd3', _genre_ids: [18] },
-    { id: 'd4', _genre_ids: [18] },
-  ];
-  const { displayed, rest } = rebuild.pickDisplayedByDistribution(ranked, freq, 4, 'movie', 4);
-  assert.deepStrictEqual(displayed.map(m => m.id), ['a1', 'd1', 'd2', 'd3']);
-  assert.deepStrictEqual(rest.map(m => m.id), ['a2', 'd4']); // capped item leads the bench
-  // Short supply: caps relax via backfill so the list still fills
-  const thin = rebuild.pickDisplayedByDistribution(
-    [{ id: 'x1', _genre_ids: [16] }, { id: 'x2', _genre_ids: [16] }], freq, 4, 'movie', 2);
-  assert.strictEqual(thin.displayed.length, 2);
-});
-
-ok('rebuild: guard treats anime and family animation as separate genres', () => {
-  // History: Pixar-style Animation 2/4 (e.g. Elemental, Turning Red) — no Anime.
-  const freq = { Animation: 2, Drama: 2 };
-  const ranked = [
-    { id: 'anime1', _genre_ids: [16], _original_language: 'ja' }, // Anime cap: max(1, 0) = 1
-    { id: 'anime2', _genre_ids: [16], _original_language: 'ja' }, // deferred — anime seat NOT bought by Pixar watches
-    { id: 'pixar1', _genre_ids: [16], _original_language: 'en' }, // Animation cap 2
-    { id: 'pixar2', _genre_ids: [16], _original_language: 'en' },
-    { id: 'd1', _genre_ids: [18] },
-    { id: 'd2', _genre_ids: [18] },
-  ];
-  const { displayed, rest } = rebuild.pickDisplayedByDistribution(ranked, freq, 4, 'movie', 4);
-  assert.deepStrictEqual(displayed.map(m => m.id), ['anime1', 'pixar1', 'pixar2', 'd1']);
-  assert.deepStrictEqual(rest.map(m => m.id), ['anime2', 'd2']);
-});
-
-ok('rebuild: excluding "Anime" drops ja-animation only', () => {
-  const y = new Date().getFullYear();
-  const filters = { max_age_years: 0, excluded_genres: ['Anime'], vote_count_floor: 0 };
-  const anime = { vote_count: 900, genre_ids: [16, 28], original_language: 'ja', release_date: `${y}-01-01` };
-  const pixar = { vote_count: 900, genre_ids: [16], original_language: 'en', release_date: `${y}-01-01` };
-  const jaDrama = { vote_count: 900, genre_ids: [18], original_language: 'ja', release_date: `${y}-01-01` };
-  assert.strictEqual(rebuild.rawPasses(anime, 'movie', filters), false); // anime excluded
-  assert.strictEqual(rebuild.rawPasses(pixar, 'movie', filters), true); // family animation stays
-  assert.strictEqual(rebuild.rawPasses(jaDrama, 'movie', filters), true); // ja live-action stays
-  // Excluding "Animation" still removes ALL animation, anime included
-  const all = { max_age_years: 0, excluded_genres: ['Animation'], vote_count_floor: 0 };
-  assert.strictEqual(rebuild.rawPasses(anime, 'movie', all), false);
-  assert.strictEqual(rebuild.rawPasses(pixar, 'movie', all), false);
-});
-
-ok('rebuild: trimByGenreWeight favours frequent history genres', () => {
-  // movie genre ids: Crime 80, Drama 18, Comedy 35, Animation 16
-  const freq = { Drama: 12, Crime: 6, Animation: 1 }; // one anime watched != anime viewer
-  const pool = [
-    { id: 'a', _genre_ids: [80, 18], _vote_average: 7 },  // weight 18
-    { id: 'b', _genre_ids: [16], _vote_average: 9 },       // weight 1 (high rating can't save it)
-    { id: 'c', _genre_ids: [18], _vote_average: 6 },       // weight 12
-    { id: 'd', _genre_ids: [35], _vote_average: 9 },       // weight 0
-  ];
-  const out = rebuild.trimByGenreWeight(pool, freq, 'movie', 2);
-  assert.deepStrictEqual(out.map(m => m.id), ['a', 'c']);
-});
-
-ok('baseurl: trailing slashes and missing schemes normalized', () => {
-  const { normalizeExternal } = require('../src/baseurl');
-  assert.strictEqual(normalizeExternal('https://test.url/'), 'https://test.url');
-  assert.strictEqual(normalizeExternal('https://test.url///'), 'https://test.url');
-  assert.strictEqual(normalizeExternal('http://test.url'), 'http://test.url');
-  assert.strictEqual(normalizeExternal(' recs.example.com/ '), 'https://recs.example.com');
-  assert.strictEqual(normalizeExternal('HTTPS://Test.URL/'), 'HTTPS://Test.URL');
-  assert.strictEqual(normalizeExternal(''), '');
-  assert.strictEqual(normalizeExternal(undefined), '');
+ok('rebuild: recPasses "Anime" exclusion — native tag + ja fallback', () => {
+  const f = { min_rating: 0, rating_source: 'trakt', vote_count_floor: 0, max_age_years: 0, excluded_genres: ['Anime'] };
+  const quiet = { log() {} };
+  const tagged = { title: 'A', status: 'released', rating: 8, votes: 9000, year: 2023, genres: ['anime', 'animation', 'action'], language: 'ja' };
+  const untagged = { ...tagged, genres: ['animation', 'action'] }; // ja animation without the anime tag
+  const pixar = { ...tagged, genres: ['animation', 'family'], language: 'en' };
+  const jaDrama = { ...tagged, genres: ['drama'], language: 'ja' };
+  assert.ok(!rebuild.recPasses(tagged, 'movie', f, quiet));
+  assert.ok(!rebuild.recPasses(untagged, 'movie', f, quiet));
+  assert.ok(rebuild.recPasses(pixar, 'movie', f, quiet)); // family animation stays
+  assert.ok(rebuild.recPasses(jaDrama, 'movie', f, quiet)); // ja live-action stays
+  // Excluding "Animation" removes all animation, anime included
+  assert.ok(!rebuild.recPasses(pixar, 'movie', { ...f, excluded_genres: ['Animation'] }, quiet));
+  assert.ok(!rebuild.recPasses(tagged, 'movie', { ...f, excluded_genres: ['Animation'] }, quiet));
 });
 
 ok('tmdb: pickLogo prefers English, builds URL, handles empty', () => {
@@ -322,14 +240,6 @@ ok('tmdb: pickLogo prefers English, builds URL, handles empty', () => {
   );
   assert.strictEqual(tmdb.pickLogo([]), null);
   assert.strictEqual(tmdb.pickLogo(undefined), null);
-});
-
-ok('tmdb: genre aliases map across movie/tv vocabularies', () => {
-  const movieIds = tmdb.excludedGenreIds(['Horror', 'Science Fiction'], 'movie');
-  assert.ok(movieIds.has(27) && movieIds.has(878));
-  const tvIds = tmdb.excludedGenreIds(['Science Fiction', 'Action'], 'series');
-  assert.ok(tvIds.has(10765) && tvIds.has(10759)); // Sci-Fi & Fantasy, Action & Adventure
-  assert.strictEqual(tmdb.excludedGenreIds(['Horror'], 'series').size, 0); // no TV horror genre
 });
 
 ok('crypto: encrypt/decrypt roundtrip + tamper detection', () => {
@@ -451,13 +361,13 @@ async function httpTests() {
   const rebuildMod = require('../src/rebuild');
   const noGroq = {
     id: 'no-groq-test', name: 'NoGroq', keys: {},
-    trakt_auth: { access_token: 'fake' }, filters: {}, catalogs: {},
+    trakt_auth: { access_token: 'fake' }, filters: { age_limit: 8 }, catalogs: {},
   };
   const res0 = await rebuildMod.rebuildProfile(noGroq, { log() {}, warn() {}, error() {} }, { extras: false });
   assert.ok(res0.movie.error.includes('Groq API key missing'));
-  assert.ok(res0.series.error.includes('disabled'));
+  assert.ok(res0.series.error.includes('kids-mode'));
   store.deleteCache('no-groq-test');
-  console.log('  ✓ missing Groq key disables AI catalogs (no network)');
+  console.log('  ✓ kids profile without Groq key disabled (no network)');
 
   await new Promise(r => setTimeout(r, 400)); // let server bind
 

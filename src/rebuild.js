@@ -6,9 +6,13 @@
 // - Backoff: failed attempts set last_attempt_at; no retry within BACKOFF_MS.
 // - Failure never purges cache: each catalog type is atomically swapped only on
 //   success with >= MIN_METAS usable titles.
-// - Inverted pipeline (Phase 1): code builds a filtered candidate pool (TMDB
-//   discover + recommendations/similar, IMDb-rated, exclusion-subtracted) and
-//   the LLM ranks it by ID in ONE call. Top list_size displayed + equal bench.
+// - v4 engine: TRAKT RECOMMENDS, CODE FILTERS, LLM GUARDS. The list comes
+//   from Trakt's personalized /recommendations (collaborative filtering over
+//   the user's full history, watched excluded at source); every profile
+//   filter (rating floor, statuses, genres/Anime, recency, vote floor) is
+//   applied locally and deterministically; the LLM's only job is a
+//   remove-only age goalkeeper for kids profiles. Top list_size displayed +
+//   equal bench, in Trakt's confidence order.
 // - Bench backfills the displayed list when items are watched (free, no LLM).
 // - Watched exclusion is cross-type on IMDb IDs: a title watched as a movie
 //   on Trakt can never appear in the series catalog (or vice versa), covering
@@ -34,13 +38,8 @@ const BACKOFF_MS = (parseInt(process.env.BACKOFF_MINUTES, 10) || 30) * 60e3;
 const WATCHED_REFRESH_MS = 60 * 60e3; // exclusion-only refresh cadence
 const MIN_METAS = 5;
 const DEFAULT_LIST_SIZE = 20;
-const COLD_START_THRESHOLD = 3;
 // Bench (hidden reserve) is always the same size as the displayed list.
-const POOL_TRIM = 120;           // candidates sent to the ranker (token budget)
-const ENRICH_CAP = 150;          // cap on candidates we pay TMDB external_ids for (per pass)
-const DISCOVER_PAGES = 5;        // discover pages fetched for the raw pool (first pass)
-const DEEP_EXTRA_PAGES = 5;      // extra discover pages when the pool comes up short
-const POOL_MIN_FACTOR = 3;       // deepen when pool < 3x list size (ranking needs choice)
+const TRAKT_REC_LIMIT = 100;     // /recommendations max; no pagination exists
 const EXTRA_LIST_TARGET = 20; // extra catalogs are fixed at 20 titles
 const MAX_EXTRA_PAGES = 5;
 const EXTRA_PAGE_SIZE = 50;
@@ -147,250 +146,105 @@ function cleanMetas(metas) {
   return metas.map(({ _tmdb_id, _genre_ids, _vote_average, _vote_count, _release_date, _imdb_rating, _original_language, ...meta }) => meta);
 }
 
-// Effective genre names for a candidate meta — Japanese animation surfaces as
-// its own "Anime" pseudo-genre so Pixar-style family watches can't buy anime
-// a seat in the distribution guard (and vice versa).
-function metaGenres(m, type) {
-  return tmdb.effectiveGenres(tmdb.genreNames(m._genre_ids, type), m._original_language);
-}
+// ---- v4 engine: Trakt recommends, code filters ----
 
-// Enriched taste profile: last-N unique watched titles annotated with genres +
-// a one-line overview (so recent/unknown titles still steer ranking), plus the
-// viewer's most-watched genres as ballast against a recent binge.
-async function buildTasteProfile(profile, type, recent, log) {
-  const enriched = await Promise.all(recent.map(async (h) => {
-    if (!h.tmdb_id) return { title: h.title, year: h.year, genres: [], overview: '' };
-    try {
-      const d = await tmdb.detailsForSeed(profile.keys.tmdb_api_key, type, h.tmdb_id);
-      return { title: h.title, year: h.year, genres: d.genres, overview: d.overview };
-    } catch (err) {
-      log.warn(`[rebuild] seed enrich ${h.tmdb_id} failed: ${err.message}`);
-      return { title: h.title, year: h.year, genres: [], overview: '' };
-    }
-  }));
-  const freq = {};
-  for (const h of enriched) for (const g of h.genres) freq[g] = (freq[g] || 0) + 1;
-  const topGenres = Object.entries(freq).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([g]) => g);
-  return { recent: enriched, topGenres, genreFreq: freq };
-}
+// Portal genre names -> Trakt genre slugs (unknown names simply never match).
+const TRAKT_SLUGS = {
+  Action: 'action', Adventure: 'adventure', Anime: 'anime', Animation: 'animation',
+  Comedy: 'comedy', Crime: 'crime', Documentary: 'documentary', Drama: 'drama',
+  Family: 'family', Fantasy: 'fantasy', History: 'history', Horror: 'horror',
+  Kids: 'children', Music: 'music', Mystery: 'mystery', News: 'news',
+  Reality: 'reality', Romance: 'romance', 'Science Fiction': 'science-fiction',
+  Soap: 'soap', Talk: 'talk-show', Thriller: 'thriller', 'TV Movie': 'tv-movie',
+  War: 'war', Western: 'western',
+};
 
-// Cheap raw filters on a TMDB item (recency, excluded genres, vote-count floor).
-// The rating floor is enforced later — the IMDb source needs enrichment first.
-function rawPasses(item, type, filters) {
-  if (filters.max_age_years > 0) {
-    const d = type === 'series' ? item.first_air_date : item.release_date;
-    if (d) {
-      const cutoff = new Date();
-      cutoff.setFullYear(cutoff.getFullYear() - filters.max_age_years);
-      if (new Date(d) < cutoff) return false;
-    }
+// Deterministic local filters over a parsed Trakt recommendation. The API
+// takes no filter params, so this is where every profile constraint is
+// enforced — on the extended=full fields Trakt already sent.
+function recPasses(r, type, filters, log = console) {
+  // Status: unwatchable or dead content out; unknown status is kept.
+  if (r.status) {
+    if (type === 'movie' && r.status !== 'released') return false;
+    if (type === 'series' && ['canceled', 'planned', 'in production', 'upcoming', 'pilot'].includes(r.status)) return false;
   }
-  const ex = tmdb.excludedGenreIds(filters.excluded_genres, type);
-  if (ex.size && (item.genre_ids || []).some((g) => ex.has(g))) return false;
-  // "Anime" is our pseudo-genre (no TMDB id): Japanese-language animation.
-  // Genre id 16 = Animation in both the movie and TV vocabularies.
-  if ((filters.excluded_genres || []).includes('Anime')
-      && item.original_language === 'ja'
-      && (item.genre_ids || []).includes(16)) return false;
-  if ((item.vote_count || 0) < tmdb.voteFloor(filters, type)) return false;
+  // Rating floor against Trakt's own 0-10 rating (rating_source 'trakt').
+  // The 'imdb' source gates later via an MDBList batch. Unrated titles kept.
+  if (filters.min_rating > 0 && (filters.rating_source || 'trakt') !== 'imdb'
+      && r.rating !== null && r.rating < filters.min_rating) {
+    log.log(`[filter] "${r.title}" Trakt ${r.rating} < ${filters.min_rating} — dropped`);
+    return false;
+  }
+  if ((r.votes || 0) < tmdb.voteFloor(filters, type)) return false;
+  if (filters.max_age_years > 0 && r.year && r.year < new Date().getFullYear() - filters.max_age_years) return false;
+  // Genre exclusions on Trakt slugs. 'Anime' uses Trakt's native anime tag,
+  // with a ja-language+animation fallback for untagged titles.
+  for (const name of filters.excluded_genres || []) {
+    const slug = TRAKT_SLUGS[name];
+    if (slug && r.genres.includes(slug)) return false;
+    if (name === 'Anime' && r.language === 'ja' && r.genres.includes('animation')) return false;
+  }
   return true;
 }
 
-// Build the candidate pool: discover + recommendations/similar -> dedupe ->
-// raw filters -> popularity pre-trim -> enrich (imdb id + logo) -> exclude
-// watched -> rating gate. Returns enriched metas (internal _fields intact).
-async function buildPool(profile, type, watched, seedTmdbIds, listSize, log) {
-  const { keys, filters } = profile;
-  const target = POOL_MIN_FACTOR * listSize; // ranking needs real choice
-  const triedTmdb = new Set(); // everything already collected — never re-enriched
-  const haveImdb = new Set();
-  const pool = [];
-
-  // Adaptive depth: pass 1 is the normal fetch; pass 2 runs ONLY when heavy
-  // exclusions/filters leave the pool under target (a well-watched profile
-  // exhausts the popular slice fast) and digs further down the popularity
-  // tail plus page 2 of every seed's similar/recommendations.
-  const passes = [
-    { fromPage: 1, pages: DISCOVER_PAGES, seedPage: 1 },
-    { fromPage: DISCOVER_PAGES + 1, pages: DEEP_EXTRA_PAGES, seedPage: 2 },
-  ];
-  for (let p = 0; p < passes.length; p++) {
-    if (p > 0) {
-      if (pool.length >= target) break;
-      log.log(`[rebuild] ${profile.name}/${type}: pool ${pool.length} < target ${target} — deepening (discover pages ${passes[p].fromPage}+, seed page ${passes[p].seedPage})`);
-    }
-    // Personalized candidates FIRST into the dedupe map so they keep their
-    // flag when discover offers the same title.
-    const personal = seedTmdbIds.length
-      ? await tmdb.similarAndRecommended(keys.tmdb_api_key, type, seedTmdbIds, log, passes[p].seedPage) : [];
-    for (const item of personal) if (item) item._personal = true;
-    const raw = [
-      ...personal,
-      ...await tmdb.discoverRaw(keys.tmdb_api_key, type, filters, { fromPage: passes[p].fromPage, pages: passes[p].pages }),
-    ];
-    // Dedupe by TMDB id (across passes), drop watched-by-tmdb, apply raw filters.
-    const byTmdb = new Map();
-    for (const item of raw) {
-      if (!item?.id || watched.tmdbIds.has(item.id) || triedTmdb.has(item.id) || byTmdb.has(item.id)) continue;
-      if (rawPasses(item, type, filters)) byTmdb.set(item.id, item);
-    }
-    for (const id of byTmdb.keys()) triedTmdb.add(id);
-    // Cap what we pay external_ids for. Personalized (similar/recommended)
-    // candidates get priority — they're the long-tail taste matches this pool
-    // exists for; a popularity-only cut would hand the cap to discover's
-    // blockbusters every time. The personalized slice keeps its round-robin
-    // per-seed order (fairness across seeds — re-sorting by popularity would
-    // put TMDB's anime-heavy chart-toppers back on top); discover fills the
-    // remainder by popularity.
-    const byPop = (a, b) => (b.popularity || 0) - (a.popularity || 0);
-    const all = [...byTmdb.values()];
-    const ranked = [
-      ...all.filter((i) => i._personal),
-      ...all.filter((i) => !i._personal).sort(byPop),
-    ].slice(0, ENRICH_CAP);
-    log.log(`[rebuild] ${profile.name}/${type}: raw pool ${all.length} (${all.filter((i) => i._personal).length} personalized) -> enriching ${ranked.length}`);
-    // Enrich in chunks — a wide parallel burst risks TMDB throttling.
-    const enriched = [];
-    for (let i = 0; i < ranked.length; i += 25) {
-      const chunk = ranked.slice(i, i + 25);
-      enriched.push(...await Promise.all(chunk.map((item) => tmdb.enrichCandidate(keys.tmdb_api_key, type, item, log))));
-    }
-    let metas = enriched.filter(Boolean);
-    // Exclude watched by IMDb (cross-type) + dedupe by IMDb id across passes.
-    metas = metas.filter((m) => {
-      if (watched.imdbIds.has(m.id) || haveImdb.has(m.id)) return false;
-      haveImdb.add(m.id);
-      return true;
-    });
-    // Rating gate: IMDb (via MDBList) or TMDB. Unrated titles are kept — they
-    // are not "below the bar" (same semantics as the extra-catalog gate).
-    const useImdb = (filters.rating_source || 'imdb') === 'imdb' && !!keys.mdblist_api_key;
-    if (filters.min_rating > 0 && useImdb) {
-      const ratings = await mdblist.imdbRatings(keys.mdblist_api_key, type, metas.map((m) => m.id), log);
-      metas = metas.filter((m) => {
-        const r = ratings.get(m.id);
-        if (r === null || r === undefined) return true;
-        m._imdb_rating = r;
-        m.imdbRating = r.toFixed(1);
-        return r >= filters.min_rating;
-      });
-    } else if (filters.min_rating > 0) {
-      metas = metas.filter((m) => !(m._vote_average > 0 && m._vote_average < filters.min_rating));
-    }
-    pool.push(...metas);
-  }
-  if (pool.length < target) {
-    log.warn(`[rebuild] ${profile.name}/${type}: over-constrained profile — pool ${pool.length} after deepening (target ${target}). Consider widening the recency window, lowering min rating, or reducing the vote floor.`);
-  }
-  return pool;
-}
-
-// Trim a pool to `cap`, weighting candidates by how OFTEN their genres appear
-// in the viewer's history (then rating). Frequency-weighted, not binary: Drama
-// watched 12/20 outweighs Animation watched once, so a single niche title in
-// the history can't buy its whole genre a large share of the ranking budget.
-function trimByGenreWeight(pool, genreFreq, type, cap) {
-  if (pool.length <= cap) return pool;
-  return pool
-    .map((m) => {
-      const names = metaGenres(m, type);
-      const weight = names.reduce((n, g) => n + (genreFreq[g] || 0), 0);
-      return { m, weight, rating: m._imdb_rating ?? m._vote_average ?? 0 };
-    })
-    .sort((a, b) => b.weight - a.weight || b.rating - a.rating)
-    .slice(0, cap)
-    .map((s) => s.m);
-}
-
-// Deterministic distribution guard — "code filters, LLM ranks" applied to
-// genre balance. Fill the displayed list in ranked order, but cap each
-// PRIMARY genre at its share of the viewer's history (min 1 slot, so a new
-// genre can still surface). LLM rankings drift toward whatever dominates the
-// pool (e.g. TMDB's anime-heavy TV charts); this guarantees the displayed
-// list mirrors the taste distribution no matter what the model does.
-// Capped-out items are NOT dropped — they lead the bench.
-function pickDisplayedByDistribution(orderedMetas, genreFreq, historyCount, type, listSize) {
-  if (!historyCount) {
-    return { displayed: orderedMetas.slice(0, listSize), rest: orderedMetas.slice(listSize) };
-  }
-  const counts = {};
-  const displayed = [];
-  const deferred = [];
-  for (const m of orderedMetas) {
-    if (displayed.length >= listSize) { deferred.push(m); continue; }
-    const primary = metaGenres(m, type)[0] || 'Unknown';
-    const cap = Math.max(1, Math.round(listSize * (genreFreq[primary] || 0) / historyCount));
-    if ((counts[primary] || 0) >= cap) { deferred.push(m); continue; }
-    counts[primary] = (counts[primary] || 0) + 1;
-    displayed.push(m);
-  }
-  // If the caps left the list short, backfill from the deferred in rank order.
-  while (displayed.length < listSize && deferred.length) displayed.push(deferred.shift());
-  return { displayed, rest: deferred };
-}
-
-// One catalog (movie|series): pool -> CSM gate -> trim 120 -> shuffle -> ONE
-// ranking call -> split into displayed (top list_size) + bench. Cold start, or
-// a pool no larger than the display list, skips the LLM and serves by rating.
+// One AI catalog (movie|series): ONE Trakt recommendations call -> local
+// deterministic filters -> cross-type watched verification (trust Trakt,
+// verify locally) -> optional IMDb rating gate -> kids gates (CSM + AI
+// goalkeeper) -> top list_size + equal bench in Trakt's confidence order ->
+// TMDB enrichment for the survivors only.
 async function buildCatalog(profile, type, watchedByType, log = console) {
   const { filters } = profile;
   const listSize = filters.list_size || DEFAULT_LIST_SIZE;
-  const recent = watchedByType[type].recent;
   const watched = exclusionSets(watchedByType, type);
-  const seedTmdbIds = recent.slice(0, filters.pool_seed_count || 5).map((h) => h.tmdb_id).filter(Boolean);
 
-  let pool = await buildPool(profile, type, watched, seedTmdbIds, listSize, log);
-  pool = await applyCsmGate(pool, type, profile, log);
+  const recs = await trakt.getRecommendations(profile, type, TRAKT_REC_LIMIT);
+  log.log(`[rebuild] ${profile.name}/${type}: ${recs.length} Trakt recommendations`);
+  let pool = recs.filter((r) => recPasses(r, type, filters, log));
+  pool = pool.filter((r) => !(r.imdb_id && watched.imdbIds.has(r.imdb_id))
+    && !(r.tmdb_id && watched.tmdbIds.has(r.tmdb_id)));
+
+  if (filters.min_rating > 0 && filters.rating_source === 'imdb' && profile.keys.mdblist_api_key) {
+    const ratings = await mdblist.imdbRatings(
+      profile.keys.mdblist_api_key, type, pool.map((r) => r.imdb_id).filter(Boolean), log,
+    );
+    pool = pool.filter((r) => {
+      const v = r.imdb_id ? ratings.get(r.imdb_id) : null;
+      return v === null || v === undefined ? true : v >= filters.min_rating;
+    });
+  }
   log.log(`[rebuild] ${profile.name}/${type}: pool ${pool.length} after filters/exclusions`);
-  if (pool.length < MIN_METAS) {
-    log.warn(`[rebuild] ${profile.name}/${type}: pool only ${pool.length} — over-constrained profile`);
+
+  // Kids profiles: CSM strict gate, then the remove-only AI goalkeeper.
+  if (filters.age_limit > 0) {
+    const wrapped = pool.filter((r) => r.imdb_id).map((r) => ({ id: r.imdb_id, name: r.title, __rec: r }));
+    pool = (await applyCsmGate(wrapped, type, profile, log)).map((x) => x.__rec);
+    const vetoed = await llm.ageGate(
+      profile.keys.groq_api_key, type, filters.age_limit,
+      pool.map((r) => ({ id: r.imdb_id, title: r.title, year: r.year, genres: r.genres, certification: r.certification, overview: r.overview })),
+      log,
+    );
+    pool = pool.filter((r) => !vetoed.has(r.imdb_id));
   }
 
-  const splitOut = (metas, source) => {
-    const all = cleanMetas(metas);
-    return { displayed: all.slice(0, listSize), bench: all.slice(listSize, listSize * 2), source };
-  };
-
-  // Cold start / thin pool: no useful ranking to do — serve pool by rating.
-  if (recent.length < COLD_START_THRESHOLD || pool.length <= listSize) {
-    const why = recent.length < COLD_START_THRESHOLD ? `cold start (${recent.length} history)` : 'pool <= list size';
-    log.log(`[rebuild] ${profile.name}/${type}: ${why} — serving pool by rating, no LLM`);
-    pool.sort((a, b) => (b._imdb_rating ?? b._vote_average ?? 0) - (a._imdb_rating ?? a._vote_average ?? 0));
-    const out = splitOut(pool, 'discover');
-    log.log(`[rebuild] ${profile.name}/${type}: displayed (${out.displayed.length}): ${out.displayed.map((m) => m.name).join(', ')}`);
-    return out;
+  // Enrich only display + bench, in Trakt's order (top recommendation first).
+  const chosen = pool.slice(0, listSize * 2);
+  const metas = [];
+  for (let i = 0; i < chosen.length; i += 25) {
+    const chunk = chosen.slice(i, i + 25);
+    metas.push(...await Promise.all(chunk.map(async (r) => {
+      if (r.tmdb_id) {
+        const m = await tmdb.metaByTmdbId(profile.keys.tmdb_api_key, type, r.tmdb_id, log);
+        if (m) return m;
+      }
+      // Minimal fallback — valid tt id for Stremio; RPDB fills the poster.
+      return r.imdb_id
+        ? { id: r.imdb_id, type, name: r.title, poster: null, description: r.overview || '', releaseInfo: r.year ? String(r.year) : null, imdbRating: r.rating !== null ? r.rating.toFixed(1) : null }
+        : null;
+    })));
   }
-
-  // Rank: enrich taste, trim to the token budget, shuffle (position bias), rank.
-  const taste = await buildTasteProfile(profile, type, recent, log);
-  const trimmed = shuffle(trimByGenreWeight(pool, taste.genreFreq, type, POOL_TRIM));
-  const byId = new Map(trimmed.map((m) => [m.id, m]));
-  const candidates = trimmed.map((m) => ({
-    id: m.id,
-    title: m.name,
-    year: m.releaseInfo ? Number(m.releaseInfo) : null,
-    genres: metaGenres(m, type), // "Anime" distinct from "Animation" here too
-    rating: m._imdb_rating ?? m._vote_average ?? null,
-  }));
-  // Ask for display + bench, clamped to the pool size — asking for more than
-  // exist invites the model to invent ids (which validation would drop,
-  // needlessly burning the retry/fallback chain).
-  const ranked = await llm.rankCandidates(
-    profile.keys.groq_api_key, type, taste, candidates, log,
-    Math.min(listSize * 2, trimmed.length), Math.min(listSize, trimmed.length),
-  );
-  const scoreById = new Map(ranked.map((r) => [r.id, r.score]));
-  const ordered = ranked.map((r) => byId.get(r.id)).filter(Boolean);
-  // Distribution guard: displayed list mirrors the history's genre shares.
-  const balanced = pickDisplayedByDistribution(ordered, taste.genreFreq, taste.recent.length, type, listSize);
-  const out = {
-    displayed: cleanMetas(balanced.displayed),
-    bench: cleanMetas(balanced.rest.slice(0, listSize)),
-    source: 'llm',
-  };
-  // Outcome logging — what actually got displayed, with scores. The prompt
-  // alone can't tell you what the ranker chose; this line can.
-  log.log(`[rebuild] ${profile.name}/${type}: displayed (${out.displayed.length}, ${balanced.rest.length} deferred/bench): ${out.displayed.map((m) => `${m.name} [${scoreById.get(m.id)}]`).join(', ')}`);
+  const all = cleanMetas(metas.filter(Boolean));
+  const out = { displayed: all.slice(0, listSize), bench: all.slice(listSize, listSize * 2), source: 'trakt' };
+  log.log(`[rebuild] ${profile.name}/${type}: displayed (${out.displayed.length}, bench ${out.bench.length}): ${out.displayed.map((m) => m.name).join(', ')}`);
   return out;
 }
 
@@ -513,11 +367,10 @@ async function buildExtraCatalog(profile, def, log = console) {
 
 // AI catalogs (movie + series): Trakt-seeded, LLM/discover, watched-excluded.
 async function buildAiCatalogs(profile, results, log) {
-  // Hard requirement: no Groq key, no run — the AI catalogs are disabled
-  // entirely (including the cold-start path) until a key is added. Checked
-  // before any network work.
-  if (!profile.keys.groq_api_key) {
-    const error = 'Groq API key missing — AI catalogs are disabled until one is added';
+  // v4: the LLM only runs the kids-mode age goalkeeper, so the Groq key is
+  // required ONLY for profiles with an age limit. Checked before any network.
+  if (profile.filters.age_limit > 0 && !profile.keys.groq_api_key) {
+    const error = 'Groq API key missing — required for the kids-mode AI age check; AI catalogs are disabled until one is added';
     log.warn(`[rebuild] ${profile.name}: ${error}`);
     results.movie = { ok: false, error };
     results.series = { ok: false, error };
@@ -616,7 +469,8 @@ function ensureFresh(profile, log = console) {
   const cache = store.loadCache(profile.id);
   const aiStale = (isStale(cache.movie) || isStale(cache.series))
     && !!profile.trakt_auth?.access_token
-    && !!profile.keys.groq_api_key; // hard requirement: no Groq key, no AI rebuilds
+    // Groq is only a prerequisite for kids profiles (AI age goalkeeper)
+    && (profile.filters.age_limit <= 0 || !!profile.keys.groq_api_key);
   const extrasStale = catalogs.enabledExtras(profile).some(
     (d) => catalogs.requirementMet(profile, d) && isStale(cache.extras?.[d.id]),
   );
@@ -682,12 +536,9 @@ module.exports = {
   isRebuilding,
   applyCsmGate,
   cleanMetas,
-  rawPasses,
-  trimByGenreWeight,
-  pickDisplayedByDistribution,
+  recPasses,
   isStale,
   STALE_MS,
   MIN_METAS,
   DEFAULT_LIST_SIZE,
-  COLD_START_THRESHOLD,
 };
