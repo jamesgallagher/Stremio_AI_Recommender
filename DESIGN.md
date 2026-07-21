@@ -160,6 +160,11 @@ filters, LLM guards.**
 - The LLM's only job: a remove-only kids age goalkeeper (ACB standards,
   structured verdicts by id, missing verdict keeps the title, total failure
   keeps the previous list). Groq key required ONLY when age_limit > 0.
+- Search catalogs (v4.1, decided 2026-07-22): live TMDB search via
+  search-only catalogs (extraRequired). Age-limited profiles get the same
+  two-layer protection as their lists (CSM + AI goalkeeper), FAIL-CLOSED —
+  gate failure returns zero results, never unfiltered ones. Adult profiles
+  ungated. The only request-path external calls in the addon.
 - Retired: TMDB discover/similar pool builder, taste-profile prompts,
   genre-weighted trim, distribution guard, cold-start discover path (thin
   history simply yields thin/popular recs — moot if nobody is watching),

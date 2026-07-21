@@ -398,10 +398,11 @@ async function httpTests() {
   assert.strictEqual(manifest.version, pkgVersion); // manifest version from package.json
   assert.deepStrictEqual(
     manifest.catalogs.map(c => c.id),
-    ['ai-recs-movies', 'ai-recs-series', 'trakt-watchlist-movies', 'trakt-watchlist-series']
+    ['ai-recs-movies', 'ai-recs-series', 'trakt-watchlist-movies', 'trakt-watchlist-series', 'ai-search-movies', 'ai-search-series']
   );
   assert.strictEqual(manifest.catalogs[0].name, 'Movies recommended for you');
   assert.strictEqual(manifest.catalogs[2].name, 'Watch Later');
+  assert.deepStrictEqual(manifest.catalogs[4].extraRequired, ['search']); // search-only catalog
   assert.ok(manifest.name.includes('SmokeTest'));
   console.log('  ✓ /addon/:token/manifest.json (Watch Later on by default)');
 
@@ -524,7 +525,7 @@ async function httpTests() {
   assert.deepStrictEqual(
     man2.catalogs.map(c => c.id),
     // AI first, then extras in registry order (stable regardless of toggle order)
-    ['ai-recs-movies', 'ai-recs-series', 'trakt-watchlist-movies', 'trakt-watchlist-series', 'mdb-popular-series', 'mdb-action-movies']
+    ['ai-recs-movies', 'ai-recs-series', 'trakt-watchlist-movies', 'trakt-watchlist-series', 'mdb-popular-series', 'mdb-action-movies', 'ai-search-movies', 'ai-search-series']
   );
   assert.strictEqual(man2.catalogs.find(c => c.id === 'mdb-popular-series').type, 'series');
   console.log('  ✓ manifest includes enabled extra catalogs');
@@ -622,12 +623,25 @@ async function httpTests() {
   assert.strictEqual(res.status, 400);
   console.log('  ✓ scrobble enable without credentials rejected');
 
+  // ---- Search catalogs (no-network paths) ----
+  // Short/missing query -> empty result set, no external calls
+  let scat = await (await fetch(`${BASE}/addon/${profile.token}/catalog/movie/ai-search-movies/search=a.json`)).json();
+  assert.deepStrictEqual(scat.metas, []);
+  // No TMDB key on the profile -> empty (guard runs before any fetch)
+  scat = await (await fetch(`${BASE}/addon/${profile.token}/catalog/movie/ai-search-movies/search=batman.json`)).json();
+  assert.deepStrictEqual(scat.metas, []);
+  console.log('  ✓ search: short query + missing TMDB key fail safe (empty)');
+  // Wrong type for a search catalog -> 404
+  res = await fetch(`${BASE}/addon/${profile.token}/catalog/series/ai-search-movies/search=batman.json`);
+  assert.strictEqual(res.status, 404);
+  console.log('  ✓ search: type mismatch rejected');
+
   // Portal page served
   const html = await (await fetch(`${BASE}/configure/`)).text();
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 33 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 35 async/http).`);
   process.exit(0);
 }
 

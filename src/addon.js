@@ -6,6 +6,8 @@ const config = require('./config');
 const store = require('./store');
 const rebuild = require('./rebuild');
 const catalogs = require('./catalogs');
+const tmdb = require('./services/tmdb');
+const llm = require('./services/groq');
 const { version } = require('../package.json'); // single source of truth for the addon version
 
 const router = express.Router({ mergeParams: true });
@@ -15,6 +17,14 @@ const router = express.Router({ mergeParams: true });
 const CATALOGS = {
   'ai-recs-movies': { type: 'movie', name: 'Movies recommended for you' },
   'ai-recs-series': { type: 'series', name: 'Series recommended for you' },
+};
+
+// Search-only catalogs (extraRequired: search — never shown on the board).
+// Live TMDB search; kids profiles get the same two-layer age protection as
+// their lists (CSM gate + AI goalkeeper), fail-closed.
+const SEARCH_CATALOGS = {
+  'ai-search-movies': { type: 'movie' },
+  'ai-search-series': { type: 'series' },
 };
 
 // RPDB (ratingposterdb.com): poster images with the rating rendered on them.
@@ -44,6 +54,14 @@ function manifestFor(profile, baseUrl = '') {
       ...catalogs.enabledExtras(profile).map((d) => (
         { type: d.type, id: d.id, name: d.name, extra: [{ name: 'skip', isRequired: false }] }
       )),
+      ...Object.entries(SEARCH_CATALOGS).map(([id, s]) => ({
+        type: s.type,
+        id,
+        name: 'Search',
+        extra: [{ name: 'search', isRequired: true }],
+        extraSupported: ['search'],
+        extraRequired: ['search'],
+      })),
     ],
     behaviorHints: { configurable: false, configurationRequired: false },
   };
@@ -74,10 +92,49 @@ router.get('/manifest.json', (req, res) => {
   res.json(manifestFor(req.profile, baseUrl(req)));
 });
 
+// Live search. The only request-path external calls in the addon — search
+// cannot be precomputed. Kids profiles (age_limit > 0) get the SAME age
+// protection as their lists: strict CSM gate, then the remove-only AI
+// goalkeeper. FAIL-CLOSED: any gate failure (missing key, MDBList/Groq down)
+// returns no results rather than unfiltered ones.
+async function handleSearch(profile, type, extraStr, res) {
+  const raw = (extraStr.match(/search=([^&]+)/) || [])[1] || '';
+  let query = '';
+  try { query = decodeURIComponent(raw).trim(); } catch { query = raw.trim(); }
+  if (query.length < 2 || !profile.keys.tmdb_api_key) {
+    return res.json({ metas: [], cacheMaxAge: 300 });
+  }
+  const kids = (profile.filters.age_limit || 0) > 0;
+  try {
+    let metas = await tmdb.searchTitles(profile.keys.tmdb_api_key, type, query, kids ? 10 : 20);
+    if (kids) {
+      metas = await rebuild.applyCsmGate(metas, type, profile, console);
+      const vetoed = await llm.ageGate(
+        profile.keys.groq_api_key, type, profile.filters.age_limit,
+        metas.map((m) => ({ id: m.id, title: m.name, year: m.releaseInfo, overview: m.description })),
+        console,
+      );
+      metas = metas.filter((m) => !vetoed.has(m.id));
+    }
+    console.log(`[search] ${profile.name}/${type} "${query}": ${metas.length} result(s)${kids ? ' (age-gated)' : ''}`);
+    return res.json({ metas: applyRpdb(rebuild.cleanMetas(metas), profile.keys.rpdb_api_key), cacheMaxAge: 3600 });
+  } catch (err) {
+    console.warn(`[search] ${profile.name}/${type} "${query}" failed (${err.message}) — returning no results${kids ? ' (fail-closed)' : ''}`);
+    return res.json({ metas: [], cacheMaxAge: 300 });
+  }
+}
+
 // Matches /catalog/movie/ai-recs-movies.json and .../ai-recs-movies/skip=20.json
-router.get('/catalog/:type/:catalogId{/:extra}', (req, res) => {
+router.get('/catalog/:type/:catalogId{/:extra}', async (req, res) => {
   const catalogId = req.params.catalogId.replace(/\.json$/, '');
   const profile = req.profile;
+
+  const searchDef = SEARCH_CATALOGS[catalogId];
+  if (searchDef) {
+    if (searchDef.type !== req.params.type) return res.status(404).json({ error: 'Unknown catalog' });
+    const extraStr = (req.params.extra || '').replace(/\.json$/, '');
+    return handleSearch(profile, searchDef.type, extraStr, res);
+  }
 
   const aiCatalog = CATALOGS[catalogId];
   const extraDef = !aiCatalog && catalogs.getExtra(catalogId);

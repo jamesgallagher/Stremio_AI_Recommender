@@ -28,6 +28,12 @@ Rebuilds happen in the background and never purge a good list on failure.
 >   limit, after the strict CSM gate, Groq reviews the list against
 >   Australian (ACB) standards and can only REMOVE titles. **Groq key is
 >   required only for kids profiles** — adult pipelines make zero LLM calls.
+> - **Search** (v4.1): the addon answers Stremio/Nuvio search. On profiles
+>   with an age limit, results pass the SAME protection as the lists — CSM
+>   gate then the AI goalkeeper — and fail CLOSED: if either gate can't run,
+>   the search returns nothing rather than unfiltered results. Adult profiles
+>   search ungated. (On a kid's device, install only this addon so no other
+>   addon answers search unfiltered.)
 > - **Bench + promote-on-watch**, Watch Later (Trakt watchlist) catalog,
 >   "Anime" exclusion filter, curated MDBList extras, auto-scrobble, RPDB,
 >   and encryption all carry over unchanged.

@@ -92,10 +92,26 @@ async function metaByTmdbId(apiKey, type, tmdbId, log = console) {
   }
 }
 
+// Live title search -> full metas for the top results (search + one details
+// call each). Used by the search catalogs — the only request-path external
+// calls in the addon, so results are capped small.
+async function searchTitles(apiKey, type, query, limit = 10, log = console) {
+  const endpoint = type === 'series' ? 'search/tv' : 'search/movie';
+  const data = await get(apiKey, endpoint, { query, language: 'en-US', include_adult: false });
+  const items = (data.results || []).slice(0, limit);
+  const metas = [];
+  for (let i = 0; i < items.length; i += 5) {
+    const chunk = items.slice(i, i + 5);
+    metas.push(...await Promise.all(chunk.map((it) => metaByTmdbId(apiKey, type, it.id, log))));
+  }
+  return metas.filter(Boolean);
+}
+
 module.exports = {
   GENRE_ALIASES,
   voteFloor,
   toMeta,
   pickLogo,
   metaByTmdbId,
+  searchTitles,
 };
