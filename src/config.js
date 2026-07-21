@@ -187,11 +187,14 @@ function updateProfile(id, patch) {
       if (f.pool_seed_count !== undefined) profile.filters.pool_seed_count = Math.min(10, Math.max(1, parseInt(f.pool_seed_count, 10) || 5));
     }
     if (patch.catalogs && typeof patch.catalogs === 'object') {
-      // Only known catalog ids, coerced to booleans — the toggle set is the
-      // whole payload, so unmentioned ids default to off.
+      // Only known catalog ids, coerced to booleans. False is stored
+      // explicitly — default-on catalogs (Watch Later) need it to opt out;
+      // ids absent from the payload fall back to the definition default.
       profile.catalogs = {};
       for (const def of EXTRA_CATALOGS) {
-        if (patch.catalogs[def.id]) profile.catalogs[def.id] = true;
+        if (patch.catalogs[def.id] !== undefined) {
+          profile.catalogs[def.id] = !!patch.catalogs[def.id];
+        }
       }
     }
     if (patch.trakt_auth !== undefined) profile.trakt_auth = patch.trakt_auth;

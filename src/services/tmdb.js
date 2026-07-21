@@ -23,6 +23,11 @@ const TV_GENRES = {
 const GENRE_ALIASES = {
   Action: { movie: ['Action'], tv: ['Action & Adventure'] },
   Adventure: { movie: ['Adventure'], tv: ['Action & Adventure'] },
+  // Anime is OUR pseudo-genre (Japanese-language animation), not a TMDB
+  // genre — it maps to no TMDB ids here; exclusion is enforced in the
+  // pipeline's raw filter on original_language + the Animation tag.
+  // Excluding "Animation" still excludes ALL animation, anime included.
+  Anime: { movie: [], tv: [] },
   Animation: { movie: ['Animation'], tv: ['Animation'] },
   Comedy: { movie: ['Comedy'], tv: ['Comedy'] },
   Crime: { movie: ['Crime'], tv: ['Crime'] },
@@ -223,6 +228,29 @@ async function similarAndRecommended(apiKey, type, tmdbIds, log = console, page 
   return out;
 }
 
+// Full meta straight from a TMDB details call, for id-only sources like the
+// Trakt watchlist: details + external_ids + images in ONE request. The
+// details response carries everything toMeta needs (title, poster, overview,
+// dates, votes) plus full genre objects, mapped back to genre_ids.
+// Returns null when there's no IMDb id (Stremio needs tt ids).
+async function metaByTmdbId(apiKey, type, tmdbId, log = console) {
+  try {
+    const base = type === 'series' ? `tv/${tmdbId}` : `movie/${tmdbId}`;
+    const data = await get(apiKey, base, {
+      language: 'en-US',
+      append_to_response: 'external_ids,images',
+      include_image_language: 'en,null',
+    });
+    const imdbId = data.external_ids?.imdb_id;
+    if (!imdbId) return null;
+    const item = { ...data, genre_ids: (data.genres || []).map((g) => g.id) };
+    return toMeta(item, type, imdbId, pickLogo(data.images?.logos));
+  } catch (err) {
+    log.warn(`[tmdb] metaByTmdbId ${type}/${tmdbId} failed: ${err.message}`);
+    return null;
+  }
+}
+
 // Enrich a raw TMDB item into a full meta (external_ids -> tt id, + logo).
 // Returns null when there's no IMDb id (Stremio needs tt ids).
 async function enrichCandidate(apiKey, type, item, log = console) {
@@ -247,5 +275,6 @@ module.exports = {
   discoverRaw,
   similarAndRecommended,
   enrichCandidate,
+  metaByTmdbId,
   pickLogo,
 };

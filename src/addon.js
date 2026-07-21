@@ -82,7 +82,7 @@ router.get('/catalog/:type/:catalogId{/:extra}', (req, res) => {
   const aiCatalog = CATALOGS[catalogId];
   const extraDef = !aiCatalog && catalogs.getExtra(catalogId);
   const def = aiCatalog || extraDef;
-  if (!def || def.type !== req.params.type || (extraDef && !profile.catalogs?.[extraDef.id])) {
+  if (!def || def.type !== req.params.type || (extraDef && !catalogs.isEnabled(profile, extraDef))) {
     return res.status(404).json({ error: 'Unknown catalog' });
   }
 
@@ -99,9 +99,13 @@ router.get('/catalog/:type/:catalogId{/:extra}', (req, res) => {
   if (!entry || !entry.metas.length) {
     // Nothing cached yet (first install / not onboarded) — friendly card, short client cache
     const description = extraDef
-      ? (profile.keys.mdblist_api_key
-        ? 'This list is being generated — check back in a minute or two.'
-        : 'This catalog needs an MDBList API key — add one in the configure portal.')
+      ? (extraDef.source === 'trakt_watchlist'
+        ? (!profile.trakt_auth?.access_token
+          ? 'Watch Later mirrors your Trakt watchlist — connect Trakt in the configure portal.'
+          : 'Your Trakt watchlist is empty — long-press a title in Stremio/Nuvio and add it to your watchlist, or add one on trakt.tv.')
+        : (profile.keys.mdblist_api_key
+          ? 'This list is being generated — check back in a minute or two.'
+          : 'This catalog needs an MDBList API key — add one in the configure portal.'))
       : (!profile.trakt_auth?.access_token
         ? 'This profile has not connected Trakt yet. Open the configure portal to finish setup.'
         : (!profile.keys.groq_api_key
@@ -110,11 +114,12 @@ router.get('/catalog/:type/:catalogId{/:extra}', (req, res) => {
     return res.json({ metas: skip > 0 ? [] : [errorCard(def.type, description)], cacheMaxAge: 5 * 60 });
   }
 
-  // Serve-time watched pruning — AI catalogs only (extra catalogs ignore
-  // watched status by design). Union of both types: IMDb IDs are global, and
+  // Serve-time watched pruning — AI catalogs AND Watch Later (a watch-later
+  // list must not show what's been seen); curated MDBList extras ignore
+  // watched status by design. Union of both types: IMDb IDs are global, and
   // Trakt/TMDB sometimes disagree on whether a title is a movie or a show.
   let served = entry.metas;
-  if (!extraDef) {
+  if (!extraDef || extraDef.source === 'trakt_watchlist') {
     const watchedImdb = new Set([
       ...(cache.watched?.movie?.imdb || []),
       ...(cache.watched?.series?.imdb || []),

@@ -25,6 +25,14 @@ Rebuilds happen in the background and never purge a good list on failure.
 >   reserve; watching a title backfills the list instantly with no LLM call.
 > - **Ranking model:** `llama-3.3-70b-versatile` primary (gpt-oss-120b cannot
 >   complete the ranking payload on the free tier; kept as fallback only).
+> - **Watch Later catalog** (on by default, toggleable): mirrors the profile's
+>   built-in Trakt watchlist — the list Stremio/Nuvio's long-press "add to
+>   watchlist" writes to. Served in your own order, refreshed within the hour
+>   of a watchlist change (via `last_activities`), watched titles pruned, no
+>   taste/rating filters, kids-mode CSM gate still applies.
+> - **"Anime" exclusion filter**: our Japanese-animation pseudo-genre is now a
+>   tickable excluded genre (excluding "Animation" still removes all
+>   animation, anime included).
 > - **Superseded v2 behavior notes below:** fill-to-quota LLM rounds, the
 >   rolling avoid-list ("Fresh picks daily"), and generation-prompt details no
 >   longer apply on this branch. Extra catalogs, kids-mode CSM gate,

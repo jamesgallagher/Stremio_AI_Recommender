@@ -201,6 +201,10 @@ async function getLastActivities(profile) {
   return {
     movies: data?.movies?.watched_at || null,
     episodes: data?.episodes?.watched_at || null,
+    // Newest watchlist change across movies+shows — lets the hourly refresh
+    // rebuild the Watch Later catalog only when the watchlist actually moved.
+    watchlist: [data?.movies?.watchlisted_at, data?.shows?.watchlisted_at]
+      .filter(Boolean).sort().pop() || null,
   };
 }
 
@@ -286,11 +290,36 @@ async function getWatchedSets(profile, type) {
   return parseWatchedItems(items, type);
 }
 
+// ---- Watch Later: the user's Trakt watchlist ----
+// The built-in list Stremio/Nuvio's long-press "add to watchlist" writes to
+// (app.trakt.tv/users/me/start-watching). Rank-ordered (the user's own order
+// on trakt.tv), newest-listed first within equal ranks.
+async function getWatchlist(profile, type) {
+  const endpoint = type === 'series' ? 'shows' : 'movies';
+  const items = await authedGetAll(profile, `/sync/watchlist/${endpoint}`);
+  return items
+    .map((it) => {
+      const media = type === 'series' ? it.show : it.movie;
+      if (!media?.ids) return null;
+      return {
+        title: media.title,
+        year: media.year,
+        tmdb_id: media.ids.tmdb || null,
+        imdb_id: media.ids.imdb || null,
+        rank: Number.isFinite(it.rank) ? it.rank : 0,
+        listed_at: it.listed_at || '',
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => (a.rank - b.rank) || (a.listed_at < b.listed_at ? 1 : -1));
+}
+
 module.exports = {
   startDeviceFlow,
   pollDeviceToken,
   refreshToken,
   getWatchedSets,
+  getWatchlist,
   parseWatchedItems,
   getLastActivities,
   getAccountUsername,

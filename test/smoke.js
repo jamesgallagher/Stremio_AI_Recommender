@@ -75,17 +75,30 @@ ok('trakt: watched parse — ID sets + recency-ordered taste seed', () => {
   assert.deepStrictEqual(shows.recent, [{ title: 'Show', year: 2023, tmdb_id: 9, imdb_id: 'tt9' }]);
 });
 
-ok('catalogs: registry ids unique, types valid, popular unfiltered', () => {
+ok('catalogs: registry, defaults, and per-source requirements', () => {
   const catalogs = require('../src/catalogs');
-  assert.strictEqual(catalogs.EXTRA_CATALOGS.length, 6);
+  assert.strictEqual(catalogs.EXTRA_CATALOGS.length, 8);
   const ids = catalogs.EXTRA_CATALOGS.map(d => d.id);
   assert.strictEqual(new Set(ids).size, ids.length);
   assert.ok(catalogs.EXTRA_CATALOGS.every(d => d.type === 'movie' || d.type === 'series'));
   assert.strictEqual(catalogs.getExtra('mdb-popular-movies').min_imdb, 0); // popular: no rating gate
   assert.strictEqual(catalogs.getExtra('mdb-action-movies').min_imdb, 6);
   assert.strictEqual(catalogs.getExtra('nope'), null);
-  assert.deepStrictEqual(catalogs.enabledExtras({ catalogs: { 'mdb-action-movies': true } }).map(d => d.id), ['mdb-action-movies']);
-  assert.deepStrictEqual(catalogs.enabledExtras({}), []);
+  // Watch Later: default ON, trakt-sourced, first among extras (the "3rd catalog")
+  const wl = catalogs.getExtra('trakt-watchlist-movies');
+  assert.strictEqual(wl.source, 'trakt_watchlist');
+  assert.strictEqual(wl.default_on, true);
+  assert.deepStrictEqual(ids.slice(0, 2), ['trakt-watchlist-movies', 'trakt-watchlist-series']);
+  // Default-on semantics: absent = on for watchlist, off for curated lists
+  assert.deepStrictEqual(catalogs.enabledExtras({}).map(d => d.id),
+    ['trakt-watchlist-movies', 'trakt-watchlist-series']);
+  assert.deepStrictEqual(
+    catalogs.enabledExtras({ catalogs: { 'mdb-action-movies': true, 'trakt-watchlist-movies': false } }).map(d => d.id),
+    ['trakt-watchlist-series', 'mdb-action-movies']); // explicit false opts out of a default-on
+  // Requirements: watchlist needs Trakt; curated lists need the MDBList key
+  assert.strictEqual(catalogs.requirementMet({ keys: {}, trakt_auth: { access_token: 't' } }, wl), true);
+  assert.strictEqual(catalogs.requirementMet({ keys: { mdblist_api_key: 'k' }, trakt_auth: null }, wl), false);
+  assert.strictEqual(catalogs.requirementMet({ keys: { mdblist_api_key: 'k' } }, catalogs.getExtra('mdb-action-movies')), true);
 });
 
 ok('store: swapExtra keeps AI catalogs untouched', () => {
@@ -120,8 +133,10 @@ ok('config: profile CRUD + filter clamping', () => {
   assert.strictEqual(p2.filters.min_rating, 0); // clamped
   assert.deepStrictEqual(p2.filters.excluded_genres, ['Horror']);
   assert.deepStrictEqual(p2.catalogs, {}); // extra catalogs default off
-  config.updateProfile(p.id, { catalogs: { 'mdb-action-movies': true, 'bogus-id': true, 'mdb-popular-movies': false } });
-  assert.deepStrictEqual(config.getProfile(p.id).catalogs, { 'mdb-action-movies': true }); // unknown ids dropped, false omitted
+  config.updateProfile(p.id, { catalogs: { 'mdb-action-movies': true, 'bogus-id': true, 'mdb-popular-movies': false, 'trakt-watchlist-movies': false } });
+  // Unknown ids dropped; false stored explicitly (needed to opt out of default-on Watch Later)
+  assert.deepStrictEqual(config.getProfile(p.id).catalogs,
+    { 'mdb-action-movies': true, 'mdb-popular-movies': false, 'trakt-watchlist-movies': false });
   assert.ok(config.getProfileByToken(p.token));
   config.removeProfile(p.id);
   assert.strictEqual(config.getProfile(p.id), null);
@@ -235,6 +250,21 @@ ok('rebuild: guard treats anime and family animation as separate genres', () => 
   const { displayed, rest } = rebuild.pickDisplayedByDistribution(ranked, freq, 4, 'movie', 4);
   assert.deepStrictEqual(displayed.map(m => m.id), ['anime1', 'pixar1', 'pixar2', 'd1']);
   assert.deepStrictEqual(rest.map(m => m.id), ['anime2', 'd2']);
+});
+
+ok('rebuild: excluding "Anime" drops ja-animation only', () => {
+  const y = new Date().getFullYear();
+  const filters = { max_age_years: 0, excluded_genres: ['Anime'], vote_count_floor: 0 };
+  const anime = { vote_count: 900, genre_ids: [16, 28], original_language: 'ja', release_date: `${y}-01-01` };
+  const pixar = { vote_count: 900, genre_ids: [16], original_language: 'en', release_date: `${y}-01-01` };
+  const jaDrama = { vote_count: 900, genre_ids: [18], original_language: 'ja', release_date: `${y}-01-01` };
+  assert.strictEqual(rebuild.rawPasses(anime, 'movie', filters), false); // anime excluded
+  assert.strictEqual(rebuild.rawPasses(pixar, 'movie', filters), true); // family animation stays
+  assert.strictEqual(rebuild.rawPasses(jaDrama, 'movie', filters), true); // ja live-action stays
+  // Excluding "Animation" still removes ALL animation, anime included
+  const all = { max_age_years: 0, excluded_genres: ['Animation'], vote_count_floor: 0 };
+  assert.strictEqual(rebuild.rawPasses(anime, 'movie', all), false);
+  assert.strictEqual(rebuild.rawPasses(pixar, 'movie', all), false);
 });
 
 ok('rebuild: trimByGenreWeight favours frequent history genres', () => {
@@ -433,14 +463,17 @@ async function httpTests() {
   assert.ok(profile.token);
   console.log('  ✓ POST /api/profiles');
 
-  // Manifest via install token
+  // Manifest via install token — AI catalogs + default-on Watch Later
   const manifest = await (await fetch(`${BASE}/addon/${profile.token}/manifest.json`)).json();
   assert.strictEqual(manifest.version, pkgVersion); // manifest version from package.json
-  assert.strictEqual(manifest.catalogs.length, 2);
+  assert.deepStrictEqual(
+    manifest.catalogs.map(c => c.id),
+    ['ai-recs-movies', 'ai-recs-series', 'trakt-watchlist-movies', 'trakt-watchlist-series']
+  );
   assert.strictEqual(manifest.catalogs[0].name, 'Movies recommended for you');
-  assert.strictEqual(manifest.catalogs[1].name, 'Series recommended for you');
+  assert.strictEqual(manifest.catalogs[2].name, 'Watch Later');
   assert.ok(manifest.name.includes('SmokeTest'));
-  console.log('  ✓ /addon/:token/manifest.json');
+  console.log('  ✓ /addon/:token/manifest.json (Watch Later on by default)');
 
   // Admin portal API exposes full key values (for pre-filled inputs)
   const listed = (await (await fetch(`${BASE}/api/profiles`)).json()).profiles.find(pp => pp.id === profile.id);
@@ -531,8 +564,9 @@ async function httpTests() {
 
   // ---- Extra catalogs (second profile keeps earlier assertions intact) ----
   const defs = await (await fetch(`${BASE}/api/catalogs`)).json();
-  assert.strictEqual(defs.catalogs.length, 6);
+  assert.strictEqual(defs.catalogs.length, 8);
   assert.ok(defs.catalogs.some(c => c.id === 'mdb-popular-series' && c.type === 'series'));
+  assert.ok(defs.catalogs.some(c => c.id === 'trakt-watchlist-movies' && c.source === 'trakt_watchlist' && c.default_on === true));
   console.log('  ✓ GET /api/catalogs lists extra-catalog definitions');
 
   res = await fetch(`${BASE}/api/profiles`, {
@@ -555,16 +589,41 @@ async function httpTests() {
   assert.deepStrictEqual(p2u.catalogs, { 'mdb-action-movies': true, 'mdb-popular-series': true });
   console.log('  ✓ PUT /api/profiles/:id catalogs persisted');
 
-  // Manifest now advertises AI + enabled extras with correct types
+  // Manifest now advertises AI + Watch Later (default-on) + enabled extras
   const man2 = await (await fetch(`${BASE}/addon/${p2.token}/manifest.json`)).json();
-  assert.strictEqual(man2.catalogs.length, 4);
   assert.deepStrictEqual(
     man2.catalogs.map(c => c.id),
     // AI first, then extras in registry order (stable regardless of toggle order)
-    ['ai-recs-movies', 'ai-recs-series', 'mdb-popular-series', 'mdb-action-movies']
+    ['ai-recs-movies', 'ai-recs-series', 'trakt-watchlist-movies', 'trakt-watchlist-series', 'mdb-popular-series', 'mdb-action-movies']
   );
   assert.strictEqual(man2.catalogs.find(c => c.id === 'mdb-popular-series').type, 'series');
   console.log('  ✓ manifest includes enabled extra catalogs');
+
+  // Watch Later without Trakt -> setup card pointing at Trakt
+  let wcat = await (await fetch(`${BASE}/addon/${p2.token}/catalog/movie/trakt-watchlist-movies.json`)).json();
+  assert.strictEqual(wcat.metas.length, 1);
+  assert.ok(wcat.metas[0].description.includes('Trakt'));
+  console.log('  ✓ Watch Later without Trakt serves setup card');
+
+  // Watch Later IS pruned by watched status (unlike curated extras)
+  store.swapExtra(p2.id, 'trakt-watchlist-movies', [
+    { id: 'tt0111161', type: 'movie', name: 'Seen Pick', poster: null, description: '', releaseInfo: '2020' },
+    { id: 'tt0068646', type: 'movie', name: 'Unseen Pick', poster: null, description: '', releaseInfo: '1972' },
+  ]);
+  store.saveWatched(p2.id, 'movie', { imdbIds: new Set(['tt0111161']), tmdbIds: new Set() });
+  wcat = await (await fetch(`${BASE}/addon/${p2.token}/catalog/movie/trakt-watchlist-movies.json`)).json();
+  assert.deepStrictEqual(wcat.metas.map(m => m.id), ['tt0068646']);
+  console.log('  ✓ Watch Later prunes watched titles at serve time');
+  store.saveWatched(p2.id, 'movie', { imdbIds: new Set(), tmdbIds: new Set() });
+
+  // Watch Later toggled off -> 404 (explicit false beats default-on)
+  await fetch(`${BASE}/api/profiles/${p2.id}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ catalogs: { 'trakt-watchlist-movies': false, 'mdb-action-movies': true, 'mdb-popular-series': true } }),
+  });
+  res = await fetch(`${BASE}/addon/${p2.token}/catalog/movie/trakt-watchlist-movies.json`);
+  assert.strictEqual(res.status, 404);
+  console.log('  ✓ Watch Later opt-out rejected with 404');
 
   // Enabled but not built yet -> warming card mentioning the MDBList key
   let ecat = await (await fetch(`${BASE}/addon/${p2.token}/catalog/movie/mdb-action-movies.json`)).json();
@@ -638,7 +697,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 30 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 33 async/http).`);
   process.exit(0);
 }
 

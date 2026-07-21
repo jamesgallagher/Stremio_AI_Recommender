@@ -97,18 +97,21 @@ function exclusionSets(watchedByType, type) {
 // errors in the safe direction.
 async function syncWatched(profile, { force = false } = {}) {
   const activity = await trakt.getLastActivities(profile);
-  if (!force) {
-    const prev = store.loadCache(profile.id).watched_activity;
-    if (prev && prev.movies === activity.movies && prev.episodes === activity.episodes) return null;
+  const prev = store.loadCache(profile.id).watched_activity || {};
+  const watchedChanged = force
+    || !(prev.movies === activity.movies && prev.episodes === activity.episodes);
+  const watchlistChanged = prev.watchlist !== activity.watchlist;
+  let watchedByType = null;
+  if (watchedChanged) {
+    watchedByType = {
+      movie: await trakt.getWatchedSets(profile, 'movie'),
+      series: await trakt.getWatchedSets(profile, 'series'),
+    };
+    store.saveWatched(profile.id, 'movie', watchedByType.movie);
+    store.saveWatched(profile.id, 'series', watchedByType.series);
   }
-  const watchedByType = {
-    movie: await trakt.getWatchedSets(profile, 'movie'),
-    series: await trakt.getWatchedSets(profile, 'series'),
-  };
-  store.saveWatched(profile.id, 'movie', watchedByType.movie);
-  store.saveWatched(profile.id, 'series', watchedByType.series);
-  store.saveWatchedActivity(profile.id, activity);
-  return watchedByType;
+  store.saveWatchedActivity(profile.id, activity); // records watchlist stamp too
+  return { watchedByType, watchlistChanged };
 }
 
 // Kids-mode gate: strict Common Sense verification via MDBList.
@@ -184,6 +187,11 @@ function rawPasses(item, type, filters) {
   }
   const ex = tmdb.excludedGenreIds(filters.excluded_genres, type);
   if (ex.size && (item.genre_ids || []).some((g) => ex.has(g))) return false;
+  // "Anime" is our pseudo-genre (no TMDB id): Japanese-language animation.
+  // Genre id 16 = Animation in both the movie and TV vocabularies.
+  if ((filters.excluded_genres || []).includes('Anime')
+      && item.original_language === 'ja'
+      && (item.genre_ids || []).includes(16)) return false;
   if ((item.vote_count || 0) < tmdb.voteFloor(filters, type)) return false;
   return true;
 }
@@ -404,7 +412,47 @@ function shuffle(arr) {
 // the same fixed sequence. Watched status is ignored by design. Kids-mode age
 // limits still apply — a child profile must never bypass the Common Sense gate
 // via an extra catalog.
+// Watch Later: mirror of the profile's built-in Trakt watchlist, in the
+// user's own order. No taste/rating filters — every item is an explicit user
+// choice — but watched titles are excluded (a watch-later list must not show
+// what's been seen) and the kids-mode CSM gate still applies. Metas enrich
+// via one TMDB details call each; items TMDB can't resolve fall back to a
+// minimal tt-id meta (RPDB fills the poster at serve time).
+const WATCHLIST_CAP = 100;
+
+async function buildWatchlistCatalog(profile, def, log = console) {
+  if (!profile.trakt_auth?.access_token) {
+    throw new Error('Trakt is not connected — Watch Later mirrors your Trakt watchlist');
+  }
+  const items = await trakt.getWatchlist(profile, def.type);
+  log.log(`[watchlist] ${profile.name}/${def.type}: ${items.length} item(s) on the Trakt watchlist`);
+  const watchedImdb = new Set([
+    ...(store.loadCache(profile.id).watched?.movie?.imdb || []),
+    ...(store.loadCache(profile.id).watched?.series?.imdb || []),
+  ]);
+  const capped = items.slice(0, WATCHLIST_CAP);
+  const metas = [];
+  for (let i = 0; i < capped.length; i += 25) {
+    const chunk = capped.slice(i, i + 25);
+    metas.push(...await Promise.all(chunk.map(async (it) => {
+      if (it.imdb_id && watchedImdb.has(it.imdb_id)) return null;
+      if (it.tmdb_id) {
+        const m = await tmdb.metaByTmdbId(profile.keys.tmdb_api_key, def.type, it.tmdb_id, log);
+        if (m) return m;
+      }
+      // Minimal fallback — still a valid tt id for Stremio; RPDB poster at serve time.
+      return it.imdb_id
+        ? { id: it.imdb_id, type: def.type, name: it.title, poster: null, description: '', releaseInfo: it.year ? String(it.year) : null }
+        : null;
+    })));
+  }
+  let out = metas.filter((m) => m && !watchedImdb.has(m.id));
+  out = await applyCsmGate(out, def.type, profile, log); // kids gate is never bypassed
+  return cleanMetas(out);
+}
+
 async function buildExtraCatalog(profile, def, log = console) {
+  if (def.source === 'trakt_watchlist') return buildWatchlistCatalog(profile, def, log);
   const key = profile.keys.mdblist_api_key;
   if (!key) throw new Error('MDBList API key is required for extra catalogs');
   const collected = [];
@@ -489,7 +537,7 @@ async function buildAiCatalogs(profile, results, log) {
   // lists are needed even when nothing changed since the last snapshot.
   let watchedByType;
   try {
-    watchedByType = await syncWatched(profile, { force: true });
+    ({ watchedByType } = await syncWatched(profile, { force: true }));
   } catch (err) {
     const error = `Trakt watched fetch failed: ${err.message} — kept previous lists`;
     log.warn(`[rebuild] ${profile.name}: ${error}`);
@@ -537,7 +585,10 @@ async function rebuildProfile(profile, log = console, opts = {}) {
       for (const def of catalogs.enabledExtras(profile)) {
         try {
           const metas = await buildExtraCatalog(profile, def, log);
-          if (metas.length >= MIN_METAS) {
+          // Watch Later is a mirror, not a generated list: any size — even
+          // empty — is the true state of the user's watchlist, so it always
+          // swaps. Curated lists keep the >= MIN_METAS quality gate.
+          if (def.source === 'trakt_watchlist' || metas.length >= MIN_METAS) {
             store.swapExtra(profile.id, def.id, metas);
             results[def.id] = { ok: true, count: metas.length };
             log.log(`[extra] ${profile.name}/${def.id}: swapped in ${metas.length} titles`);
@@ -566,8 +617,9 @@ function ensureFresh(profile, log = console) {
   const aiStale = (isStale(cache.movie) || isStale(cache.series))
     && !!profile.trakt_auth?.access_token
     && !!profile.keys.groq_api_key; // hard requirement: no Groq key, no AI rebuilds
-  const extrasStale = !!profile.keys.mdblist_api_key
-    && catalogs.enabledExtras(profile).some((d) => isStale(cache.extras?.[d.id]));
+  const extrasStale = catalogs.enabledExtras(profile).some(
+    (d) => catalogs.requirementMet(profile, d) && isStale(cache.extras?.[d.id]),
+  );
   if (!aiStale && !extrasStale) return false;
   if (locks.has(profile.id) || exclusionLocks.has(profile.id)) return false;
   if (Date.now() - (cache.last_attempt_at || 0) < BACKOFF_MS) return false;
@@ -588,16 +640,28 @@ function ensureExclusionsFresh(profile, log = console) {
   exclusionLocks.add(profile.id);
   (async () => {
     try {
-      const watchedByType = await syncWatched(profile);
-      if (!watchedByType) {
-        store.touchWatchedSync(profile.id); // nothing new watched — snapshot still valid
-        return;
+      const { watchedByType, watchlistChanged } = await syncWatched(profile);
+      if (watchedByType) {
+        const unionImdb = new Set([...watchedByType.movie.imdbIds, ...watchedByType.series.imdbIds]);
+        for (const type of ['movie', 'series']) {
+          const removed = store.pruneWatched(profile.id, type, unionImdb);
+          if (removed > 0) {
+            log.log(`[exclusions] ${profile.name}/${type}: pruned ${removed} newly-watched title(s)`);
+          }
+        }
       }
-      const unionImdb = new Set([...watchedByType.movie.imdbIds, ...watchedByType.series.imdbIds]);
-      for (const type of ['movie', 'series']) {
-        const removed = store.pruneWatched(profile.id, type, unionImdb);
-        if (removed > 0) {
-          log.log(`[exclusions] ${profile.name}/${type}: pruned ${removed} newly-watched title(s)`);
+      // Watch Later freshness: when last_activities says the watchlist moved,
+      // rebuild just the watchlist catalogs (no LLM, a handful of API calls) —
+      // titles added from Stremio/Nuvio's long-press appear within the hour.
+      if (watchlistChanged) {
+        for (const def of catalogs.enabledExtras(profile).filter((d) => d.source === 'trakt_watchlist')) {
+          try {
+            const metas = await buildExtraCatalog(profile, def, log);
+            store.swapExtra(profile.id, def.id, metas);
+            log.log(`[watchlist] ${profile.name}/${def.id}: refreshed (${metas.length} titles) — watchlist changed on Trakt`);
+          } catch (err) {
+            log.warn(`[watchlist] ${profile.name}/${def.id}: refresh failed: ${err.message}`);
+          }
         }
       }
     } catch (err) {

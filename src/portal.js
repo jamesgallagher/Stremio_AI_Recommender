@@ -101,7 +101,9 @@ router.get('/genres', (req, res) => {
 // Available extra-catalog definitions (static) for the portal's Catalogs section.
 router.get('/catalogs', (req, res) => {
   res.json({
-    catalogs: catalogs.EXTRA_CATALOGS.map(({ id, type, name, min_imdb }) => ({ id, type, name, min_imdb })),
+    catalogs: catalogs.EXTRA_CATALOGS.map(
+      ({ id, type, name, min_imdb, source, default_on }) => ({ id, type, name, min_imdb, source, default_on: !!default_on }),
+    ),
   });
 });
 
@@ -163,11 +165,13 @@ router.put('/profiles/:id', (req, res) => {
   const profile = config.updateProfile(req.params.id, patch);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
   // Rule: extra-catalog caches can be built "from the configure" — when the
-  // toggle set changes and any enabled catalog has no cache yet, build those
-  // in the background (extras only: never burns LLM quota).
-  if (patch.catalogs && profile.keys.mdblist_api_key) {
+  // toggle set changes and any enabled, buildable catalog has no cache yet,
+  // build those in the background (extras only: never burns LLM quota).
+  if (patch.catalogs) {
     const cache = store.loadCache(profile.id);
-    const missing = catalogs.enabledExtras(profile).filter((d) => !cache.extras?.[d.id]?.metas?.length);
+    const missing = catalogs.enabledExtras(profile).filter(
+      (d) => catalogs.requirementMet(profile, d) && !cache.extras?.[d.id]?.metas?.length,
+    );
     if (missing.length) {
       rebuild.rebuildProfile(profile, console, { ai: false, extras: true })
         .catch((err) => console.error(`[extra] ${profile.name}: background build failed: ${err.message}`));
@@ -400,7 +404,16 @@ router.get('/profiles/:id/diagnose', async (req, res) => {
 router.post('/profiles/:id/rebuild', (req, res) => {
   const profile = config.getProfile(req.params.id);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
-  if (!profile.trakt_auth?.access_token && !catalogs.enabledExtras(profile).length) {
+  // Clean 400 for a fully-unconfigured profile (no Trakt, nothing the user
+  // explicitly enabled). Default-on Watch Later alone doesn't count — the
+  // user never asked for it, so don't run a rebuild that can only error.
+  // Explicitly enabled catalogs DO count even with missing requirements:
+  // the rebuild's per-catalog error results tell the user what's missing.
+  const buildable = !!profile.trakt_auth?.access_token
+    || catalogs.enabledExtras(profile).some(
+      (d) => catalogs.requirementMet(profile, d) || profile.catalogs?.[d.id] === true,
+    );
+  if (!buildable) {
     return res.status(400).json({ error: 'Connect Trakt first' });
   }
   if (rebuild.isRebuilding(profile.id)) {
