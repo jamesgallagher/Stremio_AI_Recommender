@@ -141,7 +141,31 @@ authorization, key entry) and install-URL display/QR per profile.
 
 None — design is build-ready.
 
-## v3.0.0-beta — inverted pipeline (branch `v3-phase1` ONLY)
+## v4.0.0-beta — Trakt-powered engine (branch `v3-phase1` ONLY)
+
+Supersedes the v3 pool+LLM-ranking engine below (decided 2026-07-22: the LLM
+ranking never reached "enjoyable"). New doctrine: **Trakt recommends, code
+filters, LLM guards.**
+
+- Lists come from Trakt `/recommendations` (limit 100, extended=full,
+  ignore_watchlisted; watched excluded at source). The API takes no filter
+  params — the site URL's filter bar is a VIP/site feature — so ALL profile
+  filters run locally on the returned objects: Trakt 0-10 rating floor
+  (default 6.0 = the site's 60%), statuses (movies must be released; canceled/
+  planned/in-production shows dropped; ended kept), vote floor (Trakt votes,
+  series 1/5), optional recency, genre exclusions on Trakt slugs (native
+  `anime` tag + ja fallback for the Anime filter).
+- Cross-type watched verification, CSM kids gate, bench + promote-on-watch,
+  Watch Later, extras, scrobble, encryption all unchanged.
+- The LLM's only job: a remove-only kids age goalkeeper (ACB standards,
+  structured verdicts by id, missing verdict keeps the title, total failure
+  keeps the previous list). Groq key required ONLY when age_limit > 0.
+- Retired: TMDB discover/similar pool builder, taste-profile prompts,
+  genre-weighted trim, distribution guard, cold-start discover path (thin
+  history simply yields thin/popular recs — moot if nobody is watching),
+  'tmdb' rating source. One-time migration relaxes recency to all-years.
+
+## v3.0.0-beta — inverted pipeline (SUPERSEDED by v4 above)
 
 Everything in this section applies to the beta branch, not the stable v2 line.
 Authoritative plan + locked decisions: `docs/phase1-plan.md`.

@@ -7,36 +7,33 @@ refreshes in the background (stale-while-revalidate, 24 h threshold).
 Every catalog open is instant — Stremio only ever reads the pre-computed cache.
 Rebuilds happen in the background and never purge a good list on failure.
 
-> ## ⚠ v3.0.0-beta — inverted pipeline (THIS BRANCH ONLY)
+> ## ⚠ v4.0.0-beta — Trakt-powered engine (THIS BRANCH ONLY)
 >
-> Everything in this block applies to the `v3-phase1` beta, published as
-> `:3.0.0-beta` (also `:beta`) — the stable `:latest` image (v2.6.x) is
-> unaffected. Full design + decisions: [docs/phase1-plan.md](docs/phase1-plan.md).
+> Everything in this block applies to the `v3-phase1` beta branch, published
+> as `:4.0.0-beta` (also `:beta`) — the stable `:latest` image (v2.6.x) is
+> unaffected.
 >
-> - **Code generates candidates, the LLM only ranks.** The AI catalogs are
->   built from a filtered TMDB pool (discover + recommendations/similar seeded
->   from your history), then ONE Groq call ranks it by ID. No title
->   hallucination, no retry rounds, no TMDB title-resolution step.
-> - **Groq key is a hard requirement** — no key, no run: the profile's AI
->   catalogs are disabled entirely until a key is added.
-> - **Ratings gate on IMDb** (via MDBList) by default; new Filters controls:
->   rating source and minimum vote count (series auto-use ⅕ of the floor).
-> - **Bench + promote-on-watch:** each list keeps an equal-sized hidden
->   reserve; watching a title backfills the list instantly with no LLM call.
-> - **Ranking model:** `llama-3.3-70b-versatile` primary (gpt-oss-120b cannot
->   complete the ranking payload on the free tier; kept as fallback only).
-> - **Watch Later catalog** (on by default, toggleable): mirrors the profile's
->   built-in Trakt watchlist — the list Stremio/Nuvio's long-press "add to
->   watchlist" writes to. Served in your own order, refreshed within the hour
->   of a watchlist change (via `last_activities`), watched titles pruned, no
->   taste/rating filters, kids-mode CSM gate still applies.
-> - **"Anime" exclusion filter**: our Japanese-animation pseudo-genre is now a
->   tickable excluded genre (excluding "Animation" still removes all
->   animation, anime included).
+> - **Trakt recommends, code filters, LLM guards.** The AI lists now come
+>   from Trakt's own personalized `/recommendations` (collaborative filtering
+>   over your entire history; watched excluded at source, watchlisted items
+>   excluded so Watch Later isn't duplicated). Every profile filter — rating
+>   floor, statuses (no unreleased movies, no canceled shows), genre/Anime
+>   exclusions, recency, vote floor — is enforced locally and
+>   deterministically. Lists are steadier day-to-day and improve as you watch.
+> - **Ratings default to Trakt's own 0–10** (60% = 6.0 floor; new-profile
+>   default 6.0); IMDb via MDBList remains an option. Recency defaults to all
+>   years (one-time migration relaxes existing profiles; re-tighten in the
+>   portal if wanted).
+> - **The LLM is now only the kids age goalkeeper**: for profiles with an age
+>   limit, after the strict CSM gate, Groq reviews the list against
+>   Australian (ACB) standards and can only REMOVE titles. **Groq key is
+>   required only for kids profiles** — adult pipelines make zero LLM calls.
+> - **Bench + promote-on-watch**, Watch Later (Trakt watchlist) catalog,
+>   "Anime" exclusion filter, curated MDBList extras, auto-scrobble, RPDB,
+>   and encryption all carry over unchanged.
 > - **Superseded v2 behavior notes below:** fill-to-quota LLM rounds, the
->   rolling avoid-list ("Fresh picks daily"), and generation-prompt details no
->   longer apply on this branch. Extra catalogs, kids-mode CSM gate,
->   auto-scrobble, RPDB, and encryption are unchanged.
+>   rolling avoid-list ("Fresh picks daily"), and generation-prompt details
+>   no longer apply on this branch.
 
 ## Run
 
@@ -75,8 +72,8 @@ Each profile carries its own full key set — nothing is shared.
      the device code grant)
    - a TMDB API key at [themoviedb.org/settings/api](https://www.themoviedb.org/settings/api)
    - a Groq API key at [console.groq.com/keys](https://console.groq.com/keys)
-     (free tier). **Required — without it the profile's AI catalogs are
-     disabled** (v3 beta: no key, no run)
+     (free tier). **Required only for kids profiles** (age limit set) — it
+     powers the AI age check; adult profiles never call the LLM (v4 beta)
    - an MDBList API key at [mdblist.com/preferences](https://mdblist.com/preferences/)
      (free; sign in → Preferences → API Access) — powers the extra catalogs
      and Common Sense age checks
@@ -88,7 +85,7 @@ Each profile carries its own full key set — nothing is shared.
 4. **Connect Trakt** → enter the PIN at trakt.tv/activate while signed in as
    that member's Trakt account. Tokens auto-refresh from then on.
 5. Set filters if wanted (min rating, recency window, genre exclusions —
-   defaults: ≥7.0, last 5 years, none excluded).
+   v4 defaults: Trakt rating ≥6.0, all years, none excluded).
 6. Copy the install URL from the card into Stremio/Nuvio → Addons.
    Two catalogs appear: **Movies recommended for you** and
    **Series recommended for you**.
