@@ -142,8 +142,20 @@ async function applyCsmGate(metas, type, profile, log = console) {
 }
 
 // Strip internal fields before the metas are served to Stremio.
+// Strip every internal field (any `_`-prefixed key) before serving. Generic
+// rather than a fixed list so a new pipeline field can't leak by omission.
 function cleanMetas(metas) {
-  return metas.map(({ _tmdb_id, _genre_ids, _vote_average, _vote_count, _release_date, _imdb_rating, _original_language, ...meta }) => meta);
+  return metas.map((meta) => Object.fromEntries(
+    Object.entries(meta).filter(([k]) => !k.startsWith('_')),
+  ));
+}
+
+// Judgement age (decided 2026-07-23): titles are vetted one year ABOVE the
+// profile's limit. Classification brackets are coarse — a 13-year-old's
+// material sits in the 14+ bracket — and judging exactly AT the limit rejected
+// most age-appropriate anime along with the genuinely unsuitable.
+function judgementAge(filters) {
+  return (filters.age_limit || 0) + 1;
 }
 
 // ---- v4 engine: Trakt recommends, code filters ----
@@ -192,10 +204,111 @@ function recPasses(r, type, filters, log = console) {
 // verify locally) -> optional IMDb rating gate -> kids gates (CSM + AI
 // goalkeeper) -> top list_size + equal bench in Trakt's confidence order ->
 // TMDB enrichment for the survivors only.
+// ---- v5 engine: LLM generates age-aware candidates, code verifies ----
+
+// Ask for more than we need: watched-exclusion, the rating floor and the
+// verify pass all cut into the pool, and a thin list is the acceptable
+// outcome here — a wrong one is not.
+const AI_GEN_MIN = 50;
+const AI_GEN_MAX = 60;
+
+// Deterministic filters over a resolved TMDB meta. Same intent as recPasses,
+// different source fields — TMDB carries the rating/votes/genres here, Trakt's
+// recommendation shape isn't available. Unrated (vote_average 0) passes, as
+// everywhere else: "unrated" is not the same as "below the bar".
+function aiPasses(m, type, filters) {
+  if (filters.min_rating > 0 && m._vote_average && m._vote_average < filters.min_rating) return false;
+  if ((m._vote_count || 0) < tmdb.voteFloor(filters, type)) return false;
+  if (filters.max_age_years > 0) {
+    const year = parseInt(m.releaseInfo, 10);
+    if (year && year < new Date().getFullYear() - filters.max_age_years) return false;
+  }
+  const names = (m._genre_names || []).map((g) => g.toLowerCase());
+  for (const name of filters.excluded_genres || []) {
+    if (names.includes(name.toLowerCase())) return false;
+    if (name === 'Anime' && m._original_language === 'ja' && names.includes('animation')) return false;
+  }
+  return true;
+}
+
+// Pass 1: generate, then prove. Every suggestion is resolved against TMDB, so
+// a hallucinated title dies here rather than reaching a catalog.
+async function buildAiPool(profile, type, watchedByType, watched, log) {
+  const { filters } = profile;
+  const listSize = filters.list_size || DEFAULT_LIST_SIZE;
+  const count = Math.min(AI_GEN_MAX, Math.max(AI_GEN_MIN, listSize * 3));
+  const suggestions = await llm.generateCandidates(
+    profile.keys.groq_api_key, type,
+    {
+      ageLimit: filters.age_limit > 0 ? judgementAge(filters) : 0,
+      seeds: watchedByType[type].recent || [],
+      count,
+      excludedGenres: filters.excluded_genres || [],
+    },
+    log,
+  );
+
+  const resolved = [];
+  for (let i = 0; i < suggestions.length; i += 5) {
+    const chunk = suggestions.slice(i, i + 5);
+    resolved.push(...await Promise.all(
+      chunk.map((s) => tmdb.resolveTitle(profile.keys.tmdb_api_key, type, s.title, s.year, log)),
+    ));
+  }
+  let pool = resolved.filter(Boolean);
+  const lost = suggestions.length - pool.length;
+  if (lost) log.log(`[rebuild] ${profile.name}/${type}: ${lost} suggestion(s) did not resolve on TMDB — dropped`);
+
+  // Two suggestions can resolve to the same entry (alternate titles, or the
+  // model naming a show twice).
+  const seen = new Set();
+  pool = pool.filter((m) => {
+    if (seen.has(m.id)) return false;
+    seen.add(m.id);
+    return true;
+  });
+
+  pool = pool.filter((m) => !watched.imdbIds.has(m.id) && !(m._tmdb_id && watched.tmdbIds.has(m._tmdb_id)));
+  pool = pool.filter((m) => aiPasses(m, type, filters));
+  log.log(`[rebuild] ${profile.name}/${type}: pool ${pool.length} after filters/exclusions`);
+  return pool;
+}
+
+// Pass 2: a fresh remove-only review of what survived. Separated by JOB, not
+// vendor — the verifier sees each title cold, with no investment in having
+// suggested it.
+//
+// NOTE: no CSM gate on this path, deliberately. CSM's anime coverage is thin,
+// so "unrated" is the common case there and strict mode dropped whole lists —
+// which is exactly how Ciara's catalogs emptied. Stage 3 removes it elsewhere.
+async function buildAiCatalog(profile, type, watchedByType, watched, listSize, log) {
+  const { filters } = profile;
+  let pool = await buildAiPool(profile, type, watchedByType, watched, log);
+  if (filters.age_limit > 0) {
+    const vetoed = await llm.ageGate(
+      profile.keys.groq_api_key, type, judgementAge(filters),
+      pool.map((m) => ({
+        id: m.id, title: m.name, year: m.releaseInfo,
+        genres: m._genre_names, overview: m.description,
+      })),
+      log,
+    );
+    pool = pool.filter((m) => !vetoed.has(m.id));
+  }
+  const all = cleanMetas(pool);
+  const out = { displayed: all.slice(0, listSize), bench: all.slice(listSize, listSize * 2), source: 'ai' };
+  log.log(`[rebuild] ${profile.name}/${type}: displayed (${out.displayed.length}, bench ${out.bench.length}): ${out.displayed.map((m) => m.name).join(', ')}`);
+  return out;
+}
+
 async function buildCatalog(profile, type, watchedByType, log = console) {
   const { filters } = profile;
   const listSize = filters.list_size || DEFAULT_LIST_SIZE;
   const watched = exclusionSets(watchedByType, type);
+
+  if (filters.engine === 'ai') {
+    return buildAiCatalog(profile, type, watchedByType, watched, listSize, log);
+  }
 
   const recs = await trakt.getRecommendations(profile, type, TRAKT_REC_LIMIT);
   log.log(`[rebuild] ${profile.name}/${type}: ${recs.length} Trakt recommendations`);
@@ -219,7 +332,7 @@ async function buildCatalog(profile, type, watchedByType, log = console) {
     const wrapped = pool.filter((r) => r.imdb_id).map((r) => ({ id: r.imdb_id, name: r.title, __rec: r }));
     pool = (await applyCsmGate(wrapped, type, profile, log)).map((x) => x.__rec);
     const vetoed = await llm.ageGate(
-      profile.keys.groq_api_key, type, filters.age_limit,
+      profile.keys.groq_api_key, type, judgementAge(filters),
       pool.map((r) => ({ id: r.imdb_id, title: r.title, year: r.year, genres: r.genres, certification: r.certification, overview: r.overview })),
       log,
     );
@@ -286,7 +399,7 @@ async function applyExtraAgeGate(profile, def, metas, log = console) {
     throw new Error(`Groq API key missing — required for the kids age check on "${def.name}"`);
   }
   const vetoed = await llm.ageGate(
-    profile.keys.groq_api_key, def.type, ageLimit,
+    profile.keys.groq_api_key, def.type, judgementAge(profile.filters),
     metas.map((m) => ({ id: m.id, title: m.name, year: m.releaseInfo, overview: m.description })),
     log,
   );
@@ -395,10 +508,14 @@ async function buildExtraCatalog(profile, def, log = console) {
 
 // AI catalogs (movie + series): Trakt-seeded, LLM/discover, watched-excluded.
 async function buildAiCatalogs(profile, results, log) {
-  // v4: the LLM only runs the kids-mode age goalkeeper, so the Groq key is
-  // required ONLY for profiles with an age limit. Checked before any network.
-  if (profile.filters.age_limit > 0 && !profile.keys.groq_api_key) {
-    const error = 'Groq API key missing — required for the kids-mode AI age check; AI catalogs are disabled until one is added';
+  // The Groq key is required for the kids-mode age goalkeeper AND, since v5,
+  // for the 'ai' engine itself (which is the generator, not just a gate).
+  // Checked before any network.
+  if ((profile.filters.age_limit > 0 || profile.filters.engine === 'ai') && !profile.keys.groq_api_key) {
+    const need = profile.filters.engine === 'ai'
+      ? "the 'AI' recommendation engine"
+      : 'the kids-mode AI age check';
+    const error = `Groq API key missing — required for ${need}; AI catalogs are disabled until one is added`;
     log.warn(`[rebuild] ${profile.name}: ${error}`);
     results.movie = { ok: false, error };
     results.series = { ok: false, error };
@@ -566,6 +683,8 @@ module.exports = {
   applyExtraAgeGate,
   cleanMetas,
   recPasses,
+  aiPasses,
+  judgementAge,
   isStale,
   STALE_MS,
   MIN_METAS,

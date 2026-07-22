@@ -57,6 +57,9 @@ function toMeta(item, type, imdbId, logo = null) {
     _tmdb_id: item.id,
     _original_language: item.original_language || null,
     _genre_ids: item.genre_ids || [],
+    // Names as well as ids: the v5 'ai' engine filters excluded genres by the
+    // portal's genre NAMES, and only a details call carries them.
+    _genre_names: (item.genres || []).map((g) => g.name).filter(Boolean),
     _vote_average: item.vote_average || 0,
     _vote_count: item.vote_count || 0,
     _release_date: (type === 'series' ? item.first_air_date : item.release_date) || null,
@@ -105,6 +108,29 @@ async function searchTitles(apiKey, type, query, limit = 10, log = console) {
     metas.push(...await Promise.all(chunk.map((it) => metaByTmdbId(apiKey, type, it.id, log))));
   }
   return metas.filter(Boolean);
+}
+
+// Resolve an LLM-suggested title to a real TMDB entry — the step that turns a
+// model's suggestion into something we can verify. A title that doesn't
+// resolve is dropped, so hallucinated films never reach a catalog. The year
+// disambiguates remakes; if it's wrong we retry without it rather than lose a
+// real title to a bad year.
+async function resolveTitle(apiKey, type, title, year, log = console) {
+  const endpoint = type === 'series' ? 'search/tv' : 'search/movie';
+  const base = { query: title, language: 'en-US', include_adult: false };
+  const yearKey = type === 'series' ? 'first_air_date_year' : 'primary_release_year';
+  try {
+    let results = (await get(apiKey, endpoint, year ? { ...base, [yearKey]: year } : base)).results || [];
+    if (!results.length && year) results = (await get(apiKey, endpoint, base)).results || [];
+    if (!results.length) return null;
+    const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+    const want = norm(title);
+    const exact = results.find((r) => norm(type === 'series' ? r.name : r.title) === want);
+    return await metaByTmdbId(apiKey, type, (exact || results[0]).id, log);
+  } catch (err) {
+    log.warn(`[tmdb] resolve "${title}" failed: ${err.message}`);
+    return null;
+  }
 }
 
 // ---- Metadata service (v5) ----
@@ -243,6 +269,7 @@ module.exports = {
   pickLogo,
   metaByTmdbId,
   searchTitles,
+  resolveTitle,
   findByImdbId,
   seasonAppendGroups,
   buildVideos,

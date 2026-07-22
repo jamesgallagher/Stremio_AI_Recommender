@@ -177,9 +177,17 @@ ok('config: profile CRUD + filter clamping', () => {
   assert.strictEqual(p.keys.rpdb_api_key, 't0-free-rpdb'); // free RPDB key pre-set
   assert.strictEqual(p.filters.age_limit, 0); // age gate off by default
   assert.strictEqual(p.filters.list_size, 20); // fill-to-quota default
+  assert.strictEqual(p.filters.engine, 'trakt'); // v5: existing behaviour is the default
   config.updateProfile(p.id, { filters: { min_rating: -3, excluded_genres: ['Horror'] } });
   const p2 = config.getProfile(p.id);
   assert.strictEqual(p2.filters.min_rating, 0); // clamped
+
+  // Engine is a whitelist — an unknown value must never disable the age gating
+  // that a kids profile depends on, so it falls back to trakt.
+  config.updateProfile(p.id, { filters: { engine: 'ai' } });
+  assert.strictEqual(config.getProfile(p.id).filters.engine, 'ai');
+  config.updateProfile(p.id, { filters: { engine: 'skynet' } });
+  assert.strictEqual(config.getProfile(p.id).filters.engine, 'trakt');
   assert.deepStrictEqual(p2.filters.excluded_genres, ['Horror']);
   assert.deepStrictEqual(p2.catalogs, {}); // extra catalogs default off
   config.updateProfile(p.id, { catalogs: { 'mdb-action-movies': true, 'bogus-id': true, 'mdb-popular-movies': false, 'trakt-watchlist-movies': false } });
@@ -191,9 +199,9 @@ ok('config: profile CRUD + filter clamping', () => {
   assert.strictEqual(config.getProfile(p.id), null);
 });
 
-ok('filters: cleanMetas strips internal fields (incl. _imdb_rating, _original_language)', () => {
-  const out = rebuild.cleanMetas([{ id: 'tt1', name: 'X', _tmdb_id: 9, _genre_ids: [1], _vote_average: 8, _vote_count: 10, _release_date: '2024-01-01', _imdb_rating: 7.7, _original_language: 'ja' }]);
-  assert.deepStrictEqual(Object.keys(out[0]).sort(), ['id', 'name']);
+ok('filters: cleanMetas strips every internal (_-prefixed) field', () => {
+  const out = rebuild.cleanMetas([{ id: 'tt1', name: 'X', _tmdb_id: 9, _genre_ids: [1], _vote_average: 8, _vote_count: 10, _release_date: '2024-01-01', _imdb_rating: 7.7, _original_language: 'ja', _genre_names: ['Anime'], _future_field: 1 }]);
+  assert.deepStrictEqual(Object.keys(out[0]).sort(), ['id', 'name']); // incl. fields added later
 });
 
 ok('tmdb: voteFloor scales the series floor down', () => {
@@ -268,6 +276,62 @@ ok('tmdb: pickLogo prefers English, builds URL, handles empty', () => {
   );
   assert.strictEqual(tmdb.pickLogo([]), null);
   assert.strictEqual(tmdb.pickLogo(undefined), null);
+});
+
+ok('groq: generation prompt is age-aware, carries seeds and exclusions', () => {
+  const prompt = groq.buildGeneratePrompt('series', {
+    ageLimit: 14, count: 50, excludedGenres: ['Horror'],
+    seeds: [{ title: 'Demon Slayer', year: 2019 }],
+  });
+  assert.ok(prompt.includes('14-year-old'));
+  assert.ok(prompt.includes('Australian classification standards (ACB)'));
+  assert.ok(prompt.includes('Demon Slayer (2019)'));
+  assert.ok(prompt.includes('Horror'));
+  assert.ok(/anime/i.test(prompt)); // anime gets called out — it's the failure case
+  assert.ok(prompt.includes('50'));
+
+  // Adults: no age constraint at all, and no empty-history confusion
+  const adult = groq.buildGeneratePrompt('movie', { ageLimit: 0, seeds: [], count: 50 });
+  assert.ok(!adult.includes('year-old'));
+  assert.ok(adult.includes('no watch history yet'));
+});
+
+ok('groq: parseTitles dedupes, tolerates wrappers, survives a missing year', () => {
+  const parsed = groq.parseTitles('```json\n{"results":[{"title":"Spirited Away","year":2001},'
+    + '{"title":"spirited away","year":2001},{"title":"My Neighbour Totoro"},'
+    + '{"title":"","year":1999},{"year":2000}]}\n```');
+  assert.deepStrictEqual(parsed, [
+    { title: 'Spirited Away', year: 2001 },
+    { title: 'My Neighbour Totoro', year: null }, // year is optional
+  ]);
+  assert.strictEqual(groq.parseTitles('[{"title":"A"},{"title":"B"}]', 1).length, 1); // limit honoured
+});
+
+ok('rebuild: judgement age is one year above the limit (off when no limit)', () => {
+  assert.strictEqual(rebuild.judgementAge({ age_limit: 13 }), 14);
+  assert.strictEqual(rebuild.judgementAge({ age_limit: 8 }), 9);
+  assert.strictEqual(rebuild.judgementAge({}), 1); // callers only use this when age_limit > 0
+});
+
+ok('rebuild: aiPasses filters on TMDB fields (rating, votes, genres, recency)', () => {
+  const filters = { min_rating: 6, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [] };
+  const base = { releaseInfo: '2020', _vote_average: 7.5, _vote_count: 5000, _genre_names: ['Animation'], _original_language: 'en' };
+  assert.strictEqual(rebuild.aiPasses(base, 'movie', filters), true);
+  assert.strictEqual(rebuild.aiPasses({ ...base, _vote_average: 5.1 }, 'movie', filters), false);
+  // Unrated is not "below the bar" — same semantics as the rest of the pipeline
+  assert.strictEqual(rebuild.aiPasses({ ...base, _vote_average: 0 }, 'movie', filters), true);
+  assert.strictEqual(rebuild.aiPasses({ ...base, _vote_count: 200 }, 'movie', filters), false);
+  assert.strictEqual(rebuild.aiPasses({ ...base, _vote_count: 200 }, 'series', filters), true); // series use 1/5
+
+  const noHorror = { ...filters, excluded_genres: ['Horror'] };
+  assert.strictEqual(rebuild.aiPasses({ ...base, _genre_names: ['Horror'] }, 'movie', noHorror), false);
+  // Anime is a pseudo-genre: Japanese + Animation, since TMDB has no such genre
+  const noAnime = { ...filters, excluded_genres: ['Anime'] };
+  assert.strictEqual(rebuild.aiPasses({ ...base, _original_language: 'ja' }, 'movie', noAnime), false);
+  assert.strictEqual(rebuild.aiPasses(base, 'movie', noAnime), true); // English animation stays
+
+  const recent = { ...filters, max_age_years: 5 };
+  assert.strictEqual(rebuild.aiPasses({ ...base, releaseInfo: '1999' }, 'movie', recent), false);
 });
 
 ok('tmdb: seasonAppendGroups batches seasons into one call under the API cap', () => {

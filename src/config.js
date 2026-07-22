@@ -28,7 +28,17 @@ const DEFAULT_FILTERS = {
   excluded_genres: [], // portal genre names, e.g. ["Horror", "Anime"]
   age_limit: 0, // Common Sense age gate; 0 = off. >0 requires MDBList + Groq
   list_size: 20, // displayed titles per catalog (+ an equal-sized hidden bench)
+  // Which engine generates candidates (v5):
+  //   'trakt' — Trakt /recommendations. Collaborative filtering: strong for an
+  //             adult with deep history, but structurally blind to age. A 13yo
+  //             anime watcher's nearest neighbours are ADULT anime watchers,
+  //             which is how Ciara's list filled with Elfen Lied.
+  //   'ai'    — LLM generates age-aware candidates, a second LLM pass vets
+  //             them. Slower and thinner, but age is considered at generation
+  //             time instead of being filtered afterwards.
+  engine: 'trakt',
 };
+const ENGINES = ['trakt', 'ai'];
 
 // Auto-scrobble: mirror this profile's Nuvio/Stremio watched history into
 // Trakt. Per profile (no cross-account leakage). password_enc is AES-GCM (see
@@ -98,6 +108,10 @@ function applyMigrations(p) {
     p.filters.max_age_years = 0;
     p.filters.v4_recency_relaxed = true;
   }
+  // v5: engine selection. Existing profiles keep Trakt — it works well for the
+  // adults, and silently switching everyone to a slower LLM path would be a
+  // change nobody asked for. Kids profiles get moved deliberately, in the UI.
+  if (!ENGINES.includes(p.filters.engine)) p.filters.engine = 'trakt';
   if (p.catalogs === undefined) p.catalogs = {};
   if (p.scrobble === undefined) p.scrobble = { ...DEFAULT_SCROBBLE };
 }
@@ -193,6 +207,7 @@ function updateProfile(id, patch) {
       if (f.list_size !== undefined) profile.filters.list_size = Math.min(50, Math.max(5, parseInt(f.list_size, 10) || 20));
       if (f.rating_source !== undefined) profile.filters.rating_source = f.rating_source === 'imdb' ? 'imdb' : 'trakt';
       if (f.vote_count_floor !== undefined) profile.filters.vote_count_floor = Math.max(0, parseInt(f.vote_count_floor, 10) || 0);
+      if (f.engine !== undefined) profile.filters.engine = ENGINES.includes(f.engine) ? f.engine : 'trakt';
     }
     if (patch.catalogs && typeof patch.catalogs === 'object') {
       // Only known catalog ids, coerced to booleans. False is stored

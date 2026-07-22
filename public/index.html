@@ -184,7 +184,7 @@ function render(profiles) {
     const installUrl = p.install_url;
     // RPDB is optional — excluded from the required-keys gate
     // Groq is only required for kids profiles (AI age goalkeeper)
-    const keysOk = p.keys_set.trakt_client_id && p.keys_set.trakt_client_secret && p.keys_set.tmdb_api_key && p.keys_set.mdblist_api_key && (p.filters.age_limit > 0 ? p.keys_set.groq_api_key : true);
+    const keysOk = p.keys_set.trakt_client_id && p.keys_set.trakt_client_secret && p.keys_set.tmdb_api_key && p.keys_set.mdblist_api_key && (p.filters.age_limit > 0 || p.filters.engine === 'ai' ? p.keys_set.groq_api_key : true);
     const traktKeysOk = p.keys_set.trakt_client_id && p.keys_set.trakt_client_secret;
     const badge = p.trakt_connected
       ? '<span class="badge ok">Trakt connected</span>'
@@ -230,7 +230,7 @@ function render(profiles) {
       </details>
 
       <details>
-        <summary>API keys — TMDB, MDBList, Groq &amp; RPDB ${p.keys_set.tmdb_api_key && p.keys_set.mdblist_api_key && (p.filters.age_limit > 0 ? p.keys_set.groq_api_key : true) ? '✓' : '— required'}</summary>
+        <summary>API keys — TMDB, MDBList, Groq &amp; RPDB ${p.keys_set.tmdb_api_key && p.keys_set.mdblist_api_key && (p.filters.age_limit > 0 || p.filters.engine === 'ai' ? p.keys_set.groq_api_key : true) ? '✓' : '— required'}</summary>
         <div class="muted" style="margin-top:8px">Create each key while signed in as <b>${esc(p.name)}</b>'s account on that service.</div>
         <div class="keys-list">
           <div><label>TMDB API Key
@@ -256,8 +256,14 @@ function render(profiles) {
       </details>
 
       <details>
-        <summary>Filters — min rating ${p.filters.min_rating}, ${p.filters.max_age_years > 0 ? 'last ' + p.filters.max_age_years + ' years' : 'any year'}, ${p.filters.list_size} titles${p.filters.age_limit > 0 ? ', age ' + p.filters.age_limit + '+ limit' : ''}${p.filters.excluded_genres.length ? ', ' + p.filters.excluded_genres.length + ' genres excluded' : ''}</summary>
+        <summary>Filters — ${(p.filters.engine || 'trakt') === 'ai' ? 'AI engine' : 'Trakt engine'}, min rating ${p.filters.min_rating},${p.filters.max_age_years > 0 ? 'last ' + p.filters.max_age_years + ' years' : 'any year'}, ${p.filters.list_size} titles${p.filters.age_limit > 0 ? ', age ' + p.filters.age_limit + '+ limit' : ''}${p.filters.excluded_genres.length ? ', ' + p.filters.excluded_genres.length + ' genres excluded' : ''}</summary>
         <div class="cols">
+          <div><label>Recommendation engine</label>
+            <select data-filter="engine">
+              ${[['trakt','Trakt (people like you)'],['ai','AI (age-aware)']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.engine || 'trakt') ? 'selected' : ''}>${l}</option>`).join('')}
+            </select>
+            <div class="muted" style="font-size:11px;margin-top:3px">Trakt suggests what similar viewers watched next — excellent with a deep history, but it has no concept of age, so a young viewer inherits adult neighbours' taste. AI generates candidates with the age limit applied up front, then a second AI pass vets them. AI is slower and gives shorter lists. Needs the Groq key.</div>
+            ${(p.filters.engine === 'ai') && !p.keys_set.groq_api_key ? '<div style="color:var(--err);font-size:12px;margin-top:4px">⚠ AI engine is selected but no Groq key is set — rebuilds will fail until you add one.</div>' : ''}</div>
           <div><label>Minimum rating</label>
             <select data-filter="min_rating">
               ${[0,5,5.5,6,6.5,7,7.5,8,8.5,9].map(v => `<option value="${v}" ${v === p.filters.min_rating ? 'selected' : ''}>${v === 0 ? 'No minimum' : '≥ ' + v.toFixed(1)}</option>`).join('')}
@@ -289,8 +295,10 @@ function render(profiles) {
                 ${[[5,'5+ (~G, young kids)'],[6,'6+'],[8,'8+ (~PG)'],[10,'10+'],[12,'12+'],[13,'13+ (~PG-13)'],[15,'15+ (~M)']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.age_limit || 8) ? 'selected' : ''}>${l}</option>`).join('')}
               </select>
             </div>
-            <div class="muted" style="font-size:11px;margin-top:3px">Strict: every title is checked against Common Sense Media (via MDBList). Titles CSM hasn't rated are never listed. Requires the MDBList key.</div>
-            ${p.filters.age_limit > 0 && !p.keys_set.mdblist_api_key ? '<div style="color:var(--err);font-size:12px;margin-top:4px">⚠ Age limit is on but no MDBList key is set — rebuilds will fail until you add one.</div>' : ''}
+            <div class="muted" style="font-size:11px;margin-top:3px">${(p.filters.engine || 'trakt') === 'ai'
+              ? 'On the AI engine the limit is applied twice: candidates are generated for this age, then a second AI pass removes anything unsuitable. Titles are judged one year above the limit, because classification brackets are coarse. Common Sense Media is <b>not</b> used here — its anime coverage is too thin to gate on.'
+              : 'Strict: every title is checked against Common Sense Media (via MDBList), then an AI pass. Titles CSM hasn\'t rated are never listed. Requires the MDBList key.'}</div>
+            ${p.filters.age_limit > 0 && (p.filters.engine || 'trakt') !== 'ai' && !p.keys_set.mdblist_api_key ? '<div style="color:var(--err);font-size:12px;margin-top:4px">⚠ Age limit is on but no MDBList key is set — rebuilds will fail until you add one.</div>' : ''}
           </div>
         </div>
         <label>Excluded genres <span class="muted">(ticked = never recommended)</span></label>
@@ -463,6 +471,7 @@ async function saveFilters(id) {
   const card = document.querySelector(`[data-id="${id}"]`);
   const ageOn = card.querySelector('[data-filter=age_limit_on]').checked;
   const filters = {
+    engine: card.querySelector('[data-filter=engine]').value,
     min_rating: parseFloat(card.querySelector('[data-filter=min_rating]').value),
     rating_source: card.querySelector('[data-filter=rating_source]').value,
     vote_count_floor: parseInt(card.querySelector('[data-filter=vote_count_floor]').value, 10),

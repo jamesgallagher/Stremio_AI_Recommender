@@ -110,7 +110,7 @@ async function handleSearch(profile, type, extraStr, res) {
     if (kids) {
       metas = await rebuild.applyCsmGate(metas, type, profile, console);
       const vetoed = await llm.ageGate(
-        profile.keys.groq_api_key, type, profile.filters.age_limit,
+        profile.keys.groq_api_key, type, rebuild.judgementAge(profile.filters),
         metas.map((m) => ({ id: m.id, title: m.name, year: m.releaseInfo, overview: m.description })),
         console,
       );

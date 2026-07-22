@@ -72,7 +72,24 @@ which is correct for most content and much anime, and treat mis-mapped anime
 as a follow-up rather than pre-building that complexity. Ciara is the anime
 watcher, so this is the thing to watch in testing.
 
-## Stage 2 — Engine selection + AI engine
+## Stage 2 — Engine selection + AI engine ✅ shipped v4.4.0-beta
+
+**Live-tested against Groq before shipping.** Two findings changed the build:
+
+1. **Age was being read as a target, not a ceiling.** "Suitable for a
+   14-year-old" seeded with Demon Slayer/Jujutsu Kaisen returned Powerpuff
+   Girls, CatDog and Rocket Power — compliant and useless. The prompt now
+   states the ceiling *and* that the ceiling is not the target ("recommend what
+   a 14-year-old would actually choose… do not water down the genre or tone the
+   history shows"). Re-run: Attack on Titan, Haikyuu, Promised Neverland,
+   Dr. Stone, JoJo's.
+2. **That makes the verify pass load-bearing**, which is the point. Verified at
+   14 it vetoes Attack on Titan, Promised Neverland, JoJo's, Seven Deadly Sins
+   and all three titles Trakt actually served Ciara (Elfen Lied, High School
+   DxD, Devilman Crybaby). At 9 it also drops Sword Art Online and Blue
+   Exorcist — the age genuinely moves verdicts.
+
+
 
 New per-profile `engine`. `trakt` = today's v4 pipeline, unchanged. `ai` =
 age-aware generation:
