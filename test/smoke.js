@@ -272,6 +272,30 @@ ok('crypto: seal/unseal, marker, legacy plaintext passthrough', () => {
   process.env.SECRET_KEY = orig;
 });
 
+ok('stremio: normalizeItems reads episode from video_id (not season/episode)', () => {
+  const stremio = require('../src/services/stremio');
+  const rows = [
+    { _id: 'tt1375666', type: 'movie', state: { flaggedWatched: 1, lastWatched: '2026-07-01T00:00:00.000Z' } },
+    { _id: 'tt0898266', type: 'series', state: { video_id: 'tt0898266:9:18', timesWatched: 3, lastWatched: '2026-07-10T00:00:00.000Z' } },
+    { _id: 'tt0944947', type: 'series', state: { video_id: 'tt0944947:1:1', watched: 'AQ==:1', lastWatched: '' } }, // watched via bitfield, no date
+    { _id: 'tt0000000', type: 'series', state: { video_id: 'tt0000000', timesWatched: 2 } }, // series id only -> skipped
+    { _id: 'tt1111111', type: 'series', state: { video_id: 'tt1111111:2:5' } },              // not watched -> skipped
+    { _id: 'kitsu:42', type: 'series', state: { video_id: 'kitsu:42:1:3', timesWatched: 1 } }, // non-tt -> skipped
+  ];
+  const out = stremio.normalizeItems(rows);
+  assert.strictEqual(out.length, 3);
+  assert.deepStrictEqual(out.find(x => x.imdbId === 'tt0898266'),
+    { type: 'series', imdbId: 'tt0898266', season: 9, episode: 18, watchedAtMs: Date.parse('2026-07-10T00:00:00.000Z') });
+  assert.ok(out.some(x => x.imdbId === 'tt0944947' && x.season === 1 && x.episode === 1 && x.watchedAtMs === 0));
+  assert.ok(!out.some(x => x.imdbId === 'tt0000000')); // no episode pointer
+  assert.ok(!out.some(x => x.imdbId === 'tt1111111')); // not watched
+  assert.strictEqual(out.filter(x => x.type === 'movie').length, 1);
+  // parseEpisode edge cases
+  assert.deepStrictEqual(stremio.parseEpisode({ video_id: 'tt5:2:7' }), { season: 2, episode: 7 });
+  assert.strictEqual(stremio.parseEpisode({ video_id: 'tt5' }), null);
+  assert.strictEqual(stremio.parseEpisode({}), null);
+});
+
 ok('scrobble: computeDelta excludes already-on-Trakt, groups episodes', () => {
   const { computeDelta } = require('../src/services/scrobble');
   const items = [
