@@ -140,6 +140,23 @@ ok('store: swapExtra keeps AI catalogs untouched', () => {
   store.deleteCache('p5');
 });
 
+ok('mdblist: Common Sense age comes from age_rating, not the commonsense flag', () => {
+  const { parseCommonSenseAge } = require('../src/services/mdblist');
+  // Real MDBList shape: `commonsense` is a BOOLEAN availability flag and the
+  // age is `age_rating`. Parsing the flag as the age gave NaN, so every title
+  // looked unrated and strict mode emptied entire kids catalogs.
+  assert.strictEqual(parseCommonSenseAge({ certification: 'PG', commonsense: true, age_rating: 13 }), 13);
+  assert.strictEqual(parseCommonSenseAge({ commonsense: true }), null); // flag alone is not an age
+  assert.strictEqual(parseCommonSenseAge({ commonsense: false, age_rating: 8 }), 8);
+  assert.strictEqual(parseCommonSenseAge({ age_rating: '10+' }), 10);
+  // Legacy/alternate shapes still honored
+  assert.strictEqual(parseCommonSenseAge({ commonsense: 8 }), 8);
+  assert.strictEqual(parseCommonSenseAge({ ratings: [{ source: 'commonsense', value: 13 }] }), 13);
+  assert.strictEqual(parseCommonSenseAge({ ratings: [{ source: 'imdb', value: 9 }] }), null);
+  assert.strictEqual(parseCommonSenseAge({}), null);
+  assert.strictEqual(parseCommonSenseAge(null), null);
+});
+
 ok('mdblist: IMDb rating parse from list items and media info', () => {
   const { parseImdbRating } = require('../src/services/mdblist');
   assert.strictEqual(parseImdbRating({ ratings: [{ source: 'imdb', value: 7.4 }] }), 7.4);

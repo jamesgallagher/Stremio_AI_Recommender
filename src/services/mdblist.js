@@ -8,20 +8,29 @@ const store = require('../store');
 const NOT_RATED = null;
 const CSM_TTL_MS = 30 * 24 * 3600e3; // ratings are near-static; refresh monthly
 const BATCH_SIZE = 50;
+const PER_TITLE_CAP = 25; // ceiling on the per-title fallback (quota guard)
 
+// The Common Sense age is MDBList's `age_rating` (a number). `commonsense` is
+// a BOOLEAN availability flag — reading IT as the age produced NaN, so every
+// title looked unrated and strict mode dropped entire kids catalogs. Older/
+// alternate responses did carry a numeric `commonsense`, so it's still honored
+// when it actually holds a number; the ratings array is the last resort.
 function parseCommonSenseAge(data) {
-  // Field observed as `commonsense` (number, or string like "10+"); some
-  // responses carry it in the ratings array instead. Both are CSM data.
-  const direct = data?.commonsense;
-  if (direct !== undefined && direct !== null && direct !== '') {
-    const n = parseInt(String(direct), 10);
-    if (!Number.isNaN(n)) return n;
+  if (!data) return NOT_RATED;
+  const candidates = [data.age_rating, data.agerating];
+  // Only trust `commonsense` when it's a number (or numeric string) — never
+  // the boolean flag.
+  if (typeof data.commonsense === 'number'
+    || (typeof data.commonsense === 'string' && data.commonsense.trim() !== '')) {
+    candidates.push(data.commonsense);
   }
-  const entry = (data?.ratings || []).find(
+  const entry = (data.ratings || []).find(
     (r) => r.source === 'commonsense' || r.source === 'common_sense' || r.source === 'commonsensemedia'
   );
-  if (entry && entry.value !== undefined && entry.value !== null && entry.value !== '') {
-    const n = parseInt(String(entry.value), 10);
+  if (entry) candidates.push(entry.value);
+  for (const c of candidates) {
+    if (c === undefined || c === null || c === '' || typeof c === 'boolean') continue;
+    const n = parseInt(String(c), 10);
     if (!Number.isNaN(n)) return n;
   }
   return NOT_RATED;
@@ -90,7 +99,12 @@ async function commonSenseAges(apiKey, type, imdbIds, log = console) {
       }
     }
     if (misses.length >= 5 && fetched.size && [...fetched.values()].every((v) => v === NOT_RATED)) {
-      log.warn('[csm] batch response carried no Common Sense data — falling back to per-title lookups');
+      // Diagnostic: a systemic "no CSM anywhere" result is far more likely a
+      // field-name/parse problem than genuinely-unrated titles, so name the
+      // fields the API actually returned instead of silently dropping the lot.
+      const sample = [...(await mediaInfoBatch(apiKey, type, misses.slice(0, 1))).values()][0];
+      log.warn(`[csm] batch carried no Common Sense data — sample response fields: ${sample ? Object.keys(sample).join(', ') : '(none)'}`);
+      log.warn('[csm] sampling a few titles individually to confirm (capped — a parse bug must not burn the daily quota)');
       fetched.clear();
     }
   } catch (err) {
@@ -98,8 +112,16 @@ async function commonSenseAges(apiKey, type, imdbIds, log = console) {
     fetched.clear();
   }
 
+  // Cap the per-title fallback. Uncapped, one parse/field regression turns a
+  // ~2-call batch into one call PER TITLE per catalog per profile, which is
+  // exactly what exhausted the free tier and cascaded 429s into unrelated
+  // rebuilds. Anything beyond the cap stays unknown (strict mode drops it) —
+  // degraded, but the quota survives for the other profiles.
   const remaining = misses.filter((id) => !fetched.has(id));
-  const queue = [...remaining];
+  if (remaining.length > PER_TITLE_CAP) {
+    log.warn(`[csm] ${remaining.length} titles need per-title lookups — capping at ${PER_TITLE_CAP} to protect the daily quota`);
+  }
+  const queue = remaining.slice(0, PER_TITLE_CAP);
   const workers = Array.from({ length: 5 }, async () => {
     while (queue.length) {
       const id = queue.shift();
