@@ -109,6 +109,37 @@ is config so a second vendor is a setting, not a rewrite.
 
 ## Stage 3 — Retire CSM + consolidate + ship
 
+### Added after Ciara's first AI rebuild (2026-07-23)
+
+**1. Cross-type taste seeding — the movie list's root cause.** Her series list
+came back deeply anime (Haikyu, Saiki K., Toradora, Horimiya). Her movie list
+came back Free Willy, Home Alone, Matilda, Space Jam — generic 1990s family
+films with no trace of her taste. The difference is that seeds are read
+per-type from `watchedByType[type].recent`, and she has essentially no MOVIE
+history on Trakt. With no seeds the prompt falls back to "no watch history yet
+— recommend well-regarded, widely-loved titles", and combined with an age
+ceiling that yields exactly this: a generic family-film list.
+
+Fix: when one type has too few seeds (< ~5), seed from the OTHER type, labelled
+as such ("they watch these series"). Someone who watches Haikyu and Horimiya
+should be offered Your Name, A Silent Voice and Wolf Children — not Free Willy.
+
+**2. Seed-count logging.** Nothing in the current logs reports how many seeds a
+generation ran with, which is why the above needed inference. Log it.
+
+**3. New catalog — "Anime TV-14"** (requested 2026-07-23), from the Trakt list
+`snoak/trending-anime-shows`. Needs a NEW extra-catalog source, `trakt_list`
+(today only `trakt_watchlist` and `mdblist` exist): `GET /users/{user}/lists/
+{slug}/items/shows`, authed with the profile's Trakt client id.
+Note the site-URL filters (`certifications`, `ratings`, `imdb_ratings`,
+`rt_meters`, `ignore_watched`) are **website view filters — the API does not
+apply them**, so they must be re-implemented our side: IMDb ≥ 6 via the
+existing `min_imdb`, watched-exclusion via the existing prune, and the age
+ceiling via the AI gate that already runs on every extra catalog. Target 50.
+
+### Core Stage 3 work
+
+
 - Remove the strict CSM gate from **every** surface — AI lists, extra
   catalogs, Watch Later, **and search** (otherwise search silently becomes the
   weakest surface).
