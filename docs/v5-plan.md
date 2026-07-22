@@ -111,7 +111,7 @@ is config so a second vendor is a setting, not a rewrite.
 
 ### Added after Ciara's first AI rebuild (2026-07-23)
 
-**1. Cross-type taste seeding — the movie list's root cause.** Her series list
+**1. Cross-type taste seeding ✅ shipped v4.5.0-beta.** Her series list
 came back deeply anime (Haikyu, Saiki K., Toradora, Horimiya). Her movie list
 came back Free Willy, Home Alone, Matilda, Space Jam — generic 1990s family
 films with no trace of her taste. The difference is that seeds are read
@@ -120,12 +120,20 @@ history on Trakt. With no seeds the prompt falls back to "no watch history yet
 — recommend well-regarded, widely-loved titles", and combined with an age
 ceiling that yields exactly this: a generic family-film list.
 
-Fix: when one type has too few seeds (< ~5), seed from the OTHER type, labelled
-as such ("they watch these series"). Someone who watches Haikyu and Horimiya
-should be offered Your Name, A Silent Voice and Wolf Children — not Free Willy.
+Built as a permanent **70/30 weighted blend** (`rebuild.seedsFor`) rather than
+the cold-start fallback originally planned — James's call, and the better one:
+the ratio makes the borrowing fade by itself as real history accumulates, with
+no branch and no flag to unset, and the residual 30% gives established profiles
+a second angle. 20 seeds: up to 14 own-type, remainder borrowed. No history for
+a type → 100% borrowed. Groups are rendered separately and labelled in the
+prompt; flat, the model reads "Haikyu" in a movie prompt as a film.
 
-**2. Seed-count logging.** Nothing in the current logs reports how many seeds a
-generation ran with, which is why the above needed inference. Log it.
+Verified against Groq on her real series list: Ghibli, The Girl Who Leapt
+Through Time, then Perks of Being a Wallflower / Lady Bird / Scott Pilgrim /
+Easy A — it read Horimiya + Toradora + Clannad as coming-of-age taste and
+carried it across formats. Previously: Free Willy, Home Alone, Space Jam.
+
+**2. Seed-count logging ✅ shipped** — `seeds N own + M borrowed` per type.
 
 **3. New catalog — "Anime TV-14"** (requested 2026-07-23), from the Trakt list
 `snoak/trending-anime-shows`. Needs a NEW extra-catalog source, `trakt_list`

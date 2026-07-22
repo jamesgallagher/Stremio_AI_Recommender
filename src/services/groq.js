@@ -159,11 +159,34 @@ async function ageGate(apiKey, type, ageLimit, titles, log = console) {
 // Output is a SUGGESTION, never ground truth — every title is resolved against
 // TMDB, run through the deterministic filters, and vetted by a second pass
 // before anyone sees it.
+// Seeds arrive as a weighted mix of the viewer's own history for this type and
+// borrowed history from the other type (see rebuild.seedsFor). They MUST be
+// presented as separate, labelled groups: given a flat list, the model reads
+// "Haikyu" in a movie prompt as a film and starts proposing spin-offs of
+// things that aren't films. Labelled, it makes the useful jump instead —
+// anime series in, anime films out.
+function renderSeeds(seeds, type) {
+  if (!seeds.length) return '(no watch history yet — recommend well-regarded, widely-loved titles)';
+  const label = (t) => (t === 'series' ? 'TV series' : 'films');
+  const fmt = (s) => `- ${s.title}${s.year ? ` (${s.year})` : ''}`;
+  const otherType = type === 'movie' ? 'series' : 'movie';
+  const own = seeds.filter((s) => (s.type || type) === type);
+  const other = seeds.filter((s) => (s.type || type) !== type);
+
+  const parts = [];
+  if (own.length) parts.push(`Recently watched ${label(type)}:\n${own.map(fmt).join('\n')}`);
+  if (other.length) {
+    parts.push(`Recently watched ${label(otherType)} — a different format, so read these for taste (genre, tone, sensibility), not as titles to sequel or spin off:\n${other.map(fmt).join('\n')}`);
+  }
+  if (!own.length && other.length) {
+    parts.push(`This viewer has not watched many ${label(type)} yet, so infer what they would enjoy from the ${label(otherType)} above. Do not fall back on generic crowd-pleasers — their taste is already visible.`);
+  }
+  return parts.join('\n\n');
+}
+
 function buildGeneratePrompt(type, { ageLimit = 0, seeds = [], count = 50, excludedGenres = [] } = {}) {
   const kind = type === 'series' ? 'TV series' : 'movies';
-  const seedList = seeds.length
-    ? seeds.map((s) => `- ${s.title}${s.year ? ` (${s.year})` : ''}`).join('\n')
-    : '(no watch history yet — recommend well-regarded, widely-loved titles)';
+  const seedList = renderSeeds(seeds, type);
   // The age line has to do two jobs. Left as just "suitable for a 14-year-old",
   // models read it as "safe for children" and return Powerpuff Girls to a
   // shonen-anime watcher — technically compliant, useless in practice. So it

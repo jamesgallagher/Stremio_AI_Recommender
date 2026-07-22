@@ -231,17 +231,49 @@ function aiPasses(m, type, filters) {
   return true;
 }
 
+// Taste seeds for one type's generation: mostly this viewer's own history for
+// that type, topped up from the OTHER type.
+//
+// A permanent weighted blend, not a cold-start branch, because the ratio then
+// does the fading on its own. With no movie history at all (Ciara) the movie
+// seeds are 100% borrowed from her series, and her list is useful on day one;
+// as real movie history accumulates the borrowed share is squeezed out until
+// it settles at the 70/30 floor. No flag, no special case, nothing to unset.
+// The residual 30% is deliberate even for established profiles — it's a second
+// angle that one type's history alone can never provide.
+//
+// AI engine only: Trakt's /recommendations endpoint takes no seed input, so
+// profiles on the 'trakt' engine are unaffected.
+const SEED_TARGET = 20;
+const SEED_OWN_SHARE = 0.7;
+
+function seedsFor(watchedByType, type) {
+  const other = type === 'movie' ? 'series' : 'movie';
+  const own = (watchedByType[type]?.recent || []).slice(0, Math.round(SEED_TARGET * SEED_OWN_SHARE));
+  const borrowed = (watchedByType[other]?.recent || []).slice(0, SEED_TARGET - own.length);
+  return [
+    ...own.map((s) => ({ ...s, type })),
+    ...borrowed.map((s) => ({ ...s, type: other })),
+  ];
+}
+
 // Pass 1: generate, then prove. Every suggestion is resolved against TMDB, so
 // a hallucinated title dies here rather than reaching a catalog.
 async function buildAiPool(profile, type, watchedByType, watched, log) {
   const { filters } = profile;
   const listSize = filters.list_size || DEFAULT_LIST_SIZE;
   const count = Math.min(AI_GEN_MAX, Math.max(AI_GEN_MIN, listSize * 3));
+  const seeds = seedsFor(watchedByType, type);
+  const ownSeeds = seeds.filter((s) => s.type === type).length;
+  // Seed composition explains most odd lists — a generation running on
+  // borrowed seeds looks very different from one running on its own history,
+  // and until this line existed that had to be inferred from the output.
+  log.log(`[rebuild] ${profile.name}/${type}: seeds ${ownSeeds} own + ${seeds.length - ownSeeds} borrowed`);
   const suggestions = await llm.generateCandidates(
     profile.keys.groq_api_key, type,
     {
       ageLimit: filters.age_limit > 0 ? judgementAge(filters) : 0,
-      seeds: watchedByType[type].recent || [],
+      seeds,
       count,
       excludedGenres: filters.excluded_genres || [],
     },
@@ -685,6 +717,7 @@ module.exports = {
   recPasses,
   aiPasses,
   judgementAge,
+  seedsFor,
   isStale,
   STALE_MS,
   MIN_METAS,

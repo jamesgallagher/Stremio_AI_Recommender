@@ -296,6 +296,51 @@ ok('groq: generation prompt is age-aware, carries seeds and exclusions', () => {
   assert.ok(adult.includes('no watch history yet'));
 });
 
+ok('rebuild: seedsFor weights own history 70/30 and fades borrowing with use', () => {
+  const mk = (n, p) => Array.from({ length: n }, (_, i) => ({ title: `${p}${i}`, year: 2000 + i }));
+  const split = (seeds, t) => [seeds.filter(s => s.type === t).length, seeds.filter(s => s.type !== t).length];
+
+  // Established profile: 70/30, so even a full history gets a second angle
+  let seeds = rebuild.seedsFor({ movie: { recent: mk(30, 'M') }, series: { recent: mk(30, 'S') } }, 'movie');
+  assert.deepStrictEqual(split(seeds, 'movie'), [14, 6]);
+  assert.strictEqual(seeds.length, 20);
+
+  // Ciara: no movie history at all -> 100% borrowed, and a usable list on day one
+  seeds = rebuild.seedsFor({ movie: { recent: [] }, series: { recent: mk(30, 'S') } }, 'movie');
+  assert.deepStrictEqual(split(seeds, 'movie'), [0, 20]);
+  assert.strictEqual(seeds[0].type, 'series'); // labelled, so the prompt can group them
+
+  // As she watches movies the borrowed share is squeezed out automatically —
+  // this ramp is the whole reason it's a blend and not a cold-start branch.
+  seeds = rebuild.seedsFor({ movie: { recent: mk(5, 'M') }, series: { recent: mk(30, 'S') } }, 'movie');
+  assert.deepStrictEqual(split(seeds, 'movie'), [5, 15]);
+
+  // Neither type populated, and missing types, must not throw
+  assert.deepStrictEqual(rebuild.seedsFor({ movie: {}, series: {} }, 'series'), []);
+});
+
+ok('groq: cross-type seeds render as separate labelled groups', () => {
+  const seeds = [
+    { title: 'Your Name', year: 2016, type: 'movie' },
+    { title: 'Haikyu!!', year: 2014, type: 'series' },
+  ];
+  const prompt = groq.buildGeneratePrompt('movie', { seeds, count: 50 });
+  assert.ok(prompt.includes('Recently watched films:'));
+  assert.ok(prompt.includes('Recently watched TV series'));
+  // The series group must be marked as a different format, or the model
+  // proposes spin-offs of shows instead of films
+  assert.ok(/different format/.test(prompt));
+
+  // Cold start on this type: tell it to infer, and explicitly not to fall back
+  // on crowd-pleasers — that fallback is what produced Free Willy for Ciara
+  const borrowed = groq.buildGeneratePrompt('movie', { seeds: [seeds[1]], count: 50 });
+  assert.ok(borrowed.includes('has not watched many films yet'));
+  assert.ok(borrowed.includes('generic crowd-pleasers'));
+  assert.ok(!borrowed.includes('Recently watched films:')); // no empty group
+  // Untyped seeds (older callers) still count as own-type
+  assert.ok(groq.buildGeneratePrompt('movie', { seeds: [{ title: 'X', year: 1999 }] }).includes('Recently watched films:'));
+});
+
 ok('groq: parseTitles dedupes, tolerates wrappers, survives a missing year', () => {
   const parsed = groq.parseTitles('```json\n{"results":[{"title":"Spirited Away","year":2001},'
     + '{"title":"spirited away","year":2001},{"title":"My Neighbour Totoro"},'
