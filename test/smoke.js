@@ -5,6 +5,8 @@ process.env.PORT = '7311';
 process.env.SECRET_KEY = process.env.SECRET_KEY || 'test-secret-key-do-not-use-in-prod';
 
 const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
 const store = require('../src/store');
 const config = require('../src/config');
 const rebuild = require('../src/rebuild');
@@ -268,6 +270,63 @@ ok('tmdb: pickLogo prefers English, builds URL, handles empty', () => {
   assert.strictEqual(tmdb.pickLogo(undefined), null);
 });
 
+ok('tmdb: seasonAppendGroups batches seasons into one call under the API cap', () => {
+  // The whole point: a 10-season show must cost ONE request, not eleven.
+  assert.deepStrictEqual(
+    tmdb.seasonAppendGroups([0, 1, 2, 3]),
+    ['season/0,season/1,season/2,season/3']
+  );
+  const twenty = Array.from({ length: 20 }, (_, i) => i + 1);
+  assert.strictEqual(tmdb.seasonAppendGroups(twenty).length, 1); // exactly at the cap
+  const twentyFive = Array.from({ length: 25 }, (_, i) => i + 1);
+  const groups = tmdb.seasonAppendGroups(twentyFive);
+  assert.strictEqual(groups.length, 2); // ceil(25/20)
+  assert.strictEqual(groups[1], 'season/21,season/22,season/23,season/24,season/25');
+  assert.deepStrictEqual(tmdb.seasonAppendGroups([]), []);
+});
+
+ok('tmdb: buildVideos builds playable episode ids, sorts, flags unaired', () => {
+  const now = Date.parse('2026-07-23T00:00:00Z');
+  const videos = tmdb.buildVideos([
+    {
+      id: 999, // non-season keys must be ignored
+      'season/2': { episodes: [{ season_number: 2, episode_number: 1, name: 'Later', air_date: '2030-01-01' }] },
+      'season/1': {
+        episodes: [
+          { season_number: 1, episode_number: 2, name: 'Two', air_date: '2020-05-02', still_path: '/s.jpg' },
+          { season_number: 1, episode_number: 1, name: '', air_date: '2020-05-01' },
+          { season_number: 1, episode_number: null, name: 'Junk' }, // no episode number -> dropped
+        ],
+      },
+    },
+  ], 'tt1234567', now);
+
+  assert.deepStrictEqual(videos.map(v => v.id), [
+    'tt1234567:1:1', 'tt1234567:1:2', 'tt1234567:2:1', // season then episode order
+  ]);
+  assert.strictEqual(videos[0].title, 'Episode 1'); // blank name gets a fallback
+  assert.strictEqual(videos[1].thumbnail, 'https://image.tmdb.org/t/p/w500/s.jpg');
+  assert.strictEqual(videos[0].released, '2020-05-01T00:00:00.000Z');
+  assert.strictEqual(videos[0].available, true);
+  assert.strictEqual(videos[2].available, false); // airs 2030 — not playable yet
+  assert.deepStrictEqual(tmdb.buildVideos([], 'tt1', now), []);
+});
+
+ok('store: meta cache roundtrip, per-title files, TTL expiry', () => {
+  store.saveMeta('series', 'tt0903747', { id: 'tt0903747', name: 'Cached', videos: [] }, 60000);
+  assert.strictEqual(store.loadMeta('series', 'tt0903747').name, 'Cached');
+  assert.strictEqual(store.loadMeta('movie', 'tt0903747'), null); // type-scoped
+  assert.strictEqual(store.loadMeta('series', 'tt0000000'), null); // miss
+
+  // Expired entries must not be served — a stale series meta means missing episodes
+  store.saveMeta('movie', 'tt0111161', { id: 'tt0111161', name: 'Old' }, -1);
+  assert.strictEqual(store.loadMeta('movie', 'tt0111161'), null);
+
+  // ids come off the wire: path traversal must not escape the cache dir
+  store.saveMeta('movie', '../../evil', { id: 'x' });
+  assert.ok(fs.existsSync(path.join(store.DATA_DIR, 'cache', 'meta', 'movie-evil.json')));
+});
+
 ok('crypto: encrypt/decrypt roundtrip + tamper detection', () => {
   const cr = require('../src/services/crypto');
   assert.ok(cr.encryptionAvailable());
@@ -472,7 +531,10 @@ async function httpTests() {
   assert.strictEqual(manifest.catalogs[2].name, 'Watch Later');
   assert.deepStrictEqual(manifest.catalogs[4].extraRequired, ['search']); // search-only catalog
   assert.ok(manifest.name.includes('SmokeTest'));
-  console.log('  ✓ /addon/:token/manifest.json (Watch Later on by default)');
+  // meta is what lets a device drop the third-party metadata addon that was
+  // answering search unfiltered next to our gated results
+  assert.deepStrictEqual(manifest.resources, ['catalog', 'meta']);
+  console.log('  ✓ /addon/:token/manifest.json (Watch Later on by default, serves meta)');
 
   // Admin portal API exposes full key values (for pre-filled inputs)
   const listed = (await (await fetch(`${BASE}/api/profiles`)).json()).profiles.find(pp => pp.id === profile.id);
@@ -501,6 +563,28 @@ async function httpTests() {
   assert.strictEqual(cat.cacheMaxAge, 3600); // short hint so pruned lists appear fast
   assert.strictEqual(cat.staleRevalidate, 43200);
   console.log('  ✓ seeded cache served with SWR headers');
+
+  // ---- Metadata service ----
+  // Seed the meta cache so this stays a no-network test.
+  store.saveMeta('series', 'tt0944947', {
+    id: 'tt0944947', type: 'series', name: 'Seeded Show',
+    videos: [{ id: 'tt0944947:1:1', season: 1, episode: 1, title: 'Pilot', available: true }],
+  }, 3600e3);
+  let meta = await (await fetch(`${BASE}/addon/${profile.token}/meta/series/tt0944947.json`)).json();
+  assert.strictEqual(meta.meta.id, 'tt0944947');
+  assert.strictEqual(meta.meta.videos[0].id, 'tt0944947:1:1'); // episodes = playable
+  assert.strictEqual(meta.cacheMaxAge, 43200);
+  console.log('  ✓ /meta/:type/:id.json serves cached meta with episodes');
+
+  // Non-tt ids and unknown types are ours to reject, not to guess at
+  res = await fetch(`${BASE}/addon/${profile.token}/meta/series/kitsu:123.json`);
+  assert.strictEqual(res.status, 404);
+  res = await fetch(`${BASE}/addon/${profile.token}/meta/channel/tt0944947.json`);
+  assert.strictEqual(res.status, 404);
+  // No TMDB key configured -> 404 rather than a hang or a 500
+  res = await fetch(`${BASE}/addon/${profile.token}/meta/movie/tt0111161.json`);
+  assert.strictEqual(res.status, 404);
+  console.log('  ✓ meta rejects non-tt ids, unknown types, missing key');
 
   // RPDB: setting a key rewrites poster URLs at serve time (no rebuild)
   await fetch(`${BASE}/api/profiles/${profile.id}`, {
@@ -709,7 +793,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 36 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 38 async/http).`);
   process.exit(0);
 }
 

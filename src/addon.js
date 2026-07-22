@@ -47,7 +47,7 @@ function manifestFor(profile, baseUrl = '') {
     ...(baseUrl ? { logo: `${baseUrl}/logo.png` } : {}),
     types: ['movie', 'series'],
     idPrefixes: ['tt'],
-    resources: ['catalog'],
+    resources: ['catalog', 'meta'],
     catalogs: [
       { type: 'movie', id: 'ai-recs-movies', name: CATALOGS['ai-recs-movies'].name, extra: [{ name: 'skip', isRequired: false }] },
       { type: 'series', id: 'ai-recs-series', name: CATALOGS['ai-recs-series'].name, extra: [{ name: 'skip', isRequired: false }] },
@@ -123,6 +123,46 @@ async function handleSearch(profile, type, extraStr, res) {
     return res.json({ metas: [], cacheMaxAge: 300 });
   }
 }
+
+// Metadata service. This exists so a device can run THIS addon plus a stream
+// addon and nothing else: before it, a third-party metadata addon was required
+// for playback, and that addon answered search UNFILTERED alongside our gated
+// results — the kids' age protection was only as strong as the weakest addon
+// installed next to it.
+//
+// Deliberately UNGATED by age: every discovery surface (lists, extras, search)
+// is already gated, so nothing un-vetted reaches a child's screen through us,
+// and gating here would put an LLM call in front of every title open. Opening
+// a title by direct id is not discovery.
+router.get('/meta/:type/:id', async (req, res) => {
+  const { type } = req.params;
+  const id = req.params.id.replace(/\.json$/, '');
+  const profile = req.profile;
+  if ((type !== 'movie' && type !== 'series') || !id.startsWith('tt')) {
+    return res.status(404).json({ error: 'Unknown meta' });
+  }
+  // Cache first: a cached meta is a fact about the title and needs no API key,
+  // so a profile with a broken/absent TMDB key still plays what's already known.
+  const cached = store.loadMeta(type, id);
+  if (cached) {
+    return res.json({ meta: applyRpdb([cached], profile.keys.rpdb_api_key)[0], cacheMaxAge: 43200 });
+  }
+  if (!profile.keys.tmdb_api_key) return res.status(404).json({ error: 'TMDB key not configured' });
+  try {
+    const result = await tmdb.fullMeta(profile.keys.tmdb_api_key, type, id, console);
+    if (!result) return res.status(404).json({ error: 'Not found' });
+    store.saveMeta(type, id, result.meta, result.ttlMs);
+    const eps = result.meta.videos ? ` (${result.meta.videos.length} episodes)` : '';
+    console.log(`[meta] ${profile.name}/${type} ${id}: built${eps}`);
+    return res.json({
+      meta: applyRpdb([result.meta], profile.keys.rpdb_api_key)[0],
+      cacheMaxAge: Math.floor(result.ttlMs / 1000),
+    });
+  } catch (err) {
+    console.warn(`[meta] ${profile.name}/${type} ${id} failed: ${err.message}`);
+    return res.status(404).json({ error: 'Meta unavailable' });
+  }
+});
 
 // Matches /catalog/movie/ai-recs-movies.json and .../ai-recs-movies/skip=20.json
 router.get('/catalog/:type/:catalogId{/:extra}', async (req, res) => {

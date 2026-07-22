@@ -5,9 +5,10 @@ const path = require('path');
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
 const CACHE_DIR = path.join(DATA_DIR, 'cache');
+const META_DIR = path.join(CACHE_DIR, 'meta');
 
 function ensureDirs() {
-  fs.mkdirSync(CACHE_DIR, { recursive: true });
+  fs.mkdirSync(META_DIR, { recursive: true }); // creates CACHE_DIR too
 }
 
 function readJson(file, fallback) {
@@ -135,6 +136,29 @@ function saveCsmCache(entries) {
   writeJsonAtomic(CSM_FILE, entries);
 }
 
+// ---- Meta cache (v5 metadata service) ----
+// Meta is a fact about a title, not about a profile, so it's shared. One file
+// PER TITLE rather than one big map: a series meta carries every episode, and
+// rewriting a single multi-megabyte file on every cache miss would be both
+// slow and a corruption risk. `meta` is called on every title open, so this
+// cache is what keeps the endpoint viable.
+const META_TTL_DEFAULT_MS = 7 * 24 * 3600e3;
+
+function metaFile(type, id) {
+  // ids come off the wire — keep them to a safe filename charset
+  return path.join(META_DIR, `${type}-${String(id).replace(/[^a-zA-Z0-9_-]/g, '')}.json`);
+}
+
+function loadMeta(type, id) {
+  const rec = readJson(metaFile(type, id), null);
+  if (!rec?.at || Date.now() - rec.at > (rec.ttl || META_TTL_DEFAULT_MS)) return null;
+  return rec.meta;
+}
+
+function saveMeta(type, id, meta, ttlMs) {
+  writeJsonAtomic(metaFile(type, id), { at: Date.now(), ttl: ttlMs || META_TTL_DEFAULT_MS, meta });
+}
+
 function markAttempt(profileId) {
   const cache = loadCache(profileId);
   cache.last_attempt_at = Date.now();
@@ -159,6 +183,8 @@ module.exports = {
   touchWatchedSync,
   loadCsmCache,
   saveCsmCache,
+  loadMeta,
+  saveMeta,
   markAttempt,
   deleteCache,
 };

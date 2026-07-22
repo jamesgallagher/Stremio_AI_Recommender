@@ -107,6 +107,135 @@ async function searchTitles(apiKey, type, query, limit = 10, log = console) {
   return metas.filter(Boolean);
 }
 
+// ---- Metadata service (v5) ----
+// Full Stremio `meta` objects so a device can run THIS addon + a stream addon
+// only — no third-party metadata addon answering search unfiltered next to our
+// gated results.
+const IMG = 'https://image.tmdb.org/t/p';
+const META_TTL_STATIC_MS = 7 * 24 * 3600e3; // movies, ended series
+const META_TTL_LIVE_MS = 24 * 3600e3;       // returning series (new episodes land)
+
+// tt id -> TMDB id.
+async function findByImdbId(apiKey, type, imdbId) {
+  const data = await get(apiKey, `find/${imdbId}`, { external_source: 'imdb_id' });
+  const arr = type === 'series' ? data.tv_results : data.movie_results;
+  return arr?.[0]?.id || null;
+}
+
+// TMDB accepts up to 20 append_to_response items, so a show's ENTIRE season
+// list usually arrives in one request ("season/1,season/2,…") — a 10-season
+// show costs 1 call, not 11. >20 seasons chunks into ceil(n/20).
+// (Strategy borrowed from cedya77/aiometadata's genSeasonsString.)
+function seasonAppendGroups(seasonNumbers, size = 20) {
+  const groups = [];
+  for (let i = 0; i < seasonNumbers.length; i += size) {
+    groups.push(seasonNumbers.slice(i, i + size).map((n) => `season/${n}`).join(','));
+  }
+  return groups;
+}
+
+// Flatten TMDB season payloads into Stremio's `videos` array — the thing that
+// actually makes episodes playable. `available` marks whether an episode has
+// aired, so unaired ones don't present as playable.
+function buildVideos(seasonPayloads, imdbId, nowMs = Date.now()) {
+  const videos = [];
+  for (const payload of seasonPayloads) {
+    for (const [key, season] of Object.entries(payload || {})) {
+      if (!key.startsWith('season/') || !Array.isArray(season?.episodes)) continue;
+      for (const ep of season.episodes) {
+        if (!Number.isInteger(ep.season_number) || !Number.isInteger(ep.episode_number)) continue;
+        const parsed = ep.air_date ? Date.parse(`${ep.air_date}T00:00:00Z`) : NaN;
+        const ts = Number.isNaN(parsed) ? null : parsed;
+        videos.push({
+          id: `${imdbId}:${ep.season_number}:${ep.episode_number}`,
+          title: ep.name || `Episode ${ep.episode_number}`,
+          season: ep.season_number,
+          episode: ep.episode_number,
+          released: ts ? new Date(ts).toISOString() : null,
+          available: ts ? ts <= nowMs : false,
+          overview: ep.overview || '',
+          thumbnail: ep.still_path ? `${IMG}/w500${ep.still_path}` : null,
+        });
+      }
+    }
+  }
+  return videos.sort((a, b) => a.season - b.season || a.episode - b.episode);
+}
+
+const peopleNames = (list, limit) => (list || []).slice(0, limit).map((p) => p.name).filter(Boolean);
+const crewNames = (crew, job) => (crew || []).filter((c) => c.job === job).map((c) => c.name);
+const trailerStreams = (vids) => (vids?.results || [])
+  .filter((v) => v.site === 'YouTube' && /trailer/i.test(v.type || ''))
+  .slice(0, 3)
+  .map((v) => ({ title: v.name, ytId: v.key }));
+
+function commonMeta(d, type, imdbId) {
+  const date = type === 'series' ? d.first_air_date : d.release_date;
+  return {
+    id: imdbId,
+    type,
+    name: type === 'series' ? d.name : d.title,
+    poster: d.poster_path ? `${IMG}/w500${d.poster_path}` : null,
+    background: d.backdrop_path ? `${IMG}/original${d.backdrop_path}` : null,
+    logo: pickLogo(d.images?.logos),
+    description: d.overview || '',
+    releaseInfo: date ? date.substring(0, 4) : null,
+    released: date ? new Date(`${date}T00:00:00Z`).toISOString() : null,
+    imdbRating: d.vote_average ? d.vote_average.toFixed(1) : null,
+    genres: (d.genres || []).map((g) => g.name),
+    cast: peopleNames(d.credits?.cast, 10),
+    country: d.production_countries?.[0]?.name || null,
+    trailerStreams: trailerStreams(d.videos),
+  };
+}
+
+// Full meta for a tt id. Returns { meta, ttlMs } or null when TMDB can't
+// resolve it. One request for movies; for series, one for the show plus the
+// batched season group(s).
+async function fullMeta(apiKey, type, imdbId, log = console) {
+  const tmdbId = await findByImdbId(apiKey, type, imdbId);
+  if (!tmdbId) {
+    log.warn(`[meta] TMDB has no ${type} for ${imdbId}`);
+    return null;
+  }
+  if (type === 'movie') {
+    const d = await get(apiKey, `movie/${tmdbId}`, {
+      language: 'en-US',
+      append_to_response: 'credits,external_ids,images,release_dates,videos',
+      include_image_language: 'en,null',
+    });
+    return {
+      meta: {
+        ...commonMeta(d, 'movie', imdbId),
+        director: crewNames(d.credits?.crew, 'Director'),
+        writer: crewNames(d.credits?.crew, 'Writer'),
+        runtime: d.runtime ? `${d.runtime} min` : null,
+      },
+      ttlMs: META_TTL_STATIC_MS,
+    };
+  }
+  const d = await get(apiKey, `tv/${tmdbId}`, {
+    language: 'en-US',
+    append_to_response: 'credits,external_ids,images,content_ratings,videos',
+    include_image_language: 'en,null',
+  });
+  const seasonNumbers = (d.seasons || []).map((s) => s.season_number).filter((n) => Number.isInteger(n));
+  const payloads = await Promise.all(
+    seasonAppendGroups(seasonNumbers).map((g) => get(apiKey, `tv/${tmdbId}`, { language: 'en-US', append_to_response: g })),
+  );
+  const returning = /returning|in production/i.test(d.status || '');
+  return {
+    meta: {
+      ...commonMeta(d, 'series', imdbId),
+      director: peopleNames(d.created_by, 5),
+      writer: peopleNames(d.created_by, 5),
+      runtime: d.episode_run_time?.[0] ? `${d.episode_run_time[0]} min` : null,
+      videos: buildVideos(payloads, imdbId),
+    },
+    ttlMs: returning ? META_TTL_LIVE_MS : META_TTL_STATIC_MS,
+  };
+}
+
 module.exports = {
   GENRE_ALIASES,
   voteFloor,
@@ -114,4 +243,8 @@ module.exports = {
   pickLogo,
   metaByTmdbId,
   searchTitles,
+  findByImdbId,
+  seasonAppendGroups,
+  buildVideos,
+  fullMeta,
 };
