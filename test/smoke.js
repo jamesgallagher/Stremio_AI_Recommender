@@ -314,6 +314,10 @@ ok('scrobble: computeDelta excludes already-on-Trakt, groups episodes', () => {
   assert.deepStrictEqual(body.shows[0].seasons[0].episodes.map(e => e.number), [3]);
   // nothing missing -> null
   assert.strictEqual(computeDelta(items, new Set(['tt1', 'tt2', 'tt3']), new Set(['tt9:1:2', 'tt9:1:3'])), null);
+  // full rebuild = empty exclusion sets -> everything is pushed (nothing dropped)
+  const fullBody = computeDelta(items, new Set(), new Set());
+  assert.deepStrictEqual(fullBody.movies.map(m => m.ids.imdb).sort(), ['tt1', 'tt2', 'tt3']);
+  assert.deepStrictEqual(fullBody.shows[0].seasons[0].episodes.map(e => e.number).sort(), [2, 3]);
 });
 
 ok('config: scrobble defaults, migration, provider whitelist', () => {

@@ -353,7 +353,8 @@ function render(profiles) {
         </div>
         <div style="margin-top:12px" class="row">
           <button onclick="saveScrobble('${p.id}')">Save</button>
-          ${p.scrobble.enabled && p.trakt_connected ? `<button class="ghost" onclick="syncScrobble('${p.id}', this)">Sync now</button>` : ''}
+          ${p.scrobble.enabled && p.trakt_connected ? `<button class="ghost" onclick="syncScrobble('${p.id}', this, false)">Sync now</button>
+          <button class="ghost" onclick="syncScrobble('${p.id}', this, true)" title="Re-push this account's entire watched history to Trakt, ignoring what's already there (Trakt re-marks them watched — harmless)">Full rebuild</button>` : ''}
           <span class="muted"> — runs hourly; needs Trakt connected above</span>
         </div>
       </details>
@@ -548,14 +549,18 @@ async function saveScrobble(id) {
   }
 }
 
-async function syncScrobble(id, btn) {
+async function syncScrobble(id, btn, full) {
+  if (full && !confirm('Full rebuild: re-push this account\'s ENTIRE watched history to Trakt, ignoring what\'s already there. Trakt re-marks them as watched. Continue?')) return;
   btn.disabled = true;
   const orig = btn.textContent;
-  btn.textContent = 'Syncing…';
+  btn.textContent = full ? 'Rebuilding…' : 'Syncing…';
   try {
-    const { result } = await api(`/profiles/${id}/scrobble/sync`, { method: 'POST' });
+    const { result } = await api(`/profiles/${id}/scrobble/sync${full ? '?full=true' : ''}`, { method: 'POST' });
     if (result.skipped) toast('Sync skipped: ' + result.skipped);
-    else toast(`Scrobbled ${result.added.movies} movie(s) + ${result.added.episodes} episode(s) to Trakt`);
+    else {
+      const b = result.pulledBreakdown;
+      toast(`Pulled ${b ? b.movies + ' movies + ' + b.series + ' episodes' : result.pulled + ' items'} · added ${result.added.movies} movie(s) + ${result.added.episodes} episode(s) to Trakt`);
+    }
   } catch (err) {
     toast('Sync failed: ' + err.message);
   }

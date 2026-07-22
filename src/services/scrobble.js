@@ -70,26 +70,36 @@ async function pullProviderWatched(cfg) {
 }
 
 // One reconcile pass. Returns { pulled, added } or { skipped } / throws.
-async function syncProfile(profile, log = console) {
+// full=true ignores what's already on Trakt and re-pushes the provider's
+// ENTIRE watched list (Trakt de-dupes/re-marks; harmless). Doubles as a
+// diagnostic — the logged pull breakdown shows whether series are pulled at all.
+async function syncProfile(profile, log = console, { full = false } = {}) {
   const cfg = profile.scrobble;
   if (!cfg?.enabled) return { skipped: 'disabled' };
   if (!cfg.password_enc) return { skipped: 'no credentials' };
   if (!profile.trakt_auth?.access_token) return { skipped: 'trakt not connected' };
 
   const items = await pullProviderWatched(cfg);
-  const [watchedMovieIds, watchedEpisodeKeys] = await Promise.all([
-    trakt.getWatchedMovieImdbIds(profile),
-    trakt.getWatchedEpisodeKeys(profile),
-  ]);
+  const pulled = {
+    movies: items.filter((i) => i.type === 'movie').length,
+    series: items.filter((i) => i.type === 'series').length,
+  };
+  log.log(`[scrobble] ${profile.name}: pulled ${items.length} from ${cfg.provider} (${pulled.movies} movies, ${pulled.series} episodes)${full ? ' — FULL REBUILD' : ''}`);
+
+  // Full rebuild pushes everything (empty exclusion sets); normal sync only
+  // pushes what Trakt is missing.
+  const [watchedMovieIds, watchedEpisodeKeys] = full
+    ? [new Set(), new Set()]
+    : await Promise.all([trakt.getWatchedMovieImdbIds(profile), trakt.getWatchedEpisodeKeys(profile)]);
   const body = computeDelta(items, watchedMovieIds, watchedEpisodeKeys);
   if (!body) {
-    log.log(`[scrobble] ${profile.name}: nothing new to scrobble (${items.length} watched items, all already on Trakt)`);
-    return { pulled: items.length, added: { movies: 0, episodes: 0 } };
+    log.log(`[scrobble] ${profile.name}: nothing to scrobble (all ${items.length} watched items already on Trakt)`);
+    return { pulled: items.length, pulledBreakdown: pulled, added: { movies: 0, episodes: 0 } };
   }
   const res = await trakt.addToHistory(profile, body);
   const added = { movies: res?.added?.movies || 0, episodes: res?.added?.episodes || 0 };
-  log.log(`[scrobble] ${profile.name}: added ${added.movies} movie(s) + ${added.episodes} episode(s) to Trakt from ${cfg.provider}`);
-  return { pulled: items.length, added };
+  log.log(`[scrobble] ${profile.name}: added ${added.movies} movie(s) + ${added.episodes} episode(s) to Trakt from ${cfg.provider}${full ? ' (full rebuild)' : ''}`);
+  return { pulled: items.length, pulledBreakdown: pulled, added };
 }
 
 // Fire-and-forget hourly reconcile (called from the scheduler tick). Guarded by

@@ -451,13 +451,16 @@ router.post('/profiles/:id/scrobble/test', async (req, res) => {
 
 // Run a scrobble reconcile now (manual trigger). Fire-and-forget: the pull +
 // Trakt push can take a while, same reasoning as Rebuild now.
+// full=true (query or body) re-pushes the provider's entire watched list,
+// ignoring what Trakt already has — the "Full rebuild" button.
 router.post('/profiles/:id/scrobble/sync', async (req, res) => {
   const profile = config.getProfile(req.params.id);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
   if (!profile.scrobble?.enabled) return res.status(400).json({ error: 'Auto-scrobble is not enabled for this profile' });
   if (!profile.trakt_auth?.access_token) return res.status(400).json({ error: 'Connect Trakt first' });
+  const full = req.query.full === 'true' || req.body?.full === true;
   try {
-    const result = await scrobble.syncProfile(profile);
+    const result = await scrobble.syncProfile(profile, console, { full });
     res.json({ result });
   } catch (err) {
     res.status(502).json({ error: err.message });
