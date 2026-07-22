@@ -246,11 +246,20 @@ function aiPasses(m, type, filters) {
 // profiles on the 'trakt' engine are unaffected.
 const SEED_TARGET = 20;
 const SEED_OWN_SHARE = 0.7;
+const SEED_COLD_START = 3; // below this, a type has no usable signal of its own
 
 function seedsFor(watchedByType, type) {
   const other = type === 'movie' ? 'series' : 'movie';
   const own = (watchedByType[type]?.recent || []).slice(0, Math.round(SEED_TARGET * SEED_OWN_SHARE));
-  const borrowed = (watchedByType[other]?.recent || []).slice(0, SEED_TARGET - own.length);
+  const otherAll = watchedByType[other]?.recent || [];
+  // 70/30 is a RATIO, not a quota to fill. Backfilling to 20 whenever own
+  // history was short swamped it: Ciara's 7 anime series seeds were topped up
+  // with 13 family-film seeds and the list came back Bakugan and Sofia the
+  // First. Seven on-taste seeds beat twenty off-taste ones, so a short own
+  // history yields a short seed list — borrowing scales down with it.
+  const borrowed = own.length >= SEED_COLD_START
+    ? otherAll.slice(0, Math.round(own.length * (1 - SEED_OWN_SHARE) / SEED_OWN_SHARE))
+    : otherAll.slice(0, SEED_TARGET - own.length); // genuine cold start: borrow freely
   return [
     ...own.map((s) => ({ ...s, type })),
     ...borrowed.map((s) => ({ ...s, type: other })),

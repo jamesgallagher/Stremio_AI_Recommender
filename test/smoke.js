@@ -310,10 +310,17 @@ ok('rebuild: seedsFor weights own history 70/30 and fades borrowing with use', (
   assert.deepStrictEqual(split(seeds, 'movie'), [0, 20]);
   assert.strictEqual(seeds[0].type, 'series'); // labelled, so the prompt can group them
 
-  // As she watches movies the borrowed share is squeezed out automatically —
-  // this ramp is the whole reason it's a blend and not a cold-start branch.
-  seeds = rebuild.seedsFor({ movie: { recent: mk(5, 'M') }, series: { recent: mk(30, 'S') } }, 'movie');
-  assert.deepStrictEqual(split(seeds, 'movie'), [5, 15]);
+  // A SHORT but real history must not be swamped: 7 on-taste seeds beat 20
+  // off-taste ones. Backfilling to 20 here turned Ciara's anime series list
+  // into Bakugan and Sofia the First.
+  seeds = rebuild.seedsFor({ movie: { recent: mk(30, 'M') }, series: { recent: mk(7, 'S') } }, 'series');
+  assert.deepStrictEqual(split(seeds, 'series'), [7, 3]); // still 70/30, just smaller
+  seeds = rebuild.seedsFor({ movie: { recent: mk(30, 'M') }, series: { recent: mk(5, 'S') } }, 'series');
+  assert.deepStrictEqual(split(seeds, 'series'), [5, 2]);
+
+  // Only a genuine cold start (< 3) borrows beyond the 30% share
+  seeds = rebuild.seedsFor({ movie: { recent: mk(30, 'M') }, series: { recent: mk(2, 'S') } }, 'series');
+  assert.deepStrictEqual(split(seeds, 'series'), [2, 18]);
 
   // Neither type populated, and missing types, must not throw
   assert.deepStrictEqual(rebuild.seedsFor({ movie: {}, series: {} }, 'series'), []);
@@ -632,14 +639,26 @@ async function httpTests() {
   // Manifest via install token — AI catalogs + default-on Watch Later
   const manifest = await (await fetch(`${BASE}/addon/${profile.token}/manifest.json`)).json();
   assert.strictEqual(manifest.version, pkgVersion); // manifest version from package.json
+  // An empty Watch Later is dropped rather than advertised as a permanent
+  // "warming up" row — its list mirrors the Trakt watchlist, so empty is a
+  // real and lasting state, not a pending one.
   assert.deepStrictEqual(
     manifest.catalogs.map(c => c.id),
-    ['ai-recs-movies', 'ai-recs-series', 'trakt-watchlist-movies', 'trakt-watchlist-series', 'ai-search-movies', 'ai-search-series']
+    ['ai-recs-movies', 'ai-recs-series', 'ai-search-movies', 'ai-search-series']
   );
   assert.strictEqual(manifest.catalogs[0].name, 'Movies recommended for you');
-  assert.strictEqual(manifest.catalogs[2].name, 'Watch Later');
-  assert.deepStrictEqual(manifest.catalogs[4].extraRequired, ['search']); // search-only catalog
+  assert.deepStrictEqual(manifest.catalogs[2].extraRequired, ['search']); // search-only catalog
   assert.ok(manifest.name.includes('SmokeTest'));
+  // ...and it comes back once the watchlist actually has something in it
+  store.swapExtra(profile.id, 'trakt-watchlist-movies', [{ id: 'tt0111161', type: 'movie', name: 'Later' }]);
+  const withLater = await (await fetch(`${BASE}/addon/${profile.token}/manifest.json`)).json();
+  assert.ok(withLater.catalogs.some(c => c.id === 'trakt-watchlist-movies'));
+  assert.ok(!withLater.catalogs.some(c => c.id === 'trakt-watchlist-series')); // still empty
+  // A client holding a cached manifest may still ask for the empty one:
+  // answer with nothing, not a warming-up card.
+  const emptyLater = await (await fetch(`${BASE}/addon/${profile.token}/catalog/series/trakt-watchlist-series.json`)).json();
+  assert.deepStrictEqual(emptyLater.metas, []);
+  store.swapExtra(profile.id, 'trakt-watchlist-movies', []); // restore for later assertions
   // meta is what lets a device drop the third-party metadata addon that was
   // answering search unfiltered next to our gated results
   assert.deepStrictEqual(manifest.resources, ['catalog', 'meta']);
@@ -781,21 +800,25 @@ async function httpTests() {
   assert.deepStrictEqual(p2u.catalogs, { 'mdb-action-movies': true, 'mdb-popular-series': true });
   console.log('  ✓ PUT /api/profiles/:id catalogs persisted');
 
-  // Manifest now advertises AI + Watch Later (default-on) + enabled extras
+  // Manifest advertises AI + enabled extras. Watch Later is default-on but
+  // empty here, so it's dropped; MDBList extras are kept while empty (empty
+  // there means not-built-yet, and the warming-up card is the right answer).
   const man2 = await (await fetch(`${BASE}/addon/${p2.token}/manifest.json`)).json();
   assert.deepStrictEqual(
     man2.catalogs.map(c => c.id),
     // AI first, then extras in registry order (stable regardless of toggle order)
-    ['ai-recs-movies', 'ai-recs-series', 'trakt-watchlist-movies', 'trakt-watchlist-series', 'mdb-popular-series', 'mdb-action-movies', 'ai-search-movies', 'ai-search-series']
+    ['ai-recs-movies', 'ai-recs-series', 'mdb-popular-series', 'mdb-action-movies', 'ai-search-movies', 'ai-search-series']
   );
   assert.strictEqual(man2.catalogs.find(c => c.id === 'mdb-popular-series').type, 'series');
   console.log('  ✓ manifest includes enabled extra catalogs');
 
-  // Watch Later without Trakt -> setup card pointing at Trakt
+  // Watch Later without Trakt: dropped from the manifest, and answers empty
+  // rather than a card. The card told users to connect Trakt, but the row it
+  // appeared on no longer exists — the configure portal is where that state is
+  // surfaced now.
   let wcat = await (await fetch(`${BASE}/addon/${p2.token}/catalog/movie/trakt-watchlist-movies.json`)).json();
-  assert.strictEqual(wcat.metas.length, 1);
-  assert.ok(wcat.metas[0].description.includes('Trakt'));
-  console.log('  ✓ Watch Later without Trakt serves setup card');
+  assert.deepStrictEqual(wcat.metas, []);
+  console.log('  ✓ empty Watch Later serves nothing, not a placeholder card');
 
   // Watch Later IS pruned by watched status (unlike curated extras)
   store.swapExtra(p2.id, 'trakt-watchlist-movies', [

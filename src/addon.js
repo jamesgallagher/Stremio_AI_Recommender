@@ -38,6 +38,19 @@ function applyRpdb(metas, rpdbKey) {
     : m));
 }
 
+// Watch Later mirrors the Trakt watchlist, so "empty" is a normal, lasting
+// state — not a list still warming up. Advertising it anyway puts a permanent
+// placeholder row on the home screen, so an empty one is dropped from the
+// manifest entirely. Curated MDBList catalogs are NOT dropped: empty there
+// means not-built-yet, and the warming-up card is the right answer.
+//
+// Trade-off: clients cache the manifest, so a watchlist that later gains its
+// first title may not show the row again until the addon is reloaded.
+function hasContent(profile, def) {
+  if (def.source !== 'trakt_watchlist') return true;
+  return (store.loadCache(profile.id).extras?.[def.id]?.metas || []).length > 0;
+}
+
 function manifestFor(profile, baseUrl = '') {
   return {
     id: `au.com.jscc.airecommender.${profile.id.substring(0, 8)}`,
@@ -51,7 +64,7 @@ function manifestFor(profile, baseUrl = '') {
     catalogs: [
       { type: 'movie', id: 'ai-recs-movies', name: CATALOGS['ai-recs-movies'].name, extra: [{ name: 'skip', isRequired: false }] },
       { type: 'series', id: 'ai-recs-series', name: CATALOGS['ai-recs-series'].name, extra: [{ name: 'skip', isRequired: false }] },
-      ...catalogs.enabledExtras(profile).map((d) => (
+      ...catalogs.enabledExtras(profile).filter((d) => hasContent(profile, d)).map((d) => (
         { type: d.type, id: d.id, name: d.name, extra: [{ name: 'skip', isRequired: false }] }
       )),
       ...Object.entries(SEARCH_CATALOGS).map(([id, s]) => ({
@@ -194,6 +207,12 @@ router.get('/catalog/:type/:catalogId{/:extra}', async (req, res) => {
   const entry = extraDef ? cache.extras?.[extraDef.id] : cache[def.type];
 
   if (!entry || !entry.metas.length) {
+    // An empty Watch Later is a real state, not a pending one — it's dropped
+    // from the manifest, but a client with a cached manifest can still ask for
+    // it. Answer honestly with nothing rather than a warming-up placeholder.
+    if (extraDef?.source === 'trakt_watchlist') {
+      return res.json({ metas: [], cacheMaxAge: 5 * 60 });
+    }
     // Nothing cached yet (first install / not onboarded) — friendly card, short client cache
     const description = extraDef
       ? (extraDef.source === 'trakt_watchlist'
