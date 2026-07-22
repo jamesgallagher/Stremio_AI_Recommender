@@ -102,7 +102,7 @@ router.get('/genres', (req, res) => {
 router.get('/catalogs', (req, res) => {
   res.json({
     catalogs: catalogs.EXTRA_CATALOGS.map(
-      ({ id, type, name, min_imdb, source, default_on }) => ({ id, type, name, min_imdb, source, default_on: !!default_on }),
+      ({ id, type, name, min_imdb, source, default_on, target }) => ({ id, type, name, min_imdb, source, default_on: !!default_on, target: target || 20 }),
     ),
   });
 });

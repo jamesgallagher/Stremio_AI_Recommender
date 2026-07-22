@@ -97,7 +97,16 @@ ok('trakt: recommendations parse — fields, wrapped shapes, dropped junk', () =
 
 ok('catalogs: registry, defaults, and per-source requirements', () => {
   const catalogs = require('../src/catalogs');
-  assert.strictEqual(catalogs.EXTRA_CATALOGS.length, 8);
+  assert.strictEqual(catalogs.EXTRA_CATALOGS.length, 10);
+  // Kids lists: 50 titles, rating-gated at 6.0 (the site's "60"), off by default
+  const kidsM = catalogs.getExtra('mdb-kids-movies');
+  const kidsS = catalogs.getExtra('mdb-kids-series');
+  assert.strictEqual(kidsM.target, 50);
+  assert.strictEqual(kidsS.target, 50);
+  assert.strictEqual(kidsM.min_imdb, 6);
+  assert.strictEqual(kidsS.type, 'series');
+  assert.ok(!kidsM.default_on && !kidsS.default_on); // opt-in per profile
+  assert.strictEqual(catalogs.getExtra('mdb-action-movies').target, undefined); // others keep the 20 default
   const ids = catalogs.EXTRA_CATALOGS.map(d => d.id);
   assert.strictEqual(new Set(ids).size, ids.length);
   assert.ok(catalogs.EXTRA_CATALOGS.every(d => d.type === 'movie' || d.type === 'series'));
@@ -397,6 +406,20 @@ async function httpTests() {
   store.deleteCache('no-groq-test');
   console.log('  ✓ kids profile without Groq key disabled (no network)');
 
+  // Extra-catalog age gate: adult profiles untouched (no LLM), kids profiles
+  // without a Groq key FAIL CLOSED (caller keeps the previous list rather than
+  // publishing an unvetted one). No network in either path.
+  const def = require('../src/catalogs').getExtra('mdb-kids-movies');
+  const metas = [{ id: 'tt1', name: 'A' }, { id: 'tt2', name: 'B' }];
+  const quiet = { log() {}, warn() {} };
+  assert.deepStrictEqual(
+    await rebuildMod.applyExtraAgeGate({ name: 'Adult', filters: { age_limit: 0 }, keys: {} }, def, metas, quiet),
+    metas); // no age limit -> passthrough
+  await assert.rejects(
+    () => rebuildMod.applyExtraAgeGate({ name: 'Kid', filters: { age_limit: 8 }, keys: {} }, def, metas, quiet),
+    /Groq API key missing/);
+  console.log('  ✓ extra-catalog age gate: passthrough for adults, fail-closed for kids');
+
   await new Promise(r => setTimeout(r, 400)); // let server bind
 
   const health = await (await fetch(`${BASE}/health`)).json();
@@ -523,7 +546,7 @@ async function httpTests() {
 
   // ---- Extra catalogs (second profile keeps earlier assertions intact) ----
   const defs = await (await fetch(`${BASE}/api/catalogs`)).json();
-  assert.strictEqual(defs.catalogs.length, 8);
+  assert.strictEqual(defs.catalogs.length, 10);
   assert.ok(defs.catalogs.some(c => c.id === 'mdb-popular-series' && c.type === 'series'));
   assert.ok(defs.catalogs.some(c => c.id === 'trakt-watchlist-movies' && c.source === 'trakt_watchlist' && c.default_on === true));
   console.log('  ✓ GET /api/catalogs lists extra-catalog definitions');
@@ -669,7 +692,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 35 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 36 async/http).`);
   process.exit(0);
 }
 

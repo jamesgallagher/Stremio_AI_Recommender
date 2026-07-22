@@ -40,8 +40,8 @@ const MIN_METAS = 5;
 const DEFAULT_LIST_SIZE = 20;
 // Bench (hidden reserve) is always the same size as the displayed list.
 const TRAKT_REC_LIMIT = 100;     // /recommendations max; no pagination exists
-const EXTRA_LIST_TARGET = 20; // extra catalogs are fixed at 20 titles
-const MAX_EXTRA_PAGES = 5;
+const EXTRA_LIST_TARGET = 20; // default extra-catalog size (per-catalog `target` overrides)
+const MAX_EXTRA_PAGES = 8;    // headroom for the larger (50-title) kids lists
 const EXTRA_PAGE_SIZE = 50;
 
 const locks = new Set(); // profile ids currently rebuilding
@@ -274,6 +274,29 @@ function shuffle(arr) {
 // minimal tt-id meta (RPDB fills the poster at serve time).
 const WATCHLIST_CAP = 100;
 
+// Second age layer for EVERY extra catalog on an age-limited profile — the
+// same remove-only AI goalkeeper the AI lists and search use, after the strict
+// CSM gate. Adult profiles are untouched (no LLM call). FAIL-CLOSED: without a
+// Groq key, or if the gate errors, the caller keeps the previous list rather
+// than publishing an unvetted one to a child.
+async function applyExtraAgeGate(profile, def, metas, log = console) {
+  const ageLimit = profile.filters?.age_limit || 0;
+  if (ageLimit <= 0 || !metas.length) return metas;
+  if (!profile.keys.groq_api_key) {
+    throw new Error(`Groq API key missing — required for the kids age check on "${def.name}"`);
+  }
+  const vetoed = await llm.ageGate(
+    profile.keys.groq_api_key, def.type, ageLimit,
+    metas.map((m) => ({ id: m.id, title: m.name, year: m.releaseInfo, overview: m.description })),
+    log,
+  );
+  const out = metas.filter((m) => !vetoed.has(m.id));
+  if (vetoed.size) {
+    log.log(`[extra] ${profile.name}/${def.id}: AI age gate removed ${vetoed.size} of ${metas.length}`);
+  }
+  return out;
+}
+
 async function buildWatchlistCatalog(profile, def, log = console) {
   if (!profile.trakt_auth?.access_token) {
     throw new Error('Trakt is not connected — Watch Later mirrors your Trakt watchlist');
@@ -306,12 +329,15 @@ async function buildWatchlistCatalog(profile, def, log = console) {
 }
 
 async function buildExtraCatalog(profile, def, log = console) {
-  if (def.source === 'trakt_watchlist') return buildWatchlistCatalog(profile, def, log);
+  if (def.source === 'trakt_watchlist') {
+    return applyExtraAgeGate(profile, def, await buildWatchlistCatalog(profile, def, log), log);
+  }
   const key = profile.keys.mdblist_api_key;
   if (!key) throw new Error('MDBList API key is required for extra catalogs');
+  const target = def.target || EXTRA_LIST_TARGET;
   const collected = [];
   const seen = new Set();
-  for (let page = 0; page < MAX_EXTRA_PAGES && collected.length < EXTRA_LIST_TARGET; page++) {
+  for (let page = 0; page < MAX_EXTRA_PAGES && collected.length < target; page++) {
     const items = await mdblist.listItemsPage(key, def.user, def.slug, def.type, {
       limit: EXTRA_PAGE_SIZE, offset: page * EXTRA_PAGE_SIZE, sort: def.sort,
     });
@@ -357,12 +383,14 @@ async function buildExtraCatalog(profile, def, log = console) {
     }
     pageMetas = await applyCsmGate(pageMetas, def.type, profile, log);
     for (const m of pageMetas) {
-      if (collected.length >= EXTRA_LIST_TARGET) break;
+      if (collected.length >= target) break;
       collected.push(m);
     }
-    log.log(`[extra] ${profile.name}/${def.id}: page ${page + 1} -> ${collected.length}/${EXTRA_LIST_TARGET}`);
+    log.log(`[extra] ${profile.name}/${def.id}: page ${page + 1} -> ${collected.length}/${target}`);
   }
-  return shuffle(collected); // randomize order so the daily list looks fresh
+  // Second age layer for kids profiles, then randomize so the daily list
+  // looks fresh instead of serving the same fixed sequence.
+  return shuffle(await applyExtraAgeGate(profile, def, collected, log));
 }
 
 // AI catalogs (movie + series): Trakt-seeded, LLM/discover, watched-excluded.
@@ -535,6 +563,7 @@ module.exports = {
   status,
   isRebuilding,
   applyCsmGate,
+  applyExtraAgeGate,
   cleanMetas,
   recPasses,
   isStale,

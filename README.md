@@ -107,9 +107,18 @@ as its own catalog in Stremio/Nuvio:
 
 - **Popular Movies** / **Popular Series** — the JustWatch streaming charts
   (unfiltered, 20 titles).
+- **Trending Kids Movies** / **Trending Kids TV** — kids-focused curated
+  lists, **50 titles** each, anything below **IMDb 6** dropped. On a profile
+  with an age limit these carry the full protection stack (see below).
 - **Christmas / Comedy / Action / Thriller Movies** — curated lists, 20
   titles each; anything rated below **IMDb 6** is dropped and the list is
   paged further until 20 titles are collected.
+
+**Age-limited profiles:** every extra catalog passes the same two layers as
+the AI lists and search — the strict Common Sense gate, then the AI age
+goalkeeper (Australian/ACB standards). Both are fail-closed: without a Groq
+key, or if either gate errors, the catalog keeps its previous contents rather
+than publishing an unvetted list to a child.
 
 Each extra catalog's 20 titles are **shuffled on every rebuild**, so the order
 looks fresh day to day and different titles rotate into the top slots.
