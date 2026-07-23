@@ -140,6 +140,22 @@ ok('catalogs: registry, defaults, and per-source requirements', () => {
   assert.ok(!anime.default_on);
   assert.strictEqual(catalogs.requirementMet({ keys: { trakt_client_id: 'c' }, trakt_auth: null }, anime), true);
   assert.strictEqual(catalogs.requirementMet({ keys: {}, trakt_auth: { access_token: 't' } }, anime), false);
+
+  // Catalog-level age band (TV-14 -> 13+). A profile limited below the band
+  // never sees it; adults (no limit) always do. This is a catalog floor, NOT a
+  // per-title certification lookup — it can't drop titles for being unrated.
+  assert.strictEqual(anime.min_profile_age, 13);
+  assert.strictEqual(catalogs.ageAppropriate({ filters: { age_limit: 13 } }, anime), true);
+  assert.strictEqual(catalogs.ageAppropriate({ filters: { age_limit: 15 } }, anime), true);
+  assert.strictEqual(catalogs.ageAppropriate({ filters: { age_limit: 8 } }, anime), false);
+  assert.strictEqual(catalogs.ageAppropriate({ filters: { age_limit: 0 } }, anime), true); // adult
+  assert.strictEqual(catalogs.ageAppropriate({}, anime), true);
+  assert.strictEqual(catalogs.ageAppropriate({ filters: { age_limit: 8 } }, wl), true); // no band
+  // ...and enabling it on an under-age profile must not surface it anyway
+  const under = { filters: { age_limit: 8 }, catalogs: { 'trakt-anime-teen-series': true } };
+  assert.ok(!catalogs.enabledExtras(under).some(d => d.id === 'trakt-anime-teen-series'));
+  const ok13 = { filters: { age_limit: 13 }, catalogs: { 'trakt-anime-teen-series': true } };
+  assert.ok(catalogs.enabledExtras(ok13).some(d => d.id === 'trakt-anime-teen-series'));
 });
 
 ok('store: swapExtra keeps AI catalogs untouched', () => {
@@ -834,6 +850,30 @@ async function httpTests() {
   assert.strictEqual(man2.catalogs.find(c => c.id === 'mdb-popular-series').type, 'series');
   console.log('  ✓ manifest includes enabled extra catalogs');
 
+  // Age-banded catalog: enabled on an 8+ profile, it must be absent from the
+  // manifest AND refused at the catalog route — a client holding a cached
+  // manifest must not keep pulling a TV-14 list after the limit is lowered.
+  await fetch(`${BASE}/api/profiles/${p2.id}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filters: { age_limit: 8 }, catalogs: { 'trakt-anime-teen-series': true } }),
+  });
+  let man3 = await (await fetch(`${BASE}/addon/${p2.token}/manifest.json`)).json();
+  assert.ok(!man3.catalogs.some(c => c.id === 'trakt-anime-teen-series'));
+  res = await fetch(`${BASE}/addon/${p2.token}/catalog/series/trakt-anime-teen-series.json`);
+  assert.strictEqual(res.status, 404);
+  // Raise the limit to 13+ and it becomes available
+  await fetch(`${BASE}/api/profiles/${p2.id}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filters: { age_limit: 13 }, catalogs: { 'trakt-anime-teen-series': true } }),
+  });
+  man3 = await (await fetch(`${BASE}/addon/${p2.token}/manifest.json`)).json();
+  assert.ok(man3.catalogs.some(c => c.id === 'trakt-anime-teen-series'));
+  await fetch(`${BASE}/api/profiles/${p2.id}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filters: { age_limit: 0 }, catalogs: {} }), // restore
+  });
+  console.log('  ✓ TV-14 catalog hidden and refused below its age band');
+
   // Watch Later without Trakt: dropped from the manifest, and answers empty
   // rather than a card. The card told users to connect Trakt, but the row it
   // appeared on no longer exists — the configure portal is where that state is
@@ -947,7 +987,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 39 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 40 async/http).`);
   process.exit(0);
 }
 

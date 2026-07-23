@@ -105,6 +105,12 @@
 const $ = (s, el = document) => el.querySelector(s);
 let GENRES = [];
 let CATALOG_DEFS = [];
+// A catalog pitched at a rating band (min_profile_age) is hidden from profiles
+// limited below it — the option should not exist, not merely be unchecked.
+// Mirrors catalogs.ageAppropriate() on the server, which is the enforcement.
+const catFits = (p, c) => !c.min_profile_age
+  || !(p.filters.age_limit > 0) || p.filters.age_limit >= c.min_profile_age;
+const catsFor = (p) => CATALOG_DEFS.filter(c => catFits(p, c));
 
 // Feather-style eye / eye-off icons for the key show/hide toggle.
 const EYE = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/></svg>';
@@ -310,15 +316,15 @@ function render(profiles) {
       </details>
 
       <details>
-        <summary>Catalogs — AI + ${CATALOG_DEFS.filter(c => catOn(p, c)).length} extra</summary>
+        <summary>Catalogs — AI + ${catsFor(p).filter(c => catOn(p, c)).length} extra</summary>
         <div class="muted" style="margin-top:8px">The two AI catalogs are always on. <b>Watch Later</b> mirrors this profile's Trakt watchlist (the list Stremio/Nuvio's long-press "add to watchlist" writes to) — on by default, refreshed within the hour of a change, watched titles drop off. The curated MDBList lists refresh daily and <b>ignore watched status</b>; popular charts are unfiltered, the rest drop titles rated below IMDb 6, and the kids lists carry 50 titles (MDBList key required). On profiles with an age limit, <b>every</b> extra catalog also passes the Common Sense gate and the AI age check — a Groq key is required and the list is kept unpublished if either can't run.</div>
         <div class="cats">
           <label class="locked"><input type="checkbox" checked disabled>Movies recommended for you</label>
           <label class="locked"><input type="checkbox" checked disabled>Series recommended for you</label>
-          ${CATALOG_DEFS.map(c => `<label><input type="checkbox" data-catalog="${esc(c.id)}" ${catOn(p, c) ? 'checked' : ''}>${esc(c.name)}<span class="muted" style="font-size:11px">${c.type === 'series' ? 'series' : 'movies'}${c.source === 'trakt_watchlist' ? ' · Trakt watchlist' : ''}${c.min_imdb ? ' · IMDb ≥ ' + c.min_imdb : ''}${c.target && c.target !== 20 ? ' · ' + c.target + ' titles' : ''}</span></label>`).join('')}
+          ${catsFor(p).map(c => `<label><input type="checkbox" data-catalog="${esc(c.id)}" ${catOn(p, c) ? 'checked' : ''}>${esc(c.name)}<span class="muted" style="font-size:11px">${c.type === 'series' ? 'series' : 'movies'}${c.source === 'trakt_watchlist' ? ' · Trakt watchlist' : ''}${c.source === 'trakt_list' ? ' · Trakt list' : ''}${c.min_profile_age ? ' · ' + c.min_profile_age + '+ only' : ''}${c.min_imdb ? ' · IMDb ≥ ' + c.min_imdb : ''}${c.target && c.target !== 20 ? ' · ' + c.target + ' titles' : ''}</span></label>`).join('')}
         </div>
-        ${CATALOG_DEFS.some(c => catOn(p, c) && c.source === 'trakt_watchlist') && !p.trakt_connected ? '<div style="color:var(--err);font-size:12px;margin-top:6px">⚠ Watch Later is enabled but Trakt is not connected — it cannot build until this profile connects Trakt.</div>' : ''}
-        ${CATALOG_DEFS.some(c => catOn(p, c) && c.source === 'mdblist') && !p.keys_set.mdblist_api_key ? '<div style="color:var(--err);font-size:12px;margin-top:6px">⚠ Curated catalogs are enabled but no MDBList key is set — they cannot build until you add one (API keys section).</div>' : ''}
+        ${catsFor(p).some(c => catOn(p, c) && c.source === 'trakt_watchlist') && !p.trakt_connected ? '<div style="color:var(--err);font-size:12px;margin-top:6px">⚠ Watch Later is enabled but Trakt is not connected — it cannot build until this profile connects Trakt.</div>' : ''}
+        ${catsFor(p).some(c => catOn(p, c) && c.source === 'mdblist') && !p.keys_set.mdblist_api_key ? '<div style="color:var(--err);font-size:12px;margin-top:6px">⚠ Curated catalogs are enabled but no MDBList key is set — they cannot build until you add one (API keys section).</div>' : ''}
         <div style="margin-top:10px" class="row">
           <button onclick="saveCatalogs('${p.id}')">Save catalogs</button>
           <span class="muted"> — newly enabled lists build in the background; they appear in Stremio/Nuvio after the app refreshes the addon manifest (or reinstall the addon)</span>

@@ -434,7 +434,13 @@ async function applyExtraAgeGate(profile, def, metas, log = console) {
   }
   const vetoed = await llm.ageGate(
     profile.keys.groq_api_key, def.type, judgementAge(profile.filters),
-    metas.map((m) => ({ id: m.id, title: m.name, year: m.releaseInfo, overview: m.description })),
+    // Genres matter: judging "Berserk" on a truncated overview alone is a
+    // much weaker signal than judging it as Action/Horror/Fantasy. They were
+    // being stripped before the gate saw them (cleanMetas ran too early).
+    metas.map((m) => ({
+      id: m.id, title: m.name, year: m.releaseInfo,
+      genres: m._genre_names, certification: m._certification, overview: m.description,
+    })),
     log,
   );
   const out = metas.filter((m) => !vetoed.has(m.id));
@@ -470,8 +476,7 @@ async function buildWatchlistCatalog(profile, def, log = console) {
         : null;
     })));
   }
-  const out = metas.filter((m) => m && !watchedImdb.has(m.id));
-  return cleanMetas(out); // age gating happens in applyExtraAgeGate, one layer
+  return metas.filter((m) => m && !watchedImdb.has(m.id)); // cleaned after the age gate
 }
 
 // A public Trakt list -> metas. The list's web-URL filters are site-side only,
@@ -516,15 +521,15 @@ async function buildTraktListCatalog(profile, def, log = console) {
       return { id: it.imdb_id, type: def.type, name: it.title, poster: null, description: '', releaseInfo: it.year ? String(it.year) : null };
     })));
   }
-  return cleanMetas(metas.filter(Boolean));
+  return metas.filter(Boolean); // cleaned after the age gate, which needs genres
 }
 
 async function buildExtraCatalog(profile, def, log = console) {
   if (def.source === 'trakt_watchlist') {
-    return applyExtraAgeGate(profile, def, await buildWatchlistCatalog(profile, def, log), log);
+    return cleanMetas(await applyExtraAgeGate(profile, def, await buildWatchlistCatalog(profile, def, log), log));
   }
   if (def.source === 'trakt_list') {
-    return shuffle(await applyExtraAgeGate(profile, def, await buildTraktListCatalog(profile, def, log), log));
+    return shuffle(cleanMetas(await applyExtraAgeGate(profile, def, await buildTraktListCatalog(profile, def, log), log)));
   }
   const key = profile.keys.mdblist_api_key;
   if (!key) throw new Error('MDBList API key is required for extra catalogs');

@@ -81,7 +81,12 @@ function parseVerdicts(text, validIds) {
 const REVIEWER_SYSTEM = 'You are a strict parental-guidance reviewer for Australian audiences. Reply with raw JSON only.';
 const CURATOR_SYSTEM = 'You are a film and television curator with broad knowledge of world cinema, TV and anime. Reply with raw JSON only.';
 
-async function callModel(apiKey, model, prompt, { system = REVIEWER_SYSTEM, temperature = 0.2 } = {}) {
+// temperature 0 for judgement work. At 0.2 the same title flipped between
+// rebuilds — My Hero Academia and One-Punch Man were vetoed in one run and
+// allowed in the next, same age, same model, same day. A parent should not
+// see a show appear and disappear day to day; generation still uses a warmer
+// temperature, where variety is the point.
+async function callModel(apiKey, model, prompt, { system = REVIEWER_SYSTEM, temperature = 0 } = {}) {
   const res = await fetch(API, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },

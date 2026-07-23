@@ -33,7 +33,11 @@ const EXTRA_CATALOGS = [
   // here: min_imdb 6 covers imdb_ratings=6-10, the AI age gate covers
   // certifications=all_ages,parental_guidance,teens, and watched exclusion
   // covers ignore_watched.
-  { id: 'trakt-anime-teen-series', type: 'series', name: 'Anime TV-14', source: 'trakt_list', user: 'snoak', slug: 'trending-anime-shows', min_imdb: 6, target: 50, prune_watched: true },
+  // min_profile_age: the catalog itself is pitched at a rating band, so a
+  // profile limited below it never sees the option. This is a CATALOG-level
+  // floor, not a per-title certification lookup — it cannot drop titles for
+  // being unrated, which is the failure that retired the CSM gate.
+  { id: 'trakt-anime-teen-series', type: 'series', name: 'Anime TV-14', source: 'trakt_list', user: 'snoak', slug: 'trending-anime-shows', min_imdb: 6, target: 50, prune_watched: true, min_profile_age: 13 },
   { id: 'mdb-christmas-movies', type: 'movie', name: 'Christmas Movies', source: 'mdblist', user: 'jbeasley74', slug: 'christmas-movies', min_imdb: 6, sort: 'imdbpopular' },
   { id: 'mdb-comedy-movies', type: 'movie', name: 'Comedy Movies', source: 'mdblist', user: 'hdlists', slug: 'comedy-movies-2001-2020', min_imdb: 6, sort: 'imdbpopular' },
   { id: 'mdb-action-movies', type: 'movie', name: 'Action Movies', source: 'mdblist', user: 'garycrawfordgc', slug: 'action', min_imdb: 6, sort: 'imdbpopular' },
@@ -52,8 +56,23 @@ function isEnabled(profile, def) {
   return (profile.catalogs?.[def.id] ?? def.default_on ?? false) === true;
 }
 
+// Is this catalog's rating band within the profile's age limit? A catalog
+// marked min_profile_age 13 (TV-14) is hidden from a profile limited to 8.
+// No age limit = adult profile = everything available.
+//
+// Note this lines up with judgementAge(): a 13+ profile is judged at 14, so a
+// TV-14 catalog and the gate reviewing it agree on the bar.
+function ageAppropriate(profile, def) {
+  const floor = def.min_profile_age || 0;
+  if (!floor) return true;
+  const limit = profile.filters?.age_limit || 0;
+  return limit === 0 || limit >= floor;
+}
+
+// Enabled AND age-appropriate. Used for the manifest and every rebuild, so a
+// profile whose age limit drops below a catalog's band loses it automatically.
 function enabledExtras(profile) {
-  return EXTRA_CATALOGS.filter((d) => isEnabled(profile, d));
+  return EXTRA_CATALOGS.filter((d) => isEnabled(profile, d) && ageAppropriate(profile, d));
 }
 
 // The profile-side prerequisite for a catalog's data source.
@@ -64,4 +83,4 @@ function requirementMet(profile, def) {
   return !!profile.keys.mdblist_api_key;
 }
 
-module.exports = { EXTRA_CATALOGS, getExtra, isEnabled, enabledExtras, requirementMet };
+module.exports = { EXTRA_CATALOGS, getExtra, isEnabled, enabledExtras, ageAppropriate, requirementMet };

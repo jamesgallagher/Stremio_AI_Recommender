@@ -192,7 +192,11 @@ router.get('/catalog/:type/:catalogId{/:extra}', async (req, res) => {
   const aiCatalog = CATALOGS[catalogId];
   const extraDef = !aiCatalog && catalogs.getExtra(catalogId);
   const def = aiCatalog || extraDef;
-  if (!def || def.type !== req.params.type || (extraDef && !catalogs.isEnabled(profile, extraDef))) {
+  // Age-band catalogs are refused outright, not merely hidden — a client
+  // holding a cached manifest must not be able to keep pulling a TV-14 list
+  // after the profile's age limit was lowered.
+  if (!def || def.type !== req.params.type
+    || (extraDef && !(catalogs.isEnabled(profile, extraDef) && catalogs.ageAppropriate(profile, extraDef)))) {
     return res.status(404).json({ error: 'Unknown catalog' });
   }
 
