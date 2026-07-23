@@ -145,7 +145,7 @@ apply them**, so they must be re-implemented our side: IMDb ≥ 6 via the
 existing `min_imdb`, watched-exclusion via the existing prune, and the age
 ceiling via the AI gate that already runs on every extra catalog. Target 50.
 
-### Core Stage 3 work
+### Core Stage 3 work ✅ shipped v5.0.0-beta
 
 
 - Remove the strict CSM gate from **every** surface — AI lists, extra

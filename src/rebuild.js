@@ -115,30 +115,24 @@ async function syncWatched(profile, { force = false } = {}) {
 
 // Kids-mode gate: strict Common Sense verification via MDBList.
 // Every candidate is looked up; unrated titles are dropped, full stop.
-async function applyCsmGate(metas, type, profile, log = console) {
-  const limit = profile.filters.age_limit || 0;
-  if (limit <= 0) return metas;
-  if (!profile.keys.mdblist_api_key) {
-    throw new Error('Age limit is set but no MDBList API key is configured — cannot verify Common Sense ratings');
-  }
-  const ages = await mdblist.commonSenseAges(
-    profile.keys.mdblist_api_key, type, metas.map((m) => m.id), log
-  );
-  const out = [];
-  for (const meta of metas) {
-    const age = ages.get(meta.id);
-    if (age === null || age === undefined) {
-      log.log(`[csm] "${meta.name}" has no Common Sense rating — dropped (strict mode)`);
-      continue;
-    }
-    if (age > limit) {
-      log.log(`[csm] "${meta.name}" rated ${age}+ > limit ${limit}+ — dropped`);
-      continue;
-    }
-    log.log(`[csm] "${meta.name}" rated ${age}+ — allowed`);
-    out.push(meta);
-  }
-  return out;
+// Common Sense Media gate — RETIRED in v5 (2026-07-23).
+//
+// It was the primary age authority, strict by design: no CSM rating meant the
+// title was dropped. That works for mainstream Western titles and fails for
+// anime, where coverage is thin, so "unrated" was the common case rather than
+// the exception. For an anime-heavy child profile the gate wasn't strict, it
+// was absent — it emptied entire catalogs while letting nothing through, and
+// a parse bug meant it had almost certainly never worked as intended.
+//
+// The AI age gate is now the sole age authority on every surface: lists,
+// extra catalogs and search. It reads titles it recognises rather than
+// requiring a database row, which is exactly the property anime needed.
+// It stays remove-only and fail-closed.
+//
+// Kept as a pass-through for one release so any missed caller degrades to
+// "no extra filtering" rather than crashing; the AI gate still runs after it.
+async function applyCsmGate(metas) {
+  return metas;
 }
 
 // Strip internal fields before the metas are served to Stremio.
@@ -368,10 +362,9 @@ async function buildCatalog(profile, type, watchedByType, log = console) {
   }
   log.log(`[rebuild] ${profile.name}/${type}: pool ${pool.length} after filters/exclusions`);
 
-  // Kids profiles: CSM strict gate, then the remove-only AI goalkeeper.
+  // Kids profiles: the AI age gate, now the sole age authority (CSM retired).
   if (filters.age_limit > 0) {
-    const wrapped = pool.filter((r) => r.imdb_id).map((r) => ({ id: r.imdb_id, name: r.title, __rec: r }));
-    pool = (await applyCsmGate(wrapped, type, profile, log)).map((x) => x.__rec);
+    pool = pool.filter((r) => r.imdb_id); // needs a stable id to veto against
     const vetoed = await llm.ageGate(
       profile.keys.groq_api_key, type, judgementAge(filters),
       pool.map((r) => ({ id: r.imdb_id, title: r.title, year: r.year, genres: r.genres, certification: r.certification, overview: r.overview })),
@@ -477,14 +470,61 @@ async function buildWatchlistCatalog(profile, def, log = console) {
         : null;
     })));
   }
-  let out = metas.filter((m) => m && !watchedImdb.has(m.id));
-  out = await applyCsmGate(out, def.type, profile, log); // kids gate is never bypassed
-  return cleanMetas(out);
+  const out = metas.filter((m) => m && !watchedImdb.has(m.id));
+  return cleanMetas(out); // age gating happens in applyExtraAgeGate, one layer
+}
+
+// A public Trakt list -> metas. The list's web-URL filters are site-side only,
+// so the rating floor is applied here and the age ceiling by the AI gate in
+// buildExtraCatalog. Watched exclusion is opt-in per definition
+// (prune_watched), matching the list URL's ignore_watched.
+async function buildTraktListCatalog(profile, def, log = console) {
+  if (!profile.keys.trakt_client_id) {
+    throw new Error('Trakt Client ID is required for Trakt list catalogs');
+  }
+  const target = def.target || EXTRA_LIST_TARGET;
+  const items = await trakt.getListItems(profile, def.user, def.slug, def.type, Math.max(target * 2, 100));
+  log.log(`[extra] ${profile.name}/${def.id}: ${items.length} item(s) on ${def.user}/${def.slug}`);
+
+  const watchedImdb = def.prune_watched
+    ? new Set([
+      ...(store.loadCache(profile.id).watched?.movie?.imdb || []),
+      ...(store.loadCache(profile.id).watched?.series?.imdb || []),
+    ])
+    : new Set();
+
+  const picked = [];
+  const seen = new Set();
+  for (const it of items) {
+    if (picked.length >= target) break;
+    if (!it.imdb_id || seen.has(it.imdb_id)) continue;
+    seen.add(it.imdb_id);
+    if (watchedImdb.has(it.imdb_id)) continue;
+    // Trakt's rating is 0-10 like IMDb's; unrated is kept, as everywhere else.
+    if (def.min_imdb > 0 && it.rating !== null && it.rating < def.min_imdb) continue;
+    picked.push(it);
+  }
+
+  const metas = [];
+  for (let i = 0; i < picked.length; i += 25) {
+    const chunk = picked.slice(i, i + 25);
+    metas.push(...await Promise.all(chunk.map(async (it) => {
+      if (it.tmdb_id) {
+        const m = await tmdb.metaByTmdbId(profile.keys.tmdb_api_key, def.type, it.tmdb_id, log);
+        if (m) return m;
+      }
+      return { id: it.imdb_id, type: def.type, name: it.title, poster: null, description: '', releaseInfo: it.year ? String(it.year) : null };
+    })));
+  }
+  return cleanMetas(metas.filter(Boolean));
 }
 
 async function buildExtraCatalog(profile, def, log = console) {
   if (def.source === 'trakt_watchlist') {
     return applyExtraAgeGate(profile, def, await buildWatchlistCatalog(profile, def, log), log);
+  }
+  if (def.source === 'trakt_list') {
+    return shuffle(await applyExtraAgeGate(profile, def, await buildTraktListCatalog(profile, def, log), log));
   }
   const key = profile.keys.mdblist_api_key;
   if (!key) throw new Error('MDBList API key is required for extra catalogs');
@@ -535,7 +575,6 @@ async function buildExtraCatalog(profile, def, log = console) {
         imdbRating: rating !== null ? rating.toFixed(1) : null,
       });
     }
-    pageMetas = await applyCsmGate(pageMetas, def.type, profile, log);
     for (const m of pageMetas) {
       if (collected.length >= target) break;
       collected.push(m);

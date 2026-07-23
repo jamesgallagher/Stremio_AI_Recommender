@@ -7,10 +7,10 @@ refreshes in the background (stale-while-revalidate, 24 h threshold).
 Every catalog open is instant — Stremio only ever reads the pre-computed cache.
 Rebuilds happen in the background and never purge a good list on failure.
 
-> ## ⚠ v4.0.0-beta — Trakt-powered engine (THIS BRANCH ONLY)
+> ## ⚠ v5.0.0-beta — engine choice, AI age gate, metadata service (THIS BRANCH ONLY)
 >
 > Everything in this block applies to the `v3-phase1` beta branch, published
-> as `:4.0.0-beta` (also `:beta`) — the stable `:latest` image (v2.6.x) is
+> as `:5.0.0-beta` (also `:beta`) — the stable `:latest` image (v2.6.x) is
 > unaffected.
 >
 > - **Trakt recommends, code filters, LLM guards.** The AI lists now come
@@ -24,16 +24,29 @@ Rebuilds happen in the background and never purge a good list on failure.
 >   default 6.0); IMDb via MDBList remains an option. Recency defaults to all
 >   years (one-time migration relaxes existing profiles; re-tighten in the
 >   portal if wanted).
-> - **The LLM is now only the kids age goalkeeper**: for profiles with an age
->   limit, after the strict CSM gate, Groq reviews the list against
->   Australian (ACB) standards and can only REMOVE titles. **Groq key is
->   required only for kids profiles** — adult pipelines make zero LLM calls.
+> - **v5 — pick your engine per profile.** `Trakt` (default) is the v4
+>   pipeline above. `AI` generates candidates with the age limit applied UP
+>   FRONT, then a second Groq pass vets the survivors — because collaborative
+>   filtering is structurally blind to age: a 13-year-old anime viewer's
+>   nearest neighbours are ADULT anime viewers.
+> - **v5 — Common Sense Media retired.** It was strict by design (no rating =
+>   dropped), which works for mainstream Western titles and fails for anime,
+>   where coverage is thin. For an anime-heavy child the gate wasn't strict,
+>   it was absent. The AI age gate is now the sole age authority on lists,
+>   extra catalogs AND search — remove-only and fail-closed. Titles are judged
+>   one year ABOVE the limit; classification brackets are coarse.
+>   **MDBList is now OPTIONAL** (curated catalogs + the IMDb rating source).
+> - **v5 — the addon serves `meta`**, so a device can run this addon plus a
+>   stream addon and nothing else. Previously a third-party metadata addon was
+>   required for playback, and it answered search UNFILTERED next to our gated
+>   results. **Groq key is required for kids profiles and for the AI engine**;
+>   adult profiles on the Trakt engine still make zero LLM calls.
 > - **Search** (v4.1): the addon answers Stremio/Nuvio search. On profiles
->   with an age limit, results pass the SAME protection as the lists — CSM
->   gate then the AI goalkeeper — and fail CLOSED: if either gate can't run,
->   the search returns nothing rather than unfiltered results. Adult profiles
->   search ungated. (On a kid's device, install only this addon so no other
->   addon answers search unfiltered.)
+>   with an age limit, results pass the SAME protection as the lists — the AI
+>   goalkeeper — and fail CLOSED: if it can't run, search returns nothing
+>   rather than unfiltered results. Adult profiles search ungated. On a kid's
+>   device install only this addon and a stream addon, so nothing else answers
+>   search unfiltered (v5's `meta` support is what makes that possible).
 > - **Bench + promote-on-watch**, Watch Later (Trakt watchlist) catalog,
 >   "Anime" exclusion filter, curated MDBList extras, auto-scrobble, RPDB,
 >   and encryption all carry over unchanged.
@@ -78,11 +91,11 @@ Each profile carries its own full key set — nothing is shared.
      the device code grant)
    - a TMDB API key at [themoviedb.org/settings/api](https://www.themoviedb.org/settings/api)
    - a Groq API key at [console.groq.com/keys](https://console.groq.com/keys)
-     (free tier). **Required only for kids profiles** (age limit set) — it
-     powers the AI age check; adult profiles never call the LLM (v4 beta)
-   - an MDBList API key at [mdblist.com/preferences](https://mdblist.com/preferences/)
-     (free; sign in → Preferences → API Access) — powers the extra catalogs
-     and Common Sense age checks
+     (free tier). **Required for kids profiles** (age limit set) and for the
+     **AI engine**; adult profiles on the Trakt engine never call the LLM
+   - *(optional)* an MDBList API key at [mdblist.com/preferences](https://mdblist.com/preferences/)
+     (free; sign in → Preferences → API Access) — powers the curated MDBList
+     catalogs and the optional IMDb rating source
    - RPDB (rating-on-poster artwork) works out of the box — every profile is
      pre-set with the generic free-tier key (`t0-free-rpdb`). Optionally paste
      a personal key from [ratingposterdb.com](https://ratingposterdb.com/) for
@@ -99,26 +112,31 @@ Each profile carries its own full key set — nothing is shared.
 First list generates within a minute or two (a "warming up" card shows until
 then). After that, lists refresh in the background roughly daily.
 
-## Extra catalogs (curated MDBList lists)
+## Extra catalogs (curated lists)
 
 Per profile, in the portal's **Catalogs** section: the two AI catalogs are
-always on; six optional catalogs can be toggled per profile, each appearing
-as its own catalog in Stremio/Nuvio:
+always on; the optional catalogs below can be toggled per profile, each
+appearing as its own catalog in Stremio/Nuvio:
 
 - **Popular Movies** / **Popular Series** — the JustWatch streaming charts
   (unfiltered, 20 titles).
 - **Trending Kids Movies** / **Trending Kids TV** — kids-focused curated
   lists, **50 titles** each, anything below **IMDb 6** dropped. On a profile
   with an age limit these carry the full protection stack (see below).
+- **Anime TV-14** — a public Trakt list (`snoak/trending-anime-shows`),
+  **50 titles**, anything below **IMDb 6** dropped, watched titles excluded.
+  Needs only the Trakt Client ID, not the MDBList key. The certification and
+  rating filters in that list's web URL are applied by the Trakt *website*,
+  not its API, so they are re-implemented here.
 - **Christmas / Comedy / Action / Thriller Movies** — curated lists, 20
   titles each; anything rated below **IMDb 6** is dropped and the list is
   paged further until 20 titles are collected.
 
-**Age-limited profiles:** every extra catalog passes the same two layers as
-the AI lists and search — the strict Common Sense gate, then the AI age
-goalkeeper (Australian/ACB standards). Both are fail-closed: without a Groq
-key, or if either gate errors, the catalog keeps its previous contents rather
-than publishing an unvetted list to a child.
+**Age-limited profiles:** every extra catalog passes the same age gate as the
+AI lists and search — the remove-only AI goalkeeper (Australian/ACB
+standards), judged one year above the limit. Fail-closed: without a Groq key,
+or if the gate errors, the catalog keeps its previous contents rather than
+publishing an unvetted list to a child.
 
 Each extra catalog's 20 titles are **shuffled on every rebuild**, so the order
 looks fresh day to day and different titles rotate into the top slots.
@@ -132,7 +150,7 @@ addon: **Nuvio** re-fetches every installed manifest on launch, so fully quit
 and reopen the app (browser: reload the tab); **Stremio** updates an addon
 in place when you open its install URL again and press Install — same URL,
 nothing is removed, settings and ordering are kept.
-Kids-mode age limits still apply to extra catalogs — the Common Sense gate
+Kids-mode age limits still apply to extra catalogs — the AI age gate
 cannot be bypassed by toggling on a chart list.
 
 ## Auto scrobble (Nuvio / Stremio → Trakt)
@@ -191,21 +209,34 @@ Losing or changing the key is the one real risk — it doesn't touch your
 Nuvio/Stremio/Trakt data, but a mismatched key means re-setting up the addon's
 own keys. This is a helper addon, so worst case is re-entry, never lost history.
 
-## Kids mode (Common Sense age limit)
+## Kids mode (AI age gate)
 
 Per profile: tick **Limit to age** in Filters and pick a tier (5+, 6+, 8+,
-10+, 12+, 13+, 15+ — granular at the younger end). Uses that profile's
-MDBList API key. Lookups are batched (one request per ~50 titles) and cached
-on disk for 30 days — including "not rated" results — so even refill-heavy
-kids rebuilds stay well inside the free tier's 1,000 requests/day.
+10+, 12+, 13+, 15+ — granular at the younger end). Requires that profile's
+**Groq API key**.
 
-Strict by design: with an age limit set, **every** candidate title is checked
-against Common Sense Media (via MDBList) at rebuild time. Titles CSM hasn't
-rated are never listed — there is no fallback to MPAA/TMDB certifications or
-any other rating system. The Groq prompt is also steered toward
-age-appropriate content, but the CSM check is the enforcement. If MDBList
-lookups fail mid-rebuild, the previous list is kept rather than serving an
-unverified one.
+Titles are judged **one year above** the limit (13+ is judged at 14).
+Classification brackets are coarse — a 13-year-old's material sits in the 14+
+bracket — and judging exactly at the limit rejected most age-appropriate anime
+along with the genuinely unsuitable.
+
+Every discovery surface is gated: AI lists, every extra catalog, and search.
+The gate is **remove-only** (it can veto a title, never rescue one) and
+**fail-closed** (if it can't run the previous list is kept, and search returns
+nothing). On the `AI` engine the limit is applied twice — once at generation,
+once at review.
+
+`meta` is deliberately **ungated**: every discovery surface is already gated,
+so nothing un-vetted reaches a child through us, and gating there would put an
+LLM call in front of every title open. Opening a title by direct id — from
+Continue Watching, say — is not discovery.
+
+> **Common Sense Media was retired in v5.** It was the primary authority and
+> strict by design: no CSM rating meant the title was dropped. Its anime
+> coverage is thin, so "unrated" was the common case rather than the
+> exception, and entire kids catalogs came back empty. The AI gate reads
+> titles it recognises rather than requiring a database row — exactly the
+> property anime needed. MDBList is now optional.
 
 ## Behavior notes
 

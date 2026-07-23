@@ -107,8 +107,9 @@ router.get('/manifest.json', (req, res) => {
 
 // Live search. The only request-path external calls in the addon — search
 // cannot be precomputed. Kids profiles (age_limit > 0) get the SAME age
-// protection as their lists: strict CSM gate, then the remove-only AI
-// goalkeeper. FAIL-CLOSED: any gate failure (missing key, MDBList/Groq down)
+// protection as their lists: the remove-only AI goalkeeper (v5: CSM retired,
+// so this is now the sole age authority here too — search must never be the
+// weakest surface). FAIL-CLOSED: any gate failure (missing key, Groq down)
 // returns no results rather than unfiltered ones.
 async function handleSearch(profile, type, extraStr, res) {
   const raw = (extraStr.match(/search=([^&]+)/) || [])[1] || '';
@@ -121,7 +122,6 @@ async function handleSearch(profile, type, extraStr, res) {
   try {
     let metas = await tmdb.searchTitles(profile.keys.tmdb_api_key, type, query, kids ? 10 : 20);
     if (kids) {
-      metas = await rebuild.applyCsmGate(metas, type, profile, console);
       const vetoed = await llm.ageGate(
         profile.keys.groq_api_key, type, rebuild.judgementAge(profile.filters),
         metas.map((m) => ({ id: m.id, title: m.name, year: m.releaseInfo, overview: m.description })),

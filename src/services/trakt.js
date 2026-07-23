@@ -353,12 +353,49 @@ async function getWatchlist(profile, type) {
     .sort((a, b) => (a.rank - b.rank) || (a.listed_at < b.listed_at ? 1 : -1));
 }
 
+// ---- Public Trakt lists (extra-catalog source 'trakt_list') ----
+// A public list belonging to any user, e.g. snoak/trending-anime-shows. Needs
+// only the client ID, not OAuth — it isn't this profile's data.
+//
+// The filters in a Trakt list's WEB url (certifications, ratings, imdb_ratings,
+// rt_meters, ignore_watched) are view filters applied by the site. The API
+// ignores them entirely and returns the unfiltered list, so every one of them
+// has to be re-applied our side — see catalogs.js and the rebuild pipeline.
+async function getListItems(profile, user, slug, type, limit = 100) {
+  const endpoint = type === 'series' ? 'shows' : 'movies';
+  const url = `${API}/users/${encodeURIComponent(user)}/lists/${encodeURIComponent(slug)}/items/${endpoint}`
+    + `?extended=full&limit=${limit}`;
+  const res = await fetch(url, { headers: baseHeaders(profile.keys.trakt_client_id) });
+  if (!res.ok) {
+    throw new Error(`Trakt list ${user}/${slug} failed (${res.status})`
+      + (res.status === 404 ? ' — list not found, or it is private' : ''));
+  }
+  const items = await res.json();
+  return (Array.isArray(items) ? items : [])
+    .map((it) => {
+      const media = type === 'series' ? it.show : it.movie;
+      if (!media?.ids) return null;
+      return {
+        title: media.title,
+        year: media.year,
+        tmdb_id: media.ids.tmdb || null,
+        imdb_id: media.ids.imdb || null,
+        rating: typeof media.rating === 'number' ? media.rating : null,
+        votes: media.votes || 0,
+        rank: Number.isFinite(it.rank) ? it.rank : 0,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.rank - b.rank);
+}
+
 module.exports = {
   startDeviceFlow,
   pollDeviceToken,
   refreshToken,
   getWatchedSets,
   getWatchlist,
+  getListItems,
   getRecommendations,
   parseRecommendations,
   parseWatchedItems,

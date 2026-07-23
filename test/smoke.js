@@ -99,7 +99,7 @@ ok('trakt: recommendations parse — fields, wrapped shapes, dropped junk', () =
 
 ok('catalogs: registry, defaults, and per-source requirements', () => {
   const catalogs = require('../src/catalogs');
-  assert.strictEqual(catalogs.EXTRA_CATALOGS.length, 10);
+  assert.strictEqual(catalogs.EXTRA_CATALOGS.length, 11);
   // Kids lists: 50 titles, rating-gated at 6.0 (the site's "60"), off by default
   const kidsM = catalogs.getExtra('mdb-kids-movies');
   const kidsS = catalogs.getExtra('mdb-kids-series');
@@ -126,10 +126,20 @@ ok('catalogs: registry, defaults, and per-source requirements', () => {
   assert.deepStrictEqual(
     catalogs.enabledExtras({ catalogs: { 'mdb-action-movies': true, 'trakt-watchlist-movies': false } }).map(d => d.id),
     ['trakt-watchlist-series', 'mdb-action-movies']); // explicit false opts out of a default-on
-  // Requirements: watchlist needs Trakt; curated lists need the MDBList key
+  // Requirements: watchlist needs Trakt OAuth; curated lists need the MDBList
+  // key; a PUBLIC Trakt list needs only the client id (it isn't our data)
   assert.strictEqual(catalogs.requirementMet({ keys: {}, trakt_auth: { access_token: 't' } }, wl), true);
   assert.strictEqual(catalogs.requirementMet({ keys: { mdblist_api_key: 'k' }, trakt_auth: null }, wl), false);
   assert.strictEqual(catalogs.requirementMet({ keys: { mdblist_api_key: 'k' } }, catalogs.getExtra('mdb-action-movies')), true);
+  const anime = catalogs.getExtra('trakt-anime-teen-series');
+  assert.strictEqual(anime.source, 'trakt_list');
+  assert.strictEqual(anime.type, 'series');
+  assert.strictEqual(anime.target, 50);
+  assert.strictEqual(anime.min_imdb, 6);   // list URL's imdb_ratings=6-10
+  assert.strictEqual(anime.prune_watched, true); // list URL's ignore_watched
+  assert.ok(!anime.default_on);
+  assert.strictEqual(catalogs.requirementMet({ keys: { trakt_client_id: 'c' }, trakt_auth: null }, anime), true);
+  assert.strictEqual(catalogs.requirementMet({ keys: {}, trakt_auth: { access_token: 't' } }, anime), false);
 });
 
 ok('store: swapExtra keeps AI catalogs untouched', () => {
@@ -585,6 +595,17 @@ async function httpTests() {
   store.saveCsmCache({});
   console.log('  ✓ CSM disk cache answers without network');
 
+  // v5: the CSM gate is retired. A kids profile with NO MDBList key must pass
+  // straight through instead of throwing — its anime coverage was so thin that
+  // "unrated" was the common case, which emptied whole catalogs. The AI gate
+  // is the sole age authority now.
+  const kidsNoMdb = { filters: { age_limit: 8 }, keys: {} };
+  const through = await rebuild.applyCsmGate(
+    [{ id: 'tt60', name: 'Unrated By CSM' }], 'series', kidsNoMdb, { log() {} },
+  );
+  assert.deepStrictEqual(through.map(m => m.id), ['tt60']);
+  console.log('  ✓ CSM gate retired — no longer drops unrated titles or needs MDBList');
+
   // Hard requirement: no Groq key -> AI catalogs are disabled before any
   // network call (fake trakt_auth would explode if Trakt were contacted).
   const rebuildMod = require('../src/rebuild');
@@ -775,8 +796,9 @@ async function httpTests() {
 
   // ---- Extra catalogs (second profile keeps earlier assertions intact) ----
   const defs = await (await fetch(`${BASE}/api/catalogs`)).json();
-  assert.strictEqual(defs.catalogs.length, 10);
+  assert.strictEqual(defs.catalogs.length, 11);
   assert.ok(defs.catalogs.some(c => c.id === 'mdb-popular-series' && c.type === 'series'));
+  assert.ok(defs.catalogs.some(c => c.id === 'trakt-anime-teen-series' && c.source === 'trakt_list'));
   assert.ok(defs.catalogs.some(c => c.id === 'trakt-watchlist-movies' && c.source === 'trakt_watchlist' && c.default_on === true));
   console.log('  ✓ GET /api/catalogs lists extra-catalog definitions');
 
@@ -925,7 +947,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 38 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 39 async/http).`);
   process.exit(0);
 }
 
