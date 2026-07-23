@@ -385,6 +385,71 @@ ok('groq: parseTitles dedupes, tolerates wrappers, survives a missing year', () 
   assert.strictEqual(groq.parseTitles('[{"title":"A"},{"title":"B"}]', 1).length, 1); // limit honoured
 });
 
+ok('animeMap: index handles franchise arrays and { tv, movie } tmdb objects', () => {
+  const animeMap = require('../src/services/animeMap');
+  // Fribb collapses multi-part franchises into ONE entry, so imdb_id and
+  // themoviedb_id can be arrays. Indexing only the scalar silently resolves
+  // the wrong part — this is the trap aiometadata warns about.
+  const built = animeMap.buildIndex([
+    { mal_id: 1, imdb_id: ['tt1', 'tt2', 'tt3'], themoviedb_id: { movie: [10, 11] }, kitsu_id: 5, type: 'movie' },
+    { mal_id: 2, imdb_id: 'tt9', themoviedb_id: { tv: 20 }, anilist_id: 7 },
+    { mal_id: 3, imdb_id: null, themoviedb_id: 30 },
+    { imdb_id: 'tt404' }, // no mal id -> not indexed, nothing to look up by
+  ]);
+  assert.strictEqual(built.count, 3);
+  animeMap._setIndex({ at: Date.now(), etag: 'x', byImdb: built.byImdb, byTmdb: built.byTmdb });
+
+  assert.strictEqual(animeMap.lookup('tt3', null).mal, 1); // every part resolves
+  assert.strictEqual(animeMap.lookup('tt1', null).kitsu, 5);
+  assert.strictEqual(animeMap.lookup(null, 11).mal, 1);
+  assert.strictEqual(animeMap.lookup(null, 20).anilist, 7);
+  assert.strictEqual(animeMap.lookup(null, 30).mal, 3); // imdb-less entries still map by tmdb
+  assert.strictEqual(animeMap.lookup('tt404', null), null);
+  assert.strictEqual(animeMap.isAnime('tt9', null), true);
+  assert.strictEqual(animeMap.isAnime('tt-unknown', 99999), false);
+
+  assert.deepStrictEqual(animeMap.tmdbIdsOf({ themoviedb_id: { tv: 1, movie: [2, 3] } }), [1, 2, 3]);
+  assert.deepStrictEqual(animeMap.toIdList(null), []);
+
+  // Leave an EMPTY but fresh index installed. The map lives in module state,
+  // so the fixture above (tt1/tt2!) would otherwise leak into later tests and
+  // silently classify their placeholder ids as anime. A fresh empty index also
+  // keeps ensureLoaded() from reaching for the network, so the rest of the
+  // suite stays offline.
+  animeMap._setIndex({ at: Date.now(), etag: 'test', byImdb: {}, byTmdb: {} });
+  assert.strictEqual(animeMap.lookup('tt1', null), null);
+});
+
+ok('mal: rating classification, NSFW blacklist, and age banding', () => {
+  const mal = require('../src/services/mal');
+  assert.strictEqual(mal.classify('PG-13 - Teens 13 or older').minAge, 13);
+  assert.strictEqual(mal.classify('R - 17+ (violence & profanity)').minAge, 17);
+  assert.strictEqual(mal.classify('G - All Ages').minAge, 0);
+  assert.strictEqual(mal.classify('PG - Children').minAge, 6);
+  assert.strictEqual(mal.classify('Rx - Hentai').adult, true);
+  assert.strictEqual(mal.classify('R+ - Mild Nudity').adultish, true);
+  assert.strictEqual(mal.classify(''), null);
+  assert.strictEqual(mal.classify(undefined), null);
+
+  // Genres are a second adult signal from the same payload — no extra call
+  const byGenre = mal.parseAnime({ rating: 'PG-13 - Teens 13 or older', explicit_genres: [{ name: 'Hentai' }] });
+  assert.strictEqual(byGenre.adult, true);
+
+  // Blacklist is permanent and NOT tied to an age limit — adults too
+  assert.strictEqual(mal.isBlacklisted({ adult: true }), true);
+  assert.strictEqual(mal.blockedForAge({ adultish: true, minAge: 17 }, 0), false); // adult profile keeps R+
+  assert.strictEqual(mal.blockedForAge({ adultish: true, minAge: 17 }, 14), true); // never for a minor
+
+  // AGE rule is the OPPOSITE of the blacklist: only a KNOWN rating above the
+  // limit drops. Unrated falls through to the LLM — never to deletion. This is
+  // the exact conflation that emptied the kids catalogs under CSM.
+  assert.strictEqual(mal.blockedForAge({ minAge: null, code: null }, 14), false);
+  assert.strictEqual(mal.blockedForAge(null, 14), false);
+  assert.strictEqual(mal.blockedForAge({ minAge: 13 }, 14), false); // PG-13 at judged-14
+  assert.strictEqual(mal.blockedForAge({ minAge: 17 }, 14), true);  // R at judged-14
+  assert.strictEqual(mal.blockedForAge({ minAge: 17 }, 0), false);  // adult profile
+});
+
 ok('rebuild: judgement age is one year above the limit (off when no limit)', () => {
   assert.strictEqual(rebuild.judgementAge({ age_limit: 13 }), 14);
   assert.strictEqual(rebuild.judgementAge({ age_limit: 8 }), 9);
@@ -634,6 +699,53 @@ async function httpTests() {
   assert.ok(res0.series.error.includes('kids-mode'));
   store.deleteCache('no-groq-test');
   console.log('  ✓ kids profile without Groq key disabled (no network)');
+
+  // Anime gate, end to end, with a seeded map + rating cache (no network).
+  // The two rules point in OPPOSITE directions and that is the whole design.
+  {
+    const animeMap = require('../src/services/animeMap');
+    animeMap._setIndex({
+      at: Date.now(), etag: 't',
+      byImdb: { tt900: { mal: 900 }, tt901: { mal: 901 }, tt902: { mal: 902 }, tt903: { mal: 903 } },
+      byTmdb: {},
+    });
+    const now = Date.now();
+    store.saveAnimeRatings({
+      'mal:900': { at: now, verdict: { code: 'Rx', minAge: 99, adult: true } },
+      'mal:901': { at: now, verdict: { code: 'R', minAge: 17, adult: false } },
+      'mal:902': { at: now, verdict: { code: 'PG-13', minAge: 13, adult: false } },
+      // 903 deliberately absent -> unrated
+    });
+    const pool = () => ([
+      { id: 'tt900', name: 'Hentai' }, { id: 'tt901', name: 'R17' },
+      { id: 'tt902', name: 'PG13' }, { id: 'tt903', name: 'Unrated' },
+      { id: 'tt999', name: 'NotAnime' },
+    ]);
+    const quiet2 = { log() {}, warn() {} };
+
+    // ADULT profile: pornography still blocked (the blacklist is permanent and
+    // not tied to an age limit); everything else passes.
+    let out = await rebuildMod.applyAnimeGate(pool(), { name: 'Ad', filters: { age_limit: 0 } }, quiet2);
+    assert.deepStrictEqual(out.map(m => m.id), ['tt901', 'tt902', 'tt903', 'tt999']);
+
+    // KID at 13 (judged 14): Rx blocked, R(17) above band, PG-13 kept and
+    // ANNOTATED for the LLM, unrated KEPT (falls through to the LLM, never
+    // deleted — the exact conflation that emptied catalogs under CSM),
+    // non-anime untouched.
+    out = await rebuildMod.applyAnimeGate(pool(), { name: 'Kid', filters: { age_limit: 13 } }, quiet2);
+    assert.deepStrictEqual(out.map(m => m.id), ['tt902', 'tt903', 'tt999']);
+    assert.strictEqual(out.find(m => m.id === 'tt902')._certification, 'PG-13');
+
+    // Request-path blacklist for meta: cache-only, so no outbound call
+    assert.strictEqual(await rebuildMod.isBlacklistedTitle('tt900', null, quiet2), true);
+    assert.strictEqual(await rebuildMod.isBlacklistedTitle('tt902', null, quiet2), false);
+    assert.strictEqual(await rebuildMod.isBlacklistedTitle('tt903', null, quiet2), false); // uncached -> not blocked
+    assert.strictEqual(await rebuildMod.isBlacklistedTitle('tt999', null, quiet2), false);
+
+    store.saveAnimeRatings({});
+    animeMap._setIndex({ at: Date.now(), etag: 'test', byImdb: {}, byTmdb: {} });
+    console.log('  ✓ anime gate: NSFW blocked for all ages, unrated falls through to the LLM');
+  }
 
   // Extra-catalog age gate: adult profiles untouched (no LLM), kids profiles
   // without a Groq key FAIL CLOSED (caller keeps the previous list rather than
@@ -987,7 +1099,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 40 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 41 async/http).`);
   process.exit(0);
 }
 

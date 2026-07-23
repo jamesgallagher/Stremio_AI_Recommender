@@ -7,10 +7,10 @@ refreshes in the background (stale-while-revalidate, 24 h threshold).
 Every catalog open is instant — Stremio only ever reads the pre-computed cache.
 Rebuilds happen in the background and never purge a good list on failure.
 
-> ## ⚠ v5.0.0-beta — engine choice, AI age gate, metadata service (THIS BRANCH ONLY)
+> ## ⚠ v5.2.0-beta — engine choice, AI + MAL age gating, metadata service (THIS BRANCH ONLY)
 >
 > Everything in this block applies to the `v3-phase1` beta branch, published
-> as `:5.0.0-beta` (also `:beta`) — the stable `:latest` image (v2.6.x) is
+> as `:5.2.0-beta` (also `:beta`) — the stable `:latest` image (v2.6.x) is
 > unaffected.
 >
 > - **Trakt recommends, code filters, LLM guards.** The AI lists now come
@@ -41,6 +41,18 @@ Rebuilds happen in the background and never purge a good list on failure.
 >   required for playback, and it answered search UNFILTERED next to our gated
 >   results. **Groq key is required for kids profiles and for the AI engine**;
 >   adult profiles on the Trakt engine still make zero LLM calls.
+> - **v5.2 — anime is judged on data, not recall.** Titles are matched to
+>   MyAnimeList via [Fribb's anime-lists](https://github.com/Fribb/anime-lists)
+>   (ETag-refreshed daily), and MAL's rating (G / PG / PG-13 / R / R+ / Rx) is
+>   used directly. Two rules, deliberately opposite: **any** adult signal (Rx,
+>   Hentai/Erotica) is a **permanent blacklist** on every profile including
+>   adults and every surface including `meta`; but a **missing** rating never
+>   drops a title — it falls through to the LLM. "No rating" is not "too old".
+>   The LLM safeguard still runs on everything that survives, and now receives
+>   the MAL band as evidence instead of guessing at one.
+> - **v5.2 — anime episode numbering** follows Cinemeta for anime series. TMDB
+>   numbers anime by broadcast season and IMDb often doesn't; stream addons key
+>   off Cinemeta's ids, and a mismatch is what "nothing opens" looks like.
 > - **Search** (v4.1): the addon answers Stremio/Nuvio search. On profiles
 >   with an age limit, results pass the SAME protection as the lists — the AI
 >   goalkeeper — and fail CLOSED: if it can't run, search returns nothing

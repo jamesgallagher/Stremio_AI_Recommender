@@ -32,6 +32,8 @@ const trakt = require('./services/trakt');
 const llm = require('./services/groq');
 const tmdb = require('./services/tmdb');
 const mdblist = require('./services/mdblist');
+const animeMap = require('./services/animeMap');
+const mal = require('./services/mal');
 
 const STALE_MS = (parseInt(process.env.STALE_HOURS, 10) || 24) * 3600e3;
 const BACKOFF_MS = (parseInt(process.env.BACKOFF_MINUTES, 10) || 30) * 60e3;
@@ -142,6 +144,74 @@ function cleanMetas(metas) {
   return metas.map((meta) => Object.fromEntries(
     Object.entries(meta).filter(([k]) => !k.startsWith('_')),
   ));
+}
+
+// Anime gate (v5.2). Runs BEFORE the LLM on every surface and narrows what it
+// has to judge; it never replaces it. Two rules, deliberately opposite:
+//
+//   BLACKLIST — any positive adult signal (MAL Rx, Hentai/Erotica genre) drops
+//   the title permanently, for EVERY profile including adults. Presence is a
+//   positive assertion, so it is terminal.
+//
+//   AGE — only a KNOWN rating above the limit drops a title. An unrated title
+//   is KEPT and passed to the LLM. "No rating" is not "too old"; that
+//   conflation is exactly what emptied the kids catalogs under CSM.
+//
+// Survivors carry the MAL band forward as `_certification`, so the LLM judges
+// on a real classification instead of guessing at one.
+async function applyAnimeGate(metas, profile, log = console) {
+  if (!metas.length) return metas;
+  const limit = profile.filters?.age_limit || 0;
+  await animeMap.ensureLoaded(log);
+
+  const malByMeta = new Map();
+  for (const m of metas) {
+    const hit = animeMap.lookup(m.id, m._tmdb_id);
+    if (hit?.mal) malByMeta.set(m, hit.mal);
+  }
+  if (!malByMeta.size) return metas;
+
+  const verdicts = await mal.ratings([...malByMeta.values()], log);
+  const out = [];
+  let blocked = 0;
+  let aged = 0;
+  for (const m of metas) {
+    const malId = malByMeta.get(m);
+    const v = malId ? verdicts.get(malId) : null;
+    if (mal.isBlacklisted(v)) {
+      log.log(`[anime] "${m.name}" is adult-rated (${v.code || 'flagged'}) — permanently blocked`);
+      blocked++;
+      continue;
+    }
+    if (mal.blockedForAge(v, limit === 0 ? 0 : judgementAge(profile.filters))) {
+      log.log(`[anime] "${m.name}" rated ${v.code} (${v.minAge}+) > limit — dropped`);
+      aged++;
+      continue;
+    }
+    if (v?.code) m._certification = v.code; // evidence for the LLM
+    out.push(m);
+  }
+  if (blocked || aged) {
+    log.log(`[anime] ${profile.name}: ${blocked} adult-blocked, ${aged} above age band, ${out.length} kept of ${metas.length}`);
+  }
+  return out;
+}
+
+// Request-path blacklist check for `meta`. v5 left meta ungated because an LLM
+// call before every title open was unacceptable latency — that reasoning does
+// not apply to a local map lookup, so a permanent porn blacklist should not
+// have a hole here. Deliberately CACHE-ONLY: an uncached title isn't blocked,
+// because blocking must never cost an outbound call on the request path.
+// Anything that came through our own lists is already cached.
+async function isBlacklistedTitle(imdbId, tmdbId, log = console) {
+  try {
+    await animeMap.ensureLoaded(log);
+    const hit = animeMap.lookup(imdbId, tmdbId);
+    if (!hit?.mal) return false;
+    return mal.isBlacklisted(mal.cachedVerdict(hit.mal));
+  } catch {
+    return false; // never fail a title open on a lookup error
+  }
 }
 
 // Judgement age (decided 2026-07-23): titles are vetted one year ABOVE the
@@ -319,12 +389,15 @@ async function buildAiPool(profile, type, watchedByType, watched, log) {
 async function buildAiCatalog(profile, type, watchedByType, watched, listSize, log) {
   const { filters } = profile;
   let pool = await buildAiPool(profile, type, watchedByType, watched, log);
+  // Blacklist + anime age band first — unconditional, and it hands the LLM a
+  // real MAL classification instead of leaving it to guess.
+  pool = await applyAnimeGate(pool, profile, log);
   if (filters.age_limit > 0) {
     const vetoed = await llm.ageGate(
       profile.keys.groq_api_key, type, judgementAge(filters),
       pool.map((m) => ({
         id: m.id, title: m.name, year: m.releaseInfo,
-        genres: m._genre_names, overview: m.description,
+        genres: m._genre_names, certification: m._certification, overview: m.description,
       })),
       log,
     );
@@ -361,6 +434,20 @@ async function buildCatalog(profile, type, watchedByType, log = console) {
     });
   }
   log.log(`[rebuild] ${profile.name}/${type}: pool ${pool.length} after filters/exclusions`);
+
+  // Blacklist + anime age band. Outside the age_limit branch on purpose: the
+  // NSFW blacklist applies to adult profiles too. Order is preserved (Trakt's
+  // ranking is meaningful) and recs without an IMDb id are left alone — they
+  // resolve via TMDB later.
+  {
+    const wrapped = pool.filter((r) => r.imdb_id)
+      .map((r) => ({ id: r.imdb_id, _tmdb_id: r.tmdb_id, name: r.title, __rec: r }));
+    const kept = new Set((await applyAnimeGate(wrapped, profile, log)).map((x) => {
+      if (x._certification) x.__rec.certification = x._certification;
+      return x.__rec;
+    }));
+    pool = pool.filter((r) => !r.imdb_id || kept.has(r));
+  }
 
   // Kids profiles: the AI age gate, now the sole age authority (CSM retired).
   if (filters.age_limit > 0) {
@@ -428,7 +515,11 @@ const WATCHLIST_CAP = 100;
 // than publishing an unvetted one to a child.
 async function applyExtraAgeGate(profile, def, metas, log = console) {
   const ageLimit = profile.filters?.age_limit || 0;
-  if (ageLimit <= 0 || !metas.length) return metas;
+  // The NSFW blacklist is NOT conditional on an age limit — it runs for adult
+  // profiles too, and needs no Groq key, so it goes before both early exits.
+  let list = await applyAnimeGate(metas, profile, log);
+  if (ageLimit <= 0 || !list.length) return list;
+  metas = list;
   if (!profile.keys.groq_api_key) {
     throw new Error(`Groq API key missing — required for the kids age check on "${def.name}"`);
   }
@@ -771,6 +862,8 @@ module.exports = {
   aiPasses,
   judgementAge,
   seedsFor,
+  applyAnimeGate,
+  isBlacklistedTitle,
   isStale,
   STALE_MS,
   MIN_METAS,

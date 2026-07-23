@@ -8,6 +8,8 @@ const rebuild = require('./rebuild');
 const catalogs = require('./catalogs');
 const tmdb = require('./services/tmdb');
 const llm = require('./services/groq');
+const animeMap = require('./services/animeMap');
+const cinemeta = require('./services/cinemeta');
 const { version } = require('../package.json'); // single source of truth for the addon version
 
 const router = express.Router({ mergeParams: true });
@@ -121,10 +123,16 @@ async function handleSearch(profile, type, extraStr, res) {
   const kids = (profile.filters.age_limit || 0) > 0;
   try {
     let metas = await tmdb.searchTitles(profile.keys.tmdb_api_key, type, query, kids ? 10 : 20);
+    // NSFW blacklist + anime age band — runs for ADULT searches too, since the
+    // blacklist is not tied to an age limit.
+    metas = await rebuild.applyAnimeGate(metas, profile, console);
     if (kids) {
       const vetoed = await llm.ageGate(
         profile.keys.groq_api_key, type, rebuild.judgementAge(profile.filters),
-        metas.map((m) => ({ id: m.id, title: m.name, year: m.releaseInfo, overview: m.description })),
+        metas.map((m) => ({
+          id: m.id, title: m.name, year: m.releaseInfo,
+          genres: m._genre_names, certification: m._certification, overview: m.description,
+        })),
         console,
       );
       metas = metas.filter((m) => !vetoed.has(m.id));
@@ -156,6 +164,12 @@ router.get('/meta/:type/:id', async (req, res) => {
   }
   // Cache first: a cached meta is a fact about the title and needs no API key,
   // so a profile with a broken/absent TMDB key still plays what's already known.
+  // Permanent NSFW blacklist applies here too — see rebuild.isBlacklistedTitle.
+  if (await rebuild.isBlacklistedTitle(id, null, console)) {
+    console.warn(`[meta] ${profile.name}/${type} ${id}: blocked (adult-rated)`);
+    return res.status(404).json({ error: 'Not available' });
+  }
+
   const cached = store.loadMeta(type, id);
   if (cached) {
     return res.json({ meta: applyRpdb([cached], profile.keys.rpdb_api_key)[0], cacheMaxAge: 43200 });
@@ -164,6 +178,21 @@ router.get('/meta/:type/:id', async (req, res) => {
   try {
     const result = await tmdb.fullMeta(profile.keys.tmdb_api_key, type, id, console);
     if (!result) return res.status(404).json({ error: 'Not found' });
+
+    // Anime series: prefer Cinemeta's episode numbering. TMDB numbers anime by
+    // broadcast season, IMDb/Cinemeta often don't, and stream addons key off
+    // Cinemeta's ids — a mismatch means episodes that nothing can resolve.
+    if (type === 'series') {
+      await animeMap.ensureLoaded(console);
+      if (animeMap.lookup(id, result.meta._tmdb_id)) {
+        const videos = await cinemeta.seriesVideos(id, Date.now(), console);
+        if (videos) {
+          console.log(`[meta] ${id}: anime — using Cinemeta numbering (${videos.length} episodes, TMDB had ${result.meta.videos?.length || 0})`);
+          result.meta.videos = videos;
+        }
+      }
+    }
+
     store.saveMeta(type, id, result.meta, result.ttlMs);
     const eps = result.meta.videos ? ` (${result.meta.videos.length} episodes)` : '';
     console.log(`[meta] ${profile.name}/${type} ${id}: built${eps}`);

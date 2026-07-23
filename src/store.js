@@ -159,6 +159,30 @@ function saveMeta(type, id, meta, ttlMs) {
   writeJsonAtomic(metaFile(type, id), { at: Date.now(), ttl: ttlMs || META_TTL_DEFAULT_MS, meta });
 }
 
+// ---- Anime id map + MAL ratings (v5.2) ----
+// Both are facts about titles, not about profiles, so they're shared. The id
+// map is stored ALREADY SLIMMED (see services/animeMap) — the 7.5 MB source
+// file is never kept. Ratings are static, so their cache is long-lived.
+const ANIME_INDEX_FILE = path.join(CACHE_DIR, 'anime-index.json');
+const ANIME_RATINGS_FILE = path.join(CACHE_DIR, 'anime-ratings.json');
+
+function loadAnimeIndex() {
+  const rec = readJson(ANIME_INDEX_FILE, null);
+  return rec?.byImdb && rec?.byTmdb ? rec : null;
+}
+
+function saveAnimeIndex(index) {
+  writeJsonAtomic(ANIME_INDEX_FILE, index);
+}
+
+function loadAnimeRatings() {
+  return readJson(ANIME_RATINGS_FILE, {});
+}
+
+function saveAnimeRatings(entries) {
+  writeJsonAtomic(ANIME_RATINGS_FILE, entries);
+}
+
 function markAttempt(profileId) {
   const cache = loadCache(profileId);
   cache.last_attempt_at = Date.now();
@@ -185,6 +209,10 @@ module.exports = {
   saveCsmCache,
   loadMeta,
   saveMeta,
+  loadAnimeIndex,
+  saveAnimeIndex,
+  loadAnimeRatings,
+  saveAnimeRatings,
   markAttempt,
   deleteCache,
 };
