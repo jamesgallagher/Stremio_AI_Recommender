@@ -7,14 +7,27 @@
 // dropped, and a missing verdict keeps the title (CSM stays the primary gate).
 const API = 'https://api.groq.com/openai/v1/chat/completions';
 
-// Model order (override with GROQ_MODELS). llama-3.3-70b-versatile is primary:
-// reliable structured output on list-sized payloads at free-tier limits;
-// gpt-oss-120b burns its budget on hidden reasoning there, so fallback only.
+// Model order (override with GROQ_MODELS).
+//
+// Groq decommissioned BOTH llama models we used on 2026-08-16 —
+// llama-3.3-70b-versatile (the old primary) and llama-3.1-8b-instant. The two
+// gpt-oss models are the survivors, and the primary swap is a reversal of an
+// earlier reversal, so worth spelling out:
+//   * v2.6.1: gpt-oss-120b was primary.
+//   * v3: it failed at 120-candidate RANKING on the free tier (empty content,
+//     json_validate_failed, 413), so llama-3.3-70b took over.
+//   * v5: ranking was removed. The LLM now only GENERATES ~50 title/year
+//     objects and AGE-GATES ~50 id/ok objects — payloads a fraction of the
+//     old size. Re-tested against Groq at these sizes: gpt-oss-120b handles
+//     both cleanly. So it's primary again, for a different architecture.
+// gpt-oss-20b is kept as a fallback: verified it handles the age gate (the
+// child-safety path), though it fails GENERATION with json_validate_failed —
+// acceptable, since a generation failure is fail-closed (keep the previous
+// list). qwen/qwen3.6-27b was tested and rejected: it fails both jobs under
+// json_object mode.
 const DEFAULT_MODELS = [
-  'llama-3.3-70b-versatile',
   'openai/gpt-oss-120b',
   'openai/gpt-oss-20b',
-  'llama-3.1-8b-instant',
 ];
 const FALLBACK_MODELS = (process.env.GROQ_MODELS || '')
   .split(',').map((s) => s.trim()).filter(Boolean);
@@ -87,18 +100,28 @@ const CURATOR_SYSTEM = 'You are a film and television curator with broad knowled
 // see a show appear and disappear day to day; generation still uses a warmer
 // temperature, where variety is the point.
 async function callModel(apiKey, model, prompt, { system = REVIEWER_SYSTEM, temperature = 0 } = {}) {
+  const body = {
+    model,
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: prompt },
+    ],
+    temperature,
+    response_format: { type: 'json_object' },
+  };
+  // gpt-oss are REASONING models. Left to their own devices in json_object mode
+  // they spend the response budget on hidden reasoning and return empty
+  // content, which the strict validator rejects as json_validate_failed —
+  // intermittently, so it's the worst kind of flaky. Generation and the age
+  // gate are mechanical JSON tasks that need no chain-of-thought, so cap the
+  // reasoning: verified this turns intermittent failures into clean output,
+  // and it lowers token use on the free tier as a bonus. Scoped to gpt-oss so
+  // a GROQ_MODELS override to some other family isn't sent an unknown param.
+  if (/^openai\/gpt-oss/.test(model)) body.reasoning_effort = 'low';
   const res = await fetch(API, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: prompt },
-      ],
-      temperature,
-      response_format: { type: 'json_object' },
-    }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) {
     const body = (await res.text().catch(() => '')).slice(0, 200);

@@ -190,9 +190,10 @@ Authoritative plan + locked decisions: `docs/phase1-plan.md`.
   counts run far lower).
 - **Bench:** each list stores an equal-sized hidden reserve; watched items are
   pruned and backfilled from the bench with no LLM call.
-- **Ranking model:** `llama-3.3-70b-versatile` primary — `gpt-oss-120b`
-  empirically fails this payload on the free tier (empty/400/413); fallback
-  only.
+- **Ranking model (v3, historical):** `llama-3.3-70b-versatile` primary —
+  `gpt-oss-120b` empirically failed this payload on the free tier
+  (empty/400/413). Superseded: v5 dropped ranking, and both llama models were
+  decommissioned by Groq on 2026-08-16. See the v5.2 note below.
 - **Kids-mode CSM gate, extra catalogs, auto-scrobble, RPDB, encryption:**
   unchanged from v2.
 - Release discipline: tagged `beta v3.0.0`, published without moving
@@ -226,6 +227,21 @@ Where the built app deliberately differs from this design:
 - **Title logos on metas** (shipped 2026-07): `toMeta` carries a TMDB logo,
   fetched via `append_to_response=external_ids,images` folded into the existing
   ID lookup (no extra requests), for the logo-over-art look in Stremio/Nuvio.
+
+## v5.2 — Groq model migration (2026-08-16)
+
+Groq decommissioned **both** llama models the addon used on 2026-08-16:
+`llama-3.3-70b-versatile` (the v3 primary) and `llama-3.1-8b-instant`. The
+model chain is now `openai/gpt-oss-120b` → `openai/gpt-oss-20b`.
+
+This makes gpt-oss-120b primary again — a reversal of the v3 reversal, for a
+changed architecture. In v3 it failed at 120-candidate *ranking*; v5 removed
+ranking, so the LLM now only generates ~50 title/year objects and age-gates
+~50 id/ok objects. Re-tested against Groq at these sizes, gpt-oss-120b handles
+both. gpt-oss-20b is a fallback: verified on the age gate (the child-safety
+path) but fails *generation* — acceptable, as a generation failure is
+fail-closed. `qwen/qwen3.6-27b` was tested and rejected (fails both jobs under
+`json_object` mode).
 
 ## Decided
 
