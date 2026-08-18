@@ -760,8 +760,10 @@ async function checkSimklStatus(id) {
       flowEl.innerHTML = `<div class="muted">✓ Connected${r.username ? ` as <b style="color:var(--ok)">${esc(r.username)}</b>` : ''} — verified live. <b>${r.watched_count || 0}</b> watched title(s) in the local store.</div>
         <div style="margin-top:8px"><button class="ghost" onclick="syncSimkl('${id}', this)">Sync watched now</button>
         <button class="ghost" onclick="buildRecs('${id}', this)" title="Build the recommendation pool from your watched history (TMDB recommendations, recency-weighted)">Build recommendations</button>
+        <button class="ghost" onclick="viewRecs('${id}', this)">View recommendations</button>
         <button class="ghost" onclick="disconnectSimkl('${id}')">Disconnect</button>
-        <span class="tres" data-tres="simkl-sync"></span></div>`;
+        <span class="tres" data-tres="simkl-sync"></span></div>
+        <div class="recs-panel diag" style="display:none"></div>`;
     } else {
       const needsReconnect = (r.reason || '').includes('reconnect');
       sum.innerHTML = needsReconnect ? '<span style="color:var(--err)">— reconnect</span>' : '';
@@ -805,6 +807,32 @@ async function buildRecs(id, btn) {
     out.className = 'tres ' + (r.skipped ? 'err' : 'ok');
   } catch (e) { out.textContent = ' ✗ ' + e.message; out.className = 'tres err'; }
   finally { btn.disabled = false; }
+}
+
+// View the recommendation pool (until the Advanced tab exists). Each row has a
+// 🚫 "Don't recommend" that hits the shared suppress endpoint.
+async function viewRecs(id, btn) {
+  const panel = document.querySelector(`[data-id="${id}"] .recs-panel`);
+  panel.style.display = 'block';
+  panel.innerHTML = '<span class="muted">loading…</span>';
+  try {
+    const d = await api(`/profiles/${id}/recommend`);
+    const row = (r) => `<div class="rec-row" style="display:flex;gap:8px;align-items:center;padding:2px 0">
+      <span class="grow">${esc(r.title || '?')} <span class="muted">(${r.year || '?'}) · ${esc(r.primary_genre || '—')} · aff ${(r.affinity || 0).toFixed(2)}${r.age_classification ? ' · ' + esc(r.age_classification) : ''}</span></span>
+      <button class="ghost mini" title="Don't recommend" onclick="suppressRec('${id}','${r.type}','${r.tmdb_id}',this)">🚫</button></div>`;
+    const section = (list, label) => `<div style="margin-top:8px"><b>${label} (${list.length})</b>${list.map(row).join('') || '<div class="muted">none</div>'}</div>`;
+    panel.innerHTML = `<div class="muted">${d.total} in the pool (top 40 of each shown)</div>${section(d.movies, 'Movies')}${section(d.series, 'Shows')}`;
+  } catch (e) { panel.innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`; }
+}
+
+async function suppressRec(id, type, tmdbId, btn) {
+  btn.disabled = true;
+  try {
+    await api(`/profiles/${id}/recommend/suppress`, { method: 'POST', body: { type, tmdb_id: tmdbId } });
+    const rowEl = btn.closest('.rec-row');
+    if (rowEl) { rowEl.style.opacity = '0.35'; }
+    btn.textContent = 'removed';
+  } catch (e) { btn.textContent = '✗'; btn.title = e.message; }
 }
 
 async function syncSimkl(id, btn) {
