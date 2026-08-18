@@ -29,7 +29,6 @@ const store = require('./store');
 const config = require('./config');
 const settings = require('./settings');
 const catalogs = require('./catalogs');
-const trakt = require('./services/trakt');
 const simkl = require('./services/simkl');
 const watchedStore = require('./watchedStore');
 const llm = require('./services/groq');
@@ -270,54 +269,9 @@ async function buildWatchlistCatalog(profile, def, log = console) {
   return metas.filter((m) => m && !watched.imdb.has(m.id)); // cleaned after the age gate
 }
 
-// A public Trakt list -> metas. The list's web-URL filters are site-side only,
-// so the rating floor is applied here and the age ceiling by the AI gate in
-// buildExtraCatalog. Watched exclusion is opt-in per definition
-// (prune_watched), matching the list URL's ignore_watched.
-async function buildTraktListCatalog(profile, def, log = console) {
-  if (!profile.keys.trakt_client_id) {
-    throw new Error('Trakt Client ID is required for Trakt list catalogs');
-  }
-  const target = def.target || EXTRA_LIST_TARGET;
-  const items = await trakt.getListItems(profile, def.user, def.slug, def.type, Math.max(target * 2, 100));
-  log.log(`[extra] ${profile.name}/${def.id}: ${items.length} item(s) on ${def.user}/${def.slug}`);
-
-  const watchedImdb = def.prune_watched
-    ? watchedStore.watchedIdSets(profile.id).imdb
-    : new Set();
-
-  const picked = [];
-  const seen = new Set();
-  for (const it of items) {
-    if (picked.length >= target) break;
-    if (!it.imdb_id || seen.has(it.imdb_id)) continue;
-    seen.add(it.imdb_id);
-    if (watchedImdb.has(it.imdb_id)) continue;
-    // Trakt's rating is 0-10 like IMDb's; unrated is kept, as everywhere else.
-    if (def.min_imdb > 0 && it.rating !== null && it.rating < def.min_imdb) continue;
-    picked.push(it);
-  }
-
-  const metas = [];
-  for (let i = 0; i < picked.length; i += 25) {
-    const chunk = picked.slice(i, i + 25);
-    metas.push(...await Promise.all(chunk.map(async (it) => {
-      if (it.tmdb_id) {
-        const m = await tmdb.metaByTmdbId(profile.keys.tmdb_api_key, def.type, it.tmdb_id, log);
-        if (m) return m;
-      }
-      return { id: it.imdb_id, type: def.type, name: it.title, poster: null, description: '', releaseInfo: it.year ? String(it.year) : null };
-    })));
-  }
-  return metas.filter(Boolean); // cleaned after the age gate, which needs genres
-}
-
 async function buildExtraCatalog(profile, def, log = console) {
   if (def.source === 'simkl_plantowatch') {
     return cleanMetas(await applyExtraAgeGate(profile, def, await buildWatchlistCatalog(profile, def, log), log));
-  }
-  if (def.source === 'trakt_list') {
-    return shuffle(cleanMetas(await applyExtraAgeGate(profile, def, await buildTraktListCatalog(profile, def, log), log)));
   }
   const key = profile.keys.mdblist_api_key;
   if (!key) throw new Error('MDBList API key is required for extra catalogs');

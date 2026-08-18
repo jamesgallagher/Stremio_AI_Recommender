@@ -132,14 +132,14 @@ ok('catalogs: registry, defaults, and per-source requirements', () => {
   assert.strictEqual(catalogs.requirementMet({ keys: { mdblist_api_key: 'k' }, simkl_auth: null }, wl), false);
   assert.strictEqual(catalogs.requirementMet({ keys: { mdblist_api_key: 'k' } }, catalogs.getExtra('mdb-action-movies')), true);
   const anime = catalogs.getExtra('trakt-anime-teen-series');
-  assert.strictEqual(anime.source, 'trakt_list');
+  assert.strictEqual(anime.source, 'mdblist'); // v6: snoak/trending-anime-shows on MDBList
   assert.strictEqual(anime.type, 'series');
   assert.strictEqual(anime.target, 50);
-  assert.strictEqual(anime.min_imdb, 6);   // list URL's imdb_ratings=6-10
-  assert.strictEqual(anime.prune_watched, true); // list URL's ignore_watched
+  assert.strictEqual(anime.min_imdb, 6);   // list's imdb_ratings=6-10
+  assert.strictEqual(anime.min_profile_age, 13); // TV-14 band
   assert.ok(!anime.default_on);
-  assert.strictEqual(catalogs.requirementMet({ keys: { trakt_client_id: 'c' }, trakt_auth: null }, anime), true);
-  assert.strictEqual(catalogs.requirementMet({ keys: {}, trakt_auth: { access_token: 't' } }, anime), false);
+  assert.strictEqual(catalogs.requirementMet({ keys: { mdblist_api_key: 'k' } }, anime), true);
+  assert.strictEqual(catalogs.requirementMet({ keys: {} }, anime), false);
 
   // Catalog-level age band (TV-14 -> 13+). A profile limited below the band
   // never sees it; adults (no limit) always do. This is a catalog floor, NOT a
@@ -1160,7 +1160,7 @@ async function httpTests() {
   const defs = await (await fetch(`${BASE}/api/catalogs`)).json();
   assert.strictEqual(defs.catalogs.length, 11);
   assert.ok(defs.catalogs.some(c => c.id === 'mdb-popular-series' && c.type === 'series'));
-  assert.ok(defs.catalogs.some(c => c.id === 'trakt-anime-teen-series' && c.source === 'trakt_list'));
+  assert.ok(defs.catalogs.some(c => c.id === 'trakt-anime-teen-series' && c.source === 'mdblist'));
   assert.ok(defs.catalogs.some(c => c.id === 'trakt-watchlist-movies' && c.source === 'simkl_plantowatch' && c.default_on === true));
   console.log('  ✓ GET /api/catalogs lists extra-catalog definitions');
 

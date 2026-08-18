@@ -5,14 +5,11 @@
 //   plan-to-watch list (movies + shows + anime). Default ON (default_on),
 //   requires Simkl. Served in the user's own order; watched titles ARE pruned
 //   (a watch-later list must not show what's been seen).
-// - source 'trakt_list' (public Trakt lists, added 2026-07-23): any user's
-//   public list, fetched with the client ID alone. Rating-gated like the
-//   curated lists; the site-URL view filters are NOT applied by the API and
-//   are re-implemented in the pipeline.
 // - source 'mdblist' (curated lists, decided 2026-07-08): popular charts keep
 //   every item unfiltered (max 20); rating-gated catalogs (min_imdb) drop
 //   items below the bar and keep paging until 20; final order shuffled per
 //   rebuild; watched status deliberately ignored. Requires the MDBList key.
+//   Anime TV-14 is one of these (snoak/trending-anime-shows on MDBList).
 const EXTRA_CATALOGS = [
   // Watch Later first — the "3rd catalog" straight after the two AI rows.
   { id: 'trakt-watchlist-movies', type: 'movie', name: 'Watch Later', source: 'simkl_plantowatch', default_on: true },
@@ -36,7 +33,7 @@ const EXTRA_CATALOGS = [
   // profile limited below it never sees the option. This is a CATALOG-level
   // floor, not a per-title certification lookup — it cannot drop titles for
   // being unrated, which is the failure that retired the CSM gate.
-  { id: 'trakt-anime-teen-series', type: 'series', name: 'Anime TV-14', source: 'trakt_list', user: 'snoak', slug: 'trending-anime-shows', min_imdb: 6, target: 50, prune_watched: true, min_profile_age: 13 },
+  { id: 'trakt-anime-teen-series', type: 'series', name: 'Anime TV-14', source: 'mdblist', user: 'snoak', slug: 'trending-anime-shows', min_imdb: 6, sort: 'tmdbpopular', target: 50, min_profile_age: 13 },
   { id: 'mdb-christmas-movies', type: 'movie', name: 'Christmas Movies', source: 'mdblist', user: 'jbeasley74', slug: 'christmas-movies', min_imdb: 6, sort: 'imdbpopular' },
   { id: 'mdb-comedy-movies', type: 'movie', name: 'Comedy Movies', source: 'mdblist', user: 'hdlists', slug: 'comedy-movies-2001-2020', min_imdb: 6, sort: 'imdbpopular' },
   { id: 'mdb-action-movies', type: 'movie', name: 'Action Movies', source: 'mdblist', user: 'garycrawfordgc', slug: 'action', min_imdb: 6, sort: 'imdbpopular' },
@@ -77,8 +74,6 @@ function enabledExtras(profile) {
 // The profile-side prerequisite for a catalog's data source.
 function requirementMet(profile, def) {
   if (def.source === 'simkl_plantowatch') return !!profile.simkl_auth?.access_token;
-  // Public lists need only the client ID — they aren't this profile's data.
-  if (def.source === 'trakt_list') return !!profile.keys.trakt_client_id;
   return !!profile.keys.mdblist_api_key;
 }
 
