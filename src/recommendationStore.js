@@ -11,7 +11,6 @@
 const db = require('./db');
 const settings = require('./settings');
 const tmdb = require('./services/tmdb');
-const animeMap = require('./services/animeMap');
 const watchedStore = require('./watchedStore');
 
 const HALF_LIFE_DAYS = 90;  // recency weight = 0.5 ^ (days_since_watched / this)
@@ -21,20 +20,24 @@ const DAY_MS = 24 * 3600e3;
 
 // Per-source-title selection: TMDB returns ~20 recs already in RELEVANCE order
 // (strongest match first). Keeping all 20 makes the matching mushy, so we keep
-// only the strongest few PER title — gated by a rating floor and a vote-count
-// confidence floor, then the top N in TMDB's own order (NOT re-sorted by rating,
-// which would surface acclaimed-but-unrelated films for everything).
+// only the strongest few PER title — the top N in TMDB's own order, gated only
+// by the vote-count NOISE floor (an internal confidence gate, not a user
+// preference) and the porn flag.
+//
+// DELIBERATELY NOT gated by the rating floor / genres / recency here: those are
+// USER PREFERENCES that change, so we store a fuller pool of strong candidates
+// (with vote_average + genres + year) and apply those filters at SERVE time
+// (F6). Changing the floor or un-excluding a genre then takes effect with no
+// rebuild and no TMDB refetch. (Decided 2026-08 — see docs/v6-features F5.)
 const PER_TITLE_CAP = 5;
 const VOTE_FLOOR_MOVIE = 150;
 const VOTE_FLOOR_TV = 50;   // TV vote counts run lower, same asymmetry as elsewhere
 const voteFloorFor = (type) => (type === 'series' ? VOTE_FLOOR_TV : VOTE_FLOOR_MOVIE);
 
-// The strongest ≤N recommendations for one source title.
-function selectStrong(recs, minRating = 0) {
+// The strongest ≤N recommendations for one source title (relevance order).
+function selectStrong(recs) {
   return (recs || [])
-    .filter((r) => !r.adult
-      && (r.vote_count || 0) >= voteFloorFor(r.type)
-      && (minRating <= 0 || (r.vote_average || 0) >= minRating))
+    .filter((r) => !r.adult && (r.vote_count || 0) >= voteFloorFor(r.type))
     .slice(0, PER_TITLE_CAP); // TMDB relevance order preserved
 }
 
@@ -49,7 +52,9 @@ function init() {
       imdb_id     TEXT,
       title       TEXT,
       year        INTEGER,
-      primary_genre       TEXT,
+      primary_genre       TEXT,           -- genres[0], for genre-balanced serve
+      genres      TEXT,                   -- full CSV genre list, for serve-time exclusion
+      vote_average REAL,                  -- for the serve-time rating floor
       age_classification  TEXT,           -- filled by the age-gate slice
       affinity    REAL,                   -- recency-weighted score (primary rank)
       rec_count   INTEGER,                -- raw # of watched titles that recommended it
@@ -72,6 +77,11 @@ function init() {
       PRIMARY KEY (profile_id, type, tmdb_id)
     );
   `);
+  // Migrate older beta DBs that predate the serve-time-filter columns. ADD COLUMN
+  // throws "duplicate column" once present, so each is best-effort.
+  for (const [col, decl] of [['genres', 'TEXT'], ['vote_average', 'REAL']]) {
+    try { db.get().exec(`ALTER TABLE recommended ADD COLUMN ${col} ${decl}`); } catch { /* already present */ }
+  }
   ready = true;
 }
 
@@ -140,17 +150,18 @@ function upsertCandidates(profileId, candidates) {
   init();
   const conn = db.get();
   const stmt = conn.prepare(`
-    INSERT INTO recommended (profile_id, type, tmdb_id, imdb_id, title, year, primary_genre, affinity, rec_count, popularity, poster, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO recommended (profile_id, type, tmdb_id, imdb_id, title, year, primary_genre, genres, vote_average, affinity, rec_count, popularity, poster, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(profile_id, type, tmdb_id) DO UPDATE SET
       affinity = excluded.affinity, rec_count = excluded.rec_count, popularity = excluded.popularity,
-      primary_genre = excluded.primary_genre, title = excluded.title, year = excluded.year, poster = excluded.poster
+      primary_genre = excluded.primary_genre, genres = excluded.genres, vote_average = excluded.vote_average,
+      title = excluded.title, year = excluded.year, poster = excluded.poster
   `);
   conn.prepare('BEGIN').run();
   try {
     const now = Date.now();
     for (const c of candidates) {
-      stmt.run(profileId, c.type, c.tmdb_id, c.imdb_id || null, c.title, c.year, c.primary_genre || null, c.affinity, c.rec_count, c.popularity, c.poster || null, now);
+      stmt.run(profileId, c.type, c.tmdb_id, c.imdb_id || null, c.title, c.year, c.primary_genre || null, c.genres || null, c.vote_average ?? null, c.affinity, c.rec_count, c.popularity, c.poster || null, now);
     }
     conn.prepare('COMMIT').run();
   } catch (err) { conn.prepare('ROLLBACK').run(); throw err; }
@@ -224,10 +235,11 @@ async function buildRecommendations(profile, log = console) {
   const seeds = seedsAll.slice(0, SEED_CAP);
   if (!seeds.length) return { skipped: true, reason: 'no watched titles to seed from' };
 
-  const minRating = filters.min_rating || 0;
   // Fetch recommendations per seed, then keep only the STRONGEST few per title
-  // (rating + vote-count gated, TMDB relevance order). This is the matching
-  // quality lever — ~5/title instead of ~20.
+  // (vote-count noise gate, TMDB relevance order). This is the matching quality
+  // lever — ~5/title instead of ~20. User-preference filters (rating floor,
+  // excluded genres, recency) are NOT applied here — they run at serve time over
+  // this stored pool, so changing one takes effect with no rebuild.
   const recsBySeed = new Map();
   let rawFetched = 0;
   for (let i = 0; i < seeds.length; i += 5) {
@@ -236,7 +248,7 @@ async function buildRecommendations(profile, log = console) {
       try {
         const recs = await tmdb.getRecommendations(tmdbKey, w.type, w.tmdb_id);
         rawFetched += recs.length;
-        recsBySeed.set(key(w.type, w.tmdb_id), selectStrong(recs, minRating));
+        recsBySeed.set(key(w.type, w.tmdb_id), selectStrong(recs));
       } catch (err) { log.warn(`[rec] recs for ${w.title} failed: ${err.message}`); }
     }));
   }
@@ -245,25 +257,24 @@ async function buildRecommendations(profile, log = console) {
   const watchedIds = watchedStore.watchedIdSets(profile.id);
   const dont = dontRecommendKeys(profile.id);
   const genreMap = await tmdb.getGenreMap(tmdbKey);
-  await animeMap.ensureLoaded(log);
-  const excluded = new Set((filters.excluded_genres || []));
 
   const kept = [];
   for (const c of candidates.values()) {
     if (watchedIds.tmdb.has(c.tmdb_id)) continue;             // already watched
     if (dont.has(key(c.type, c.tmdb_id))) continue;           // user-rejected / decayed
-    // rating + vote-count already enforced per-title in selectStrong
+    // Resolve genre names once and store the FULL list — serve-time exclusion
+    // needs every genre, not just the primary, or a title whose secondary genre
+    // is excluded would slip through.
     const names = (c.genre_ids || []).map((g) => genreMap[g]).filter(Boolean);
-    if (names.some((n) => excluded.has(n))) continue;         // excluded genre
-    if (excluded.has('Anime') && animeMap.isAnime(null, c.tmdb_id)) continue; // pseudo-genre
     c.primary_genre = names[0] || null;
+    c.genres = names.join(',');
     kept.push(c);
   }
   kept.sort((a, b) => b.affinity - a.affinity || b.popularity - a.popularity);
   const top = kept.slice(0, STORE_CAP);
   upsertCandidates(profile.id, top);
 
-  log.log(`[rec] ${profile.name}: ${seeds.length} seed(s), ${rawFetched} raw recs → top-${PER_TITLE_CAP}/title → ${candidates.size} unique → ${kept.length} after filters → stored ${top.length} (total ${countRecommended(profile.id)})`);
+  log.log(`[rec] ${profile.name}: ${seeds.length} seed(s), ${rawFetched} raw recs → top-${PER_TITLE_CAP}/title → ${candidates.size} unique → ${kept.length} after de-dupe → stored ${top.length} (total ${countRecommended(profile.id)})`);
   return { seeds: seeds.length, raw: rawFetched, strong: candidates.size, kept: kept.length, stored: top.length, total: countRecommended(profile.id) };
 }
 

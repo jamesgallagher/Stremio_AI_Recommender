@@ -670,31 +670,36 @@ ok('recommendationStore: recency-weighted affinity (the Pirates behaviour)', () 
   assert.ok(out.get('movie:B').affinity > out.get('movie:C').affinity);
 });
 
-ok('recommendationStore: selectStrong gates on rating + votes, caps at 5, keeps TMDB order', () => {
+ok('recommendationStore: selectStrong gates on votes only (NOT rating), caps at 5, keeps TMDB order', () => {
   const rs = require('../src/recommendationStore');
   const mk = (id, va, vc, adult = false, type = 'movie') => ({ type, tmdb_id: id, vote_average: va, vote_count: vc, adult });
   const recs = [
-    mk('A', 8, 1000), mk('bad-rating', 5, 1000), mk('B', 7, 1000), mk('low-votes', 9, 10),
-    mk('adult', 8, 1000, true), mk('C', 6, 200), mk('D', 8, 1000), mk('E', 7, 1000), mk('F', 9, 1000),
+    mk('A', 8, 1000), mk('low-rating', 5, 1000), mk('B', 7, 1000), mk('low-votes', 9, 10),
+    mk('adult', 8, 1000, true), mk('C', 6, 200), mk('D', 8, 1000), mk('E', 7, 1000),
   ];
-  // pass rating>=6 + votes>=150 + not adult: A,B,C,D,E,F -> capped to top 5 in ORDER
-  assert.deepStrictEqual(rs.selectStrong(recs, 6).map((r) => r.tmdb_id), ['A', 'B', 'C', 'D', 'E']);
-  // NOT re-sorted by rating (F has the highest rating but is 6th in TMDB order -> excluded by the cap)
-  assert.ok(!rs.selectStrong(recs, 6).some((r) => r.tmdb_id === 'F'));
+  // Rating floor is NOT applied here (moved to serve time) — low-rating stays; the
+  // vote NOISE floor (>=150) drops low-votes; porn is dropped. Then top-5 in ORDER.
+  assert.deepStrictEqual(rs.selectStrong(recs).map((r) => r.tmdb_id), ['A', 'low-rating', 'B', 'C', 'D']);
+  // low-votes and adult are excluded regardless of position
+  assert.ok(!rs.selectStrong(recs).some((r) => r.tmdb_id === 'low-votes' || r.tmdb_id === 'adult'));
   // TV vote floor (50) is lower than movie (150) — same 60-vote title differs by type
-  assert.strictEqual(rs.selectStrong([mk('T', 7, 60, false, 'series')], 6).length, 1);
-  assert.strictEqual(rs.selectStrong([mk('M', 7, 60, false, 'movie')], 6).length, 0);
+  assert.strictEqual(rs.selectStrong([mk('T', 7, 60, false, 'series')]).length, 1);
+  assert.strictEqual(rs.selectStrong([mk('M', 7, 60, false, 'movie')]).length, 0);
 });
 
 ok('recommendationStore: upsert, dont_recommend suppresses + drops from pool', () => {
   const rs = require('../src/recommendationStore');
   const pid = 'rec-test';
   rs.upsertCandidates(pid, [
-    { type: 'movie', tmdb_id: '280', title: 'T2', year: 1991, primary_genre: 'Action', affinity: 2.0, rec_count: 2, popularity: 50, poster: null },
-    { type: 'series', tmdb_id: '1399', title: 'GoT', year: 2011, primary_genre: 'Drama', affinity: 1.0, rec_count: 1, popularity: 90, poster: null },
+    { type: 'movie', tmdb_id: '280', title: 'T2', year: 1991, primary_genre: 'Action', genres: 'Action,Science Fiction', vote_average: 8.1, affinity: 2.0, rec_count: 2, popularity: 50, poster: null },
+    { type: 'series', tmdb_id: '1399', title: 'GoT', year: 2011, primary_genre: 'Drama', genres: 'Drama,Fantasy', vote_average: 8.4, affinity: 1.0, rec_count: 1, popularity: 90, poster: null },
   ]);
   assert.strictEqual(rs.countRecommended(pid), 2);
-  assert.strictEqual(rs.getRecommended(pid, { type: 'movie' })[0].title, 'T2');
+  const t2 = rs.getRecommended(pid, { type: 'movie' })[0];
+  assert.strictEqual(t2.title, 'T2');
+  // serve-time filter columns round-trip: full genre list + rating
+  assert.strictEqual(t2.genres, 'Action,Science Fiction');
+  assert.strictEqual(t2.vote_average, 8.1);
   // Suppress the movie -> gone from the pool + in the dont_recommend set
   rs.addDontRecommend(pid, 'movie', '280', 'user');
   assert.strictEqual(rs.countRecommended(pid), 1);
