@@ -702,6 +702,30 @@ ok('config: secrets sealed on disk, plaintext in memory, locked mode recovers', 
   config.removeProfile(p.id);
 });
 
+ok('config: Simkl fields present + simkl_auth token sealed at rest (v6)', () => {
+  const fs = require('fs'); const path = require('path');
+  const p = config.addProfile('SimklTest');
+  // New profiles carry the Simkl fields
+  assert.strictEqual(p.keys.simkl_client_id, '');
+  assert.strictEqual(p.keys.simkl_client_secret, '');
+  assert.strictEqual(p.simkl_auth, null);
+  // Store a client id + a connected token
+  config.updateProfile(p.id, {
+    keys: { simkl_client_id: 'simkl-cid-abc' },
+    simkl_auth: { access_token: 'simkl-token-xyz', username: 'james', connected_at: 1 },
+  });
+  // On disk: both the client id and the auth token are sealed, plaintext absent
+  const raw = fs.readFileSync(path.join(process.env.DATA_DIR, 'profiles.json'), 'utf8');
+  assert.ok(!raw.includes('simkl-token-xyz'), 'simkl token must be sealed on disk');
+  assert.ok(!raw.includes('simkl-cid-abc'), 'simkl client id must be sealed on disk');
+  // In memory: plaintext, and updateProfile accepted simkl_auth
+  const fresh = config.getProfile(p.id);
+  assert.strictEqual(fresh.keys.simkl_client_id, 'simkl-cid-abc');
+  assert.strictEqual(fresh.simkl_auth.access_token, 'simkl-token-xyz');
+  assert.strictEqual(fresh.simkl_auth.username, 'james');
+  config.removeProfile(p.id);
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');
@@ -894,6 +918,20 @@ async function httpTests() {
   res = await fetch(`${BASE}/addon/deadbeef/manifest.json`);
   assert.strictEqual(res.status, 404);
   console.log('  ✓ unknown token rejected');
+
+  // Simkl auth routes (no-network paths). The profile API exposes simkl fields;
+  // connect without a Client ID -> 400; live status with no token -> not
+  // connected (no network); disconnect -> ok.
+  assert.ok('simkl_client_id' in listed.keys && 'simkl_connected' in listed);
+  assert.strictEqual(listed.simkl_connected, false);
+  res = await fetch(`${BASE}/api/profiles/${profile.id}/simkl/connect`, { method: 'POST' });
+  assert.strictEqual(res.status, 400); // no Client ID set
+  const sstatus = await (await fetch(`${BASE}/api/profiles/${profile.id}/simkl/status`)).json();
+  assert.strictEqual(sstatus.connected, false);
+  assert.strictEqual(sstatus.reason, 'not connected'); // token-less check is network-free
+  const sdis = await fetch(`${BASE}/api/profiles/${profile.id}/simkl/disconnect`, { method: 'POST' });
+  assert.strictEqual(sdis.status, 200);
+  console.log('  ✓ Simkl auth routes: connect needs Client ID, live status token-less, disconnect');
 
   // Empty cache -> warming-up card, short client cache
   let cat = await (await fetch(`${BASE}/addon/${profile.token}/catalog/movie/ai-recs-movies.json`)).json();
@@ -1170,7 +1208,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 42 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 43 async/http).`);
   process.exit(0);
 }
 

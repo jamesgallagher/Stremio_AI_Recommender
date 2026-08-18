@@ -201,6 +201,7 @@ function render(profiles) {
     // Groq is only required for kids profiles (AI age goalkeeper)
     const keysOk = p.keys_set.trakt_client_id && p.keys_set.trakt_client_secret && p.keys_set.tmdb_api_key && (p.filters.age_limit > 0 || p.filters.engine === 'ai' ? p.keys_set.groq_api_key : true);
     const traktKeysOk = p.keys_set.trakt_client_id && p.keys_set.trakt_client_secret;
+    const simklKeysOk = p.keys_set.simkl_client_id; // PIN flow needs only the Client ID
     const badge = p.trakt_connected
       ? '<span class="badge ok">Trakt connected</span>'
       : (keysOk ? '<span class="badge warn">Trakt not authorized</span>' : '<span class="badge err">Keys missing</span>');
@@ -241,6 +242,22 @@ function render(profiles) {
             : `<div><button onclick="connectTrakt('${p.id}')" ${traktKeysOk ? '' : 'disabled'}>Connect Trakt</button>
                <span class="muted"> — sign in as <b>${esc(p.name)}</b>'s Trakt account when prompted${traktKeysOk ? '' : ' (save both keys above first)'}</span></div>
                <div class="flow-status" style="margin-top:10px"></div>`}
+        </div>
+      </details>
+
+      <details ontoggle="if(this.open) checkSimklStatus('${p.id}')">
+        <summary>Simkl — account &amp; authorization <span class="simkl-sum" data-sid="${p.id}">${simklKeysOk ? '' : '— Client ID required'}</span></summary>
+        <div class="muted" style="margin-top:8px">v6 tracker. Create a Simkl API app for <b>${esc(p.name)}</b> (redirect URI can be anything), paste the Client ID (and Secret), Save, then Connect. The status below is verified <b>live</b> against Simkl each time you open this section.</div>
+        <div class="keys-list">
+          <div><label>Client ID
+              <a class="getkey" href="https://simkl.com/settings/developer/new/" target="_blank" rel="noopener">get key ↗</a></label>
+            ${keyRow(p.id, 'simkl_client_id', p.keys.simkl_client_id)}</div>
+          <div><label>Client Secret <span class="muted">(optional for PIN)</span></label>
+            ${keyRow(p.id, 'simkl_client_secret', p.keys.simkl_client_secret)}</div>
+        </div>
+        <div style="margin-top:10px"><button onclick="saveKeys('${p.id}')">Save</button></div>
+        <div class="simkl-flow" data-sid="${p.id}" style="margin-top:12px; padding-top:10px; border-top:1px solid var(--border)">
+          <span class="muted">Open this section to check the live connection status…</span>
         </div>
       </details>
 
@@ -727,6 +744,51 @@ async function connectTrakt(id) {
 async function disconnectTrakt(id) {
   await api(`/profiles/${id}/trakt/disconnect`, { method: 'POST' });
   load();
+}
+
+// LIVE Simkl status — runs on the Simkl section opening. Never trusts a stored
+// flag: a token Simkl has invalidated shows as needing reconnect (the v5 bug).
+async function checkSimklStatus(id) {
+  const card = document.querySelector(`[data-id="${id}"]`);
+  const flowEl = card.querySelector('.simkl-flow');
+  const sum = card.querySelector('.simkl-sum');
+  flowEl.innerHTML = '<span class="muted">⟳ Checking Simkl…</span>';
+  try {
+    const r = await api(`/profiles/${id}/simkl/status`);
+    if (r.connected) {
+      sum.innerHTML = '<span style="color:var(--ok)">✓ connected</span>';
+      flowEl.innerHTML = `<div class="muted">✓ Connected${r.username ? ` as <b style="color:var(--ok)">${esc(r.username)}</b>` : ''} — verified live.</div>
+        <div style="margin-top:8px"><button class="ghost" onclick="disconnectSimkl('${id}')">Disconnect</button></div>`;
+    } else {
+      const needsReconnect = (r.reason || '').includes('reconnect');
+      sum.innerHTML = needsReconnect ? '<span style="color:var(--err)">— reconnect</span>' : '';
+      flowEl.innerHTML = `<div><button onclick="connectSimkl('${id}')">Connect Simkl</button>${r.reason ? ` <span class="muted">— ${esc(r.reason)}</span>` : ''}</div>
+        <div class="flow-status" style="margin-top:10px"></div>`;
+    }
+  } catch (e) { flowEl.innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`; }
+}
+
+async function connectSimkl(id) {
+  const card = document.querySelector(`[data-id="${id}"]`);
+  const statusEl = card.querySelector('.simkl-flow .flow-status');
+  try {
+    await saveKeys(id, true); // persist the Client ID if just typed
+    const { user_code, verification_url } = await api(`/profiles/${id}/simkl/connect`, { method: 'POST' });
+    statusEl.innerHTML = `Go to <a href="${verification_url}" target="_blank" style="color:var(--accent)">${verification_url}</a> and enter:
+      <div class="pin">${user_code}</div><div class="muted">Waiting for authorization…</div>`;
+    const poll = setInterval(async () => {
+      const { connected, flow } = await api(`/profiles/${id}/simkl/status`);
+      if (connected) { clearInterval(poll); toast('Simkl connected 🎉'); checkSimklStatus(id); }
+      else if (flow && flow.state === 'error') { clearInterval(poll); statusEl.innerHTML = `<span style="color:var(--err)">${esc(flow.error)}</span>`; }
+    }, 3000);
+  } catch (err) {
+    statusEl.innerHTML = `<span style="color:var(--err)">${esc(err.message)}</span>`;
+  }
+}
+
+async function disconnectSimkl(id) {
+  await api(`/profiles/${id}/simkl/disconnect`, { method: 'POST' });
+  checkSimklStatus(id);
 }
 
 async function diagnose(id, btn) {

@@ -56,8 +56,10 @@ const SCROBBLE_PROVIDERS = ['nuvio', 'stremio'];
 
 // Secret fields sealed at rest. The scrobble password_enc is already its own
 // AES blob and the install token is deliberately excluded (see header).
-const SECRET_KEY_FIELDS = ['trakt_client_id', 'trakt_client_secret', 'tmdb_api_key', 'groq_api_key', 'rpdb_api_key', 'mdblist_api_key'];
+const SECRET_KEY_FIELDS = ['trakt_client_id', 'trakt_client_secret', 'simkl_client_id', 'simkl_client_secret', 'tmdb_api_key', 'groq_api_key', 'rpdb_api_key', 'mdblist_api_key'];
 const SECRET_TOKEN_FIELDS = ['access_token', 'refresh_token'];
+// Top-level auth objects whose tokens are sealed (Trakt legacy + Simkl v6).
+const AUTH_OBJECTS = ['trakt_auth', 'simkl_auth'];
 
 let locked = false;
 function secretsLocked() {
@@ -72,12 +74,15 @@ function newProfile(name) {
     keys: {
       trakt_client_id: '',
       trakt_client_secret: '',
+      simkl_client_id: '', // v6: one Simkl app per profile
+      simkl_client_secret: '',
       tmdb_api_key: '',
       groq_api_key: '',
       rpdb_api_key: DEFAULT_RPDB_KEY, // rating-overlay posters; free key pre-set
       mdblist_api_key: '', // required: extra catalogs + Common Sense age checks
     },
     trakt_auth: null, // { access_token, refresh_token, expires_at(ms) }
+    simkl_auth: null, // v6: { access_token, connected_at } — Simkl PIN token
     filters: { ...DEFAULT_FILTERS },
     catalogs: {}, // extra-catalog toggles by id; absent/false = off. AI catalogs are always on.
     scrobble: { ...DEFAULT_SCROBBLE },
@@ -112,6 +117,10 @@ function applyMigrations(p) {
   // adults, and silently switching everyone to a slower LLM path would be a
   // change nobody asked for. Kids profiles get moved deliberately, in the UI.
   if (!ENGINES.includes(p.filters.engine)) p.filters.engine = 'trakt';
+  // v6: Simkl fields alongside the (still-present) Trakt ones.
+  if (p.keys.simkl_client_id === undefined) p.keys.simkl_client_id = '';
+  if (p.keys.simkl_client_secret === undefined) p.keys.simkl_client_secret = '';
+  if (p.simkl_auth === undefined) p.simkl_auth = null;
   if (p.catalogs === undefined) p.catalogs = {};
   if (p.scrobble === undefined) p.scrobble = { ...DEFAULT_SCROBBLE };
 }
@@ -121,9 +130,10 @@ function applyMigrations(p) {
 function sealProfile(p) {
   const q = { ...p, keys: { ...p.keys } };
   for (const f of SECRET_KEY_FIELDS) if (q.keys[f]) q.keys[f] = secret.seal(q.keys[f]);
-  if (q.trakt_auth) {
-    q.trakt_auth = { ...q.trakt_auth };
-    for (const t of SECRET_TOKEN_FIELDS) if (q.trakt_auth[t]) q.trakt_auth[t] = secret.seal(q.trakt_auth[t]);
+  for (const a of AUTH_OBJECTS) {
+    if (!q[a]) continue;
+    q[a] = { ...q[a] };
+    for (const t of SECRET_TOKEN_FIELDS) if (q[a][t]) q[a][t] = secret.seal(q[a][t]);
   }
   return q;
 }
@@ -132,14 +142,20 @@ function sealProfile(p) {
 // (missing/wrong key) — callers catch it to enter locked mode.
 function unsealProfileInPlace(p) {
   for (const f of SECRET_KEY_FIELDS) if (p.keys?.[f]) p.keys[f] = secret.unseal(p.keys[f]);
-  if (p.trakt_auth) for (const t of SECRET_TOKEN_FIELDS) if (p.trakt_auth[t]) p.trakt_auth[t] = secret.unseal(p.trakt_auth[t]);
+  for (const a of AUTH_OBJECTS) {
+    if (!p[a]) continue;
+    for (const t of SECRET_TOKEN_FIELDS) if (p[a][t]) p[a][t] = secret.unseal(p[a][t]);
+  }
 }
 
 // Locked-mode read: replace unreadable sealed secrets with empty so no
 // ciphertext is ever used as a key/token. The on-disk value is untouched.
 function blankSecretsInPlace(p) {
   for (const f of SECRET_KEY_FIELDS) if (secret.isSealed(p.keys?.[f])) p.keys[f] = '';
-  if (p.trakt_auth) for (const t of SECRET_TOKEN_FIELDS) if (secret.isSealed(p.trakt_auth[t])) p.trakt_auth[t] = '';
+  for (const a of AUTH_OBJECTS) {
+    if (!p[a]) continue;
+    for (const t of SECRET_TOKEN_FIELDS) if (secret.isSealed(p[a][t])) p[a][t] = '';
+  }
 }
 
 // Read path: migrate + unseal every profile to plaintext for use. On any
@@ -221,6 +237,7 @@ function updateProfile(id, patch) {
       }
     }
     if (patch.trakt_auth !== undefined) profile.trakt_auth = patch.trakt_auth;
+    if (patch.simkl_auth !== undefined) profile.simkl_auth = patch.simkl_auth;
     if (patch.scrobble && typeof patch.scrobble === 'object') {
       const s = patch.scrobble;
       if (!profile.scrobble) profile.scrobble = { ...DEFAULT_SCROBBLE };

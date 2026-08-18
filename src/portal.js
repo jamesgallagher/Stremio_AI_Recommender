@@ -12,6 +12,7 @@ const scrobble = require('./services/scrobble');
 const crypto = require('./services/crypto');
 const settings = require('./settings');
 const llm = require('./services/llm');
+const simkl = require('./services/simkl');
 
 const { version } = require('../package.json');
 
@@ -58,6 +59,8 @@ function publicProfile(p, req) {
     keys: {
       trakt_client_id: p.keys.trakt_client_id || '',
       trakt_client_secret: p.keys.trakt_client_secret || '',
+      simkl_client_id: p.keys.simkl_client_id || '',
+      simkl_client_secret: p.keys.simkl_client_secret || '',
       tmdb_api_key: p.keys.tmdb_api_key || '',
       groq_api_key: p.keys.groq_api_key || '',
       rpdb_api_key: p.keys.rpdb_api_key || '',
@@ -66,6 +69,8 @@ function publicProfile(p, req) {
     keys_set: {
       trakt_client_id: !!p.keys.trakt_client_id,
       trakt_client_secret: !!p.keys.trakt_client_secret,
+      simkl_client_id: !!p.keys.simkl_client_id,
+      simkl_client_secret: !!p.keys.simkl_client_secret,
       tmdb_api_key: !!p.keys.tmdb_api_key,
       groq_api_key: !!p.keys.groq_api_key,
       rpdb_api_key: !!p.keys.rpdb_api_key,
@@ -82,6 +87,10 @@ function publicProfile(p, req) {
     trakt_connected: !!p.trakt_auth?.access_token,
     trakt_expires_at: p.trakt_auth?.expires_at || null,
     trakt_username: p.trakt_auth?.username || null,
+    // Simkl: whether a token is STORED. Live validity is checked separately via
+    // /simkl/status (the portal calls it on the Simkl tab open).
+    simkl_connected: !!p.simkl_auth?.access_token,
+    simkl_username: p.simkl_auth?.username || null,
     // Auto-scrobble config — password is never returned, only whether it's set.
     scrobble: {
       enabled: !!p.scrobble?.enabled,
@@ -358,6 +367,81 @@ router.post('/profiles/:id/trakt/disconnect', (req, res) => {
   const profile = config.updateProfile(req.params.id, { trakt_auth: null });
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
   deviceFlows.delete(req.params.id);
+  res.json({ ok: true });
+});
+
+// ---- Simkl PIN device flow (v6) ----
+const simklFlows = new Map(); // profileId -> { user_code, verification_url, state, error, expires_at }
+
+router.post('/profiles/:id/simkl/connect', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  const clientId = profile.keys.simkl_client_id;
+  if (!clientId) return res.status(400).json({ error: 'Set the Simkl Client ID first' });
+  try {
+    const dc = await simkl.startPinFlow(clientId);
+    const flow = {
+      user_code: dc.user_code,
+      verification_url: dc.verification_url || 'https://simkl.com/pin',
+      state: 'pending', error: null,
+      expires_at: Date.now() + (dc.expires_in || 900) * 1000,
+    };
+    simklFlows.set(profile.id, flow);
+
+    const intervalMs = Math.max(dc.interval || 5, 5) * 1000;
+    const poll = setInterval(async () => {
+      const current = simklFlows.get(profile.id);
+      if (!current || current !== flow || Date.now() > flow.expires_at) {
+        clearInterval(poll);
+        if (current === flow && flow.state === 'pending') { flow.state = 'error'; flow.error = 'PIN expired — start again'; }
+        return;
+      }
+      try {
+        const result = await simkl.pollPin(clientId, dc.user_code);
+        if (result.pending) return;
+        clearInterval(poll);
+        if (result.token) {
+          config.updateProfile(profile.id, { simkl_auth: result.token });
+          flow.state = 'connected';
+          try {
+            const username = await simkl.accountName(clientId, result.token.access_token);
+            if (username) config.updateProfile(profile.id, { simkl_auth: { ...result.token, username } });
+            console.log(`[simkl] ${profile.name}: connected via PIN${username ? ` as "${username}"` : ''}`);
+          } catch { /* username is best-effort */ }
+        } else {
+          flow.state = 'error'; flow.error = result.error || 'Authorization failed';
+          console.error(`[simkl] ${profile.name}: PIN flow failed — ${flow.error}`);
+        }
+      } catch (err) {
+        clearInterval(poll); flow.state = 'error'; flow.error = err.message;
+      }
+    }, intervalMs);
+
+    res.json({ user_code: flow.user_code, verification_url: flow.verification_url });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// LIVE status — verifies the token against Simkl, never trusts a stored flag.
+// This is the fix for the v5 bug where dead tokens still showed "connected".
+router.get('/profiles/:id/simkl/status', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  const flow = simklFlows.get(profile.id);
+  const check = await simkl.checkConnection(profile.keys.simkl_client_id, profile.simkl_auth?.access_token);
+  res.json({
+    connected: check.valid,
+    username: check.username || profile.simkl_auth?.username || null,
+    reason: check.valid ? null : check.reason,
+    flow: flow ? { state: flow.state, user_code: flow.user_code, verification_url: flow.verification_url, error: flow.error } : null,
+  });
+});
+
+router.post('/profiles/:id/simkl/disconnect', (req, res) => {
+  const profile = config.updateProfile(req.params.id, { simkl_auth: null });
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  simklFlows.delete(req.params.id);
   res.json({ ok: true });
 });
 
