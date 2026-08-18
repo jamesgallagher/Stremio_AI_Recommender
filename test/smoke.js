@@ -259,38 +259,6 @@ ok('groq: parseVerdicts validates ids, dedupes, tolerates wrappers', () => {
   assert.throws(() => groq.parseVerdicts('no json here', valid));
 });
 
-ok('rebuild: recPasses enforces status, rating, votes, recency, genres', () => {
-  const f = { min_rating: 6, rating_source: 'trakt', vote_count_floor: 1000, max_age_years: 0, excluded_genres: [] };
-  const base = { title: 'X', status: 'released', rating: 7.5, votes: 5000, year: 2020, genres: ['drama'], language: 'en' };
-  const quiet = { log() {} };
-  assert.ok(rebuild.recPasses(base, 'movie', f, quiet));
-  assert.ok(!rebuild.recPasses({ ...base, rating: 5.9 }, 'movie', f, quiet)); // below Trakt floor
-  assert.ok(rebuild.recPasses({ ...base, rating: null }, 'movie', f, quiet)); // unrated kept
-  assert.ok(!rebuild.recPasses({ ...base, votes: 100 }, 'movie', f, quiet)); // vote floor
-  assert.ok(rebuild.recPasses({ ...base, votes: 300, status: 'returning series' }, 'series', f, quiet)); // series floor = 1/5
-  assert.ok(!rebuild.recPasses({ ...base, status: 'in production' }, 'movie', f, quiet)); // unreleased movie
-  assert.ok(!rebuild.recPasses({ ...base, status: 'canceled' }, 'series', f, quiet)); // dead show
-  assert.ok(rebuild.recPasses({ ...base, status: 'ended' }, 'series', f, quiet)); // finished shows are fine
-  assert.ok(!rebuild.recPasses({ ...base, year: 2001 }, 'movie', { ...f, max_age_years: 5 }, quiet)); // recency honored when set
-  assert.ok(!rebuild.recPasses({ ...base, genres: ['horror', 'drama'] }, 'movie', { ...f, excluded_genres: ['Horror'] }, quiet));
-});
-
-ok('rebuild: recPasses "Anime" exclusion — native tag + ja fallback', () => {
-  const f = { min_rating: 0, rating_source: 'trakt', vote_count_floor: 0, max_age_years: 0, excluded_genres: ['Anime'] };
-  const quiet = { log() {} };
-  const tagged = { title: 'A', status: 'released', rating: 8, votes: 9000, year: 2023, genres: ['anime', 'animation', 'action'], language: 'ja' };
-  const untagged = { ...tagged, genres: ['animation', 'action'] }; // ja animation without the anime tag
-  const pixar = { ...tagged, genres: ['animation', 'family'], language: 'en' };
-  const jaDrama = { ...tagged, genres: ['drama'], language: 'ja' };
-  assert.ok(!rebuild.recPasses(tagged, 'movie', f, quiet));
-  assert.ok(!rebuild.recPasses(untagged, 'movie', f, quiet));
-  assert.ok(rebuild.recPasses(pixar, 'movie', f, quiet)); // family animation stays
-  assert.ok(rebuild.recPasses(jaDrama, 'movie', f, quiet)); // ja live-action stays
-  // Excluding "Animation" removes all animation, anime included
-  assert.ok(!rebuild.recPasses(pixar, 'movie', { ...f, excluded_genres: ['Animation'] }, quiet));
-  assert.ok(!rebuild.recPasses(tagged, 'movie', { ...f, excluded_genres: ['Animation'] }, quiet));
-});
-
 ok('tmdb: pickCertification prefers AU, then US, then any (movie + tv)', () => {
   const t = require('../src/services/tmdb');
   // Movie release_dates: AU wins over US
@@ -339,36 +307,6 @@ ok('groq: generation prompt is age-aware, carries seeds and exclusions', () => {
   const adult = groq.buildGeneratePrompt('movie', { ageLimit: 0, seeds: [], count: 50 });
   assert.ok(!adult.includes('year-old'));
   assert.ok(adult.includes('no watch history yet'));
-});
-
-ok('rebuild: seedsFor weights own history 70/30 and fades borrowing with use', () => {
-  const mk = (n, p) => Array.from({ length: n }, (_, i) => ({ title: `${p}${i}`, year: 2000 + i }));
-  const split = (seeds, t) => [seeds.filter(s => s.type === t).length, seeds.filter(s => s.type !== t).length];
-
-  // Established profile: 70/30, so even a full history gets a second angle
-  let seeds = rebuild.seedsFor({ movie: { recent: mk(30, 'M') }, series: { recent: mk(30, 'S') } }, 'movie');
-  assert.deepStrictEqual(split(seeds, 'movie'), [14, 6]);
-  assert.strictEqual(seeds.length, 20);
-
-  // Ciara: no movie history at all -> 100% borrowed, and a usable list on day one
-  seeds = rebuild.seedsFor({ movie: { recent: [] }, series: { recent: mk(30, 'S') } }, 'movie');
-  assert.deepStrictEqual(split(seeds, 'movie'), [0, 20]);
-  assert.strictEqual(seeds[0].type, 'series'); // labelled, so the prompt can group them
-
-  // A SHORT but real history must not be swamped: 7 on-taste seeds beat 20
-  // off-taste ones. Backfilling to 20 here turned Ciara's anime series list
-  // into Bakugan and Sofia the First.
-  seeds = rebuild.seedsFor({ movie: { recent: mk(30, 'M') }, series: { recent: mk(7, 'S') } }, 'series');
-  assert.deepStrictEqual(split(seeds, 'series'), [7, 3]); // still 70/30, just smaller
-  seeds = rebuild.seedsFor({ movie: { recent: mk(30, 'M') }, series: { recent: mk(5, 'S') } }, 'series');
-  assert.deepStrictEqual(split(seeds, 'series'), [5, 2]);
-
-  // Only a genuine cold start (< 3) borrows beyond the 30% share
-  seeds = rebuild.seedsFor({ movie: { recent: mk(30, 'M') }, series: { recent: mk(2, 'S') } }, 'series');
-  assert.deepStrictEqual(split(seeds, 'series'), [2, 18]);
-
-  // Neither type populated, and missing types, must not throw
-  assert.deepStrictEqual(rebuild.seedsFor({ movie: {}, series: {} }, 'series'), []);
 });
 
 ok('groq: cross-type seeds render as separate labelled groups', () => {
@@ -473,27 +411,6 @@ ok('rebuild: judgement age is one year above the limit (off when no limit)', () 
   assert.strictEqual(rebuild.judgementAge({ age_limit: 13 }), 14);
   assert.strictEqual(rebuild.judgementAge({ age_limit: 8 }), 9);
   assert.strictEqual(rebuild.judgementAge({}), 1); // callers only use this when age_limit > 0
-});
-
-ok('rebuild: aiPasses filters on TMDB fields (rating, votes, genres, recency)', () => {
-  const filters = { min_rating: 6, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [] };
-  const base = { releaseInfo: '2020', _vote_average: 7.5, _vote_count: 5000, _genre_names: ['Animation'], _original_language: 'en' };
-  assert.strictEqual(rebuild.aiPasses(base, 'movie', filters), true);
-  assert.strictEqual(rebuild.aiPasses({ ...base, _vote_average: 5.1 }, 'movie', filters), false);
-  // Unrated is not "below the bar" — same semantics as the rest of the pipeline
-  assert.strictEqual(rebuild.aiPasses({ ...base, _vote_average: 0 }, 'movie', filters), true);
-  assert.strictEqual(rebuild.aiPasses({ ...base, _vote_count: 200 }, 'movie', filters), false);
-  assert.strictEqual(rebuild.aiPasses({ ...base, _vote_count: 200 }, 'series', filters), true); // series use 1/5
-
-  const noHorror = { ...filters, excluded_genres: ['Horror'] };
-  assert.strictEqual(rebuild.aiPasses({ ...base, _genre_names: ['Horror'] }, 'movie', noHorror), false);
-  // Anime is a pseudo-genre: Japanese + Animation, since TMDB has no such genre
-  const noAnime = { ...filters, excluded_genres: ['Anime'] };
-  assert.strictEqual(rebuild.aiPasses({ ...base, _original_language: 'ja' }, 'movie', noAnime), false);
-  assert.strictEqual(rebuild.aiPasses(base, 'movie', noAnime), true); // English animation stays
-
-  const recent = { ...filters, max_age_years: 5 };
-  assert.strictEqual(rebuild.aiPasses({ ...base, releaseInfo: '1999' }, 'movie', recent), false);
 });
 
 ok('tmdb: seasonAppendGroups batches seasons into one call under the API cap', () => {
@@ -944,27 +861,10 @@ async function httpTests() {
   );
   assert.deepStrictEqual(through.map(m => m.id), ['tt60']);
   console.log('  ✓ CSM gate retired — no longer drops unrated titles or needs MDBList');
-
-  // v6: the AI age gate needs a GLOBAL LLM (custom endpoint OR Groq key), not a
-  // per-profile key. With no LLM configured, kids AI catalogs are disabled
-  // before any network call (fake trakt_auth would explode if Trakt were hit).
-  const settingsMod = require('../src/settings');
-  settingsMod.updateSettings({ llm: { custom_uri: '', custom_name: '', custom_api_key: '', groq_api_key: '', groq_api_key_backup: '' } });
-  assert.strictEqual(settingsMod.hasLlm(), false);
-  const rebuildMod = require('../src/rebuild');
-  const noLlm = {
-    id: 'no-llm-test', name: 'NoLlm', keys: {},
-    trakt_auth: { access_token: 'fake' }, filters: { age_limit: 8 }, catalogs: {},
-  };
-  const res0 = await rebuildMod.rebuildProfile(noLlm, { log() {}, warn() {}, error() {} }, { extras: false });
-  assert.ok(res0.movie.error.includes('No LLM configured'));
-  assert.ok(res0.series.error.includes('kids-mode'));
-  store.deleteCache('no-llm-test');
-  console.log('  ✓ kids profile with no global LLM disabled (no network)');
-
   // Anime gate, end to end, with a seeded map + rating cache (no network).
   // The two rules point in OPPOSITE directions and that is the whole design.
   {
+    const rebuildMod = require('../src/rebuild');
     const animeMap = require('../src/services/animeMap');
     animeMap._setIndex({
       at: Date.now(), etag: 't',
@@ -1011,7 +911,11 @@ async function httpTests() {
 
   // Extra-catalog age gate: adult profiles untouched (no LLM call), kids
   // profiles with no global LLM FAIL CLOSED (caller keeps the previous list).
-  // Global LLM is still cleared from the check above. No network in either path.
+  // No network in either path.
+  const rebuildMod = require('../src/rebuild');
+  // Clear the global LLM so the kids gate below fails closed.
+  require('../src/settings').updateSettings({ llm: { custom_uri: '', custom_name: '', custom_api_key: '', groq_api_key: '', groq_api_key_backup: '' } });
+  assert.strictEqual(require('../src/settings').hasLlm(), false);
   const def = require('../src/catalogs').getExtra('mdb-kids-movies');
   const metas = [{ id: 'tt1', name: 'A' }, { id: 'tt2', name: 'B' }];
   const quiet = { log() {}, warn() {} };
@@ -1381,9 +1285,10 @@ async function httpTests() {
   }
   assert.ok(st.last_results, 'last_results recorded after rebuild');
   const lr = st.last_results.results;
-  assert.strictEqual(lr.movie.ok, false); // Trakt not connected
+  // v6: rebuildProfile builds EXTRA catalogs only — AI recs come from the pool.
+  assert.strictEqual(lr.movie, undefined); // no AI half here anymore
   assert.ok(/MDBList/i.test(lr['mdb-action-movies'].error)); // extras need a key
-  console.log('  ✓ async rebuild: 202 + polled status carries results');
+  console.log('  ✓ async rebuild: 202 + polled status carries extras results');
 
   await fetch(`${BASE}/api/profiles/${p2.id}`, { method: 'DELETE' });
 
@@ -1429,7 +1334,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 44 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 43 async/http).`);
   process.exit(0);
 }
 

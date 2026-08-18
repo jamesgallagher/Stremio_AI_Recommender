@@ -42,7 +42,6 @@ const WATCHED_REFRESH_MS = 60 * 60e3; // exclusion-only refresh cadence
 const MIN_METAS = 5;
 const DEFAULT_LIST_SIZE = 20;
 // Bench (hidden reserve) is always the same size as the displayed list.
-const TRAKT_REC_LIMIT = 100;     // /recommendations max; no pagination exists
 const EXTRA_LIST_TARGET = 20; // default extra-catalog size (per-catalog `target` overrides)
 const MAX_EXTRA_PAGES = 8;    // headroom for the larger (50-title) kids lists
 const EXTRA_PAGE_SIZE = 50;
@@ -76,17 +75,6 @@ function status(profile) {
     rebuilding: locks.has(profile.id),
     stale: isStale(cache.movie) || isStale(cache.series),
     last_results: lastResults.get(profile.id) || null,
-  };
-}
-
-// Cross-type watched exclusion sets. IMDb tt IDs are globally unique, so a
-// title Trakt logged as a movie but TMDB resolved as a series (docs and
-// miniseries flip type between the two databases) is still excluded. TMDB ids
-// stay per-type: movie id 550 and TV id 550 are different titles.
-function exclusionSets(watchedByType, type) {
-  return {
-    imdbIds: new Set([...watchedByType.movie.imdbIds, ...watchedByType.series.imdbIds]),
-    tmdbIds: watchedByType[type].tmdbIds,
   };
 }
 
@@ -221,266 +209,6 @@ async function isBlacklistedTitle(imdbId, tmdbId, log = console) {
 // most age-appropriate anime along with the genuinely unsuitable.
 function judgementAge(filters) {
   return (filters.age_limit || 0) + 1;
-}
-
-// ---- v4 engine: Trakt recommends, code filters ----
-
-// Portal genre names -> Trakt genre slugs (unknown names simply never match).
-const TRAKT_SLUGS = {
-  Action: 'action', Adventure: 'adventure', Anime: 'anime', Animation: 'animation',
-  Comedy: 'comedy', Crime: 'crime', Documentary: 'documentary', Drama: 'drama',
-  Family: 'family', Fantasy: 'fantasy', History: 'history', Horror: 'horror',
-  Kids: 'children', Music: 'music', Mystery: 'mystery', News: 'news',
-  Reality: 'reality', Romance: 'romance', 'Science Fiction': 'science-fiction',
-  Soap: 'soap', Talk: 'talk-show', Thriller: 'thriller', 'TV Movie': 'tv-movie',
-  War: 'war', Western: 'western',
-};
-
-// Deterministic local filters over a parsed Trakt recommendation. The API
-// takes no filter params, so this is where every profile constraint is
-// enforced — on the extended=full fields Trakt already sent.
-function recPasses(r, type, filters, log = console) {
-  // Status: unwatchable or dead content out; unknown status is kept.
-  if (r.status) {
-    if (type === 'movie' && r.status !== 'released') return false;
-    if (type === 'series' && ['canceled', 'planned', 'in production', 'upcoming', 'pilot'].includes(r.status)) return false;
-  }
-  // Rating floor against Trakt's own 0-10 rating (rating_source 'trakt').
-  // The 'imdb' source gates later via an MDBList batch. Unrated titles kept.
-  if (filters.min_rating > 0 && (filters.rating_source || 'trakt') !== 'imdb'
-      && r.rating !== null && r.rating < filters.min_rating) {
-    log.log(`[filter] "${r.title}" Trakt ${r.rating} < ${filters.min_rating} — dropped`);
-    return false;
-  }
-  if ((r.votes || 0) < tmdb.voteFloor(filters, type)) return false;
-  if (filters.max_age_years > 0 && r.year && r.year < new Date().getFullYear() - filters.max_age_years) return false;
-  // Genre exclusions on Trakt slugs. 'Anime' uses Trakt's native anime tag,
-  // with a ja-language+animation fallback for untagged titles.
-  for (const name of filters.excluded_genres || []) {
-    const slug = TRAKT_SLUGS[name];
-    if (slug && r.genres.includes(slug)) return false;
-    if (name === 'Anime' && r.language === 'ja' && r.genres.includes('animation')) return false;
-  }
-  return true;
-}
-
-// One AI catalog (movie|series): ONE Trakt recommendations call -> local
-// deterministic filters -> cross-type watched verification (trust Trakt,
-// verify locally) -> optional IMDb rating gate -> kids gates (CSM + AI
-// goalkeeper) -> top list_size + equal bench in Trakt's confidence order ->
-// TMDB enrichment for the survivors only.
-// ---- v5 engine: LLM generates age-aware candidates, code verifies ----
-
-// Ask for more than we need: watched-exclusion, the rating floor and the
-// verify pass all cut into the pool, and a thin list is the acceptable
-// outcome here — a wrong one is not.
-const AI_GEN_MIN = 50;
-const AI_GEN_MAX = 60;
-
-// Deterministic filters over a resolved TMDB meta. Same intent as recPasses,
-// different source fields — TMDB carries the rating/votes/genres here, Trakt's
-// recommendation shape isn't available. Unrated (vote_average 0) passes, as
-// everywhere else: "unrated" is not the same as "below the bar".
-function aiPasses(m, type, filters) {
-  if (filters.min_rating > 0 && m._vote_average && m._vote_average < filters.min_rating) return false;
-  if ((m._vote_count || 0) < tmdb.voteFloor(filters, type)) return false;
-  if (filters.max_age_years > 0) {
-    const year = parseInt(m.releaseInfo, 10);
-    if (year && year < new Date().getFullYear() - filters.max_age_years) return false;
-  }
-  const names = (m._genre_names || []).map((g) => g.toLowerCase());
-  for (const name of filters.excluded_genres || []) {
-    if (names.includes(name.toLowerCase())) return false;
-    if (name === 'Anime' && m._original_language === 'ja' && names.includes('animation')) return false;
-  }
-  return true;
-}
-
-// Taste seeds for one type's generation: mostly this viewer's own history for
-// that type, topped up from the OTHER type.
-//
-// A permanent weighted blend, not a cold-start branch, because the ratio then
-// does the fading on its own. With no movie history at all (Ciara) the movie
-// seeds are 100% borrowed from her series, and her list is useful on day one;
-// as real movie history accumulates the borrowed share is squeezed out until
-// it settles at the 70/30 floor. No flag, no special case, nothing to unset.
-// The residual 30% is deliberate even for established profiles — it's a second
-// angle that one type's history alone can never provide.
-//
-// AI engine only: Trakt's /recommendations endpoint takes no seed input, so
-// profiles on the 'trakt' engine are unaffected.
-const SEED_TARGET = 20;
-const SEED_OWN_SHARE = 0.7;
-const SEED_COLD_START = 3; // below this, a type has no usable signal of its own
-
-function seedsFor(watchedByType, type) {
-  const other = type === 'movie' ? 'series' : 'movie';
-  const own = (watchedByType[type]?.recent || []).slice(0, Math.round(SEED_TARGET * SEED_OWN_SHARE));
-  const otherAll = watchedByType[other]?.recent || [];
-  // 70/30 is a RATIO, not a quota to fill. Backfilling to 20 whenever own
-  // history was short swamped it: Ciara's 7 anime series seeds were topped up
-  // with 13 family-film seeds and the list came back Bakugan and Sofia the
-  // First. Seven on-taste seeds beat twenty off-taste ones, so a short own
-  // history yields a short seed list — borrowing scales down with it.
-  const borrowed = own.length >= SEED_COLD_START
-    ? otherAll.slice(0, Math.round(own.length * (1 - SEED_OWN_SHARE) / SEED_OWN_SHARE))
-    : otherAll.slice(0, SEED_TARGET - own.length); // genuine cold start: borrow freely
-  return [
-    ...own.map((s) => ({ ...s, type })),
-    ...borrowed.map((s) => ({ ...s, type: other })),
-  ];
-}
-
-// Pass 1: generate, then prove. Every suggestion is resolved against TMDB, so
-// a hallucinated title dies here rather than reaching a catalog.
-async function buildAiPool(profile, type, watchedByType, watched, log) {
-  const { filters } = profile;
-  const listSize = filters.list_size || DEFAULT_LIST_SIZE;
-  const count = Math.min(AI_GEN_MAX, Math.max(AI_GEN_MIN, listSize * 3));
-  const seeds = seedsFor(watchedByType, type);
-  const ownSeeds = seeds.filter((s) => s.type === type).length;
-  // Seed composition explains most odd lists — a generation running on
-  // borrowed seeds looks very different from one running on its own history,
-  // and until this line existed that had to be inferred from the output.
-  log.log(`[rebuild] ${profile.name}/${type}: seeds ${ownSeeds} own + ${seeds.length - ownSeeds} borrowed`);
-  const suggestions = await llm.generateCandidates(
-    type,
-    {
-      ageLimit: filters.age_limit > 0 ? judgementAge(filters) : 0,
-      seeds,
-      count,
-      excludedGenres: filters.excluded_genres || [],
-    },
-    log,
-  );
-
-  const resolved = [];
-  for (let i = 0; i < suggestions.length; i += 5) {
-    const chunk = suggestions.slice(i, i + 5);
-    resolved.push(...await Promise.all(
-      chunk.map((s) => tmdb.resolveTitle(profile.keys.tmdb_api_key, type, s.title, s.year, log)),
-    ));
-  }
-  let pool = resolved.filter(Boolean);
-  const lost = suggestions.length - pool.length;
-  if (lost) log.log(`[rebuild] ${profile.name}/${type}: ${lost} suggestion(s) did not resolve on TMDB — dropped`);
-
-  // Two suggestions can resolve to the same entry (alternate titles, or the
-  // model naming a show twice).
-  const seen = new Set();
-  pool = pool.filter((m) => {
-    if (seen.has(m.id)) return false;
-    seen.add(m.id);
-    return true;
-  });
-
-  pool = pool.filter((m) => !watched.imdbIds.has(m.id) && !(m._tmdb_id && watched.tmdbIds.has(m._tmdb_id)));
-  pool = pool.filter((m) => aiPasses(m, type, filters));
-  log.log(`[rebuild] ${profile.name}/${type}: pool ${pool.length} after filters/exclusions`);
-  return pool;
-}
-
-// Pass 2: a fresh remove-only review of what survived. Separated by JOB, not
-// vendor — the verifier sees each title cold, with no investment in having
-// suggested it.
-//
-// NOTE: no CSM gate on this path, deliberately. CSM's anime coverage is thin,
-// so "unrated" is the common case there and strict mode dropped whole lists —
-// which is exactly how Ciara's catalogs emptied. Stage 3 removes it elsewhere.
-async function buildAiCatalog(profile, type, watchedByType, watched, listSize, log) {
-  const { filters } = profile;
-  let pool = await buildAiPool(profile, type, watchedByType, watched, log);
-  // Blacklist + anime age band first — unconditional, and it hands the LLM a
-  // real MAL classification instead of leaving it to guess.
-  pool = await applyAnimeGate(pool, profile, log);
-  if (filters.age_limit > 0) {
-    const vetoed = await llm.ageGate(
-      type, judgementAge(filters),
-      pool.map((m) => ({
-        id: m.id, title: m.name, year: m.releaseInfo,
-        genres: m._genre_names, certification: m._certification, overview: m.description,
-      })),
-      log,
-    );
-    pool = pool.filter((m) => !vetoed.has(m.id));
-  }
-  const all = cleanMetas(pool);
-  const out = { displayed: all.slice(0, listSize), bench: all.slice(listSize, listSize * 2), source: 'ai' };
-  log.log(`[rebuild] ${profile.name}/${type}: displayed (${out.displayed.length}, bench ${out.bench.length}): ${out.displayed.map((m) => m.name).join(', ')}`);
-  return out;
-}
-
-async function buildCatalog(profile, type, watchedByType, log = console) {
-  const { filters } = profile;
-  const listSize = filters.list_size || DEFAULT_LIST_SIZE;
-  const watched = exclusionSets(watchedByType, type);
-
-  if (filters.engine === 'ai') {
-    return buildAiCatalog(profile, type, watchedByType, watched, listSize, log);
-  }
-
-  const recs = await trakt.getRecommendations(profile, type, TRAKT_REC_LIMIT);
-  log.log(`[rebuild] ${profile.name}/${type}: ${recs.length} Trakt recommendations`);
-  let pool = recs.filter((r) => recPasses(r, type, filters, log));
-  pool = pool.filter((r) => !(r.imdb_id && watched.imdbIds.has(r.imdb_id))
-    && !(r.tmdb_id && watched.tmdbIds.has(r.tmdb_id)));
-
-  if (filters.min_rating > 0 && filters.rating_source === 'imdb' && profile.keys.mdblist_api_key) {
-    const ratings = await mdblist.imdbRatings(
-      profile.keys.mdblist_api_key, type, pool.map((r) => r.imdb_id).filter(Boolean), log,
-    );
-    pool = pool.filter((r) => {
-      const v = r.imdb_id ? ratings.get(r.imdb_id) : null;
-      return v === null || v === undefined ? true : v >= filters.min_rating;
-    });
-  }
-  log.log(`[rebuild] ${profile.name}/${type}: pool ${pool.length} after filters/exclusions`);
-
-  // Blacklist + anime age band. Outside the age_limit branch on purpose: the
-  // NSFW blacklist applies to adult profiles too. Order is preserved (Trakt's
-  // ranking is meaningful) and recs without an IMDb id are left alone — they
-  // resolve via TMDB later.
-  {
-    const wrapped = pool.filter((r) => r.imdb_id)
-      .map((r) => ({ id: r.imdb_id, _tmdb_id: r.tmdb_id, name: r.title, __rec: r }));
-    const kept = new Set((await applyAnimeGate(wrapped, profile, log)).map((x) => {
-      if (x._certification) x.__rec.certification = x._certification;
-      return x.__rec;
-    }));
-    pool = pool.filter((r) => !r.imdb_id || kept.has(r));
-  }
-
-  // Kids profiles: the AI age gate, now the sole age authority (CSM retired).
-  if (filters.age_limit > 0) {
-    pool = pool.filter((r) => r.imdb_id); // needs a stable id to veto against
-    const vetoed = await llm.ageGate(
-      type, judgementAge(filters),
-      pool.map((r) => ({ id: r.imdb_id, title: r.title, year: r.year, genres: r.genres, certification: r.certification, overview: r.overview })),
-      log,
-    );
-    pool = pool.filter((r) => !vetoed.has(r.imdb_id));
-  }
-
-  // Enrich only display + bench, in Trakt's order (top recommendation first).
-  const chosen = pool.slice(0, listSize * 2);
-  const metas = [];
-  for (let i = 0; i < chosen.length; i += 25) {
-    const chunk = chosen.slice(i, i + 25);
-    metas.push(...await Promise.all(chunk.map(async (r) => {
-      if (r.tmdb_id) {
-        const m = await tmdb.metaByTmdbId(profile.keys.tmdb_api_key, type, r.tmdb_id, log);
-        if (m) return m;
-      }
-      // Minimal fallback — valid tt id for Stremio; RPDB fills the poster.
-      return r.imdb_id
-        ? { id: r.imdb_id, type, name: r.title, poster: null, description: r.overview || '', releaseInfo: r.year ? String(r.year) : null, imdbRating: r.rating !== null ? r.rating.toFixed(1) : null }
-        : null;
-    })));
-  }
-  const all = cleanMetas(metas.filter(Boolean));
-  const out = { displayed: all.slice(0, listSize), bench: all.slice(listSize, listSize * 2), source: 'trakt' };
-  log.log(`[rebuild] ${profile.name}/${type}: displayed (${out.displayed.length}, bench ${out.bench.length}): ${out.displayed.map((m) => m.name).join(', ')}`);
-  return out;
 }
 
 // Fisher-Yates shuffle (in place, returns the same array). Used to randomize
@@ -683,79 +411,15 @@ async function buildExtraCatalog(profile, def, log = console) {
   return shuffle(await applyExtraAgeGate(profile, def, collected, log));
 }
 
-// AI catalogs (movie + series): Trakt-seeded, LLM/discover, watched-excluded.
-async function buildAiCatalogs(profile, results, log) {
-  // The Groq key is required for the kids-mode age goalkeeper AND, since v5,
-  // for the 'ai' engine itself (which is the generator, not just a gate).
-  // Checked before any network.
-  if ((profile.filters.age_limit > 0 || profile.filters.engine === 'ai') && !settings.hasLlm()) {
-    const need = profile.filters.engine === 'ai'
-      ? "the 'AI' recommendation engine"
-      : 'the kids-mode AI age check';
-    const error = `No LLM configured — required for ${need}; set a Custom LLM or Groq key in Server Config. AI catalogs are disabled until one is added`;
-    log.warn(`[rebuild] ${profile.name}: ${error}`);
-    results.movie = { ok: false, error };
-    results.series = { ok: false, error };
-    return;
-  }
-  // Backfill the Trakt account name for profiles connected before we
-  // started recording it — surfaces wrong-account authorizations.
-  if (!profile.trakt_auth.username) {
-    try {
-      const username = await trakt.getAccountUsername(profile);
-      config.updateProfile(profile.id, { trakt_auth: { ...profile.trakt_auth, username } });
-      log.log(`[trakt] ${profile.name}: profile is authorized as Trakt user "${username}"`);
-    } catch { /* non-fatal */ }
-  }
-  // One watched fetch per rebuild, shared by both catalogs — snapshot for
-  // serve-time pruning, exclusion sets, and the taste seed. force: the full
-  // lists are needed even when nothing changed since the last snapshot.
-  let watchedByType;
-  try {
-    ({ watchedByType } = await syncWatched(profile, { force: true }));
-  } catch (err) {
-    const error = `Trakt watched fetch failed: ${err.message} — kept previous lists`;
-    log.warn(`[rebuild] ${profile.name}: ${error}`);
-    results.movie = { ok: false, error };
-    results.series = { ok: false, error };
-    return;
-  }
-  const listSize = profile.filters.list_size || DEFAULT_LIST_SIZE;
-  for (const type of ['movie', 'series']) {
-    try {
-      const { displayed, bench, source } = await buildCatalog(profile, type, watchedByType, log);
-      if (displayed.length >= MIN_METAS) {
-        store.swapCatalog(profile.id, type, displayed, bench, source, listSize); // atomic swap on success only
-        results[type] = { ok: true, count: displayed.length, bench: bench.length, source };
-        log.log(`[rebuild] ${profile.name}/${type}: swapped in ${displayed.length} + ${bench.length} bench (${source})`);
-      } else {
-        results[type] = { ok: false, error: `only ${displayed.length} usable titles (< ${MIN_METAS}) — kept previous list` };
-        log.warn(`[rebuild] ${profile.name}/${type}: ${results[type].error}`);
-      }
-    } catch (err) {
-      results[type] = { ok: false, error: err.message };
-      log.warn(`[rebuild] ${profile.name}/${type} failed: ${err.message} — kept previous list`);
-    }
-  }
-}
-
-// opts.ai / opts.extras scope the rebuild (both default on) so an extras-only
-// refresh never burns LLM quota and vice versa.
+// Rebuilds a profile's EXTRA catalogs (MDBList curated + the remaining
+// list-backed catalogs). The AI recommendation catalogs are built separately by
+// recommendationStore (v6) — this pipeline no longer touches them.
 async function rebuildProfile(profile, log = console, opts = {}) {
   if (locks.has(profile.id)) return { skipped: 'locked' };
   locks.add(profile.id);
   const results = {};
   try {
     store.markAttempt(profile.id);
-    if (opts.ai !== false) {
-      if (profile.trakt_auth?.access_token) {
-        await buildAiCatalogs(profile, results, log);
-      } else {
-        const error = 'Trakt not connected — AI catalogs skipped';
-        results.movie = { ok: false, error };
-        results.series = { ok: false, error };
-      }
-    }
     if (opts.extras !== false) {
       for (const def of catalogs.enabledExtras(profile)) {
         try {
@@ -789,17 +453,13 @@ async function rebuildProfile(profile, log = console, opts = {}) {
 // skipped when its prerequisite key/auth is missing.
 function ensureFresh(profile, log = console) {
   const cache = store.loadCache(profile.id);
-  const aiStale = (isStale(cache.movie) || isStale(cache.series))
-    && !!profile.trakt_auth?.access_token
-    // An LLM is only a prerequisite for kids profiles (AI age goalkeeper)
-    && (profile.filters.age_limit <= 0 || settings.hasLlm());
   const extrasStale = catalogs.enabledExtras(profile).some(
     (d) => catalogs.requirementMet(profile, d) && isStale(cache.extras?.[d.id]),
   );
-  if (!aiStale && !extrasStale) return false;
+  if (!extrasStale) return false;
   if (locks.has(profile.id) || exclusionLocks.has(profile.id)) return false;
   if (Date.now() - (cache.last_attempt_at || 0) < BACKOFF_MS) return false;
-  rebuildProfile(profile, log, { ai: aiStale, extras: extrasStale })
+  rebuildProfile(profile, log, { extras: true })
     .catch((err) => log.error(`[rebuild] unexpected: ${err.message}`));
   return true;
 }
@@ -859,10 +519,7 @@ module.exports = {
   applyCsmGate,
   applyExtraAgeGate,
   cleanMetas,
-  recPasses,
-  aiPasses,
   judgementAge,
-  seedsFor,
   applyAnimeGate,
   isBlacklistedTitle,
   isStale,
