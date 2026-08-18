@@ -89,11 +89,72 @@ async function accountName(clientId, accessToken) {
   return data?.user?.name || data?.user?.username || null;
 }
 
+// ---- watched-history read (v6) ----
+// Verified live against the real API (account "James", 2026-08-18): activities
+// returns per-type change timestamps; all-items/{type}/completed returns items
+// carrying imdb+tmdb ids and last_watched_at inline (genres/cert are NOT
+// included — enriched at ingest, see the watched store).
+
+async function authedGet(profile, path, extra = {}) {
+  const clientId = profile.keys.simkl_client_id;
+  const token = profile.simkl_auth?.access_token;
+  if (!clientId || !token) throw new Error('Simkl is not connected for this profile');
+  const res = await fetch(withParams(clientId, path, extra), { headers: headers(token) });
+  if (res.status === 401 || res.status === 403) throw new Error('Simkl token rejected — reconnect the account');
+  if (!res.ok) throw new Error(`Simkl GET ${path} failed (${res.status})`);
+  return res.json();
+}
+
+// The cheap "what changed" call. Returns { all, movies, tv_shows, anime, ... }
+// ISO timestamps. Compare against the saved value before pulling all-items —
+// mandatory per Simkl's rules (docs/v6-plan §6b).
+async function getActivities(profile) {
+  return authedGet(profile, '/sync/activities');
+}
+
+// Full/delta watched read for one type ('movies' | 'shows' | 'anime'), status
+// 'completed'. Pass dateFrom (ISO) for Phase-2 delta syncs; omit for the
+// Phase-1 initial pull. Always sequential per type (Simkl asks not to hammer).
+async function getAllItems(profile, type, { status = 'completed', dateFrom } = {}) {
+  const extra = dateFrom ? { date_from: dateFrom } : {};
+  const body = await authedGet(profile, `/sync/all-items/${type}/${status}`, extra);
+  if (Array.isArray(body)) return body;
+  // Combined all-items responses key by section; single-type still returns an
+  // array here, but guard for the { movies:[], shows:[], anime:[] } shape.
+  return body?.[type] || body?.[type === 'shows' ? 'tv' : type] || [];
+}
+
+// Normalise a Simkl all-items entry to our watched-store shape. Genres and age
+// classification are filled by the ingest enrichment, not here.
+function parseWatchedItem(item, type) {
+  const media = item.movie || item.show || item.anime || (type === 'movies' ? item.movie : item.show);
+  if (!media?.ids) return null;
+  const kind = (item.movie || type === 'movies') ? 'movie' : 'series';
+  return {
+    type: kind,
+    title: media.title || null,
+    year: media.year || null,
+    tmdb_id: media.ids.tmdb ? String(media.ids.tmdb) : null,
+    imdb_id: media.ids.imdb || null,
+    simkl_id: media.ids.simkl || null,
+    watched_at: item.last_watched_at || item.watched_at || null,
+  };
+}
+
+function parseWatchedItems(items, type) {
+  return (Array.isArray(items) ? items : []).map((it) => parseWatchedItem(it, type)).filter(Boolean);
+}
+
 module.exports = {
   startPinFlow,
   pollPin,
   checkConnection,
   accountName,
+  authedGet,
+  getActivities,
+  getAllItems,
+  parseWatchedItem,
+  parseWatchedItems,
   withParams,
   USER_AGENT,
   APP_NAME,

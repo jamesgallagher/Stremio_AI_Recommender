@@ -567,6 +567,32 @@ ok('settings: roundtrip, migration seeds from "James", isComplete, llmChain', ()
   assert.ok(!raw.includes('JAMES-TMDB'));
 });
 
+ok('simkl: parseWatchedItems maps the real all-items shape (verified fixtures)', () => {
+  const simkl = require('../src/services/simkl');
+  // Exact shapes captured live from James's account (2026-08-18).
+  const movies = [{
+    last_watched_at: '2026-08-18T03:49:25Z', status: 'completed',
+    movie: { title: 'Terminator 2: Judgment Day', year: 1991, ids: { simkl: 53510, imdb: 'tt0103064', tmdb: '280', tvdb: '412' } },
+  }];
+  const shows = [{
+    last_watched_at: '2026-08-18T03:46:48Z', status: 'completed', watched_episodes_count: 16,
+    show: { title: '1943', year: 2013, ids: { simkl: 1587730, imdb: 'tt4516770', tmdb: '130065' } },
+  }];
+  const m = simkl.parseWatchedItems(movies, 'movies');
+  assert.deepStrictEqual(m, [{
+    type: 'movie', title: 'Terminator 2: Judgment Day', year: 1991,
+    tmdb_id: '280', imdb_id: 'tt0103064', simkl_id: 53510, watched_at: '2026-08-18T03:49:25Z',
+  }]);
+  const s = simkl.parseWatchedItems(shows, 'shows');
+  assert.strictEqual(s[0].type, 'series');
+  assert.strictEqual(s[0].tmdb_id, '130065'); // stringified, feeds TMDB /recommendations
+  assert.strictEqual(s[0].imdb_id, 'tt4516770');
+  assert.strictEqual(s[0].watched_at, '2026-08-18T03:46:48Z');
+  // Entries with no ids are dropped, not thrown on
+  assert.deepStrictEqual(simkl.parseWatchedItems([{ movie: { title: 'x' } }], 'movies'), []);
+  assert.deepStrictEqual(simkl.parseWatchedItems(null, 'movies'), []);
+});
+
 ok('llm: chatUrl joins, extractArray tolerates wrappers, groq model list', () => {
   const llm = require('../src/services/llm');
   assert.strictEqual(llm.chatUrl('http://h:1/v1/'), 'http://h:1/v1/chat/completions');
