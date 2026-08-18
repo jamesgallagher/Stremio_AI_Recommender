@@ -705,6 +705,38 @@ ok('stremio: normalizeItems reads episode from video_id (not season/episode)', (
   assert.strictEqual(stremio.parseEpisode({}), null);
 });
 
+ok('governor: reserve paces per-service, 429 backs off, stats reports', () => {
+  const g = require('../src/services/governor');
+  g._reset();
+  // First call runs now (0); concurrent calls are spaced by the interval (tmdb 25ms)
+  assert.strictEqual(g.reserve('tmdb', 0), 0);
+  assert.strictEqual(g.reserve('tmdb', 0), 25);
+  assert.strictEqual(g.reserve('tmdb', 0), 50);
+  assert.strictEqual(g.reserve('tmdb', 1000), 0); // arriving after the window waits nothing
+  // Simkl POST is the hard 1/s write cap
+  g._reset();
+  assert.strictEqual(g.reserve('simkl_post', 0), 0);
+  assert.strictEqual(g.reserve('simkl_post', 0), 1100);
+  // A 429 with Retry-After pushes the next slot out by that window
+  g._reset();
+  g.noteResponse('groq', { status: 429, headers: { get: (k) => (k === 'retry-after' ? '2' : null) } }, 0);
+  assert.strictEqual(g.reserve('groq', 0), 2000); // 2s honoured
+  // A non-429 response is a no-op; an unknown service is not paced
+  g._reset();
+  g.noteResponse('tmdb', { status: 200, headers: { get: () => null } }, 0);
+  assert.strictEqual(g.reserve('tmdb', 0), 0);
+  assert.strictEqual(g.reserve('nope', 0), 0);
+  assert.strictEqual(g.reserve('nope', 0), 0);
+  // Stats snapshot shape (MDBList carries a daily cap)
+  g._reset();
+  g.reserve('mdblist', 0);
+  const st = g.stats(0);
+  assert.strictEqual(st.mdblist.calls, 1);
+  assert.strictEqual(st.mdblist.today, 1);
+  assert.strictEqual(st.mdblist.daily_cap, 1000);
+  assert.strictEqual(st.mdblist.backing_off, false);
+});
+
 ok('scrobble: computeDelta excludes already-watched, groups episodes', () => {
   const { computeDelta } = require('../src/services/scrobble');
   const items = [
@@ -903,6 +935,11 @@ async function httpTests() {
   const ver = await (await fetch(`${BASE}/api/version`)).json();
   assert.strictEqual(ver.version, pkgVersion);
   console.log('  ✓ /api/version matches package.json');
+
+  // Rate-governor stats endpoint responds with a stats object
+  const gov = await (await fetch(`${BASE}/api/governor`)).json();
+  assert.ok(gov.stats && typeof gov.stats === 'object');
+  console.log('  ✓ /api/governor exposes rate-governor stats');
 
   // Server Config (global settings): PUT then GET roundtrip, complete flag,
   // sealed-on-disk, and unknown test service rejected.
@@ -1296,7 +1333,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 42 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 43 async/http).`);
   process.exit(0);
 }
 

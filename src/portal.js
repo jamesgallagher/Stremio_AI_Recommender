@@ -36,6 +36,13 @@ router.get('/version', (req, res) => {
   res.json({ version, secrets_locked: config.secretsLocked(), encryption_available: crypto.encryptionAvailable() });
 });
 
+// Rate-governor snapshot: per-service call totals, today's count vs any daily
+// cap, and current throttle/backoff state. Observability for the heavy paths
+// (Simkl 1-POST/s write cap, TMDB build volume, Jikan 60/min) — GET /api/governor.
+router.get('/governor', (req, res) => {
+  res.json({ stats: require('./services/governor').stats() });
+});
+
 function redactKey(v) {
   if (!v) return '';
   return v.length > 8 ? `${v.slice(0, 4)}…${v.slice(-4)}` : '••••';

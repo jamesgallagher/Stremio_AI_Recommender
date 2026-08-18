@@ -9,6 +9,7 @@
 //     a descriptive User-Agent header.
 //   - Reads are 10/s, writes 1/s (the rate governor, a later slice, will pace
 //     the sync traffic; auth calls here are one-offs).
+const governor = require('./governor');
 const API = 'https://api.simkl.com';
 const USER_AGENT = 'AI-Recommender/1.0 (+https://github.com/jamesgallagher/Stremio_AI_Recommender)';
 const APP_NAME = 'AI-Recommender';
@@ -99,7 +100,7 @@ async function authedGet(profile, path, extra = {}) {
   const clientId = profile.keys.simkl_client_id;
   const token = profile.simkl_auth?.access_token;
   if (!clientId || !token) throw new Error('Simkl is not connected for this profile');
-  const res = await fetch(withParams(clientId, path, extra), { headers: headers(token) });
+  const res = await governor.schedule('simkl_get', () => fetch(withParams(clientId, path, extra), { headers: headers(token) }));
   if (res.status === 401 || res.status === 403) throw new Error('Simkl token rejected — reconnect the account');
   if (!res.ok) throw new Error(`Simkl GET ${path} failed (${res.status})`);
   return res.json();
@@ -155,9 +156,9 @@ async function addToHistory(profile, body) {
   const clientId = profile.keys.simkl_client_id;
   const token = profile.simkl_auth?.access_token;
   if (!clientId || !token) throw new Error('Simkl is not connected for this profile');
-  const res = await fetch(withParams(clientId, '/sync/history'), {
+  const res = await governor.schedule('simkl_post', () => fetch(withParams(clientId, '/sync/history'), {
     method: 'POST', headers: headers(token), body: JSON.stringify(body),
-  });
+  }));
   if (res.status === 401 || res.status === 403) throw new Error('Simkl token rejected — reconnect the account');
   if (!res.ok) throw new Error(`Simkl POST /sync/history failed (${res.status})`);
   return res.json().catch(() => ({}));

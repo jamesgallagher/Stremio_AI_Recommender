@@ -78,6 +78,20 @@ diagnostics (Advanced tab). This is the piece that stops a heavy weekly
 recommendation build from tripping a limit and, per Simkl's policy, getting a
 client_id suspended.
 
+**SHIPPED — v6.16.0-beta (`src/services/governor.js`).** Central per-service
+pacing via `schedule(service, fn)`: a synchronous slot-reservation queue spaces
+concurrent callers by each service's min-interval (tmdb ~40/s, simkl_get ~8/s,
+**simkl_post <1/s** — the hard write cap, mdblist ~4/s + daily counter, jikan
+~57/min, groq ~28/min). A 429 sets a backoff window honouring `Retry-After` that
+pushes subsequent slots out. Wired into every governed fetch: tmdb `get`, simkl
+`authedGet`/`addToHistory`, mdblist list + `mediaInfoBatch`, MAL/Jikan, and the
+Groq leg of the LLM chain (the local Custom LLM is NOT paced). Groq **key
+rotation** stays in the LLM chain (custom → primary → backup), so the governor
+only paces. Not a retry layer — callers keep their own error handling; a 429
+still surfaces, the governor just makes the NEXT call wait. Stats exposed at
+`GET /api/governor` (calls, today vs daily cap, backoff state) for the Advanced
+tab. Auto-retry-after-backoff is a possible future enhancement.
+
 ---
 
 ## Portal structure

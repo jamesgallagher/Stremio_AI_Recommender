@@ -1,6 +1,6 @@
-// TMDB: meta enrichment for id-based sources (posters, logos, descriptions)
-// and the portal's genre vocabulary. v4: TMDB is no longer a recommendation
-// source — Trakt recommends; TMDB dresses the survivors for Stremio.
+// TMDB: meta enrichment for id-based sources (posters, logos, descriptions),
+// the portal's genre vocabulary, and (v6) the per-title recommendation source.
+const governor = require('./governor');
 const API = 'https://api.themoviedb.org/3';
 
 // Portal genre vocabulary (checkbox names). Values are legacy TMDB alias
@@ -37,7 +37,7 @@ async function get(apiKey, endpoint, params = {}) {
   for (const [k, v] of Object.entries({ ...authParams(apiKey), ...params })) {
     url.searchParams.set(k, v);
   }
-  const res = await fetch(url, { headers: authHeaders(apiKey) });
+  const res = await governor.schedule('tmdb', () => fetch(url, { headers: authHeaders(apiKey) }));
   if (!res.ok) throw new Error(`TMDB ${endpoint} failed (${res.status})`);
   return res.json();
 }

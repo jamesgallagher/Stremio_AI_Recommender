@@ -3,6 +3,7 @@
 // The chain comes from global settings (settings.llmChain). Domain prompts and
 // parsing stay in services/groq.js; this module only knows how to talk to a
 // provider and how to fall through to the next one.
+const governor = require('./governor');
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
 // Groq model order within the Groq providers (override with GROQ_MODELS).
@@ -32,7 +33,9 @@ async function callProvider(provider, model, messages, { temperature = 0 } = {})
   const headers = { 'Content-Type': 'application/json' };
   if (provider.apiKey) headers.Authorization = `Bearer ${provider.apiKey}`;
 
-  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+  // Only Groq is rate-governed — the local Custom LLM has no quota to respect.
+  const doFetch = () => fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+  const res = isGroq ? await governor.schedule('groq', doFetch) : await doFetch();
   if (!res.ok) {
     const detail = (await res.text().catch(() => '')).slice(0, 200);
     const err = new Error(`${provider.label || provider.type}/${model} failed (${res.status})${detail ? `: ${detail}` : ''}`);

@@ -630,3 +630,30 @@ recommend-count adopted.
 4. Genre-balanced playlist assembly (F6).
 5. Catalog re-source to TMDB Discover + Simkl; drop MDBList (F7/F8/F9).
 6. Retire dead LLM-generation code; docs; major version bump.
+
+## Build status & remaining work (updated 2026-08-19)
+
+**DONE:** F1 (Simkl replaces Trakt — full code teardown, `trakt.js` deleted),
+F2 (scrobble → Simkl `/sync/history`), F3 (SQLite watched store), F5 (recency-
+weighted TMDB-recs builder, upsert-not-wipe), F6 (genre-balanced serve + serve-
+time filters), Watch Later → Simkl plantowatch, Anime TV-14 → **MDBList** (we
+diverged from AniList), global/per-profile config split + LLM chain, explicit
+"Don't recommend" (portal), "because you watched X" debug line, and the **rate
+governor** (v6-ui.md §Rate governance).
+
+**NEXT — Catalog overhaul (this is the next slice).** Two parts, in order:
+1. **Registry** — replace the current curated set with the intended list
+   (real, verified MDBList URLs — the registry table above may be stale; confirm
+   each slug against the live API with the global key before committing, the
+   `official/…/popular` shape especially).
+2. **Behavioural (the "what's included" rules)** — the locked catalog rules:
+   de-dupe curated lists against the local watched table **except Christmas**
+   (per-catalog `dedupe_watched`, default true), and apply the **kids age-band
+   always** (even on adult profiles), effective gate `min(catalog_band,
+   profile.age_limit)`. Route the curated fetches through the rate governor.
+
+**STILL NOT BUILT after that:** recommendation **decay** (streak-based implicit
+rejection — columns exist, no logic runs), **Mobile Companion** (needs a Simkl
+`plantowatch` *write*), the **in-app meta "🚫 Don't recommend" link**, the
+**tabbed profile UI**, and cleanup of the vestigial `engine`/`rating_source`
+config fields.

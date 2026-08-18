@@ -11,6 +11,7 @@
 //     falls through to the LLM, NEVER to deletion. "No rating" is not "too
 //     old" — conflating those is what emptied the kids catalogs under CSM.
 const store = require('../store');
+const governor = require('./governor');
 
 const API = 'https://api.jikan.moe/v4';
 const USER_AGENT = 'AI-Recommender/1.0 (+https://github.com/jamesgallagher/Stremio_AI_Recommender)';
@@ -64,9 +65,9 @@ function parseAnime(data) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function fetchRating(malId, retryOn429 = true) {
-  const res = await fetch(`${API}/anime/${encodeURIComponent(malId)}`, {
+  const res = await governor.schedule('jikan', () => fetch(`${API}/anime/${encodeURIComponent(malId)}`, {
     headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
-  });
+  }));
   if (res.status === 404) return { code: null, minAge: null, adult: false, adultish: false };
   if (res.status === 429 && retryOn429) {
     // One backoff, then give up and let the title go to the LLM unrated. A

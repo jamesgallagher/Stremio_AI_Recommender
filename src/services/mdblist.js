@@ -4,6 +4,7 @@
 // not fall back to MPAA/TMDB certifications or any other source.
 const USER_AGENT = 'AI-Recommender/1.0 (+https://github.com/jamesgallagher/Stremio_AI_Recommender)';
 const store = require('../store');
+const governor = require('./governor');
 
 const NOT_RATED = null;
 const CSM_TTL_MS = 30 * 24 * 3600e3; // ratings are near-static; refresh monthly
@@ -37,7 +38,7 @@ function parseCommonSenseAge(data) {
 }
 
 async function fetchJson(url) {
-  const res = await fetch(url, { headers: { 'User-Agent': USER_AGENT } });
+  const res = await governor.schedule('mdblist', () => fetch(url, { headers: { 'User-Agent': USER_AGENT } }));
   if (!res.ok) {
     const err = new Error(`MDBList request failed (${res.status})`);
     err.status = res.status;
@@ -188,11 +189,11 @@ async function listItemsPage(apiKey, user, slug, type, { limit = 50, offset = 0,
 async function mediaInfoBatch(apiKey, type, imdbIds) {
   if (!imdbIds.length) return new Map();
   const mediaType = type === 'series' ? 'show' : 'movie';
-  const res = await fetch(`${API}/imdb/${mediaType}?apikey=${encodeURIComponent(apiKey)}`, {
+  const res = await governor.schedule('mdblist', () => fetch(`${API}/imdb/${mediaType}?apikey=${encodeURIComponent(apiKey)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'User-Agent': USER_AGENT },
     body: JSON.stringify({ ids: imdbIds }),
-  });
+  }));
   if (!res.ok) {
     const err = new Error(`MDBList batch lookup failed (${res.status})`);
     err.status = res.status;
