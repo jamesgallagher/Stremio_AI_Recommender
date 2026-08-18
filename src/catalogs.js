@@ -10,31 +10,40 @@
 //   items below the bar and keep paging until 20; final order shuffled per
 //   rebuild; watched status deliberately ignored. Requires the MDBList key.
 //   Anime TV-14 is one of these (snoak/trending-anime-shows on MDBList).
+// v6 catalog registry (overhaul 2026-08-19). Every user/slug below was verified
+// against the live MDBList API (GET /lists/{user}/{slug}/items → 401 = valid,
+// needs the key) before committing. Catalog IDs are kept stable across the
+// re-source so installed manifests don't break — only the underlying list moved.
+//
+// POPULAR — DIVERGENCE FROM THE DESIGN DOC. The doc's `official/movies/popular`
+// and `official/shows/popular` are NOT reachable via the user-list API (they
+// 404 — they're MDBList's built-in dynamic lists on a different mechanism), and
+// the old `official/justwatch-streaming-charts` is dead too. Both replaced with
+// linaspurinis' "top-watched-of-the-week" lists, which ARE valid user lists.
 const EXTRA_CATALOGS = [
   // Watch Later first — the "3rd catalog" straight after the two AI rows.
   { id: 'trakt-watchlist-movies', type: 'movie', name: 'Watch Later', source: 'simkl_plantowatch', default_on: true },
   { id: 'trakt-watchlist-series', type: 'series', name: 'Watch Later', source: 'simkl_plantowatch', default_on: true },
-  // The JustWatch streaming charts list holds movies and shows in one list;
-  // the API returns them as separate arrays, so two catalogs share one slug.
-  { id: 'mdb-popular-movies', type: 'movie', name: 'Popular Movies', source: 'mdblist', user: 'official', slug: 'justwatch-streaming-charts', min_imdb: 0 },
-  { id: 'mdb-popular-series', type: 'series', name: 'Popular Series', source: 'mdblist', user: 'official', slug: 'justwatch-streaming-charts', min_imdb: 0 },
-  // Kids lists (added 2026-07-22): bigger targets (50) and rating-gated at 6.0
-  // (the site's "60"). On age-limited profiles they get the full protection
-  // stack like every other surface — CSM gate + AI age goalkeeper.
-  { id: 'mdb-kids-movies', type: 'movie', name: 'Trending Kids Movies', source: 'mdblist', user: 'snoak', slug: 'trending-kids-movies', min_imdb: 6, sort: 'tmdbpopular', target: 50 },
-  { id: 'mdb-kids-series', type: 'series', name: 'Trending Kids TV', source: 'mdblist', user: 'tvgeniekodi', slug: 'trending-kids-tv-shows', min_imdb: 6, sort: 'tmdbpopular', target: 50 },
-  // Anime TV-14 (v6: snoak/trending-anime-shows on MDBList — was a public Trakt
-  // list). A plain curated MDBList catalog now: min_imdb 6 gates rating, the
-  // anime/AI age gate handles certifications, IDs kept for manifest stability.
-  // min_profile_age: the catalog itself is pitched at a rating band, so a
-  // profile limited below it never sees the option. This is a CATALOG-level
-  // floor, not a per-title certification lookup — it cannot drop titles for
-  // being unrated, which is the failure that retired the CSM gate.
-  { id: 'trakt-anime-teen-series', type: 'series', name: 'Anime TV-14', source: 'mdblist', user: 'snoak', slug: 'trending-anime-shows', min_imdb: 6, sort: 'tmdbpopular', target: 50, min_profile_age: 13 },
-  { id: 'mdb-christmas-movies', type: 'movie', name: 'Christmas Movies', source: 'mdblist', user: 'jbeasley74', slug: 'christmas-movies', min_imdb: 6, sort: 'imdbpopular' },
+  // Popular — top-watched-of-the-week (see DIVERGENCE note above). Unfiltered.
+  { id: 'mdb-popular-movies', type: 'movie', name: 'Popular Movies', source: 'mdblist', user: 'linaspurinis', slug: 'top-watched-movies-of-the-week', min_imdb: 0 },
+  { id: 'mdb-popular-series', type: 'series', name: 'Popular Series', source: 'mdblist', user: 'linaspurinis', slug: 'top-watched-shows-of-the-week', min_imdb: 0 },
+  // Genre lists — rating-gated at 6.0, imdbpopular order.
   { id: 'mdb-comedy-movies', type: 'movie', name: 'Comedy Movies', source: 'mdblist', user: 'hdlists', slug: 'comedy-movies-2001-2020', min_imdb: 6, sort: 'imdbpopular' },
-  { id: 'mdb-action-movies', type: 'movie', name: 'Action Movies', source: 'mdblist', user: 'garycrawfordgc', slug: 'action', min_imdb: 6, sort: 'imdbpopular' },
+  { id: 'mdb-action-movies', type: 'movie', name: 'Action Movies', source: 'mdblist', user: 'hdlists', slug: 'latest-hd-action-movies-from-1980-to-today', min_imdb: 6, sort: 'imdbpopular' },
+  { id: 'mdb-romcom-movies', type: 'movie', name: 'Rom-Com Movies', source: 'mdblist', user: 'abbacarter', slug: 'rom-com', min_imdb: 6, sort: 'imdbpopular' },
+  { id: 'mdb-war-movies', type: 'movie', name: 'War Movies', source: 'mdblist', user: 'garycrawfordgc', slug: 'war', min_imdb: 6, sort: 'imdbpopular' },
+  { id: 'mdb-horror-movies', type: 'movie', name: 'Horror Movies', source: 'mdblist', user: 'hdlists', slug: 'latest-hd-horror-movies-top-rated-from-1980-to-today', min_imdb: 6, sort: 'imdbpopular' },
   { id: 'mdb-thriller-movies', type: 'movie', name: 'Thriller Movies', source: 'mdblist', user: 'garycrawfordgc', slug: 'thriller', min_imdb: 6, sort: 'imdbpopular' },
+  // Christmas — seasonal re-watchables (behavioural step exempts it from watched de-dupe).
+  { id: 'mdb-christmas-movies', type: 'movie', name: 'Christmas Movies', source: 'mdblist', user: 'hdlists', slug: 'christmas-movies', min_imdb: 6, sort: 'imdbpopular' },
+  // Kids lists — bigger targets (50), rating-gated at 6.0. The behavioural step
+  // will apply the catalog-level age band ALWAYS (even on adult profiles).
+  { id: 'mdb-kids-movies', type: 'movie', name: 'Trending Kids Movies', source: 'mdblist', user: 'tvgeniekodi', slug: 'trending-kids-movies', min_imdb: 6, sort: 'tmdbpopular', target: 50 },
+  { id: 'mdb-kids-series', type: 'series', name: 'Trending Kids TV', source: 'mdblist', user: 'tvgeniekodi', slug: 'trending-kids-tv-shows', min_imdb: 6, sort: 'tmdbpopular', target: 50 },
+  // Anime TV-14 — snoak/trending-anime-shows on MDBList (v6 decision, not the
+  // doc's AniList). min_profile_age hides it below the TV-14 band; the anime/AI
+  // age gate handles certifications. ID kept for manifest stability.
+  { id: 'trakt-anime-teen-series', type: 'series', name: 'Anime TV-14', source: 'mdblist', user: 'snoak', slug: 'trending-anime-shows', min_imdb: 6, sort: 'tmdbpopular', target: 50, min_profile_age: 13 },
 ];
 
 const byId = new Map(EXTRA_CATALOGS.map((d) => [d.id, d]));

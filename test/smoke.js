@@ -60,7 +60,9 @@ ok('store: watched activity snapshot + touch', () => {
 
 ok('catalogs: registry, defaults, and per-source requirements', () => {
   const catalogs = require('../src/catalogs');
-  assert.strictEqual(catalogs.EXTRA_CATALOGS.length, 11);
+  assert.strictEqual(catalogs.EXTRA_CATALOGS.length, 14); // v6 registry: 2 Watch Later + 12 curated
+  // New genre lists from the overhaul are present
+  assert.ok(catalogs.getExtra('mdb-romcom-movies') && catalogs.getExtra('mdb-war-movies') && catalogs.getExtra('mdb-horror-movies'));
   // Kids lists: 50 titles, rating-gated at 6.0 (the site's "60"), off by default
   const kidsM = catalogs.getExtra('mdb-kids-movies');
   const kidsS = catalogs.getExtra('mdb-kids-series');
@@ -1156,7 +1158,7 @@ async function httpTests() {
 
   // ---- Extra catalogs (second profile keeps earlier assertions intact) ----
   const defs = await (await fetch(`${BASE}/api/catalogs`)).json();
-  assert.strictEqual(defs.catalogs.length, 11);
+  assert.strictEqual(defs.catalogs.length, 14);
   assert.ok(defs.catalogs.some(c => c.id === 'mdb-popular-series' && c.type === 'series'));
   assert.ok(defs.catalogs.some(c => c.id === 'trakt-anime-teen-series' && c.source === 'mdblist'));
   assert.ok(defs.catalogs.some(c => c.id === 'trakt-watchlist-movies' && c.source === 'simkl_plantowatch' && c.default_on === true));
