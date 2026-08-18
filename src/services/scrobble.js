@@ -1,17 +1,19 @@
-// Auto-scrobble: mirror a profile's Nuvio/Stremio watched history into Trakt.
+// Auto-scrobble: mirror a profile's Nuvio/Stremio watched history into Simkl.
 //
-// Why this exists: the native apps only scrobble reliably while their own Trakt
-// session is healthy, and they swallow write failures silently — so watched
-// items drift out of Trakt and leak back into recommendations. This server has
-// robust per-profile Trakt tokens (auto-refreshed), so it reconciles the
-// provider's watched state into Trakt on the hourly tick.
+// Why this exists: the native apps only scrobble reliably while their own
+// tracker session is healthy, and they swallow write failures silently — so
+// watched items drift out of Simkl and leak back into recommendations. This
+// server holds a per-profile Simkl token, so it reconciles the provider's
+// watched state into Simkl on the hourly tick (v6: destination is Simkl, not
+// Trakt).
 //
 // Discipline (matches the rebuild pipeline): per-profile, best-effort, and
-// FAIL-CLOSED — any provider/Trakt error logs a warning and changes nothing.
+// FAIL-CLOSED — any provider/Simkl error logs a warning and changes nothing.
 // Isolation: creds are per profile; the delta is pushed only to THAT profile's
-// own Trakt token. There is no shared path between profiles.
+// own Simkl token. There is no shared path between profiles.
 const crypto = require('./crypto');
-const trakt = require('./trakt');
+const simkl = require('./simkl');
+const watchedStore = require('../watchedStore');
 const nuvio = require('./nuvio');
 const stremio = require('./stremio');
 
@@ -29,9 +31,10 @@ function epochMsToIso(ms) {
   return ms > 0 ? new Date(ms).toISOString() : undefined;
 }
 
-// Pure: given the provider's normalized watched items and Trakt's current
+// Pure: given the provider's normalized watched items and the current watched
 // state, return the { movies, shows } /sync/history body for what's missing
-// (or null if nothing is missing). Exported for tests.
+// (or null if nothing is missing). The body shape is shared by Trakt and Simkl.
+// Exported for tests.
 function computeDelta(items, watchedMovieIds, watchedEpisodeKeys) {
   const movies = [];
   const showMap = new Map(); // imdb -> Map(season -> [episodes])
@@ -77,7 +80,7 @@ async function syncProfile(profile, log = console, { full = false } = {}) {
   const cfg = profile.scrobble;
   if (!cfg?.enabled) return { skipped: 'disabled' };
   if (!cfg.password_enc) return { skipped: 'no credentials' };
-  if (!profile.trakt_auth?.access_token) return { skipped: 'trakt not connected' };
+  if (!profile.simkl_auth?.access_token) return { skipped: 'simkl not connected' };
 
   const items = await pullProviderWatched(cfg);
   const pulled = {
@@ -86,19 +89,21 @@ async function syncProfile(profile, log = console, { full = false } = {}) {
   };
   log.log(`[scrobble] ${profile.name}: pulled ${items.length} from ${cfg.provider} (${pulled.movies} movies, ${pulled.series} episodes)${full ? ' — FULL REBUILD' : ''}`);
 
-  // Full rebuild pushes everything (empty exclusion sets); normal sync only
-  // pushes what Trakt is missing.
-  const [watchedMovieIds, watchedEpisodeKeys] = full
-    ? [new Set(), new Set()]
-    : await Promise.all([trakt.getWatchedMovieImdbIds(profile), trakt.getWatchedEpisodeKeys(profile)]);
-  const body = computeDelta(items, watchedMovieIds, watchedEpisodeKeys);
+  // Normal sync excludes movies already known-watched on Simkl (from the local
+  // watched store). Per-episode state isn't tracked locally, so episodes are
+  // always pushed — Simkl de-dupes re-marks. full=true pushes everything.
+  const watchedMovieIds = full ? new Set() : watchedStore.watchedIdSets(profile.id).imdb;
+  const body = computeDelta(items, watchedMovieIds, new Set());
   if (!body) {
-    log.log(`[scrobble] ${profile.name}: nothing to scrobble (all ${items.length} watched items already on Trakt)`);
+    log.log(`[scrobble] ${profile.name}: nothing to scrobble (all ${items.length} watched items already on Simkl)`);
     return { pulled: items.length, pulledBreakdown: pulled, added: { movies: 0, episodes: 0 } };
   }
-  const res = await trakt.addToHistory(profile, body);
-  const added = { movies: res?.added?.movies || 0, episodes: res?.added?.episodes || 0 };
-  log.log(`[scrobble] ${profile.name}: added ${added.movies} movie(s) + ${added.episodes} episode(s) to Trakt from ${cfg.provider}${full ? ' (full rebuild)' : ''}`);
+  await simkl.addToHistory(profile, body);
+  const added = {
+    movies: body.movies.length,
+    episodes: body.shows.reduce((n, s) => n + s.seasons.reduce((m, se) => m + se.episodes.length, 0), 0),
+  };
+  log.log(`[scrobble] ${profile.name}: added ${added.movies} movie(s) + ${added.episodes} episode(s) to Simkl from ${cfg.provider}${full ? ' (full rebuild)' : ''}`);
   return { pulled: items.length, pulledBreakdown: pulled, added };
 }
 
@@ -107,7 +112,7 @@ async function syncProfile(profile, log = console, { full = false } = {}) {
 const lastSyncedAt = new Map();
 function ensureSynced(profile, log = console) {
   const cfg = profile.scrobble;
-  if (!cfg?.enabled || !cfg.password_enc || !profile.trakt_auth?.access_token) return false;
+  if (!cfg?.enabled || !cfg.password_enc || !profile.simkl_auth?.access_token) return false;
   if (locks.has(profile.id)) return false;
   if (Date.now() - (lastSyncedAt.get(profile.id) || 0) < SYNC_INTERVAL_MS) return false;
   locks.add(profile.id);

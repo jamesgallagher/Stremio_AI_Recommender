@@ -145,6 +145,24 @@ function parseWatchedItems(items, type) {
   return (Array.isArray(items) ? items : []).map((it) => parseWatchedItem(it, type)).filter(Boolean);
 }
 
+// ---- watched-history write (v6, auto-scrobble destination) ----
+// POST missing watched items to Simkl's history. The body shape matches what
+// scrobble.computeDelta already builds:
+//   { movies: [{ ids:{imdb}, watched_at? }],
+//     shows:  [{ ids:{imdb}, seasons:[{ number, episodes:[{ number, watched_at? }] }] }] }
+// Simkl de-dupes re-marks, so an over-broad push is harmless.
+async function addToHistory(profile, body) {
+  const clientId = profile.keys.simkl_client_id;
+  const token = profile.simkl_auth?.access_token;
+  if (!clientId || !token) throw new Error('Simkl is not connected for this profile');
+  const res = await fetch(withParams(clientId, '/sync/history'), {
+    method: 'POST', headers: headers(token), body: JSON.stringify(body),
+  });
+  if (res.status === 401 || res.status === 403) throw new Error('Simkl token rejected — reconnect the account');
+  if (!res.ok) throw new Error(`Simkl POST /sync/history failed (${res.status})`);
+  return res.json().catch(() => ({}));
+}
+
 // Plan-to-watch list for one media KIND ('movie' | 'series'), normalised to the
 // watched-store item shape ({ tmdb_id, imdb_id, title, year, ... }). This is the
 // v6 backing for the "Watch Later" catalog (replaces the Trakt watchlist).
@@ -169,6 +187,7 @@ module.exports = {
   getActivities,
   getAllItems,
   getPlanToWatch,
+  addToHistory,
   parseWatchedItem,
   parseWatchedItems,
   withParams,

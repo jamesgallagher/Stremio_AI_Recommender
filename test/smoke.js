@@ -739,7 +739,7 @@ ok('stremio: normalizeItems reads episode from video_id (not season/episode)', (
   assert.strictEqual(stremio.parseEpisode({}), null);
 });
 
-ok('scrobble: computeDelta excludes already-on-Trakt, groups episodes', () => {
+ok('scrobble: computeDelta excludes already-watched, groups episodes', () => {
   const { computeDelta } = require('../src/services/scrobble');
   const items = [
     { type: 'movie', imdbId: 'tt1', watchedAtMs: 1700000000000 }, // already watched -> dropped

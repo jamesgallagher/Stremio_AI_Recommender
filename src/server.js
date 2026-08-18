@@ -136,7 +136,7 @@ app.listen(PORT, '0.0.0.0', () => {
 // Scheduler: keep lists warm and pruned so nobody ever waits on a cold open.
 // Checks every profile hourly; ensureFresh() is a no-op unless a curated extra
 // catalog is past the 24h staleness threshold. ensureSynced() mirrors the
-// profile's Nuvio/Stremio watched history into Trakt when auto-scrobble is
+// profile's Nuvio/Stremio watched history into Simkl when auto-scrobble is
 // configured.
 const scrobble = require('./services/scrobble');
 const watchedStore = require('./watchedStore');
