@@ -145,6 +145,21 @@ function parseWatchedItems(items, type) {
   return (Array.isArray(items) ? items : []).map((it) => parseWatchedItem(it, type)).filter(Boolean);
 }
 
+// Plan-to-watch list for one media KIND ('movie' | 'series'), normalised to the
+// watched-store item shape ({ tmdb_id, imdb_id, title, year, ... }). This is the
+// v6 backing for the "Watch Later" catalog (replaces the Trakt watchlist).
+// Series pulls BOTH the 'shows' and 'anime' Simkl sections, since Simkl files
+// anime separately.
+async function getPlanToWatch(profile, kind) {
+  const sections = kind === 'movie' ? ['movies'] : ['shows', 'anime'];
+  const out = [];
+  for (const section of sections) {
+    const items = await getAllItems(profile, section, { status: 'plantowatch' });
+    out.push(...parseWatchedItems(items, section));
+  }
+  return out;
+}
+
 module.exports = {
   startPinFlow,
   pollPin,
@@ -153,6 +168,7 @@ module.exports = {
   authedGet,
   getActivities,
   getAllItems,
+  getPlanToWatch,
   parseWatchedItem,
   parseWatchedItems,
   withParams,

@@ -1,11 +1,10 @@
 // Optional extra catalogs, toggleable per profile in the portal's Catalogs
 // section (the two AI catalogs are always on and are not defined here).
 // Two sources:
-// - source 'trakt_watchlist' (Watch Later, decided 2026-07-15): mirrors the
-//   profile's built-in Trakt watchlist — the list Stremio/Nuvio's long-press
-//   "add to watchlist" writes to. Default ON (default_on), requires Trakt.
-//   Served verbatim in the user's own order; watched titles ARE pruned (a
-//   watch-later list must not show what's been seen).
+// - source 'simkl_plantowatch' (Watch Later, v6): mirrors the profile's Simkl
+//   plan-to-watch list (movies + shows + anime). Default ON (default_on),
+//   requires Simkl. Served in the user's own order; watched titles ARE pruned
+//   (a watch-later list must not show what's been seen).
 // - source 'trakt_list' (public Trakt lists, added 2026-07-23): any user's
 //   public list, fetched with the client ID alone. Rating-gated like the
 //   curated lists; the site-URL view filters are NOT applied by the API and
@@ -16,8 +15,8 @@
 //   rebuild; watched status deliberately ignored. Requires the MDBList key.
 const EXTRA_CATALOGS = [
   // Watch Later first — the "3rd catalog" straight after the two AI rows.
-  { id: 'trakt-watchlist-movies', type: 'movie', name: 'Watch Later', source: 'trakt_watchlist', default_on: true },
-  { id: 'trakt-watchlist-series', type: 'series', name: 'Watch Later', source: 'trakt_watchlist', default_on: true },
+  { id: 'trakt-watchlist-movies', type: 'movie', name: 'Watch Later', source: 'simkl_plantowatch', default_on: true },
+  { id: 'trakt-watchlist-series', type: 'series', name: 'Watch Later', source: 'simkl_plantowatch', default_on: true },
   // The JustWatch streaming charts list holds movies and shows in one list;
   // the API returns them as separate arrays, so two catalogs share one slug.
   { id: 'mdb-popular-movies', type: 'movie', name: 'Popular Movies', source: 'mdblist', user: 'official', slug: 'justwatch-streaming-charts', min_imdb: 0 },
@@ -77,7 +76,7 @@ function enabledExtras(profile) {
 
 // The profile-side prerequisite for a catalog's data source.
 function requirementMet(profile, def) {
-  if (def.source === 'trakt_watchlist') return !!profile.trakt_auth?.access_token;
+  if (def.source === 'simkl_plantowatch') return !!profile.simkl_auth?.access_token;
   // Public lists need only the client ID — they aren't this profile's data.
   if (def.source === 'trakt_list') return !!profile.keys.trakt_client_id;
   return !!profile.keys.mdblist_api_key;

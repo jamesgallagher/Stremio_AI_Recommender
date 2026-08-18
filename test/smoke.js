@@ -115,9 +115,9 @@ ok('catalogs: registry, defaults, and per-source requirements', () => {
   assert.strictEqual(catalogs.getExtra('mdb-popular-movies').min_imdb, 0); // popular: no rating gate
   assert.strictEqual(catalogs.getExtra('mdb-action-movies').min_imdb, 6);
   assert.strictEqual(catalogs.getExtra('nope'), null);
-  // Watch Later: default ON, trakt-sourced, first among extras (the "3rd catalog")
+  // Watch Later: default ON, Simkl plan-to-watch sourced, first among extras
   const wl = catalogs.getExtra('trakt-watchlist-movies');
-  assert.strictEqual(wl.source, 'trakt_watchlist');
+  assert.strictEqual(wl.source, 'simkl_plantowatch');
   assert.strictEqual(wl.default_on, true);
   assert.deepStrictEqual(ids.slice(0, 2), ['trakt-watchlist-movies', 'trakt-watchlist-series']);
   // Default-on semantics: absent = on for watchlist, off for curated lists
@@ -126,10 +126,10 @@ ok('catalogs: registry, defaults, and per-source requirements', () => {
   assert.deepStrictEqual(
     catalogs.enabledExtras({ catalogs: { 'mdb-action-movies': true, 'trakt-watchlist-movies': false } }).map(d => d.id),
     ['trakt-watchlist-series', 'mdb-action-movies']); // explicit false opts out of a default-on
-  // Requirements: watchlist needs Trakt OAuth; curated lists need the MDBList
+  // Requirements: Watch Later needs Simkl OAuth; curated lists need the MDBList
   // key; a PUBLIC Trakt list needs only the client id (it isn't our data)
-  assert.strictEqual(catalogs.requirementMet({ keys: {}, trakt_auth: { access_token: 't' } }, wl), true);
-  assert.strictEqual(catalogs.requirementMet({ keys: { mdblist_api_key: 'k' }, trakt_auth: null }, wl), false);
+  assert.strictEqual(catalogs.requirementMet({ keys: {}, simkl_auth: { access_token: 't' } }, wl), true);
+  assert.strictEqual(catalogs.requirementMet({ keys: { mdblist_api_key: 'k' }, simkl_auth: null }, wl), false);
   assert.strictEqual(catalogs.requirementMet({ keys: { mdblist_api_key: 'k' } }, catalogs.getExtra('mdb-action-movies')), true);
   const anime = catalogs.getExtra('trakt-anime-teen-series');
   assert.strictEqual(anime.source, 'trakt_list');
@@ -1161,7 +1161,7 @@ async function httpTests() {
   assert.strictEqual(defs.catalogs.length, 11);
   assert.ok(defs.catalogs.some(c => c.id === 'mdb-popular-series' && c.type === 'series'));
   assert.ok(defs.catalogs.some(c => c.id === 'trakt-anime-teen-series' && c.source === 'trakt_list'));
-  assert.ok(defs.catalogs.some(c => c.id === 'trakt-watchlist-movies' && c.source === 'trakt_watchlist' && c.default_on === true));
+  assert.ok(defs.catalogs.some(c => c.id === 'trakt-watchlist-movies' && c.source === 'simkl_plantowatch' && c.default_on === true));
   console.log('  ✓ GET /api/catalogs lists extra-catalog definitions');
 
   res = await fetch(`${BASE}/api/profiles`, {
@@ -1220,24 +1220,25 @@ async function httpTests() {
   });
   console.log('  ✓ TV-14 catalog hidden and refused below its age band');
 
-  // Watch Later without Trakt: dropped from the manifest, and answers empty
-  // rather than a card. The card told users to connect Trakt, but the row it
-  // appeared on no longer exists — the configure portal is where that state is
-  // surfaced now.
+  // Watch Later without Simkl: dropped from the manifest, and answers empty
+  // rather than a card. The row it appeared on no longer exists — the configure
+  // portal is where that state is surfaced now.
   let wcat = await (await fetch(`${BASE}/addon/${p2.token}/catalog/movie/trakt-watchlist-movies.json`)).json();
   assert.deepStrictEqual(wcat.metas, []);
   console.log('  ✓ empty Watch Later serves nothing, not a placeholder card');
 
-  // Watch Later IS pruned by watched status (unlike curated extras)
+  // Watch Later IS pruned by watched status (unlike curated extras) — via the
+  // Simkl-backed watched store now, not the old Trakt snapshot.
+  const wStore2 = require('../src/watchedStore');
   store.swapExtra(p2.id, 'trakt-watchlist-movies', [
     { id: 'tt0111161', type: 'movie', name: 'Seen Pick', poster: null, description: '', releaseInfo: '2020' },
     { id: 'tt0068646', type: 'movie', name: 'Unseen Pick', poster: null, description: '', releaseInfo: '1972' },
   ]);
-  store.saveWatched(p2.id, 'movie', { imdbIds: new Set(['tt0111161']), tmdbIds: new Set() });
+  wStore2.upsertMany(p2.id, [{ type: 'movie', title: 'Seen Pick', year: 2020, tmdb_id: '9111', imdb_id: 'tt0111161', simkl_id: 9111, watched_at: '2026-08-18T00:00:00Z' }]);
   wcat = await (await fetch(`${BASE}/addon/${p2.token}/catalog/movie/trakt-watchlist-movies.json`)).json();
   assert.deepStrictEqual(wcat.metas.map(m => m.id), ['tt0068646']);
   console.log('  ✓ Watch Later prunes watched titles at serve time');
-  store.saveWatched(p2.id, 'movie', { imdbIds: new Set(), tmdbIds: new Set() });
+  wStore2.deleteForProfile(p2.id);
 
   // Watch Later toggled off -> 404 (explicit false beats default-on)
   await fetch(`${BASE}/api/profiles/${p2.id}`, {

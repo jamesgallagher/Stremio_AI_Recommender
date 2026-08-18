@@ -42,16 +42,16 @@ function applyRpdb(metas, rpdbKey) {
     : m));
 }
 
-// Watch Later mirrors the Trakt watchlist, so "empty" is a normal, lasting
-// state — not a list still warming up. Advertising it anyway puts a permanent
-// placeholder row on the home screen, so an empty one is dropped from the
-// manifest entirely. Curated MDBList catalogs are NOT dropped: empty there
+// Watch Later mirrors the Simkl plan-to-watch list, so "empty" is a normal,
+// lasting state — not a list still warming up. Advertising it anyway puts a
+// permanent placeholder row on the home screen, so an empty one is dropped from
+// the manifest entirely. Curated MDBList catalogs are NOT dropped: empty there
 // means not-built-yet, and the warming-up card is the right answer.
 //
 // Trade-off: clients cache the manifest, so a watchlist that later gains its
 // first title may not show the row again until the addon is reloaded.
 function hasContent(profile, def) {
-  if (def.source !== 'trakt_watchlist') return true;
+  if (def.source !== 'simkl_plantowatch') return true;
   return (store.loadCache(profile.id).extras?.[def.id]?.metas || []).length > 0;
 }
 
@@ -275,14 +275,14 @@ router.get('/catalog/:type/:catalogId{/:extra}', async (req, res) => {
     // An empty Watch Later is a real state, not a pending one — it's dropped
     // from the manifest, but a client with a cached manifest can still ask for
     // it. Answer honestly with nothing rather than a warming-up placeholder.
-    if (extraDef?.source === 'trakt_watchlist') {
+    if (extraDef?.source === 'simkl_plantowatch') {
       return res.json({ metas: [], cacheMaxAge: 5 * 60 });
     }
     // Nothing cached yet (first install / not onboarded) — friendly card, short client cache
-    const description = extraDef.source === 'trakt_watchlist'
-      ? (!profile.trakt_auth?.access_token
-        ? 'Watch Later mirrors your Trakt watchlist — connect Trakt in the configure portal.'
-        : 'Your Trakt watchlist is empty — long-press a title in Stremio/Nuvio and add it to your watchlist, or add one on trakt.tv.')
+    const description = extraDef.source === 'simkl_plantowatch'
+      ? (!profile.simkl_auth?.access_token
+        ? 'Watch Later mirrors your Simkl plan-to-watch list — connect Simkl in the configure portal.'
+        : 'Your Simkl plan-to-watch list is empty — add titles on simkl.com or from your player, and they appear here.')
       : (profile.keys.mdblist_api_key
         ? 'This list is being generated — check back in a minute or two.'
         : 'This catalog needs an MDBList API key — add one in the configure portal.');
@@ -291,14 +291,11 @@ router.get('/catalog/:type/:catalogId{/:extra}', async (req, res) => {
 
   // Serve-time watched pruning — Watch Later only (a watch-later list must not
   // show what's been seen); curated MDBList extras ignore watched status by
-  // design. Union of both types: IMDb IDs are global, and Trakt/TMDB sometimes
-  // disagree on whether a title is a movie or a show.
+  // design. Uses the Simkl-backed watched store; IMDb IDs are global, so a title
+  // Simkl/TMDB disagree on (movie vs show) is still pruned.
   let served = entry.metas;
-  if (extraDef.source === 'trakt_watchlist') {
-    const watchedImdb = new Set([
-      ...(cache.watched?.movie?.imdb || []),
-      ...(cache.watched?.series?.imdb || []),
-    ]);
+  if (extraDef.source === 'simkl_plantowatch') {
+    const watchedImdb = watchedStore.watchedIdSets(profile.id).imdb;
     served = served.filter((m) => !watchedImdb.has(m.id));
   }
 

@@ -30,6 +30,8 @@ const config = require('./config');
 const settings = require('./settings');
 const catalogs = require('./catalogs');
 const trakt = require('./services/trakt');
+const simkl = require('./services/simkl');
+const watchedStore = require('./watchedStore');
 const llm = require('./services/groq');
 const tmdb = require('./services/tmdb');
 const mdblist = require('./services/mdblist');
@@ -271,21 +273,18 @@ async function applyExtraAgeGate(profile, def, metas, log = console) {
 }
 
 async function buildWatchlistCatalog(profile, def, log = console) {
-  if (!profile.trakt_auth?.access_token) {
-    throw new Error('Trakt is not connected — Watch Later mirrors your Trakt watchlist');
+  if (!profile.simkl_auth?.access_token) {
+    throw new Error('Simkl is not connected — Watch Later mirrors your Simkl plan-to-watch list');
   }
-  const items = await trakt.getWatchlist(profile, def.type);
-  log.log(`[watchlist] ${profile.name}/${def.type}: ${items.length} item(s) on the Trakt watchlist`);
-  const watchedImdb = new Set([
-    ...(store.loadCache(profile.id).watched?.movie?.imdb || []),
-    ...(store.loadCache(profile.id).watched?.series?.imdb || []),
-  ]);
+  const items = await simkl.getPlanToWatch(profile, def.type);
+  log.log(`[watchlist] ${profile.name}/${def.type}: ${items.length} item(s) on the Simkl plan-to-watch list`);
+  const watched = watchedStore.watchedIdSets(profile.id);
   const capped = items.slice(0, WATCHLIST_CAP);
   const metas = [];
   for (let i = 0; i < capped.length; i += 25) {
     const chunk = capped.slice(i, i + 25);
     metas.push(...await Promise.all(chunk.map(async (it) => {
-      if (it.imdb_id && watchedImdb.has(it.imdb_id)) return null;
+      if (it.imdb_id && watched.imdb.has(it.imdb_id)) return null;
       if (it.tmdb_id) {
         const m = await tmdb.metaByTmdbId(profile.keys.tmdb_api_key, def.type, it.tmdb_id, log);
         if (m) return m;
@@ -296,7 +295,7 @@ async function buildWatchlistCatalog(profile, def, log = console) {
         : null;
     })));
   }
-  return metas.filter((m) => m && !watchedImdb.has(m.id)); // cleaned after the age gate
+  return metas.filter((m) => m && !watched.imdb.has(m.id)); // cleaned after the age gate
 }
 
 // A public Trakt list -> metas. The list's web-URL filters are site-side only,
@@ -345,7 +344,7 @@ async function buildTraktListCatalog(profile, def, log = console) {
 }
 
 async function buildExtraCatalog(profile, def, log = console) {
-  if (def.source === 'trakt_watchlist') {
+  if (def.source === 'simkl_plantowatch') {
     return cleanMetas(await applyExtraAgeGate(profile, def, await buildWatchlistCatalog(profile, def, log), log));
   }
   if (def.source === 'trakt_list') {
@@ -427,7 +426,7 @@ async function rebuildProfile(profile, log = console, opts = {}) {
           // Watch Later is a mirror, not a generated list: any size — even
           // empty — is the true state of the user's watchlist, so it always
           // swaps. Curated lists keep the >= MIN_METAS quality gate.
-          if (def.source === 'trakt_watchlist' || metas.length >= MIN_METAS) {
+          if (def.source === 'simkl_plantowatch' || metas.length >= MIN_METAS) {
             store.swapExtra(profile.id, def.id, metas);
             results[def.id] = { ok: true, count: metas.length };
             log.log(`[extra] ${profile.name}/${def.id}: swapped in ${metas.length} titles`);
