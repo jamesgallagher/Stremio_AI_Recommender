@@ -443,10 +443,10 @@ function renderServerConfig(data) {
         <label>Custom LLM name / model <span class="muted">(sent as the model, e.g. qwen3.5:9b)</span></label>
         ${textField('custom_name', llmv.custom_name, 'qwen3.5:9b')}
         <label>Custom LLM URI <span class="muted">— must support OpenAI v1 (<code>/chat/completions</code>)</span></label>
-        <div class="keyrow">${textField('custom_uri', llmv.custom_uri, 'http://localhost:11434/v1')}<button class="ghost mini" onclick="testLlm(this)">Test</button></div>
-        <span class="tres" data-tres="llm"></span>
+        ${textField('custom_uri', llmv.custom_uri, 'http://localhost:11434/v1')}
         <label>Custom LLM API key <span class="muted">(blank for keyless local servers)</span></label>
-        ${keyField('custom_api_key', llmv.custom_api_key)}
+        <div class="keyrow">${keyField('custom_api_key', llmv.custom_api_key)}<button class="ghost mini" onclick="testLlm(this)">Test</button></div>
+        <span class="tres" data-tres="llm"></span>
         <div class="muted" style="font-size:11px;margin-top:3px">Tried first. Test runs a real OpenAI-shape check plus our generation + age-gate JSON tasks — it must pass all three to be trusted.</div>
       </div>
       <div class="cols" style="margin-top:10px">
@@ -505,6 +505,9 @@ async function testSettingKey(service, dataKey, btn) {
   } catch (e) { out.textContent = '✗ ' + e.message; out.className = 'tres err'; }
 }
 
+// Runs the three checks ONE AT A TIME so the user sees live progress
+// ("Running test N/3 …") rather than a single silent wait. Stops at the first
+// failure (later checks are meaningless once one fails).
 async function testLlm(btn) {
   const el = $('#serverConfig');
   const out = el.querySelector('[data-tres="llm"]');
@@ -513,13 +516,26 @@ async function testLlm(btn) {
     uri: el.querySelector('[data-key="custom_uri"]').value.trim(),
     apiKey: el.querySelector('[data-key="custom_api_key"]').value.trim(),
   };
-  btn.disabled = true; out.textContent = 'testing (3 checks)…'; out.className = 'tres';
+  if (!body.uri) { out.textContent = '✗ Enter a URI first'; out.className = 'tres err'; return; }
+  const steps = [['shape', 'OpenAI v1 shape'], ['generation', 'JSON generation'], ['agegate', 'JSON age-gate']];
+  btn.disabled = true; out.className = 'tres';
+  const done = [];
+  let allOk = true;
   try {
-    const r = await api('/settings/test-llm', { method: 'POST', body });
-    out.innerHTML = r.checks.map(c => `${c.ok ? '✓' : '✗'} ${esc(c.name)}${c.detail ? ' — ' + esc(c.detail) : ''}`).join('<br>');
-    out.className = 'tres ' + (r.ok ? 'ok' : 'err');
-  } catch (e) { out.textContent = '✗ ' + e.message; out.className = 'tres err'; }
-  finally { btn.disabled = false; }
+    for (let i = 0; i < steps.length; i++) {
+      const [step, label] = steps[i];
+      out.innerHTML = [...done, `<span class="muted">⟳ Running test ${i + 1}/3: ${esc(label)}…</span>`].join('<br>');
+      const r = await api('/settings/test-llm', { method: 'POST', body: { ...body, step } });
+      const c = r.checks[0] || { ok: false, detail: 'no result' };
+      done.push(`${c.ok ? '✓' : '✗'} ${esc(label)}${c.detail ? ' — ' + esc(c.detail) : ''}`);
+      out.innerHTML = done.join('<br>');
+      if (!c.ok) { allOk = false; break; }
+    }
+    if (allOk) done.push('<b>All 3 passed — endpoint is usable.</b>'), out.innerHTML = done.join('<br>');
+    out.className = 'tres ' + (allOk ? 'ok' : 'err');
+  } catch (e) {
+    out.innerHTML = [...done, '✗ ' + esc(e.message)].join('<br>'); out.className = 'tres err';
+  } finally { btn.disabled = false; }
 }
 
 async function load() {

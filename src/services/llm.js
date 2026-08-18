@@ -89,54 +89,62 @@ function extractArray(text) {
 }
 
 // Custom LLM "Test" — proves the endpoint is not just reachable but can do OUR
-// work. Three checks, each returning {name, ok, detail}. The endpoint is only
-// worth enabling if all pass (docs/v6-ui.md).
-async function testCustomLlm({ name, uri, apiKey } = {}, log = console) {
-  const provider = { type: 'custom', name: name || 'custom', uri, apiKey, label: 'custom' };
-  const model = name || 'default';
-  const checks = [];
-  const run = async (label, fn) => {
-    try { const detail = await fn(); checks.push({ name: label, ok: true, detail }); return true; }
-    catch (err) { checks.push({ name: label, ok: false, detail: err.message }); return false; }
-  };
+// work. The three checks are named steps so the portal can run them one at a
+// time and show live progress ("Running test 1/3 …"). Each returns
+// {name, ok, detail}. The endpoint is only worth enabling if all pass.
+const TEST_STEPS = ['shape', 'generation', 'agegate'];
+const STEP_LABELS = { shape: 'OpenAI v1 shape', generation: 'JSON generation task', agegate: 'JSON age-gate task' };
 
-  if (!uri) return { ok: false, checks: [{ name: 'config', ok: false, detail: 'No URI provided' }] };
-
-  // 1. OpenAI shape — a trivial call must return choices[0].message.content.
-  const shapeOk = await run('OpenAI v1 chat/completions shape', async () => {
+async function runStep(provider, model, step) {
+  if (step === 'shape') {
     const txt = await callProvider(provider, model, [{ role: 'user', content: 'Reply with the single word: ok' }], { temperature: 0 });
     return `responded (${txt.slice(0, 40).replace(/\s+/g, ' ')})`;
-  });
-
-  // 2. Generation JSON task — must return a parseable [{title,year}].
-  let genOk = false;
-  if (shapeOk) {
-    genOk = await run('JSON generation task', async () => {
-      const txt = await callProvider(provider, model, [
-        { role: 'system', content: 'Reply with raw JSON only.' },
-        { role: 'user', content: 'Return a JSON array of exactly 2 objects, each {"title": string, "year": number}. Example: [{"title":"Inception","year":2010}]' },
-      ], { temperature: 0 });
-      const arr = extractArray(txt);
-      if (!arr.length || typeof arr[0]?.title !== 'string') throw new Error('parsed but not {title,year} objects');
-      return `parsed ${arr.length} title(s)`;
-    });
   }
-
-  // 3. Age-gate JSON task — must return a parseable [{id,ok}].
-  let gateOk = false;
-  if (shapeOk) {
-    gateOk = await run('JSON age-gate task', async () => {
-      const txt = await callProvider(provider, model, [
-        { role: 'system', content: 'Reply with raw JSON only.' },
-        { role: 'user', content: 'For each candidate return {"id": the id, "ok": boolean}. Candidates: [{"id":"tt1","title":"Bluey"},{"id":"tt2","title":"Saw"}]. Output ONLY a JSON array.' },
-      ], { temperature: 0 });
-      const arr = extractArray(txt);
-      if (!arr.length || typeof arr[0]?.id !== 'string' || typeof arr[0]?.ok !== 'boolean') throw new Error('parsed but not {id,ok} objects');
-      return `parsed ${arr.length} verdict(s)`;
-    });
+  if (step === 'generation') {
+    const txt = await callProvider(provider, model, [
+      { role: 'system', content: 'Reply with raw JSON only.' },
+      { role: 'user', content: 'Return a JSON array of exactly 2 objects, each {"title": string, "year": number}. Example: [{"title":"Inception","year":2010}]' },
+    ], { temperature: 0 });
+    const arr = extractArray(txt);
+    if (!arr.length || typeof arr[0]?.title !== 'string') throw new Error('parsed but not {title,year} objects');
+    return `parsed ${arr.length} title(s)`;
   }
-
-  return { ok: shapeOk && genOk && gateOk, checks };
+  if (step === 'agegate') {
+    const txt = await callProvider(provider, model, [
+      { role: 'system', content: 'Reply with raw JSON only.' },
+      { role: 'user', content: 'For each candidate return {"id": the id, "ok": boolean}. Candidates: [{"id":"tt1","title":"Bluey"},{"id":"tt2","title":"Saw"}]. Output ONLY a JSON array.' },
+    ], { temperature: 0 });
+    const arr = extractArray(txt);
+    if (!arr.length || typeof arr[0]?.id !== 'string' || typeof arr[0]?.ok !== 'boolean') throw new Error('parsed but not {id,ok} objects');
+    return `parsed ${arr.length} verdict(s)`;
+  }
+  throw new Error(`unknown test step: ${step}`);
 }
 
-module.exports = { chat, callProvider, testCustomLlm, extractArray, GROQ_MODELS, chatUrl };
+// Run one step (when `step` is given) or all three. One-step mode powers the
+// portal's live per-test progress; all-mode is kept for programmatic callers.
+async function testCustomLlm({ name, uri, apiKey, step } = {}, log = console) {
+  if (!uri) return { ok: false, checks: [{ name: 'config', ok: false, detail: 'No URI provided' }] };
+  const provider = { type: 'custom', name: name || 'custom', uri, apiKey, label: 'custom' };
+  const model = name || 'default';
+  const one = async (s) => {
+    try { return { name: STEP_LABELS[s], ok: true, detail: await runStep(provider, model, s) }; }
+    catch (err) { return { name: STEP_LABELS[s], ok: false, detail: err.message }; }
+  };
+
+  if (step) {
+    if (!TEST_STEPS.includes(step)) return { ok: false, checks: [{ name: 'step', ok: false, detail: `unknown step: ${step}` }] };
+    const r = await one(step);
+    return { ok: r.ok, step, checks: [r] };
+  }
+
+  const checks = [];
+  for (const s of TEST_STEPS) {
+    const r = await one(s);
+    checks.push(r);
+    if (!r.ok) break; // a failed step makes later steps meaningless
+  }
+  return { ok: checks.length === TEST_STEPS.length && checks.every((c) => c.ok), checks };
+}
+
+module.exports = { chat, callProvider, testCustomLlm, extractArray, TEST_STEPS, STEP_LABELS, GROQ_MODELS, chatUrl };

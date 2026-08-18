@@ -511,11 +511,11 @@ router.post('/settings/test/:service', async (req, res) => {
 
 // Custom LLM test — validates OpenAI shape + our two JSON tasks live.
 router.post('/settings/test-llm', async (req, res) => {
-  const { name, uri, apiKey } = req.body || {};
+  const { name, uri, apiKey, step } = req.body || {};
   try {
-    const result = await llm.testCustomLlm({ name, uri, apiKey }, console);
+    const result = await llm.testCustomLlm({ name, uri, apiKey, step }, console);
     const summary = result.checks.map((c) => `${c.ok ? '✓' : '✗'} ${c.name}${c.detail ? ` (${c.detail})` : ''}`).join(' · ');
-    console.log(`[test] custom LLM ${uri}: ${result.ok ? 'OK' : 'FAIL'} — ${summary}`);
+    console.log(`[test] custom LLM ${uri}${step ? ` [${step}]` : ''}: ${result.ok ? 'OK' : 'FAIL'} — ${summary}`);
     res.json(result);
   } catch (err) {
     res.status(500).json({ ok: false, checks: [{ name: 'request', ok: false, detail: err.message }] });

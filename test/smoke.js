@@ -576,6 +576,7 @@ ok('llm: chatUrl joins, extractArray tolerates wrappers, groq model list', () =>
   assert.deepStrictEqual(llm.extractArray('{"results":[{"x":2}]}'), [{ x: 2 }]); // json-mode wrapper
   assert.throws(() => llm.extractArray('not json at all'));
   assert.ok(llm.GROQ_MODELS.includes('openai/gpt-oss-120b'));
+  assert.deepStrictEqual(llm.TEST_STEPS, ['shape', 'generation', 'agegate']);
 });
 
 ok('crypto: encrypt/decrypt roundtrip + tamper detection', () => {
@@ -830,7 +831,13 @@ async function httpTests() {
   assert.ok(!rawSettings.includes('ROUNDTRIP-GROQ')); // sealed on disk
   const badSvc = await fetch(`${BASE}/api/settings/test/nope`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
   assert.strictEqual(badSvc.status, 400);
-  console.log('  ✓ /api/settings PUT/GET roundtrip, sealed, complete flag');
+  // Custom LLM test: early-return paths need no network — missing URI + bad step
+  const llmSvc = require('../src/services/llm');
+  assert.strictEqual((await llmSvc.testCustomLlm({}, { warn() {} })).checks[0].name, 'config');
+  const badStep = await llmSvc.testCustomLlm({ uri: 'http://x/v1', step: 'nope' }, { warn() {} });
+  assert.strictEqual(badStep.ok, false);
+  assert.strictEqual(badStep.checks[0].name, 'step');
+  console.log('  ✓ /api/settings PUT/GET roundtrip, sealed, complete flag; LLM test step-routing');
 
   const genres = await (await fetch(`${BASE}/api/genres`)).json();
   assert.ok(genres.genres.includes('Horror') && genres.genres.includes('Kids'));
