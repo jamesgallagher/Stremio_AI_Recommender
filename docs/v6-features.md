@@ -643,10 +643,11 @@ governor** (v6-ui.md §Rate governance).
 
 **DONE — Catalog overhaul (v6.17.0 / v6.18.0-beta).** Both parts shipped:
 1. **Registry** — re-sourced to the design list + kept Thriller. Every user/slug
-   verified against the live MDBList API (401 = valid) before committing; IDs
-   kept stable. Added Rom-Com/War/Horror. **Popular diverged** from the doc:
-   `official/*/popular` 404 on the user-list API (built-in dynamic lists), so
-   both use `linaspurinis/top-watched-{movies,shows}-of-the-week` instead.
+   verified against the live MDBList API before committing; IDs kept stable.
+   Added Rom-Com/War/Horror. **Popular** = MDBList's `official/popular` — ONE
+   combined list (API slug `popular`; the site's `movies/`+`shows/` are just page
+   groupings), returned as `{ movies, shows }` and split by type, so both Popular
+   catalogs share the slug. Needs the MDBList key (authenticated list).
 2. **Behavioural** — serve-time de-dupe against the Simkl watched store for every
    catalog EXCEPT `dedupe_watched:false` (Christmas); `age_band` applied ALWAYS
    (Kids 12, Anime 13), effective `min(band, profile.age_limit)` — so those rows

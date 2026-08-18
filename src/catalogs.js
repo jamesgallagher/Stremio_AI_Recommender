@@ -14,19 +14,17 @@
 // against the live MDBList API (GET /lists/{user}/{slug}/items → 401 = valid,
 // needs the key) before committing. Catalog IDs are kept stable across the
 // re-source so installed manifests don't break — only the underlying list moved.
-//
-// POPULAR — DIVERGENCE FROM THE DESIGN DOC. The doc's `official/movies/popular`
-// and `official/shows/popular` are NOT reachable via the user-list API (they
-// 404 — they're MDBList's built-in dynamic lists on a different mechanism), and
-// the old `official/justwatch-streaming-charts` is dead too. Both replaced with
-// linaspurinis' "top-watched-of-the-week" lists, which ARE valid user lists.
 const EXTRA_CATALOGS = [
   // Watch Later first — the "3rd catalog" straight after the two AI rows.
   { id: 'trakt-watchlist-movies', type: 'movie', name: 'Watch Later', source: 'simkl_plantowatch', default_on: true },
   { id: 'trakt-watchlist-series', type: 'series', name: 'Watch Later', source: 'simkl_plantowatch', default_on: true },
-  // Popular — top-watched-of-the-week (see DIVERGENCE note above). Unfiltered.
-  { id: 'mdb-popular-movies', type: 'movie', name: 'Popular Movies', source: 'mdblist', user: 'linaspurinis', slug: 'top-watched-movies-of-the-week', min_imdb: 0 },
-  { id: 'mdb-popular-series', type: 'series', name: 'Popular Series', source: 'mdblist', user: 'linaspurinis', slug: 'top-watched-shows-of-the-week', min_imdb: 0 },
+  // Popular — MDBList's official "popular" list. It's ONE combined list: the API
+  // (/lists/official/popular/items) returns { movies, shows } arrays and
+  // listItemsPage splits by type, so both catalogs share the single slug
+  // 'popular'. (The site groups it as movies/popular + shows/popular pages, but
+  // the API slug is just 'popular'.) Unfiltered.
+  { id: 'mdb-popular-movies', type: 'movie', name: 'Popular Movies', source: 'mdblist', user: 'official', slug: 'popular', min_imdb: 0 },
+  { id: 'mdb-popular-series', type: 'series', name: 'Popular Series', source: 'mdblist', user: 'official', slug: 'popular', min_imdb: 0 },
   // Genre lists — rating-gated at 6.0, imdbpopular order.
   { id: 'mdb-comedy-movies', type: 'movie', name: 'Comedy Movies', source: 'mdblist', user: 'hdlists', slug: 'comedy-movies-2001-2020', min_imdb: 6, sort: 'imdbpopular' },
   { id: 'mdb-action-movies', type: 'movie', name: 'Action Movies', source: 'mdblist', user: 'hdlists', slug: 'latest-hd-action-movies-from-1980-to-today', min_imdb: 6, sort: 'imdbpopular' },
