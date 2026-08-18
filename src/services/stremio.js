@@ -13,7 +13,7 @@
 //              satisfy the recommender's show-level exclusion) without
 //              over-claiming. Full per-episode history means decoding
 //              state.watched (a bitfield) against Cinemeta — a clean v2.
-const { USER_AGENT } = require('./trakt');
+const USER_AGENT = 'AI-Recommender/1.0 (+https://github.com/jamesgallagher/Stremio_AI_Recommender)';
 
 const BASE = (process.env.STREMIO_API_URL || 'https://api.strem.io/api').replace(/\/+$/, '');
 

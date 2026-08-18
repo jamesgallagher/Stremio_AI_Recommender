@@ -8,7 +8,7 @@
 // Rides Nuvio's private backend (undocumented). Endpoint + anon key are
 // overridable via env in case Nuvio rotates them; callers treat every failure
 // as "leave Trakt untouched" (fail-closed) rather than guessing.
-const { USER_AGENT } = require('./trakt');
+const USER_AGENT = 'AI-Recommender/1.0 (+https://github.com/jamesgallagher/Stremio_AI_Recommender)';
 
 // Public anon key (shipped in Nuvio's web bundle; RLS + login is the real
 // guard). Overridable if it ever rotates — no image rebuild needed.

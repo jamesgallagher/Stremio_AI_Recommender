@@ -5,7 +5,6 @@ const config = require('./config');
 const store = require('./store');
 const rebuild = require('./rebuild');
 const catalogs = require('./catalogs');
-const trakt = require('./services/trakt');
 const tmdb = require('./services/tmdb');
 const mdblistService = require('./services/mdblist');
 const scrobble = require('./services/scrobble');
@@ -17,6 +16,7 @@ const watchedStore = require('./watchedStore');
 const recommendationStore = require('./recommendationStore');
 
 const { version } = require('../package.json');
+const USER_AGENT = `AI-Recommender/1.0 (+https://github.com/jamesgallagher/Stremio_AI_Recommender)`;
 
 const router = express.Router();
 router.use(express.json());
@@ -35,9 +35,6 @@ router.use((req, res, next) => {
 router.get('/version', (req, res) => {
   res.json({ version, secrets_locked: config.secretsLocked(), encryption_available: crypto.encryptionAvailable() });
 });
-
-// In-flight device-flow sessions: profileId -> { user_code, verification_url, state, error }
-const deviceFlows = new Map();
 
 function redactKey(v) {
   if (!v) return '';
@@ -59,8 +56,6 @@ function publicProfile(p, req) {
     // input can be pre-filled (with a show/hide toggle). This endpoint is
     // behind adminAuth; the public /addon surface never sees these.
     keys: {
-      trakt_client_id: p.keys.trakt_client_id || '',
-      trakt_client_secret: p.keys.trakt_client_secret || '',
       simkl_client_id: p.keys.simkl_client_id || '',
       simkl_client_secret: p.keys.simkl_client_secret || '',
       tmdb_api_key: p.keys.tmdb_api_key || '',
@@ -69,8 +64,6 @@ function publicProfile(p, req) {
       mdblist_api_key: p.keys.mdblist_api_key || '',
     },
     keys_set: {
-      trakt_client_id: !!p.keys.trakt_client_id,
-      trakt_client_secret: !!p.keys.trakt_client_secret,
       simkl_client_id: !!p.keys.simkl_client_id,
       simkl_client_secret: !!p.keys.simkl_client_secret,
       tmdb_api_key: !!p.keys.tmdb_api_key,
@@ -79,16 +72,11 @@ function publicProfile(p, req) {
       mdblist_api_key: !!p.keys.mdblist_api_key,
     },
     keys_preview: {
-      trakt_client_id: redactKey(p.keys.trakt_client_id),
-      trakt_client_secret: redactKey(p.keys.trakt_client_secret),
       tmdb_api_key: redactKey(p.keys.tmdb_api_key),
       groq_api_key: redactKey(p.keys.groq_api_key),
       rpdb_api_key: redactKey(p.keys.rpdb_api_key),
       mdblist_api_key: redactKey(p.keys.mdblist_api_key),
     },
-    trakt_connected: !!p.trakt_auth?.access_token,
-    trakt_expires_at: p.trakt_auth?.expires_at || null,
-    trakt_username: p.trakt_auth?.username || null,
     // Simkl: whether a token is STORED. Live validity is checked separately via
     // /simkl/status (the portal calls it on the Simkl tab open).
     simkl_connected: !!p.simkl_auth?.access_token,
@@ -141,7 +129,7 @@ router.put('/profiles/:id', (req, res) => {
   if (req.body.keys) {
     // Only overwrite keys that were actually provided (non-empty)
     patch.keys = {};
-    for (const k of ['trakt_client_id', 'trakt_client_secret', 'simkl_client_id', 'simkl_client_secret', 'tmdb_api_key', 'groq_api_key', 'rpdb_api_key', 'mdblist_api_key']) {
+    for (const k of ['simkl_client_id', 'simkl_client_secret', 'tmdb_api_key', 'groq_api_key', 'rpdb_api_key', 'mdblist_api_key']) {
       if (req.body.keys[k]) patch.keys[k] = String(req.body.keys[k]).trim();
     }
     // Explicit clear for optional keys (null -> '' disables the feature)
@@ -195,49 +183,18 @@ router.put('/profiles/:id', (req, res) => {
 
 router.delete('/profiles/:id', (req, res) => {
   if (!config.removeProfile(req.params.id)) return res.status(404).json({ error: 'Profile not found' });
-  deviceFlows.delete(req.params.id);
   simklFlows.delete(req.params.id);
   try { watchedStore.deleteForProfile(req.params.id); recommendationStore.deleteForProfile(req.params.id); } catch (err) { console.warn(`[store] cleanup failed for ${req.params.id}: ${err.message}`); }
   res.json({ ok: true });
 });
 
 // ---- Key testing ----
-async function testTrakt(profile) {
-  if (!profile.keys.trakt_client_id) return { ok: false, error: 'Client ID not set' };
-  if (!profile.keys.trakt_client_secret) return { ok: false, error: 'Client Secret not set — both fields are required before Trakt can be used' };
-  // Full check when already authorized
-  if (profile.trakt_auth?.access_token) {
-    const res = await fetch('https://api.trakt.tv/sync/last_activities', {
-      headers: {
-        ...trakt.baseHeaders(profile.keys.trakt_client_id),
-        Authorization: `Bearer ${profile.trakt_auth.access_token}`,
-      },
-    });
-    if (res.ok) {
-      const who = profile.trakt_auth.username ? ` (authorized as Trakt user "${profile.trakt_auth.username}")` : '';
-      return { ok: true, detail: `Client ID and OAuth token both valid${who}` };
-    }
-    return { ok: false, error: `Trakt returned ${res.status} — token may need re-authorization` };
-  }
-  // Not authorized yet: validate the Client ID via a device-code request
-  // (harmless — the code simply expires unused). The secret can only be
-  // verified by completing Connect Trakt.
-  const res = await fetch('https://api.trakt.tv/oauth/device/code', {
-    method: 'POST',
-    headers: trakt.baseHeaders(profile.keys.trakt_client_id),
-    body: JSON.stringify({ client_id: profile.keys.trakt_client_id }),
-  });
-  if (res.ok) return { ok: true, detail: 'Client ID valid. Secret is verified when you Connect Trakt.' };
-  const body = (await res.text().catch(() => '')).slice(0, 200);
-  return { ok: false, error: `Trakt rejected the request (${res.status}${body ? `: ${body}` : ''})` };
-}
-
 async function testTmdb(profile) {
   const key = profile.keys.tmdb_api_key;
   if (!key) return { ok: false, error: 'TMDB key not set' };
   const isBearer = key.length > 50;
   const url = `https://api.themoviedb.org/3/authentication${isBearer ? '' : `?api_key=${encodeURIComponent(key)}`}`;
-  const headers = { 'User-Agent': trakt.USER_AGENT, ...(isBearer ? { Authorization: `Bearer ${key}` } : {}) };
+  const headers = { 'User-Agent': USER_AGENT, ...(isBearer ? { Authorization: `Bearer ${key}` } : {}) };
   const res = await fetch(url, { headers });
   if (res.ok) return { ok: true, detail: 'TMDB key valid' };
   return { ok: false, error: `Invalid TMDB key (${res.status})` };
@@ -247,7 +204,7 @@ async function testGroq(profile) {
   const key = profile.keys.groq_api_key;
   if (!key) return { ok: false, error: 'Groq key not set' };
   const res = await fetch('https://api.groq.com/openai/v1/models', {
-    headers: { Authorization: `Bearer ${key}`, 'User-Agent': trakt.USER_AGENT },
+    headers: { Authorization: `Bearer ${key}`, 'User-Agent': USER_AGENT },
   });
   if (res.ok) return { ok: true, detail: 'Groq key valid' };
   if (res.status === 429) return { ok: true, detail: 'Key valid, but free-tier rate limit is currently exhausted' };
@@ -258,7 +215,7 @@ async function testRpdb(profile) {
   const key = profile.keys.rpdb_api_key;
   if (!key) return { ok: false, error: 'RPDB key not set (optional — posters stay standard without it)' };
   const res = await fetch(`https://api.ratingposterdb.com/${encodeURIComponent(key)}/isValid`, {
-    headers: { 'User-Agent': trakt.USER_AGENT },
+    headers: { 'User-Agent': USER_AGENT },
   });
   if (res.ok) return { ok: true, detail: 'RPDB key valid — posters will show ratings' };
   return { ok: false, error: `Invalid RPDB key (${res.status})` };
@@ -275,7 +232,7 @@ async function testMdblist(profile) {
   }
 }
 
-const TESTERS = { trakt: testTrakt, tmdb: testTmdb, groq: testGroq, rpdb: testRpdb, mdblist: testMdblist };
+const TESTERS = { tmdb: testTmdb, groq: testGroq, rpdb: testRpdb, mdblist: testMdblist };
 
 router.post('/profiles/:id/test/:service', async (req, res) => {
   const profile = config.getProfile(req.params.id);
@@ -290,88 +247,6 @@ router.post('/profiles/:id/test/:service', async (req, res) => {
     console.error(`[test] ${profile.name}/${req.params.service}: ERROR — ${err.message}`);
     res.json({ ok: false, error: `Test failed: ${err.message}` });
   }
-});
-
-// ---- Trakt device flow ----
-router.post('/profiles/:id/trakt/connect', async (req, res) => {
-  const profile = config.getProfile(req.params.id);
-  if (!profile) return res.status(404).json({ error: 'Profile not found' });
-  if (!profile.keys.trakt_client_id || !profile.keys.trakt_client_secret) {
-    return res.status(400).json({ error: 'Set the Trakt Client ID and Secret first' });
-  }
-  try {
-    const dc = await trakt.startDeviceFlow(profile);
-    const flow = {
-      user_code: dc.user_code,
-      verification_url: dc.verification_url,
-      state: 'pending',
-      error: null,
-      expires_at: Date.now() + dc.expires_in * 1000,
-    };
-    deviceFlows.set(profile.id, flow);
-
-    // Poll in the background at Trakt's requested interval
-    const intervalMs = Math.max(dc.interval || 5, 5) * 1000;
-    const poll = setInterval(async () => {
-      const current = deviceFlows.get(profile.id);
-      if (!current || current !== flow || Date.now() > flow.expires_at) {
-        clearInterval(poll);
-        if (current === flow && flow.state === 'pending') {
-          flow.state = 'error';
-          flow.error = 'Code expired — start again';
-        }
-        return;
-      }
-      try {
-        const result = await trakt.pollDeviceToken(profile, dc.device_code);
-        if (result.pending) return;
-        clearInterval(poll);
-        if (result.token) {
-          config.updateProfile(profile.id, { trakt_auth: result.token });
-          flow.state = 'connected';
-          // Record which Trakt account actually authorized — mismatches
-          // (wrong family member signed in) become visible in the portal.
-          try {
-            const fresh = config.getProfile(profile.id);
-            const username = await trakt.getAccountUsername(fresh);
-            config.updateProfile(profile.id, { trakt_auth: { ...fresh.trakt_auth, username } });
-            console.log(`[trakt] ${profile.name}: connected via device flow as Trakt user "${username}"`);
-          } catch {
-            console.log(`[trakt] ${profile.name}: connected via device flow (could not fetch account name)`);
-          }
-        } else {
-          flow.state = 'error';
-          flow.error = result.error || 'Authorization failed';
-          console.error(`[trakt] ${profile.name}: device flow failed — ${flow.error}`);
-        }
-      } catch (err) {
-        clearInterval(poll);
-        flow.state = 'error';
-        flow.error = err.message;
-      }
-    }, intervalMs);
-
-    res.json({ user_code: flow.user_code, verification_url: flow.verification_url });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-router.get('/profiles/:id/trakt/status', (req, res) => {
-  const profile = config.getProfile(req.params.id);
-  if (!profile) return res.status(404).json({ error: 'Profile not found' });
-  const flow = deviceFlows.get(profile.id);
-  res.json({
-    connected: !!profile.trakt_auth?.access_token,
-    flow: flow ? { state: flow.state, user_code: flow.user_code, verification_url: flow.verification_url, error: flow.error } : null,
-  });
-});
-
-router.post('/profiles/:id/trakt/disconnect', (req, res) => {
-  const profile = config.updateProfile(req.params.id, { trakt_auth: null });
-  if (!profile) return res.status(404).json({ error: 'Profile not found' });
-  deviceFlows.delete(req.params.id);
-  res.json({ ok: true });
 });
 
 // ---- Simkl PIN device flow (v6) ----
@@ -512,42 +387,6 @@ router.post('/profiles/:id/simkl/disconnect', (req, res) => {
   res.json({ ok: true });
 });
 
-// ---- Watched-exclusion diagnostics ----
-// Answers "why is a watched item still in my list?": fetches the LIVE Trakt
-// watched sets and flags every currently-listed title against them. Any item
-// flagged in_trakt_watched=true is a bug in this addon; an item the app shows
-// a watched tick for but is flagged false here was never scrobbled to Trakt
-// (app-side watched state or a different Trakt account).
-router.get('/profiles/:id/diagnose', async (req, res) => {
-  const profile = config.getProfile(req.params.id);
-  if (!profile) return res.status(404).json({ error: 'Profile not found' });
-  if (!profile.trakt_auth?.access_token) return res.status(400).json({ error: 'Connect Trakt first' });
-  try {
-    const watched = {
-      movie: await trakt.getWatchedSets(profile, 'movie'),
-      series: await trakt.getWatchedSets(profile, 'series'),
-    };
-    const cache = store.loadCache(profile.id);
-    const catalogs = {};
-    for (const type of ['movie', 'series']) {
-      catalogs[type] = (cache[type]?.metas || []).map((m) => ({
-        id: m.id,
-        name: m.name,
-        in_trakt_watched: watched.movie.imdbIds.has(m.id) || watched.series.imdbIds.has(m.id),
-      }));
-    }
-    res.json({
-      trakt_username: profile.trakt_auth.username || null,
-      watched_counts: { movies: watched.movie.imdbIds.size, shows: watched.series.imdbIds.size },
-      watched_synced_at: cache.watched_synced_at || null,
-      catalogs,
-      note: 'in_trakt_watched=true should never happen (report it). A title your app ticks as watched but shows false here was not scrobbled to this Trakt account.',
-    });
-  } catch (err) {
-    res.status(502).json({ error: `Trakt lookup failed: ${err.message}` });
-  }
-});
-
 // ---- Rebuild now ----
 // Fire-and-forget: a rebuild runs for minutes, and holding the HTTP response
 // open that long gets killed upstream (Cloudflare Tunnel caps origin responses
@@ -557,17 +396,17 @@ router.get('/profiles/:id/diagnose', async (req, res) => {
 router.post('/profiles/:id/rebuild', (req, res) => {
   const profile = config.getProfile(req.params.id);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
-  // Clean 400 for a fully-unconfigured profile (no Trakt, nothing the user
+  // Clean 400 for a fully-unconfigured profile (no Simkl, nothing the user
   // explicitly enabled). Default-on Watch Later alone doesn't count — the
   // user never asked for it, so don't run a rebuild that can only error.
   // Explicitly enabled catalogs DO count even with missing requirements:
   // the rebuild's per-catalog error results tell the user what's missing.
-  const buildable = !!profile.trakt_auth?.access_token
+  const buildable = !!profile.simkl_auth?.access_token
     || catalogs.enabledExtras(profile).some(
       (d) => catalogs.requirementMet(profile, d) || profile.catalogs?.[d.id] === true,
     );
   if (!buildable) {
-    return res.status(400).json({ error: 'Connect Trakt first' });
+    return res.status(400).json({ error: 'Connect Simkl first' });
   }
   if (rebuild.isRebuilding(profile.id)) {
     return res.status(409).json({ error: 'A rebuild is already running for this profile — try again in a minute' });
@@ -603,14 +442,14 @@ router.post('/profiles/:id/scrobble/test', async (req, res) => {
 });
 
 // Run a scrobble reconcile now (manual trigger). Fire-and-forget: the pull +
-// Trakt push can take a while, same reasoning as Rebuild now.
+// Simkl push can take a while, same reasoning as Rebuild now.
 // full=true (query or body) re-pushes the provider's entire watched list,
-// ignoring what Trakt already has — the "Full rebuild" button.
+// ignoring what Simkl already has — the "Full rebuild" button.
 router.post('/profiles/:id/scrobble/sync', async (req, res) => {
   const profile = config.getProfile(req.params.id);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
   if (!profile.scrobble?.enabled) return res.status(400).json({ error: 'Auto-scrobble is not enabled for this profile' });
-  if (!profile.trakt_auth?.access_token) return res.status(400).json({ error: 'Connect Trakt first' });
+  if (!profile.simkl_auth?.access_token) return res.status(400).json({ error: 'Connect Simkl first' });
   const full = req.query.full === 'true' || req.body?.full === true;
   try {
     const result = await scrobble.syncProfile(profile, console, { full });

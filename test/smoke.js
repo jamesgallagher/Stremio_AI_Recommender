@@ -58,45 +58,6 @@ ok('store: watched activity snapshot + touch', () => {
   store.deleteCache('p4');
 });
 
-ok('trakt: watched parse — ID sets + recency-ordered taste seed', () => {
-  const { parseWatchedItems } = require('../src/services/trakt');
-  const items = [
-    { last_watched_at: '2026-01-01T00:00:00Z', movie: { title: 'Old', year: 2000, ids: { imdb: 'tt1', tmdb: 1 } } },
-    { last_watched_at: '2026-06-01T00:00:00Z', movie: { title: 'New', year: 2024, ids: { imdb: 'tt2', tmdb: 2 } } },
-    { last_watched_at: '2026-03-01T00:00:00Z', movie: { title: 'Mid', year: 2020, ids: { tmdb: 3 } } }, // no imdb id
-    { movie: { title: 'NoIds' } }, // dropped entirely
-  ];
-  const w = parseWatchedItems(items, 'movie');
-  assert.deepStrictEqual([...w.imdbIds].sort(), ['tt1', 'tt2']);
-  assert.deepStrictEqual([...w.tmdbIds].sort(), [1, 2, 3]);
-  assert.deepStrictEqual(w.recent.map(r => r.title), ['New', 'Mid', 'Old']); // newest first
-  assert.strictEqual(w.recent[0].tmdb_id, 2); // seed carries ids for enrichment
-  const shows = parseWatchedItems([
-    { last_watched_at: '2026-05-01T00:00:00Z', show: { title: 'Show', year: 2023, ids: { imdb: 'tt9', tmdb: 9 } } },
-  ], 'series');
-  assert.deepStrictEqual(shows.recent, [{ title: 'Show', year: 2023, tmdb_id: 9, imdb_id: 'tt9' }]);
-});
-
-ok('trakt: recommendations parse — fields, wrapped shapes, dropped junk', () => {
-  const { parseRecommendations } = require('../src/services/trakt');
-  const raw = [
-    { title: 'Dune', year: 2021, ids: { tmdb: 438631, imdb: 'tt1160419' }, rating: 7.7, votes: 32000, genres: ['science-fiction', 'adventure'], status: 'released', certification: 'PG-13', language: 'en', overview: 'Spice.' },
-    { show: { title: 'Silo', year: 2023, ids: { tmdb: 125988, imdb: 'tt14688458' }, rating: 7.8, votes: 9000, genres: ['drama'], status: 'returning series' } }, // wrapped shape
-    { title: 'NoIds' }, // dropped
-  ];
-  const movies = parseRecommendations(raw, 'movie');
-  assert.strictEqual(movies.length, 1); // wrapped show not a movie; NoIds dropped
-  assert.deepStrictEqual(movies[0], {
-    title: 'Dune', year: 2021, tmdb_id: 438631, imdb_id: 'tt1160419', rating: 7.7,
-    votes: 32000, genres: ['science-fiction', 'adventure'], status: 'released',
-    certification: 'PG-13', language: 'en', overview: 'Spice.',
-  });
-  const shows = parseRecommendations([raw[1]], 'series');
-  assert.strictEqual(shows[0].title, 'Silo');
-  assert.strictEqual(shows[0].status, 'returning series');
-  assert.strictEqual(shows[0].overview, ''); // absent fields default sanely
-});
-
 ok('catalogs: registry, defaults, and per-source requirements', () => {
   const catalogs = require('../src/catalogs');
   assert.strictEqual(catalogs.EXTRA_CATALOGS.length, 11);
@@ -1121,11 +1082,6 @@ async function httpTests() {
   console.log('  ✓ cross-type serve-time watched pruning');
   wStore.deleteForProfile(profile.id);
 
-  // Diagnose endpoint requires Trakt auth
-  res = await fetch(`${BASE}/api/profiles/${profile.id}/diagnose`);
-  assert.strictEqual(res.status, 400);
-  console.log('  ✓ diagnose without Trakt auth rejected cleanly');
-
   // Age-limit + list-size filters persist and clamp
   res = await fetch(`${BASE}/api/profiles/${profile.id}`, {
     method: 'PUT', headers: { 'Content-Type': 'application/json' },
@@ -1151,10 +1107,10 @@ async function httpTests() {
   assert.deepStrictEqual(updated.filters.excluded_genres, ['Horror', 'Reality']);
   console.log('  ✓ PUT /api/profiles/:id filters');
 
-  // Rebuild without Trakt auth -> clean 400
+  // Rebuild without Simkl or any enabled catalog -> clean 400
   res = await fetch(`${BASE}/api/profiles/${profile.id}/rebuild`, { method: 'POST' });
   assert.strictEqual(res.status, 400);
-  console.log('  ✓ rebuild without Trakt auth rejected cleanly');
+  console.log('  ✓ rebuild without Simkl / enabled catalogs rejected cleanly');
 
   // ---- Extra catalogs (second profile keeps earlier assertions intact) ----
   const defs = await (await fetch(`${BASE}/api/catalogs`)).json();
@@ -1335,7 +1291,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 43 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 42 async/http).`);
   process.exit(0);
 }
 

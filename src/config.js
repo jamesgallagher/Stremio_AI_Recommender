@@ -56,10 +56,10 @@ const SCROBBLE_PROVIDERS = ['nuvio', 'stremio'];
 
 // Secret fields sealed at rest. The scrobble password_enc is already its own
 // AES blob and the install token is deliberately excluded (see header).
-const SECRET_KEY_FIELDS = ['trakt_client_id', 'trakt_client_secret', 'simkl_client_id', 'simkl_client_secret', 'tmdb_api_key', 'groq_api_key', 'rpdb_api_key', 'mdblist_api_key'];
+const SECRET_KEY_FIELDS = ['simkl_client_id', 'simkl_client_secret', 'tmdb_api_key', 'groq_api_key', 'rpdb_api_key', 'mdblist_api_key'];
 const SECRET_TOKEN_FIELDS = ['access_token', 'refresh_token'];
-// Top-level auth objects whose tokens are sealed (Trakt legacy + Simkl v6).
-const AUTH_OBJECTS = ['trakt_auth', 'simkl_auth'];
+// Top-level auth objects whose tokens are sealed (Simkl v6).
+const AUTH_OBJECTS = ['simkl_auth'];
 
 let locked = false;
 function secretsLocked() {
@@ -72,8 +72,6 @@ function newProfile(name) {
     name,
     token: crypto.randomBytes(16).toString('hex'), // unguessable install-URL token
     keys: {
-      trakt_client_id: '',
-      trakt_client_secret: '',
       simkl_client_id: '', // v6: one Simkl app per profile
       simkl_client_secret: '',
       tmdb_api_key: '',
@@ -81,7 +79,6 @@ function newProfile(name) {
       rpdb_api_key: DEFAULT_RPDB_KEY, // rating-overlay posters; free key pre-set
       mdblist_api_key: '', // required: extra catalogs + Common Sense age checks
     },
-    trakt_auth: null, // { access_token, refresh_token, expires_at(ms) }
     simkl_auth: null, // v6: { access_token, connected_at } — Simkl PIN token
     filters: { ...DEFAULT_FILTERS },
     catalogs: {}, // extra-catalog toggles by id; absent/false = off. AI catalogs are always on.
@@ -236,7 +233,6 @@ function updateProfile(id, patch) {
         }
       }
     }
-    if (patch.trakt_auth !== undefined) profile.trakt_auth = patch.trakt_auth;
     if (patch.simkl_auth !== undefined) profile.simkl_auth = patch.simkl_auth;
     if (patch.scrobble && typeof patch.scrobble === 'object') {
       const s = patch.scrobble;
@@ -286,7 +282,7 @@ function migrateSecrets() {
   }
   const needsSeal = data.profiles.some((p) =>
     SECRET_KEY_FIELDS.some((f) => p.keys?.[f] && !secret.isSealed(p.keys[f]))
-    || (p.trakt_auth && SECRET_TOKEN_FIELDS.some((t) => p.trakt_auth[t] && !secret.isSealed(p.trakt_auth[t]))));
+    || AUTH_OBJECTS.some((a) => p[a] && SECRET_TOKEN_FIELDS.some((t) => p[a][t] && !secret.isSealed(p[a][t]))));
   if (needsSeal) {
     store.saveProfiles({ ...data, profiles: data.profiles.map(sealProfile) });
     console.log('[secrets] encrypted existing plaintext secrets at rest ✓');

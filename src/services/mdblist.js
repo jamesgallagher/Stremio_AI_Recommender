@@ -2,7 +2,7 @@
 // STRICT by design: kids/age-limited profiles only list titles that HAVE a
 // Common Sense rating at or below the limit. No rating -> not listed. We do
 // not fall back to MPAA/TMDB certifications or any other source.
-const { USER_AGENT } = require('./trakt');
+const USER_AGENT = 'AI-Recommender/1.0 (+https://github.com/jamesgallagher/Stremio_AI_Recommender)';
 const store = require('../store');
 
 const NOT_RATED = null;
