@@ -128,7 +128,7 @@ async function handleSearch(profile, type, extraStr, res) {
     metas = await rebuild.applyAnimeGate(metas, profile, console);
     if (kids) {
       const vetoed = await llm.ageGate(
-        profile.keys.groq_api_key, type, rebuild.judgementAge(profile.filters),
+        type, rebuild.judgementAge(profile.filters),
         metas.map((m) => ({
           id: m.id, title: m.name, year: m.releaseInfo,
           genres: m._genre_names, certification: m._certification, overview: m.description,

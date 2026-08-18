@@ -732,18 +732,22 @@ async function httpTests() {
   assert.deepStrictEqual(through.map(m => m.id), ['tt60']);
   console.log('  ✓ CSM gate retired — no longer drops unrated titles or needs MDBList');
 
-  // Hard requirement: no Groq key -> AI catalogs are disabled before any
-  // network call (fake trakt_auth would explode if Trakt were contacted).
+  // v6: the AI age gate needs a GLOBAL LLM (custom endpoint OR Groq key), not a
+  // per-profile key. With no LLM configured, kids AI catalogs are disabled
+  // before any network call (fake trakt_auth would explode if Trakt were hit).
+  const settingsMod = require('../src/settings');
+  settingsMod.updateSettings({ llm: { custom_uri: '', custom_name: '', custom_api_key: '', groq_api_key: '', groq_api_key_backup: '' } });
+  assert.strictEqual(settingsMod.hasLlm(), false);
   const rebuildMod = require('../src/rebuild');
-  const noGroq = {
-    id: 'no-groq-test', name: 'NoGroq', keys: {},
+  const noLlm = {
+    id: 'no-llm-test', name: 'NoLlm', keys: {},
     trakt_auth: { access_token: 'fake' }, filters: { age_limit: 8 }, catalogs: {},
   };
-  const res0 = await rebuildMod.rebuildProfile(noGroq, { log() {}, warn() {}, error() {} }, { extras: false });
-  assert.ok(res0.movie.error.includes('Groq API key missing'));
+  const res0 = await rebuildMod.rebuildProfile(noLlm, { log() {}, warn() {}, error() {} }, { extras: false });
+  assert.ok(res0.movie.error.includes('No LLM configured'));
   assert.ok(res0.series.error.includes('kids-mode'));
-  store.deleteCache('no-groq-test');
-  console.log('  ✓ kids profile without Groq key disabled (no network)');
+  store.deleteCache('no-llm-test');
+  console.log('  ✓ kids profile with no global LLM disabled (no network)');
 
   // Anime gate, end to end, with a seeded map + rating cache (no network).
   // The two rules point in OPPOSITE directions and that is the whole design.
@@ -792,9 +796,9 @@ async function httpTests() {
     console.log('  ✓ anime gate: NSFW blocked for all ages, unrated falls through to the LLM');
   }
 
-  // Extra-catalog age gate: adult profiles untouched (no LLM), kids profiles
-  // without a Groq key FAIL CLOSED (caller keeps the previous list rather than
-  // publishing an unvetted one). No network in either path.
+  // Extra-catalog age gate: adult profiles untouched (no LLM call), kids
+  // profiles with no global LLM FAIL CLOSED (caller keeps the previous list).
+  // Global LLM is still cleared from the check above. No network in either path.
   const def = require('../src/catalogs').getExtra('mdb-kids-movies');
   const metas = [{ id: 'tt1', name: 'A' }, { id: 'tt2', name: 'B' }];
   const quiet = { log() {}, warn() {} };
@@ -803,7 +807,7 @@ async function httpTests() {
     metas); // no age limit -> passthrough
   await assert.rejects(
     () => rebuildMod.applyExtraAgeGate({ name: 'Kid', filters: { age_limit: 8 }, keys: {} }, def, metas, quiet),
-    /Groq API key missing/);
+    /No LLM configured/);
   console.log('  ✓ extra-catalog age gate: passthrough for adults, fail-closed for kids');
 
   await new Promise(r => setTimeout(r, 400)); // let server bind

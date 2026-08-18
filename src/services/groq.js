@@ -1,37 +1,14 @@
-// LLM age GOALKEEPER via Groq (OpenAI-compatible Chat Completions).
-// v4: the LLM no longer generates or ranks recommendations — Trakt's own
-// engine does that. The one remaining LLM job is a defence-in-depth age check
-// for kids profiles (age_limit > 0): given the already-CSM-gated list, veto
-// anything unsuitable for the age under Australian (ACB) standards.
-// REMOVE-ONLY by construction: it can veto titles, never rescue ones CSM
-// dropped, and a missing verdict keeps the title (CSM stays the primary gate).
-const API = 'https://api.groq.com/openai/v1/chat/completions';
-
-// Model order (override with GROQ_MODELS).
+// LLM recommendation prompts + parsing. The DOMAIN layer: it builds the
+// generation and age-gate prompts and parses the results. The TRANSPORT — which
+// provider/model actually answers, and the fallback chain — lives in
+// services/llm.js (v6). This file no longer talks HTTP; it hands a prompt +
+// validator to llm.chat and gets back a parsed result.
 //
-// Groq decommissioned BOTH llama models we used on 2026-08-16 —
-// llama-3.3-70b-versatile (the old primary) and llama-3.1-8b-instant. The two
-// gpt-oss models are the survivors, and the primary swap is a reversal of an
-// earlier reversal, so worth spelling out:
-//   * v2.6.1: gpt-oss-120b was primary.
-//   * v3: it failed at 120-candidate RANKING on the free tier (empty content,
-//     json_validate_failed, 413), so llama-3.3-70b took over.
-//   * v5: ranking was removed. The LLM now only GENERATES ~50 title/year
-//     objects and AGE-GATES ~50 id/ok objects — payloads a fraction of the
-//     old size. Re-tested against Groq at these sizes: gpt-oss-120b handles
-//     both cleanly. So it's primary again, for a different architecture.
-// gpt-oss-20b is kept as a fallback: verified it handles the age gate (the
-// child-safety path), though it fails GENERATION with json_validate_failed —
-// acceptable, since a generation failure is fail-closed (keep the previous
-// list). qwen/qwen3.6-27b was tested and rejected: it fails both jobs under
-// json_object mode.
-const DEFAULT_MODELS = [
-  'openai/gpt-oss-120b',
-  'openai/gpt-oss-20b',
-];
-const FALLBACK_MODELS = (process.env.GROQ_MODELS || '')
-  .split(',').map((s) => s.trim()).filter(Boolean);
-if (!FALLBACK_MODELS.length) FALLBACK_MODELS.push(...DEFAULT_MODELS);
+// v6: the provider chain is global (Custom local endpoint → Groq primary →
+// Groq backup), sourced from Server Config, NOT a per-profile Groq key. So the
+// two entry points below take no apiKey — the chain is resolved from settings.
+const llm = require('./llm');
+const settings = require('../settings');
 
 function buildAgePrompt(type, ageLimit, titles) {
   const kind = type === 'series' ? 'TV series' : 'movies';
@@ -94,87 +71,35 @@ function parseVerdicts(text, validIds) {
 const REVIEWER_SYSTEM = 'You are a strict parental-guidance reviewer for Australian audiences. Reply with raw JSON only.';
 const CURATOR_SYSTEM = 'You are a film and television curator with broad knowledge of world cinema, TV and anime. Reply with raw JSON only.';
 
-// temperature 0 for judgement work. At 0.2 the same title flipped between
-// rebuilds — My Hero Academia and One-Punch Man were vetoed in one run and
-// allowed in the next, same age, same model, same day. A parent should not
-// see a show appear and disappear day to day; generation still uses a warmer
-// temperature, where variety is the point.
-async function callModel(apiKey, model, prompt, { system = REVIEWER_SYSTEM, temperature = 0 } = {}) {
-  const body = {
-    model,
-    messages: [
-      { role: 'system', content: system },
-      { role: 'user', content: prompt },
-    ],
-    temperature,
-    response_format: { type: 'json_object' },
-  };
-  // gpt-oss are REASONING models. Left to their own devices in json_object mode
-  // they spend the response budget on hidden reasoning and return empty
-  // content, which the strict validator rejects as json_validate_failed —
-  // intermittently, so it's the worst kind of flaky. Generation and the age
-  // gate are mechanical JSON tasks that need no chain-of-thought, so cap the
-  // reasoning: verified this turns intermittent failures into clean output,
-  // and it lowers token use on the free tier as a bonus. Scoped to gpt-oss so
-  // a GROQ_MODELS override to some other family isn't sent an unknown param.
-  if (/^openai\/gpt-oss/.test(model)) body.reasoning_effort = 'low';
-  const res = await fetch(API, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const body = (await res.text().catch(() => '')).slice(0, 200);
-    const err = new Error(`Groq ${model} failed (${res.status})${body ? `: ${body}` : ''}`);
-    err.status = res.status;
-    throw err;
-  }
-  const data = await res.json();
-  const text = data.choices?.[0]?.message?.content || '';
-  if (!text) throw new Error(`Groq ${model} returned empty response`);
-  return text;
-}
-
 // Run the age gate over `titles` ([{id,title,year,genres,certification,
 // overview}]). Returns the Set of VETOED ids. Requires verdicts for >= 60% of
-// the list (else retry/fallback); throws when every model fails — kids-mode
-// callers treat that like a broken CSM lookup: keep the previous list rather
-// than serve an unverified one.
-async function ageGate(apiKey, type, ageLimit, titles, log = console) {
+// the list (a thinner response is rejected and the chain falls through to the
+// next provider/model); throws when the WHOLE chain fails — kids-mode callers
+// treat that as fail-closed: keep the previous list rather than serve an
+// unverified one. Provider order (Custom → Groq primary → Groq backup) and the
+// per-provider quirks (gpt-oss reasoning_effort, etc.) are handled in llm.chat.
+async function ageGate(type, ageLimit, titles, log = console) {
   if (!titles.length) return new Set();
   const validIds = new Set(titles.map((t) => t.id));
   const prompt = buildAgePrompt(type, ageLimit, titles);
-  log.log(`[groq] full age-gate prompt for ${type}:\n----- PROMPT START -----\n${prompt}\n----- PROMPT END -----`);
+  log.log(`[llm] full age-gate prompt for ${type}:\n----- PROMPT START -----\n${prompt}\n----- PROMPT END -----`);
   const minVerdicts = Math.ceil(titles.length * 0.6);
-  const primary = FALLBACK_MODELS[0];
-  let lastError = null;
-  for (let i = 0; i < FALLBACK_MODELS.length; i++) {
-    const model = FALLBACK_MODELS[i];
-    try {
-      const verdicts = parseVerdicts(await callModel(apiKey, model, prompt), validIds);
-      if (verdicts.size < minVerdicts) throw new Error(`only ${verdicts.size}/${titles.length} verdicts`);
-      const vetoed = new Set([...verdicts.entries()].filter(([, ok]) => !ok).map(([id]) => id));
-      if (i === 0) {
-        log.log(`[groq] ${type}: age gate by PRIMARY model ${model} — ${vetoed.size} of ${titles.length} vetoed`);
-      } else {
-        log.warn(`[groq] ${type}: ⚠ age gate by BACKUP model "${model}" — primary "${primary}" was unavailable (see above). ${vetoed.size} of ${titles.length} vetoed.`);
-      }
-      if (vetoed.size) {
-        const names = titles.filter((t) => vetoed.has(t.id)).map((t) => t.title).join(', ');
-        log.log(`[groq] ${type}: age-gate vetoed: ${names}`);
-      }
-      return vetoed;
-    } catch (err) {
-      lastError = err;
-      const rate = err.status === 429 || /rate.?limit|quota|free.?tier|too many requests/i.test(err.message);
-      const next = FALLBACK_MODELS[i + 1];
-      const tail = next ? `falling back to backup model "${next}"` : 'no backup models left — this rebuild will fail';
-      if (rate) log.warn(`[groq] ⚠ FREE-TIER RATE LIMIT hit on "${model}" (HTTP 429) — ${tail}`);
-      else log.warn(`[groq] "${model}" age gate failed (${err.message}) — ${tail}`);
-      continue;
-    }
+  const validate = (text) => {
+    const verdicts = parseVerdicts(text, validIds);
+    if (verdicts.size < minVerdicts) throw new Error(`only ${verdicts.size}/${titles.length} verdicts`);
+    return verdicts;
+  };
+  const verdicts = await llm.chat(
+    settings.llmChain(), [{ role: 'user', content: prompt }],
+    { temperature: 0, system: REVIEWER_SYSTEM, validate }, log,
+  );
+  const vetoed = new Set([...verdicts.entries()].filter(([, ok]) => !ok).map(([id]) => id));
+  log.log(`[llm] ${type}: age gate — ${vetoed.size} of ${titles.length} vetoed`);
+  if (vetoed.size) {
+    const names = titles.filter((t) => vetoed.has(t.id)).map((t) => t.title).join(', ');
+    log.log(`[llm] ${type}: age-gate vetoed: ${names}`);
   }
-  throw lastError || new Error('All Groq models failed');
+  return vetoed;
 }
 
 // ---- Generation pass (v5 'ai' engine) ----
@@ -268,34 +193,25 @@ function parseTitles(text, limit = 200) {
   return out;
 }
 
-// Generate candidate titles. Returns [{title, year}]. Throws when every model
-// fails — kids callers treat that as fail-closed (keep the previous list).
-async function generateCandidates(apiKey, type, opts = {}, log = console) {
+// Generate candidate titles. Returns [{title, year}]. A near-empty generation
+// is treated as a FAILURE (not a thin success), so the chain falls through to
+// the next provider/model rather than shipping 4 titles. Throws when the whole
+// chain fails — kids callers treat that as fail-closed (keep the previous list).
+async function generateCandidates(type, opts = {}, log = console) {
   const count = opts.count || 50;
   const prompt = buildGeneratePrompt(type, { ...opts, count });
-  // A generation that returns almost nothing is a failed generation, not a
-  // thin one — fall through to the next model rather than shipping 4 titles.
   const minTitles = Math.ceil(count * 0.4);
-  let lastError = null;
-  for (let i = 0; i < FALLBACK_MODELS.length; i++) {
-    const model = FALLBACK_MODELS[i];
-    try {
-      const text = await callModel(apiKey, model, prompt, { system: CURATOR_SYSTEM, temperature: 0.6 });
-      const titles = parseTitles(text, count * 2);
-      if (titles.length < minTitles) throw new Error(`only ${titles.length}/${count} titles`);
-      const via = i === 0 ? `model ${model}` : `⚠ BACKUP model "${model}"`;
-      log.log(`[groq] ${type}: generated ${titles.length} candidate(s) via ${via}${opts.ageLimit ? ` (age-aware, ${opts.ageLimit}yo)` : ''}`);
-      return titles;
-    } catch (err) {
-      lastError = err;
-      const rate = err.status === 429 || /rate.?limit|quota|free.?tier|too many requests/i.test(err.message);
-      const next = FALLBACK_MODELS[i + 1];
-      const tail = next ? `falling back to backup model "${next}"` : 'no backup models left — this rebuild will fail';
-      if (rate) log.warn(`[groq] ⚠ FREE-TIER RATE LIMIT hit on "${model}" (HTTP 429) — ${tail}`);
-      else log.warn(`[groq] "${model}" generation failed (${err.message}) — ${tail}`);
-    }
-  }
-  throw lastError || new Error('All Groq models failed');
+  const validate = (text) => {
+    const titles = parseTitles(text, count * 2);
+    if (titles.length < minTitles) throw new Error(`only ${titles.length}/${count} titles`);
+    return titles;
+  };
+  const titles = await llm.chat(
+    settings.llmChain(), [{ role: 'user', content: prompt }],
+    { temperature: 0.6, system: CURATOR_SYSTEM, validate }, log,
+  );
+  log.log(`[llm] ${type}: generated ${titles.length} candidate(s)${opts.ageLimit ? ` (age-aware, ${opts.ageLimit}yo)` : ''}`);
+  return titles;
 }
 
 module.exports = {
@@ -305,5 +221,4 @@ module.exports = {
   buildGeneratePrompt,
   parseTitles,
   generateCandidates,
-  FALLBACK_MODELS,
 };

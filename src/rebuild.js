@@ -27,6 +27,7 @@
 //   The kids-mode CSM gate applies to extras too.
 const store = require('./store');
 const config = require('./config');
+const settings = require('./settings');
 const catalogs = require('./catalogs');
 const trakt = require('./services/trakt');
 const llm = require('./services/groq');
@@ -343,7 +344,7 @@ async function buildAiPool(profile, type, watchedByType, watched, log) {
   // and until this line existed that had to be inferred from the output.
   log.log(`[rebuild] ${profile.name}/${type}: seeds ${ownSeeds} own + ${seeds.length - ownSeeds} borrowed`);
   const suggestions = await llm.generateCandidates(
-    profile.keys.groq_api_key, type,
+    type,
     {
       ageLimit: filters.age_limit > 0 ? judgementAge(filters) : 0,
       seeds,
@@ -394,7 +395,7 @@ async function buildAiCatalog(profile, type, watchedByType, watched, listSize, l
   pool = await applyAnimeGate(pool, profile, log);
   if (filters.age_limit > 0) {
     const vetoed = await llm.ageGate(
-      profile.keys.groq_api_key, type, judgementAge(filters),
+      type, judgementAge(filters),
       pool.map((m) => ({
         id: m.id, title: m.name, year: m.releaseInfo,
         genres: m._genre_names, certification: m._certification, overview: m.description,
@@ -453,7 +454,7 @@ async function buildCatalog(profile, type, watchedByType, log = console) {
   if (filters.age_limit > 0) {
     pool = pool.filter((r) => r.imdb_id); // needs a stable id to veto against
     const vetoed = await llm.ageGate(
-      profile.keys.groq_api_key, type, judgementAge(filters),
+      type, judgementAge(filters),
       pool.map((r) => ({ id: r.imdb_id, title: r.title, year: r.year, genres: r.genres, certification: r.certification, overview: r.overview })),
       log,
     );
@@ -520,11 +521,11 @@ async function applyExtraAgeGate(profile, def, metas, log = console) {
   let list = await applyAnimeGate(metas, profile, log);
   if (ageLimit <= 0 || !list.length) return list;
   metas = list;
-  if (!profile.keys.groq_api_key) {
-    throw new Error(`Groq API key missing — required for the kids age check on "${def.name}"`);
+  if (!settings.hasLlm()) {
+    throw new Error(`No LLM configured — required for the kids age check on "${def.name}" (set a Custom LLM or Groq key in Server Config)`);
   }
   const vetoed = await llm.ageGate(
-    profile.keys.groq_api_key, def.type, judgementAge(profile.filters),
+    def.type, judgementAge(profile.filters),
     // Genres matter: judging "Berserk" on a truncated overview alone is a
     // much weaker signal than judging it as Action/Horror/Fantasy. They were
     // being stripped before the gate saw them (cleanMetas ran too early).
@@ -687,11 +688,11 @@ async function buildAiCatalogs(profile, results, log) {
   // The Groq key is required for the kids-mode age goalkeeper AND, since v5,
   // for the 'ai' engine itself (which is the generator, not just a gate).
   // Checked before any network.
-  if ((profile.filters.age_limit > 0 || profile.filters.engine === 'ai') && !profile.keys.groq_api_key) {
+  if ((profile.filters.age_limit > 0 || profile.filters.engine === 'ai') && !settings.hasLlm()) {
     const need = profile.filters.engine === 'ai'
       ? "the 'AI' recommendation engine"
       : 'the kids-mode AI age check';
-    const error = `Groq API key missing — required for ${need}; AI catalogs are disabled until one is added`;
+    const error = `No LLM configured — required for ${need}; set a Custom LLM or Groq key in Server Config. AI catalogs are disabled until one is added`;
     log.warn(`[rebuild] ${profile.name}: ${error}`);
     results.movie = { ok: false, error };
     results.series = { ok: false, error };
@@ -790,8 +791,8 @@ function ensureFresh(profile, log = console) {
   const cache = store.loadCache(profile.id);
   const aiStale = (isStale(cache.movie) || isStale(cache.series))
     && !!profile.trakt_auth?.access_token
-    // Groq is only a prerequisite for kids profiles (AI age goalkeeper)
-    && (profile.filters.age_limit <= 0 || !!profile.keys.groq_api_key);
+    // An LLM is only a prerequisite for kids profiles (AI age goalkeeper)
+    && (profile.filters.age_limit <= 0 || settings.hasLlm());
   const extrasStale = catalogs.enabledExtras(profile).some(
     (d) => catalogs.requirementMet(profile, d) && isStale(cache.extras?.[d.id]),
   );

@@ -144,6 +144,11 @@ function llmChain(s = getSettings()) {
   return chain;
 }
 
+// Is at least one LLM provider configured? (custom endpoint or a Groq key)
+function hasLlm(s = getSettings()) {
+  return llmChain(s).length > 0;
+}
+
 module.exports = {
   blankSettings,
   getSettings,
@@ -151,6 +156,7 @@ module.exports = {
   migrateFromProfiles,
   isComplete,
   llmChain,
+  hasLlm,
   settingsLocked,
   DEFAULT_RPDB_KEY,
   LLM_SECRET_FIELDS,
