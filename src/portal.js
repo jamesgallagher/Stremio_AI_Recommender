@@ -464,10 +464,23 @@ router.post('/profiles/:id/recommend/build', async (req, res) => {
   const profile = config.getProfile(req.params.id);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
   try {
-    res.json(await recommendationStore.buildRecommendations(profile, console));
+    const result = await recommendationStore.buildRecommendations(profile, console);
+    if (!result.skipped) {
+      try { result.age = await recommendationStore.ageGatePool(profile, console); }
+      catch (err) { result.age = { error: err.message }; }
+    }
+    res.json(result);
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
+});
+
+// Reset: wipe the pool + the user's don't-recommend flags (Advanced section later).
+router.post('/profiles/:id/recommend/reset', (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  recommendationStore.resetRecommendations(profile.id);
+  res.json({ ok: true, total: recommendationStore.countRecommended(profile.id) });
 });
 
 // Read the pool (Advanced tab "view Recommended Movies / Shows" + debugging).

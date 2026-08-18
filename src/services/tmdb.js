@@ -275,7 +275,9 @@ async function getRecommendations(apiKey, type, tmdbId, { page = 1 } = {}) {
     year: parseInt((isMovie ? r.release_date : r.first_air_date) || '', 10) || null,
     genre_ids: r.genre_ids || [],
     vote_average: r.vote_average || 0,
+    vote_count: r.vote_count || 0,   // confidence signal for the strongest-N selection
     popularity: r.popularity || 0,
+    adult: !!r.adult,                // TMDB's own porn flag
     poster: r.poster_path || null,
   }));
 }

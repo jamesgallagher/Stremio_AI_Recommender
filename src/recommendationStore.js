@@ -19,6 +19,25 @@ const SEED_CAP = 60;        // use the N most-recent watched titles as seeds
 const STORE_CAP = 300;      // keep the top-N candidates by affinity
 const DAY_MS = 24 * 3600e3;
 
+// Per-source-title selection: TMDB returns ~20 recs already in RELEVANCE order
+// (strongest match first). Keeping all 20 makes the matching mushy, so we keep
+// only the strongest few PER title — gated by a rating floor and a vote-count
+// confidence floor, then the top N in TMDB's own order (NOT re-sorted by rating,
+// which would surface acclaimed-but-unrelated films for everything).
+const PER_TITLE_CAP = 5;
+const VOTE_FLOOR_MOVIE = 150;
+const VOTE_FLOOR_TV = 50;   // TV vote counts run lower, same asymmetry as elsewhere
+const voteFloorFor = (type) => (type === 'series' ? VOTE_FLOOR_TV : VOTE_FLOOR_MOVIE);
+
+// The strongest ≤N recommendations for one source title.
+function selectStrong(recs, minRating = 0) {
+  return (recs || [])
+    .filter((r) => !r.adult
+      && (r.vote_count || 0) >= voteFloorFor(r.type)
+      && (minRating <= 0 || (r.vote_average || 0) >= minRating))
+    .slice(0, PER_TITLE_CAP); // TMDB relevance order preserved
+}
+
 let ready = false;
 function init() {
   if (ready) return;
@@ -137,9 +156,63 @@ function upsertCandidates(profileId, candidates) {
   } catch (err) { conn.prepare('ROLLBACK').run(); throw err; }
 }
 
+function setAgeClassification(profileId, type, tmdbId, age) {
+  db.get().prepare('UPDATE recommended SET age_classification = ? WHERE profile_id = ? AND type = ? AND tmdb_id = ?').run(age, profileId, type, String(tmdbId));
+}
+
+function hardDrop(profileId, type, tmdbId) {
+  db.get().prepare('DELETE FROM recommended WHERE profile_id = ? AND type = ? AND tmdb_id = ?').run(profileId, type, String(tmdbId));
+}
+
+// Age-gate the pool (docs/v6-features F5). Reuses the shipped v5.2 stack:
+//   1. NSFW blacklist + anime age band (ALL profiles) via rebuild.applyAnimeGate
+//      — porn is dropped for everyone; anime over the band for age-limited ones.
+//      The MAL band it resolves is stored as age_classification.
+//   2. LLM ACB pass (age-limited profiles only) — remove-only, per type.
+// Failures are deleted from the pool (re-evaluated on the next build, not a
+// permanent user rejection). TMDB `adult` porn was already dropped at build.
+async function ageGatePool(profile, log = console) {
+  init();
+  const rebuild = require('./rebuild');   // lazy — heavy module, avoids load-order surprises
+  const groq = require('./services/groq');
+  const rows = getRecommended(profile.id, { limit: 100000 });
+  if (!rows.length) return { dropped: 0, vetoed: 0, remain: 0 };
+  const limit = profile.filters?.age_limit || 0;
+
+  // 1. NSFW + anime band. Shape candidates as the metas applyAnimeGate expects.
+  const metas = rows.map((r) => ({ id: r.imdb_id || r.tmdb_id, _tmdb_id: r.tmdb_id, name: r.title, _rtype: r.type }));
+  const kept = await rebuild.applyAnimeGate(metas, profile, log);
+  const keptKeys = new Set(kept.map((m) => key(m._rtype, m._tmdb_id)));
+  for (const m of kept) if (m._certification) setAgeClassification(profile.id, m._rtype, m._tmdb_id, m._certification);
+  let dropped = 0;
+  for (const r of rows) if (!keptKeys.has(key(r.type, r.tmdb_id))) { hardDrop(profile.id, r.type, r.tmdb_id); dropped++; }
+
+  // 2. LLM ACB pass — kids only, remove-only, per type.
+  let vetoed = 0;
+  if (limit > 0) {
+    for (const type of ['movie', 'series']) {
+      const survivors = getRecommended(profile.id, { type, limit: 100000 });
+      if (!survivors.length) continue;
+      const veto = await groq.ageGate(type, rebuild.judgementAge(profile.filters),
+        survivors.map((r) => ({ id: r.tmdb_id, title: r.title, year: r.year, genres: r.primary_genre ? [r.primary_genre] : [], certification: r.age_classification })), log);
+      for (const r of survivors) if (veto.has(r.tmdb_id)) { hardDrop(profile.id, r.type, r.tmdb_id); vetoed++; }
+    }
+  }
+  log.log(`[rec] ${profile.name}: age gate — ${dropped} NSFW/band dropped, ${vetoed} LLM-vetoed, ${countRecommended(profile.id)} remain`);
+  return { dropped, vetoed, remain: countRecommended(profile.id) };
+}
+
+// Reset: wipe the pool AND the user's don't-recommend flags for a profile.
+function resetRecommendations(profileId) {
+  init();
+  db.get().prepare('DELETE FROM recommended WHERE profile_id = ?').run(profileId);
+  db.get().prepare('DELETE FROM dont_recommend WHERE profile_id = ?').run(profileId);
+  return { cleared: true };
+}
+
 // Build the recommendation pool for a profile. Fetches TMDB recs per watched
 // seed, scores by affinity, applies deterministic filters, upserts the top N.
-// Age gating is a later slice; this produces the candidate pool only.
+// The caller runs ageGatePool() after this to make the pool age-safe.
 async function buildRecommendations(profile, log = console) {
   init();
   const s = settings.getSettings();
@@ -151,13 +224,20 @@ async function buildRecommendations(profile, log = console) {
   const seeds = seedsAll.slice(0, SEED_CAP);
   if (!seeds.length) return { skipped: true, reason: 'no watched titles to seed from' };
 
-  // Fetch recommendations per seed (sequential-ish, small chunks to be gentle).
+  const minRating = filters.min_rating || 0;
+  // Fetch recommendations per seed, then keep only the STRONGEST few per title
+  // (rating + vote-count gated, TMDB relevance order). This is the matching
+  // quality lever — ~5/title instead of ~20.
   const recsBySeed = new Map();
+  let rawFetched = 0;
   for (let i = 0; i < seeds.length; i += 5) {
     const chunk = seeds.slice(i, i + 5);
     await Promise.all(chunk.map(async (w) => {
-      try { recsBySeed.set(key(w.type, w.tmdb_id), await tmdb.getRecommendations(tmdbKey, w.type, w.tmdb_id)); }
-      catch (err) { log.warn(`[rec] recs for ${w.title} failed: ${err.message}`); }
+      try {
+        const recs = await tmdb.getRecommendations(tmdbKey, w.type, w.tmdb_id);
+        rawFetched += recs.length;
+        recsBySeed.set(key(w.type, w.tmdb_id), selectStrong(recs, minRating));
+      } catch (err) { log.warn(`[rec] recs for ${w.title} failed: ${err.message}`); }
     }));
   }
 
@@ -167,13 +247,12 @@ async function buildRecommendations(profile, log = console) {
   const genreMap = await tmdb.getGenreMap(tmdbKey);
   await animeMap.ensureLoaded(log);
   const excluded = new Set((filters.excluded_genres || []));
-  const minRating = filters.min_rating || 0;
 
   const kept = [];
   for (const c of candidates.values()) {
     if (watchedIds.tmdb.has(c.tmdb_id)) continue;             // already watched
     if (dont.has(key(c.type, c.tmdb_id))) continue;           // user-rejected / decayed
-    if (minRating > 0 && c.vote_average > 0 && c.vote_average < minRating) continue; // rating floor (unrated kept)
+    // rating + vote-count already enforced per-title in selectStrong
     const names = (c.genre_ids || []).map((g) => genreMap[g]).filter(Boolean);
     if (names.some((n) => excluded.has(n))) continue;         // excluded genre
     if (excluded.has('Anime') && animeMap.isAnime(null, c.tmdb_id)) continue; // pseudo-genre
@@ -184,14 +263,17 @@ async function buildRecommendations(profile, log = console) {
   const top = kept.slice(0, STORE_CAP);
   upsertCandidates(profile.id, top);
 
-  log.log(`[rec] ${profile.name}: built from ${seeds.length} seed(s) → ${candidates.size} raw → ${kept.length} after filters → stored ${top.length} (total ${countRecommended(profile.id)})`);
-  return { seeds: seeds.length, raw: candidates.size, kept: kept.length, stored: top.length, total: countRecommended(profile.id) };
+  log.log(`[rec] ${profile.name}: ${seeds.length} seed(s), ${rawFetched} raw recs → top-${PER_TITLE_CAP}/title → ${candidates.size} unique → ${kept.length} after filters → stored ${top.length} (total ${countRecommended(profile.id)})`);
+  return { seeds: seeds.length, raw: rawFetched, strong: candidates.size, kept: kept.length, stored: top.length, total: countRecommended(profile.id) };
 }
 
 module.exports = {
   init,
   computeAffinity,
+  selectStrong,
   buildRecommendations,
+  ageGatePool,
+  resetRecommendations,
   upsertCandidates,
   getRecommended,
   countRecommended,
@@ -199,4 +281,5 @@ module.exports = {
   addDontRecommend,
   deleteForProfile,
   HALF_LIFE_DAYS,
+  PER_TITLE_CAP,
 };

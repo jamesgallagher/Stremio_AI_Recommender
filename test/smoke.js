@@ -670,6 +670,22 @@ ok('recommendationStore: recency-weighted affinity (the Pirates behaviour)', () 
   assert.ok(out.get('movie:B').affinity > out.get('movie:C').affinity);
 });
 
+ok('recommendationStore: selectStrong gates on rating + votes, caps at 5, keeps TMDB order', () => {
+  const rs = require('../src/recommendationStore');
+  const mk = (id, va, vc, adult = false, type = 'movie') => ({ type, tmdb_id: id, vote_average: va, vote_count: vc, adult });
+  const recs = [
+    mk('A', 8, 1000), mk('bad-rating', 5, 1000), mk('B', 7, 1000), mk('low-votes', 9, 10),
+    mk('adult', 8, 1000, true), mk('C', 6, 200), mk('D', 8, 1000), mk('E', 7, 1000), mk('F', 9, 1000),
+  ];
+  // pass rating>=6 + votes>=150 + not adult: A,B,C,D,E,F -> capped to top 5 in ORDER
+  assert.deepStrictEqual(rs.selectStrong(recs, 6).map((r) => r.tmdb_id), ['A', 'B', 'C', 'D', 'E']);
+  // NOT re-sorted by rating (F has the highest rating but is 6th in TMDB order -> excluded by the cap)
+  assert.ok(!rs.selectStrong(recs, 6).some((r) => r.tmdb_id === 'F'));
+  // TV vote floor (50) is lower than movie (150) — same 60-vote title differs by type
+  assert.strictEqual(rs.selectStrong([mk('T', 7, 60, false, 'series')], 6).length, 1);
+  assert.strictEqual(rs.selectStrong([mk('M', 7, 60, false, 'movie')], 6).length, 0);
+});
+
 ok('recommendationStore: upsert, dont_recommend suppresses + drops from pool', () => {
   const rs = require('../src/recommendationStore');
   const pid = 'rec-test';
@@ -683,10 +699,11 @@ ok('recommendationStore: upsert, dont_recommend suppresses + drops from pool', (
   rs.addDontRecommend(pid, 'movie', '280', 'user');
   assert.strictEqual(rs.countRecommended(pid), 1);
   assert.ok(rs.dontRecommendKeys(pid).has('movie:280'));
-  // A rebuild must NOT re-add a suppressed candidate (build filters on this set)
-  assert.ok(rs.dontRecommendKeys(pid).has('movie:280'));
-  rs.deleteForProfile(pid);
+  // Reset wipes BOTH the pool and the don't-recommend flags
+  rs.resetRecommendations(pid);
   assert.strictEqual(rs.countRecommended(pid), 0);
+  assert.strictEqual(rs.dontRecommendKeys(pid).size, 0);
+  rs.deleteForProfile(pid);
 });
 
 ok('llm: chatUrl joins, extractArray tolerates wrappers, groq model list', () => {
@@ -1085,7 +1102,10 @@ async function httpTests() {
   assert.strictEqual(badSuppress.status, 400);
   const okSuppress = await (await fetch(`${BASE}/api/profiles/${profile.id}/recommend/suppress`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'movie', tmdb_id: '999' }) })).json();
   assert.strictEqual(okSuppress.ok, true);
-  console.log('  ✓ recommendation build (seedless -> skipped) + view + suppress endpoints');
+  const reset = await (await fetch(`${BASE}/api/profiles/${profile.id}/recommend/reset`, { method: 'POST' })).json();
+  assert.strictEqual(reset.ok, true);
+  assert.strictEqual(reset.total, 0);
+  console.log('  ✓ recommendation build/view/suppress/reset endpoints');
 
   // Empty cache -> warming-up card, short client cache
   let cat = await (await fetch(`${BASE}/addon/${profile.token}/catalog/movie/ai-recs-movies.json`)).json();

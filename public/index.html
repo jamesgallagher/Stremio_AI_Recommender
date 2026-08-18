@@ -761,6 +761,7 @@ async function checkSimklStatus(id) {
         <div style="margin-top:8px"><button class="ghost" onclick="syncSimkl('${id}', this)">Sync watched now</button>
         <button class="ghost" onclick="buildRecs('${id}', this)" title="Build the recommendation pool from your watched history (TMDB recommendations, recency-weighted)">Build recommendations</button>
         <button class="ghost" onclick="viewRecs('${id}', this)">View recommendations</button>
+        <button class="ghost" onclick="resetRecs('${id}', this)" title="Wipe the recommendation pool and your 'don't recommend' flags">Reset recommendations</button>
         <button class="ghost" onclick="disconnectSimkl('${id}')">Disconnect</button>
         <span class="tres" data-tres="simkl-sync"></span></div>
         <div class="recs-panel diag" style="display:none"></div>`;
@@ -823,6 +824,19 @@ async function viewRecs(id, btn) {
     const section = (list, label) => `<div style="margin-top:8px"><b>${label} (${list.length})</b>${list.map(row).join('') || '<div class="muted">none</div>'}</div>`;
     panel.innerHTML = `<div class="muted">${d.total} in the pool (top 40 of each shown)</div>${section(d.movies, 'Movies')}${section(d.series, 'Shows')}`;
   } catch (e) { panel.innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`; }
+}
+
+async function resetRecs(id, btn) {
+  if (!confirm('Wipe the recommendation pool AND your "don\'t recommend" flags for this profile? The pool rebuilds from watched history on the next build.')) return;
+  const out = document.querySelector(`[data-id="${id}"] [data-tres="simkl-sync"]`);
+  btn.disabled = true; out.textContent = ' ⟳ resetting…'; out.className = 'tres';
+  try {
+    await api(`/profiles/${id}/recommend/reset`, { method: 'POST' });
+    out.textContent = ' ✓ recommendations + don\'t-recommend flags cleared'; out.className = 'tres ok';
+    const panel = document.querySelector(`[data-id="${id}"] .recs-panel`);
+    if (panel) panel.style.display = 'none';
+  } catch (e) { out.textContent = ' ✗ ' + e.message; out.className = 'tres err'; }
+  finally { btn.disabled = false; }
 }
 
 async function suppressRec(id, type, tmdbId, btn) {
