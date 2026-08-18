@@ -90,6 +90,8 @@
     🔒 <b>Secrets are locked.</b> profiles.json holds encrypted secrets but <code>SECRET_KEY</code> is missing or wrong on the server, so API keys and Trakt tokens can't be read. Recommendations keep serving from cache, but <b>editing is disabled</b> until you restore the correct key. <b>Nothing was changed or lost</b> — set the right <code>SECRET_KEY</code> and restart.
   </div>
 
+  <div id="serverConfig"></div>
+
   <div class="card">
     <div class="row">
       <input type="text" id="newName" class="grow" placeholder="New profile name (e.g. James)">
@@ -416,10 +418,107 @@ function toggleKey(btn) {
   btn.innerHTML = reveal ? EYE : EYE_OFF;
 }
 
+// ---- Server Config (global settings, v6) ----
+function renderServerConfig(data) {
+  const s = data.settings || { llm: {}, keys: {} };
+  const llmv = s.llm || {}; const keys = s.keys || {};
+  const badge = data.complete
+    ? '<span class="badge ok">✓ ready</span>'
+    : '<span class="badge err">— setup incomplete</span>';
+  const el = $('#serverConfig');
+  el.innerHTML = `<div class="card">
+    <div class="row"><h2>Server Config</h2> ${badge} <span class="grow"></span>
+      <button onclick="saveSettings(this)">Save server config</button></div>
+    <div class="muted" style="margin:4px 0 10px">Shared infrastructure for the whole addon — the LLM chain and lookup keys. Profiles stay disabled until TMDB and at least one LLM are set.</div>
+
+    <details open><summary>LLM — Custom endpoint, then Groq fallback</summary>
+      <div style="border-left:2px solid var(--border);padding-left:12px;margin-top:6px">
+        <label>Custom LLM name / model <span class="muted">(sent as the model, e.g. qwen3.5:9b)</span></label>
+        ${keyField('custom_name', llmv.custom_name)}
+        <label>Custom LLM URI <span class="muted">— must support OpenAI v1 (<code>/chat/completions</code>)</span></label>
+        <div class="keyrow">${keyField('custom_uri', llmv.custom_uri)}<button class="ghost mini" onclick="testLlm(this)">Test</button></div>
+        <span class="tres" data-tres="llm"></span>
+        <label>Custom LLM API key <span class="muted">(blank for keyless local servers)</span></label>
+        ${keyField('custom_api_key', llmv.custom_api_key)}
+        <div class="muted" style="font-size:11px;margin-top:3px">Tried first. Test runs a real OpenAI-shape check plus our generation + age-gate JSON tasks — it must pass all three to be trusted.</div>
+      </div>
+      <div class="cols" style="margin-top:10px">
+        <div><label>Groq primary key</label>${keyRowS('groq', 'groq_api_key', llmv.groq_api_key)}</div>
+        <div><label>Groq backup key <span class="muted">(resilience)</span></label>${keyRowS('groq', 'groq_api_key_backup', llmv.groq_api_key_backup)}</div>
+      </div>
+    </details>
+
+    <details open><summary>API keys — TMDB, MDBList, RPDB</summary>
+      <div class="cols" style="margin-top:6px">
+        <div><label>TMDB <span class="muted">(required)</span></label>${keyRowS('tmdb', 'tmdb_api_key', keys.tmdb_api_key)}</div>
+        <div><label>MDBList</label>${keyRowS('mdblist', 'mdblist_api_key', keys.mdblist_api_key)}</div>
+        <div><label>RPDB</label>${keyRowS('rpdb', 'rpdb_api_key', keys.rpdb_api_key)}</div>
+      </div>
+    </details>
+  </div>`;
+}
+
+// key row with a Test button that hits /settings/test/:service with the field's
+// current value (so unsaved edits can be tested).
+function keyRowS(service, dataKey, value) {
+  return `<div class="keyrow">${keyField(dataKey, value)}<button class="ghost mini" onclick="testSettingKey('${service}','${dataKey}',this)">Test</button></div><span class="tres" data-tres="${dataKey}"></span>`;
+}
+
+function collectSettings() {
+  const el = $('#serverConfig');
+  const val = (k) => (el.querySelector(`[data-key="${k}"]`)?.value ?? '').trim();
+  return {
+    llm: {
+      custom_name: val('custom_name'), custom_uri: val('custom_uri'), custom_api_key: val('custom_api_key'),
+      groq_api_key: val('groq_api_key'), groq_api_key_backup: val('groq_api_key_backup'),
+    },
+    keys: { tmdb_api_key: val('tmdb_api_key'), mdblist_api_key: val('mdblist_api_key'), rpdb_api_key: val('rpdb_api_key') },
+  };
+}
+
+async function saveSettings(btn) {
+  btn.disabled = true;
+  try {
+    await api('/settings', { method: 'PUT', body: collectSettings() });
+    toast('Server config saved');
+    load();
+  } catch (e) { toast('Save failed: ' + e.message); } finally { btn.disabled = false; }
+}
+
+async function testSettingKey(service, dataKey, btn) {
+  const el = $('#serverConfig');
+  const out = el.querySelector(`[data-tres="${dataKey}"]`);
+  const key = el.querySelector(`[data-key="${dataKey}"]`)?.value.trim();
+  out.textContent = 'testing…'; out.className = 'tres';
+  try {
+    const r = await api(`/settings/test/${service}`, { method: 'POST', body: { key } });
+    out.textContent = r.ok ? ('✓ ' + (r.detail || 'valid')) : ('✗ ' + (r.error || 'failed'));
+    out.className = 'tres ' + (r.ok ? 'ok' : 'err');
+  } catch (e) { out.textContent = '✗ ' + e.message; out.className = 'tres err'; }
+}
+
+async function testLlm(btn) {
+  const el = $('#serverConfig');
+  const out = el.querySelector('[data-tres="llm"]');
+  const body = {
+    name: el.querySelector('[data-key="custom_name"]').value.trim(),
+    uri: el.querySelector('[data-key="custom_uri"]').value.trim(),
+    apiKey: el.querySelector('[data-key="custom_api_key"]').value.trim(),
+  };
+  btn.disabled = true; out.textContent = 'testing (3 checks)…'; out.className = 'tres';
+  try {
+    const r = await api('/settings/test-llm', { method: 'POST', body });
+    out.innerHTML = r.checks.map(c => `${c.ok ? '✓' : '✗'} ${esc(c.name)}${c.detail ? ' — ' + esc(c.detail) : ''}`).join('<br>');
+    out.className = 'tres ' + (r.ok ? 'ok' : 'err');
+  } catch (e) { out.textContent = '✗ ' + e.message; out.className = 'tres err'; }
+  finally { btn.disabled = false; }
+}
+
 async function load() {
   if (!GENRES.length) GENRES = (await api('/genres')).genres;
   if (!CATALOG_DEFS.length) CATALOG_DEFS = (await api('/catalogs')).catalogs;
   if (!$('#ver').textContent) $('#ver').textContent = `· v${(await api('/version')).version}`;
+  renderServerConfig(await api('/settings'));
   const { profiles, secrets_locked } = await api('/profiles');
   $('#lockBanner').style.display = secrets_locked ? 'block' : 'none';
   render(profiles);

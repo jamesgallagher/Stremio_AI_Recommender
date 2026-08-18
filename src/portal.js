@@ -10,6 +10,8 @@ const tmdb = require('./services/tmdb');
 const mdblistService = require('./services/mdblist');
 const scrobble = require('./services/scrobble');
 const crypto = require('./services/crypto');
+const settings = require('./settings');
+const llm = require('./services/llm');
 
 const { version } = require('../package.json');
 
@@ -464,6 +466,59 @@ router.post('/profiles/:id/scrobble/sync', async (req, res) => {
     res.json({ result });
   } catch (err) {
     res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- Server Config (global settings, v6) ----
+
+// Full values returned for portal pre-fill (same policy as the profile API).
+router.get('/settings', (req, res) => {
+  const s = settings.getSettings();
+  res.json({
+    settings: s, // null = never set up
+    complete: settings.isComplete(s),
+    locked: settings.settingsLocked(),
+  });
+});
+
+router.put('/settings', (req, res) => {
+  try {
+    const patch = {};
+    if (req.body.llm && typeof req.body.llm === 'object') patch.llm = req.body.llm;
+    if (req.body.keys && typeof req.body.keys === 'object') patch.keys = req.body.keys;
+    const updated = settings.updateSettings(patch);
+    res.json({ settings: updated, complete: settings.isComplete(updated) });
+  } catch (err) {
+    res.status(423).json({ error: err.message });
+  }
+});
+
+// Test one global lookup key by reusing the per-profile testers (they only read
+// `.keys`). Key comes from the request body so an unsaved value can be tested.
+const SETTINGS_KEY_TESTERS = { tmdb: testTmdb, mdblist: testMdblist, rpdb: testRpdb, groq: testGroq };
+router.post('/settings/test/:service', async (req, res) => {
+  const tester = SETTINGS_KEY_TESTERS[req.params.service];
+  if (!tester) return res.status(400).json({ error: 'Unknown service' });
+  const field = req.params.service === 'groq' ? 'groq_api_key' : `${req.params.service}_api_key`;
+  const key = req.body.key;
+  try {
+    const result = await tester({ keys: { [field]: key } });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Custom LLM test — validates OpenAI shape + our two JSON tasks live.
+router.post('/settings/test-llm', async (req, res) => {
+  const { name, uri, apiKey } = req.body || {};
+  try {
+    const result = await llm.testCustomLlm({ name, uri, apiKey }, console);
+    const summary = result.checks.map((c) => `${c.ok ? '✓' : '✗'} ${c.name}${c.detail ? ` (${c.detail})` : ''}`).join(' · ');
+    console.log(`[test] custom LLM ${uri}: ${result.ok ? 'OK' : 'FAIL'} — ${summary}`);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ ok: false, checks: [{ name: 'request', ok: false, detail: err.message }] });
   }
 });
 

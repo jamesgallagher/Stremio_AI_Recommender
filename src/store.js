@@ -37,6 +37,21 @@ function saveProfiles(data) {
   writeJsonAtomic(PROFILES_FILE, data);
 }
 
+// ---- Global server settings (v6) ----
+// Shared infrastructure that used to live per-profile: the LLM chain
+// (custom + Groq primary/backup) and the TMDB/MDBList/RPDB keys. One file for
+// the whole addon; secret fields are sealed by the settings layer before they
+// reach here (see src/settings.js), so this is a dumb read/write like profiles.
+const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
+
+function loadSettings() {
+  return readJson(SETTINGS_FILE, null); // null = never set up (Server Config incomplete)
+}
+
+function saveSettings(data) {
+  writeJsonAtomic(SETTINGS_FILE, data);
+}
+
 // ---- Per-profile recommendation cache ----
 // Shape: {
 //   movie:  { metas: [<displayed>], bench: [<reserve>], display_size, generated_at, source: 'llm'|'discover' },
@@ -198,6 +213,8 @@ module.exports = {
   ensureDirs,
   loadProfiles,
   saveProfiles,
+  loadSettings,
+  saveSettings,
   loadCache,
   swapCatalog,
   swapExtra,

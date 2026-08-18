@@ -534,6 +534,50 @@ ok('store: meta cache roundtrip, per-title files, TTL expiry', () => {
   assert.ok(fs.existsSync(path.join(store.DATA_DIR, 'cache', 'meta', 'movie-evil.json')));
 });
 
+ok('settings: roundtrip, migration seeds from "James", isComplete, llmChain', () => {
+  const settings = require('../src/settings');
+  // Fresh: never set up
+  assert.strictEqual(settings.getSettings(), null);
+  assert.strictEqual(settings.isComplete(), false);
+
+  // Migration prefers the "James" profile over an older non-James one
+  const seeded = settings.migrateFromProfiles([
+    { name: 'Ciara', created_at: 1, keys: { tmdb_api_key: 'CIARA' } },
+    { name: 'James', created_at: 2, keys: { tmdb_api_key: 'JAMES-TMDB', groq_api_key: 'JAMES-GROQ', mdblist_api_key: 'JAMES-MDB' } },
+  ]);
+  assert.strictEqual(seeded.seededFrom, 'James');
+  let s = settings.getSettings();
+  assert.strictEqual(s.keys.tmdb_api_key, 'JAMES-TMDB'); // unsealed back to plaintext
+  assert.strictEqual(s.llm.groq_api_key, 'JAMES-GROQ');
+  assert.strictEqual(settings.isComplete(s), true); // TMDB + a groq key
+
+  // Migration is one-time — a second call is a no-op
+  assert.strictEqual(settings.migrateFromProfiles([{ name: 'James', keys: { tmdb_api_key: 'X' } }]), null);
+
+  // Add a custom LLM → chain is custom → groq primary (no backup set)
+  settings.updateSettings({ llm: { custom_uri: 'http://localhost:11434/v1', custom_name: 'qwen3.5:9b' } });
+  const chain = settings.llmChain();
+  assert.deepStrictEqual(chain.map((p) => p.type), ['custom', 'groq']);
+  assert.strictEqual(chain[0].name, 'qwen3.5:9b');
+  assert.strictEqual(chain[1].label, 'groq-primary');
+
+  // Secrets are sealed on disk, plaintext in memory
+  const raw = require('fs').readFileSync(require('path').join(process.env.DATA_DIR, 'settings.json'), 'utf8');
+  assert.ok(!raw.includes('JAMES-GROQ')); // groq key sealed, not plaintext on disk
+  assert.ok(!raw.includes('JAMES-TMDB'));
+});
+
+ok('llm: chatUrl joins, extractArray tolerates wrappers, groq model list', () => {
+  const llm = require('../src/services/llm');
+  assert.strictEqual(llm.chatUrl('http://h:1/v1/'), 'http://h:1/v1/chat/completions');
+  assert.strictEqual(llm.chatUrl('http://h:1/v1'), 'http://h:1/v1/chat/completions');
+  assert.deepStrictEqual(llm.extractArray('```json\n[{"a":1}]\n```'), [{ a: 1 }]);
+  assert.deepStrictEqual(llm.extractArray('sure: [{"id":"tt1","ok":true}] done'), [{ id: 'tt1', ok: true }]);
+  assert.deepStrictEqual(llm.extractArray('{"results":[{"x":2}]}'), [{ x: 2 }]); // json-mode wrapper
+  assert.throws(() => llm.extractArray('not json at all'));
+  assert.ok(llm.GROQ_MODELS.includes('openai/gpt-oss-120b'));
+});
+
 ok('crypto: encrypt/decrypt roundtrip + tamper detection', () => {
   const cr = require('../src/services/crypto');
   assert.ok(cr.encryptionAvailable());
@@ -771,6 +815,22 @@ async function httpTests() {
   const ver = await (await fetch(`${BASE}/api/version`)).json();
   assert.strictEqual(ver.version, pkgVersion);
   console.log('  ✓ /api/version matches package.json');
+
+  // Server Config (global settings): PUT then GET roundtrip, complete flag,
+  // sealed-on-disk, and unknown test service rejected.
+  await fetch(`${BASE}/api/settings`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ llm: { groq_api_key: 'ROUNDTRIP-GROQ' }, keys: { tmdb_api_key: 'ROUNDTRIP-TMDB' } }),
+  });
+  const sget = await (await fetch(`${BASE}/api/settings`)).json();
+  assert.strictEqual(sget.settings.keys.tmdb_api_key, 'ROUNDTRIP-TMDB');
+  assert.strictEqual(sget.settings.llm.groq_api_key, 'ROUNDTRIP-GROQ');
+  assert.strictEqual(sget.complete, true); // TMDB + groq
+  const rawSettings = require('fs').readFileSync(require('path').join(process.env.DATA_DIR, 'settings.json'), 'utf8');
+  assert.ok(!rawSettings.includes('ROUNDTRIP-GROQ')); // sealed on disk
+  const badSvc = await fetch(`${BASE}/api/settings/test/nope`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  assert.strictEqual(badSvc.status, 400);
+  console.log('  ✓ /api/settings PUT/GET roundtrip, sealed, complete flag');
 
   const genres = await (await fetch(`${BASE}/api/genres`)).json();
   assert.ok(genres.genres.includes('Horror') && genres.genres.includes('Kids'));
@@ -1099,7 +1159,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 41 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 42 async/http).`);
   process.exit(0);
 }
 
