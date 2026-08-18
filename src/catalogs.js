@@ -23,12 +23,9 @@ const EXTRA_CATALOGS = [
   // stack like every other surface — CSM gate + AI age goalkeeper.
   { id: 'mdb-kids-movies', type: 'movie', name: 'Trending Kids Movies', source: 'mdblist', user: 'snoak', slug: 'trending-kids-movies', min_imdb: 6, sort: 'tmdbpopular', target: 50 },
   { id: 'mdb-kids-series', type: 'series', name: 'Trending Kids TV', source: 'mdblist', user: 'tvgeniekodi', slug: 'trending-kids-tv-shows', min_imdb: 6, sort: 'tmdbpopular', target: 50 },
-  // Anime TV-14 (added 2026-07-23): a public Trakt list. The certification /
-  // ratings / ignore_watched filters in the list's web URL are SITE view
-  // filters — the API returns the list unfiltered — so they're re-applied
-  // here: min_imdb 6 covers imdb_ratings=6-10, the AI age gate covers
-  // certifications=all_ages,parental_guidance,teens, and watched exclusion
-  // covers ignore_watched.
+  // Anime TV-14 (v6: snoak/trending-anime-shows on MDBList — was a public Trakt
+  // list). A plain curated MDBList catalog now: min_imdb 6 gates rating, the
+  // anime/AI age gate handles certifications, IDs kept for manifest stability.
   // min_profile_age: the catalog itself is pitched at a rating band, so a
   // profile limited below it never sees the option. This is a CATALOG-level
   // floor, not a per-title certification lookup — it cannot drop titles for
