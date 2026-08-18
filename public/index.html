@@ -84,10 +84,10 @@
 <body>
 <div class="wrap">
   <h1><img src="logo.svg" alt="" class="brand">AI Recommender</h1>
-  <div class="sub">Admin portal — each section below manages one family member's addon: their keys, Trakt link, filters, and install URL. <span id="ver"></span></div>
+  <div class="sub">Admin portal — each section below manages one family member's addon: their keys, Simkl link, filters, and install URL. <span id="ver"></span></div>
 
   <div id="lockBanner" style="display:none;background:var(--err);color:#fff;padding:12px 14px;border-radius:8px;margin:10px 0;font-size:14px">
-    🔒 <b>Secrets are locked.</b> profiles.json holds encrypted secrets but <code>SECRET_KEY</code> is missing or wrong on the server, so API keys and Trakt tokens can't be read. Recommendations keep serving from cache, but <b>editing is disabled</b> until you restore the correct key. <b>Nothing was changed or lost</b> — set the right <code>SECRET_KEY</code> and restart.
+    🔒 <b>Secrets are locked.</b> profiles.json holds encrypted secrets but <code>SECRET_KEY</code> is missing or wrong on the server, so API keys and Simkl tokens can't be read. Recommendations keep serving from cache, but <b>editing is disabled</b> until you restore the correct key. <b>Nothing was changed or lost</b> — set the right <code>SECRET_KEY</code> and restart.
   </div>
 
   <div id="serverConfig"></div>
@@ -199,51 +199,24 @@ function render(profiles) {
     const installUrl = p.install_url;
     // RPDB is optional — excluded from the required-keys gate
     // Groq is only required for kids profiles (AI age goalkeeper)
-    const keysOk = p.keys_set.trakt_client_id && p.keys_set.trakt_client_secret && p.keys_set.tmdb_api_key && (p.filters.age_limit > 0 || p.filters.engine === 'ai' ? p.keys_set.groq_api_key : true);
-    const traktKeysOk = p.keys_set.trakt_client_id && p.keys_set.trakt_client_secret;
+    const keysOk = p.keys_set.tmdb_api_key && (p.filters.age_limit > 0 ? p.keys_set.groq_api_key : true);
     const simklKeysOk = p.keys_set.simkl_client_id; // PIN flow needs only the Client ID
-    const badge = p.trakt_connected
-      ? '<span class="badge ok">Trakt connected</span>'
-      : (keysOk ? '<span class="badge warn">Trakt not authorized</span>' : '<span class="badge err">Keys missing</span>');
+    const badge = p.simkl_connected
+      ? '<span class="badge ok">Simkl connected</span>'
+      : (simklKeysOk ? '<span class="badge warn">Simkl not authorized</span>' : '<span class="badge err">Simkl Client ID required</span>');
     const rebuilding = p.status.rebuilding ? '<span class="badge warn">rebuilding…</span>' : '';
     return `
     <div class="card" data-id="${p.id}">
       <div class="row">
         <h2>${esc(p.name)}</h2> ${badge} ${rebuilding}
         <div class="grow"></div>
-        <button class="ghost" onclick="rebuildNow('${p.id}', this)" ${p.trakt_connected && !p.status.rebuilding ? '' : 'disabled'}>${p.status.rebuilding ? 'Rebuilding…' : 'Rebuild now'}</button>
-        <button class="ghost" onclick="diagnose('${p.id}', this)" ${p.trakt_connected ? '' : 'disabled'} title="Check every listed title against your live Trakt watched history">Diagnose</button>
+        <button class="ghost" onclick="rebuildNow('${p.id}', this)" ${p.simkl_connected && !p.status.rebuilding ? '' : 'disabled'}>${p.status.rebuilding ? 'Rebuilding…' : 'Rebuild now'}</button>
         <button class="danger" onclick="delProfile('${p.id}')">Delete</button>
       </div>
       <div class="status-line">
         ${catalogLine('🎬 Movies', p.status.movie)} &nbsp;·&nbsp; ${catalogLine('📺 Series', p.status.series)}
       </div>
       <div class="diag"></div>
-
-      <details>
-        <summary>Trakt — account & authorization ${p.trakt_connected ? '✓ connected' : (traktKeysOk ? '— ready to connect' : '— keys required')}</summary>
-        <div class="muted" style="margin-top:8px">Steps: 1) create a Trakt API app while signed in as <b>${esc(p.name)}</b>'s Trakt account, 2) paste both values, 3) Save &amp; Test, 4) Connect.</div>
-        <div class="keys-list">
-          <div><label>Client ID
-              <a class="getkey" href="https://app.trakt.tv/settings/advanced?mode=media" target="_blank" rel="noopener">get key ↗</a></label>
-            ${keyRow(p.id, 'trakt_client_id', p.keys.trakt_client_id)}</div>
-          <div><label>Client Secret
-              <a class="getkey" href="https://app.trakt.tv/settings/advanced?mode=media" target="_blank" rel="noopener">get key ↗</a></label>
-            ${keyRow(p.id, 'trakt_client_secret', p.keys.trakt_client_secret, 'trakt')}</div>
-        </div>
-        <div style="margin-top:10px">
-          <button onclick="saveKeys('${p.id}')">Save</button>
-        </div>
-        <div class="trakt-flow" style="margin-top:12px; padding-top:10px; border-top:1px solid var(--border)">
-          ${p.trakt_connected
-            ? `<div class="muted">✓ Authorized${p.trakt_username ? ` as Trakt account <b style="color:var(--ok)">${esc(p.trakt_username)}</b>` : ''}. Token auto-refreshes; expires ${p.trakt_expires_at ? new Date(p.trakt_expires_at).toLocaleDateString() : '—'}.
-               ${p.trakt_username ? `<div style="font-size:11px;margin-top:2px">If that isn't ${esc(p.name)}'s own Trakt account, disconnect and re-authorize signed in as ${esc(p.name)} — recommendations are built from this account's history.</div>` : ''}</div>
-               <div style="margin-top:8px"><button class="ghost" onclick="disconnectTrakt('${p.id}')">Disconnect</button></div>`
-            : `<div><button onclick="connectTrakt('${p.id}')" ${traktKeysOk ? '' : 'disabled'}>Connect Trakt</button>
-               <span class="muted"> — sign in as <b>${esc(p.name)}</b>'s Trakt account when prompted${traktKeysOk ? '' : ' (save both keys above first)'}</span></div>
-               <div class="flow-status" style="margin-top:10px"></div>`}
-        </div>
-      </details>
 
       <details ontoggle="if(this.open) checkSimklStatus('${p.id}')">
         <summary>Simkl — account &amp; authorization <span class="simkl-sum" data-sid="${p.id}">${simklKeysOk ? '' : '— Client ID required'}</span></summary>
@@ -276,7 +249,7 @@ function render(profiles) {
           <div><label>MDBList API Key
               <a class="getkey" href="https://mdblist.com/preferences/" target="_blank" rel="noopener">get key ↗</a></label>
             ${keyRow(p.id, 'mdblist_api_key', p.keys.mdblist_api_key, 'mdblist')}
-            <div class="muted" style="font-size:11px;margin-top:3px">Required — powers the extra catalogs and Common Sense age checks. Free key: sign in at mdblist.com → Preferences (1,000 requests/day; lookups are cached, so daily use is a fraction of that).</div></div>
+            <div class="muted" style="font-size:11px;margin-top:3px">Required — powers the extra (MDBList) catalogs. Free key: sign in at mdblist.com → Preferences (1,000 requests/day; lookups are cached, so daily use is a fraction of that).</div></div>
           <div><label>RPDB API Key <span class="muted">(optional)</span>
               <a class="getkey" href="https://ratingposterdb.com/" target="_blank" rel="noopener">get key ↗</a></label>
             ${keyRow(p.id, 'rpdb_api_key', p.keys.rpdb_api_key, 'rpdb')}
@@ -288,28 +261,19 @@ function render(profiles) {
       </details>
 
       <details>
-        <summary>Filters — ${(p.filters.engine || 'trakt') === 'ai' ? 'AI engine' : 'Trakt engine'}, min rating ${p.filters.min_rating},${p.filters.max_age_years > 0 ? 'last ' + p.filters.max_age_years + ' years' : 'any year'}, ${p.filters.list_size} titles${p.filters.age_limit > 0 ? ', age ' + p.filters.age_limit + '+ limit' : ''}${p.filters.excluded_genres.length ? ', ' + p.filters.excluded_genres.length + ' genres excluded' : ''}</summary>
+        <summary>Filters — min rating ${p.filters.min_rating},${p.filters.max_age_years > 0 ? 'last ' + p.filters.max_age_years + ' years' : 'any year'}, ${p.filters.list_size} titles${p.filters.age_limit > 0 ? ', age ' + p.filters.age_limit + '+ limit' : ''}${p.filters.excluded_genres.length ? ', ' + p.filters.excluded_genres.length + ' genres excluded' : ''}</summary>
+        <div class="muted" style="margin-bottom:8px;font-size:11px">Rating floor, excluded genres and recency apply at <b>serve time</b> over the stored pool — change one and it takes effect immediately, no rebuild.</div>
         <div class="cols">
-          <div><label>Recommendation engine</label>
-            <select data-filter="engine">
-              ${[['trakt','Trakt (people like you)'],['ai','AI (age-aware)']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.engine || 'trakt') ? 'selected' : ''}>${l}</option>`).join('')}
-            </select>
-            <div class="muted" style="font-size:11px;margin-top:3px">Trakt suggests what similar viewers watched next — excellent with a deep history, but it has no concept of age, so a young viewer inherits adult neighbours' taste. AI generates candidates with the age limit applied up front, then a second AI pass vets them. AI is slower and gives shorter lists. Needs the Groq key.</div>
-            ${(p.filters.engine === 'ai') && !p.keys_set.groq_api_key ? '<div style="color:var(--err);font-size:12px;margin-top:4px">⚠ AI engine is selected but no Groq key is set — rebuilds will fail until you add one.</div>' : ''}</div>
           <div><label>Minimum rating</label>
             <select data-filter="min_rating">
               ${[0,5,5.5,6,6.5,7,7.5,8,8.5,9].map(v => `<option value="${v}" ${v === p.filters.min_rating ? 'selected' : ''}>${v === 0 ? 'No minimum' : '≥ ' + v.toFixed(1)}</option>`).join('')}
-            </select></div>
-          <div><label>Rating source</label>
-            <select data-filter="rating_source">
-              ${[['trakt','Trakt (built-in)'],['imdb','IMDb (via MDBList)']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.rating_source || 'trakt') ? 'selected' : ''}>${l}</option>`).join('')}
             </select>
-            <div class="muted" style="font-size:11px;margin-top:3px">Trakt's own 0–10 rating comes free with the recommendations (60% = 6.0). IMDb needs the MDBList key and costs one extra lookup batch.</div></div>
+            <div class="muted" style="font-size:11px;margin-top:3px">Applied to the TMDB rating (0–10) at serve time. Unrated titles are kept.</div></div>
           <div><label>Minimum vote count</label>
             <select data-filter="vote_count_floor">
               ${[[0,'No minimum'],[250,'250+'],[500,'500+'],[1000,'1,000+'],[2500,'2,500+'],[5000,'5,000+']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.vote_count_floor ?? 1000) ? 'selected' : ''}>${l}</option>`).join('')}
             </select>
-            <div class="muted" style="font-size:11px;margin-top:3px">Noise gate on Trakt vote counts — a high rating on very few votes is meaningless. Lower it to surface niche gems. Series automatically use ⅕ of this (TV vote counts run far lower).</div></div>
+            <div class="muted" style="font-size:11px;margin-top:3px">Noise gate on TMDB vote counts — a high rating on very few votes is meaningless. Series automatically use ⅕ of this (TV vote counts run far lower).</div></div>
           <div><label>Released within</label>
             <select data-filter="max_age_years">
               ${[[1,'1 year'],[2,'2 years'],[5,'5 years'],[10,'10 years'],[20,'20 years'],[0,'No limit']].map(([v,l]) => `<option value="${v}" ${v === p.filters.max_age_years ? 'selected' : ''}>${l}</option>`).join('')}
@@ -318,7 +282,7 @@ function render(profiles) {
             <select data-filter="list_size">
               ${[10,15,20,25,30,40].map(v => `<option value="${v}" ${v === p.filters.list_size ? 'selected' : ''}>${v} titles</option>`).join('')}
             </select></div>
-          <div><label>Age limit (Common Sense Media)</label>
+          <div><label>Age limit</label>
             <div class="row" style="gap:8px">
               <label style="margin:0;display:flex;align-items:center;gap:6px;color:var(--text);font-size:13px">
                 <input type="checkbox" data-filter="age_limit_on" ${p.filters.age_limit > 0 ? 'checked' : ''} onchange="const s=this.closest('.row').querySelector('[data-filter=age_limit]'); s.disabled=!this.checked; s.style.display=this.checked?'':'none'"> Limit to age
@@ -327,9 +291,7 @@ function render(profiles) {
                 ${[[5,'5+ (~G, young kids)'],[6,'6+'],[8,'8+ (~PG)'],[10,'10+'],[12,'12+'],[13,'13+ (~PG-13)'],[15,'15+ (~M)']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.age_limit || 8) ? 'selected' : ''}>${l}</option>`).join('')}
               </select>
             </div>
-            <div class="muted" style="font-size:11px;margin-top:3px">${(p.filters.engine || 'trakt') === 'ai'
-              ? 'On the AI engine the limit is applied twice: candidates are generated for this age, then a second AI pass removes anything unsuitable. Titles are judged one year above the limit, because classification brackets are coarse. Common Sense Media is <b>not</b> used here — its anime coverage is too thin to gate on.'
-              : 'Strict: every title is checked against Common Sense Media (via MDBList), then an AI pass. Titles CSM hasn\'t rated are never listed. Requires the MDBList key.'}</div>
+            <div class="muted" style="font-size:11px;margin-top:3px">At build time an AI pass removes anything unsuitable for this age (anime also gets its MAL band), judged one year above the limit because classification brackets are coarse. A cheap band re-check runs again at serve time. Requires the Groq/LLM key.</div>
             ${p.filters.age_limit > 0 && !p.keys_set.groq_api_key ? '<div style="color:var(--err);font-size:12px;margin-top:4px">⚠ Age limit is on but no Groq key is set — rebuilds will fail until you add one.</div>' : ''}
           </div>
         </div>
@@ -343,13 +305,13 @@ function render(profiles) {
 
       <details>
         <summary>Catalogs — AI + ${catsFor(p).filter(c => catOn(p, c)).length} extra</summary>
-        <div class="muted" style="margin-top:8px">The two AI catalogs are always on. <b>Watch Later</b> mirrors this profile's Trakt watchlist (the list Stremio/Nuvio's long-press "add to watchlist" writes to) — on by default, refreshed within the hour of a change, watched titles drop off. The curated MDBList lists refresh daily and <b>ignore watched status</b>; popular charts are unfiltered, the rest drop titles rated below IMDb 6, and the kids lists carry 50 titles (MDBList key required). On profiles with an age limit, <b>every</b> extra catalog also passes the Common Sense gate and the AI age check — a Groq key is required and the list is kept unpublished if either can't run.</div>
+        <div class="muted" style="margin-top:8px">The two AI catalogs are always on. <b>Watch Later</b> mirrors this profile's Simkl plan-to-watch list — on by default, refreshed daily, watched titles drop off. The curated MDBList lists refresh daily and <b>ignore watched status</b>; popular charts are unfiltered, the rest drop titles rated below IMDb 6, and the kids lists carry 50 titles (MDBList key required). On profiles with an age limit, <b>every</b> extra catalog also passes the anime/NSFW gate and the AI age check — a Groq/LLM key is required and the list is kept unpublished if either can't run.</div>
         <div class="cats">
           <label class="locked"><input type="checkbox" checked disabled>Movies recommended for you</label>
           <label class="locked"><input type="checkbox" checked disabled>Series recommended for you</label>
-          ${catsFor(p).map(c => `<label><input type="checkbox" data-catalog="${esc(c.id)}" ${catOn(p, c) ? 'checked' : ''}>${esc(c.name)}<span class="muted" style="font-size:11px">${c.type === 'series' ? 'series' : 'movies'}${c.source === 'trakt_watchlist' ? ' · Trakt watchlist' : ''}${c.source === 'trakt_list' ? ' · Trakt list' : ''}${c.min_profile_age ? ' · ' + c.min_profile_age + '+ only' : ''}${c.min_imdb ? ' · IMDb ≥ ' + c.min_imdb : ''}${c.target && c.target !== 20 ? ' · ' + c.target + ' titles' : ''}</span></label>`).join('')}
+          ${catsFor(p).map(c => `<label><input type="checkbox" data-catalog="${esc(c.id)}" ${catOn(p, c) ? 'checked' : ''}>${esc(c.name)}<span class="muted" style="font-size:11px">${c.type === 'series' ? 'series' : 'movies'}${c.source === 'simkl_plantowatch' ? ' · Simkl plan-to-watch' : ''}${c.min_profile_age ? ' · ' + c.min_profile_age + '+ only' : ''}${c.min_imdb ? ' · IMDb ≥ ' + c.min_imdb : ''}${c.target && c.target !== 20 ? ' · ' + c.target + ' titles' : ''}</span></label>`).join('')}
         </div>
-        ${catsFor(p).some(c => catOn(p, c) && c.source === 'trakt_watchlist') && !p.trakt_connected ? '<div style="color:var(--err);font-size:12px;margin-top:6px">⚠ Watch Later is enabled but Trakt is not connected — it cannot build until this profile connects Trakt.</div>' : ''}
+        ${catsFor(p).some(c => catOn(p, c) && c.source === 'simkl_plantowatch') && !p.simkl_connected ? '<div style="color:var(--err);font-size:12px;margin-top:6px">⚠ Watch Later is enabled but Simkl is not connected — it cannot build until this profile connects Simkl.</div>' : ''}
         ${catsFor(p).some(c => catOn(p, c) && c.source === 'mdblist') && !p.keys_set.mdblist_api_key ? '<div style="color:var(--err);font-size:12px;margin-top:6px">⚠ Curated catalogs are enabled but no MDBList key is set — they cannot build until you add one (API keys section).</div>' : ''}
         <div style="margin-top:10px" class="row">
           <button onclick="saveCatalogs('${p.id}')">Save catalogs</button>
@@ -359,10 +321,10 @@ function render(profiles) {
 
       <details>
         <summary>Auto scrobble ${p.scrobble.enabled ? '✓ ' + p.scrobble.provider + (p.scrobble.provider === 'nuvio' && p.scrobble.nuvio_profile_name ? ' · ' + esc(p.scrobble.nuvio_profile_name) : '') : '— off'}</summary>
-        <div class="muted" style="margin-top:8px">Mirror <b>${esc(p.name)}</b>'s <b>Nuvio</b> or <b>Stremio</b> watched history into their Trakt account hourly — so marks made in the app reach Trakt even if the app's own Trakt session silently drops. Per account, kept isolated from other profiles.</div>
+        <div class="muted" style="margin-top:8px">Mirror <b>${esc(p.name)}</b>'s <b>Nuvio</b> or <b>Stremio</b> watched history into their Simkl account hourly — so marks made in the app reach Simkl and feed recommendations, even if the app's own tracker session drops. Per account, kept isolated from other profiles.</div>
         ${p.scrobble.encryption_available ? '' : '<div style="color:var(--err);font-size:12px;margin-top:6px">⚠ SCROBBLE_KEY is not set on the server — you can test credentials but not save a password. Set the SCROBBLE_KEY environment variable (any long random string) on the container, then reload.</div>'}
         <label style="margin-top:10px;display:flex;align-items:center;gap:8px;color:var(--text);font-size:14px">
-          <input type="checkbox" data-scrobble="enabled" ${p.scrobble.enabled ? 'checked' : ''}> Auto-scrobble watched content to Trakt
+          <input type="checkbox" data-scrobble="enabled" ${p.scrobble.enabled ? 'checked' : ''}> Auto-scrobble watched content to Simkl
         </label>
         <div class="cols" style="margin-top:10px">
           <div><label>Source app</label>
@@ -393,9 +355,9 @@ function render(profiles) {
         </div>
         <div style="margin-top:12px" class="row">
           <button onclick="saveScrobble('${p.id}')">Save</button>
-          ${p.scrobble.enabled && p.trakt_connected ? `<button class="ghost" onclick="syncScrobble('${p.id}', this, false)">Sync now</button>
-          <button class="ghost" onclick="syncScrobble('${p.id}', this, true)" title="Re-push this account's entire watched history to Trakt, ignoring what's already there (Trakt re-marks them watched — harmless)">Full rebuild</button>` : ''}
-          <span class="muted"> — runs hourly; needs Trakt connected above</span>
+          ${p.scrobble.enabled && p.simkl_connected ? `<button class="ghost" onclick="syncScrobble('${p.id}', this, false)">Sync now</button>
+          <button class="ghost" onclick="syncScrobble('${p.id}', this, true)" title="Re-push this account's entire watched history to Simkl, ignoring what's already there (Simkl re-marks them watched — harmless)">Full rebuild</button>` : ''}
+          <span class="muted"> — runs hourly; needs Simkl connected above</span>
         </div>
       </details>
 
@@ -705,7 +667,7 @@ async function saveScrobble(id) {
 }
 
 async function syncScrobble(id, btn, full) {
-  if (full && !confirm('Full rebuild: re-push this account\'s ENTIRE watched history to Trakt, ignoring what\'s already there. Trakt re-marks them as watched. Continue?')) return;
+  if (full && !confirm('Full rebuild: re-push this account\'s ENTIRE watched history to Simkl, ignoring what\'s already there. Simkl re-marks them as watched. Continue?')) return;
   btn.disabled = true;
   const orig = btn.textContent;
   btn.textContent = full ? 'Rebuilding…' : 'Syncing…';
@@ -714,36 +676,13 @@ async function syncScrobble(id, btn, full) {
     if (result.skipped) toast('Sync skipped: ' + result.skipped);
     else {
       const b = result.pulledBreakdown;
-      toast(`Pulled ${b ? b.movies + ' movies + ' + b.series + ' episodes' : result.pulled + ' items'} · added ${result.added.movies} movie(s) + ${result.added.episodes} episode(s) to Trakt`);
+      toast(`Pulled ${b ? b.movies + ' movies + ' + b.series + ' episodes' : result.pulled + ' items'} · added ${result.added.movies} movie(s) + ${result.added.episodes} episode(s) to Simkl`);
     }
   } catch (err) {
     toast('Sync failed: ' + err.message);
   }
   btn.disabled = false;
   btn.textContent = orig;
-}
-
-async function connectTrakt(id) {
-  const card = document.querySelector(`[data-id="${id}"]`);
-  const statusEl = card.querySelector('.flow-status');
-  try {
-    await saveKeys(id, true); // persist anything typed but not yet saved
-    const { user_code, verification_url } = await api(`/profiles/${id}/trakt/connect`, { method: 'POST' });
-    statusEl.innerHTML = `Go to <a href="${verification_url}" target="_blank" style="color:var(--accent)">${verification_url}</a> and enter:
-      <div class="pin">${user_code}</div><div class="muted">Waiting for authorization…</div>`;
-    const poll = setInterval(async () => {
-      const { connected, flow } = await api(`/profiles/${id}/trakt/status`);
-      if (connected) { clearInterval(poll); toast('Trakt connected 🎉'); load(); }
-      else if (flow && flow.state === 'error') { clearInterval(poll); statusEl.innerHTML = `<span style="color:var(--err)">${esc(flow.error)}</span>`; }
-    }, 3000);
-  } catch (err) {
-    statusEl.innerHTML = `<span style="color:var(--err)">${esc(err.message)}</span>`;
-  }
-}
-
-async function disconnectTrakt(id) {
-  await api(`/profiles/${id}/trakt/disconnect`, { method: 'POST' });
-  load();
 }
 
 // LIVE Simkl status — runs on the Simkl section opening. Never trusts a stored
@@ -862,29 +801,6 @@ async function syncSimkl(id, btn) {
   finally { btn.disabled = false; }
 }
 
-async function diagnose(id, btn) {
-  const card = document.querySelector(`[data-id="${id}"]`);
-  const out = card.querySelector('.diag');
-  btn.disabled = true; btn.textContent = 'Checking…';
-  try {
-    const d = await api(`/profiles/${id}/diagnose`);
-    const lines = Object.entries(d.catalogs).map(([type, items]) => {
-      const flagged = items.filter(i => i.in_trakt_watched);
-      const label = type === 'movie' ? '🎬 Movies' : '📺 Series';
-      return `<div>${label}: ${items.length} listed, <b style="color:${flagged.length ? 'var(--err)' : 'var(--ok)'}">${flagged.length} flagged as watched on Trakt</b>${flagged.length ? ' — ' + flagged.map(i => esc(i.name)).join(', ') : ''}</div>`;
-    });
-    out.innerHTML = `
-      <div>Trakt account: <b>${esc(d.trakt_username || 'unknown')}</b> · ${d.watched_counts.movies} movies / ${d.watched_counts.shows} shows in watched history</div>
-      ${lines.join('')}
-      <div class="muted" style="margin-top:6px">Flagged = addon bug, please report. If your player shows a watched tick on a title that is NOT flagged here, that play never reached this Trakt account — check the player's Trakt integration and which account it's signed into.</div>`;
-    out.style.display = 'block';
-  } catch (err) {
-    out.textContent = 'Diagnose failed: ' + err.message;
-    out.style.display = 'block';
-  }
-  btn.disabled = false; btn.textContent = 'Diagnose';
-}
-
 async function rebuildNow(id, btn) {
   // The endpoint returns 202 immediately (a rebuild runs for minutes — a
   // response held open that long is killed by proxies like Cloudflare Tunnel,
@@ -931,7 +847,7 @@ function copyText(t) { navigator.clipboard.writeText(t).then(() => toast('Copied
 
 // Auto-refresh keeps status lines fresh, but must NEVER interrupt the user:
 // it skips whenever there is unsaved input (typing, ticking checkboxes) or a
-// Trakt authorization in progress (PIN on screen).
+// Simkl authorization in progress (PIN on screen).
 let dirty = false;
 // Any unsaved edit — in a profile OR in Server Config — pauses the auto-refresh
 // so it can't wipe what you're typing before you save.
