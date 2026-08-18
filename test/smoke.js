@@ -924,14 +924,25 @@ async function httpTests() {
   // connected (no network); disconnect -> ok.
   assert.ok('simkl_client_id' in listed.keys && 'simkl_connected' in listed);
   assert.strictEqual(listed.simkl_connected, false);
+  // connect with NO Client ID -> 400 (checked before any key is set)
   res = await fetch(`${BASE}/api/profiles/${profile.id}/simkl/connect`, { method: 'POST' });
-  assert.strictEqual(res.status, 400); // no Client ID set
+  assert.strictEqual(res.status, 400);
   const sstatus = await (await fetch(`${BASE}/api/profiles/${profile.id}/simkl/status`)).json();
   assert.strictEqual(sstatus.connected, false);
   assert.strictEqual(sstatus.reason, 'not connected'); // token-less check is network-free
   const sdis = await fetch(`${BASE}/api/profiles/${profile.id}/simkl/disconnect`, { method: 'POST' });
   assert.strictEqual(sdis.status, 200);
-  console.log('  ✓ Simkl auth routes: connect needs Client ID, live status token-less, disconnect');
+  // Regression (the "Save erased my keys" bug): the PUT key whitelist must
+  // include the Simkl keys, or Save silently drops them. Persist + read back.
+  // Done LAST so the connect-needs-Client-ID check above still sees no key.
+  await fetch(`${BASE}/api/profiles/${profile.id}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ keys: { simkl_client_id: 'CID-WL-1', simkl_client_secret: 'SEC-WL-2' } }),
+  });
+  const after = (await (await fetch(`${BASE}/api/profiles`)).json()).profiles.find(pp => pp.id === profile.id);
+  assert.strictEqual(after.keys.simkl_client_id, 'CID-WL-1');
+  assert.strictEqual(after.keys.simkl_client_secret, 'SEC-WL-2');
+  console.log('  ✓ Simkl auth routes + keys persist through the PUT whitelist');
 
   // Empty cache -> warming-up card, short client cache
   let cat = await (await fetch(`${BASE}/addon/${profile.token}/catalog/movie/ai-recs-movies.json`)).json();
