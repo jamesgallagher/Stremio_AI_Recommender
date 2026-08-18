@@ -530,8 +530,8 @@ ok('recommendationStore: recency-weighted affinity (the Pirates behaviour)', () 
   const now = Date.parse('2026-08-18T00:00:00Z');
   const day = 24 * 3600e3;
   const seeds = [
-    { type: 'movie', tmdb_id: 'S1', watched_at: '2026-08-18T00:00:00Z' },        // today -> weight 1.0
-    { type: 'movie', tmdb_id: 'S2', watched_at: new Date(now - 90 * day).toISOString() }, // 90d -> weight 0.5
+    { type: 'movie', tmdb_id: 'S1', title: 'Terminator 2', watched_at: '2026-08-18T00:00:00Z' },        // today -> weight 1.0
+    { type: 'movie', tmdb_id: 'S2', title: 'Predator', watched_at: new Date(now - 90 * day).toISOString() }, // 90d -> weight 0.5
   ];
   const recsBySeed = new Map([
     ['movie:S1', [{ type: 'movie', tmdb_id: 'A', title: 'A' }, { type: 'movie', tmdb_id: 'B', title: 'B' }]],
@@ -546,6 +546,10 @@ ok('recommendationStore: recency-weighted affinity (the Pirates behaviour)', () 
   // A (intersection of taste) outranks B, which outranks C
   assert.ok(out.get('movie:A').affinity > out.get('movie:B').affinity);
   assert.ok(out.get('movie:B').affinity > out.get('movie:C').affinity);
+  // "because you watched": strongest contributor wins — A came from both, but the
+  // recent seed (weight 1.0) beats the old one (0.5), so it credits Terminator 2.
+  assert.strictEqual(out.get('movie:A').because_title, 'Terminator 2');
+  assert.strictEqual(out.get('movie:C').because_title, 'Predator'); // C only came from the old seed
 });
 
 ok('recommendationStore: selectStrong gates on votes only (NOT rating), caps at 5, keeps TMDB order', () => {
@@ -614,15 +618,16 @@ ok('recommendationStore: upsert, dont_recommend suppresses + drops from pool', (
   const rs = require('../src/recommendationStore');
   const pid = 'rec-test';
   rs.upsertCandidates(pid, [
-    { type: 'movie', tmdb_id: '280', title: 'T2', year: 1991, primary_genre: 'Action', genres: 'Action,Science Fiction', vote_average: 8.1, affinity: 2.0, rec_count: 2, popularity: 50, poster: null },
+    { type: 'movie', tmdb_id: '280', title: 'T2', year: 1991, primary_genre: 'Action', genres: 'Action,Science Fiction', vote_average: 8.1, affinity: 2.0, rec_count: 2, because_title: 'The Terminator', popularity: 50, poster: null },
     { type: 'series', tmdb_id: '1399', title: 'GoT', year: 2011, primary_genre: 'Drama', genres: 'Drama,Fantasy', vote_average: 8.4, affinity: 1.0, rec_count: 1, popularity: 90, poster: null },
   ]);
   assert.strictEqual(rs.countRecommended(pid), 2);
   const t2 = rs.getRecommended(pid, { type: 'movie' })[0];
   assert.strictEqual(t2.title, 'T2');
-  // serve-time filter columns round-trip: full genre list + rating
+  // serve-time filter columns round-trip: full genre list + rating + the debug reason
   assert.strictEqual(t2.genres, 'Action,Science Fiction');
   assert.strictEqual(t2.vote_average, 8.1);
+  assert.strictEqual(t2.because_title, 'The Terminator');
   // Suppress the movie -> gone from the pool + in the dont_recommend set
   rs.addDontRecommend(pid, 'movie', '280', 'user');
   assert.strictEqual(rs.countRecommended(pid), 1);

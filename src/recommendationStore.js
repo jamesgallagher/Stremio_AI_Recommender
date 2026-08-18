@@ -67,6 +67,7 @@ function init() {
       age_classification  TEXT,           -- filled by the age-gate slice
       affinity    REAL,                   -- recency-weighted score (primary rank)
       rec_count   INTEGER,                -- raw # of watched titles that recommended it
+      because_title TEXT,                 -- strongest-contributing watched title (debug "why")
       popularity  REAL,
       poster      TEXT,
       first_shown_at INTEGER,             -- decay lifecycle (later slice)
@@ -93,7 +94,7 @@ function init() {
   `);
   // Migrate older beta DBs that predate the serve-time-filter columns. ADD COLUMN
   // throws "duplicate column" once present, so each is best-effort.
-  for (const [col, decl] of [['genres', 'TEXT'], ['vote_average', 'REAL']]) {
+  for (const [col, decl] of [['genres', 'TEXT'], ['vote_average', 'REAL'], ['because_title', 'TEXT']]) {
     try { db.get().exec(`ALTER TABLE recommended ADD COLUMN ${col} ${decl}`); } catch { /* already present */ }
   }
   ready = true;
@@ -102,9 +103,11 @@ function init() {
 const key = (type, tmdbId) => `${type}:${tmdbId}`;
 
 // PURE: aggregate recommendations into scored candidates. Exported for testing.
-//   seeds:          [{ tmdb_id, type, watched_at }]
+//   seeds:          [{ tmdb_id, type, watched_at, title }]
 //   recsBySeed:     Map<`type:tmdb_id`, recs[]>  (recs from tmdb.getRecommendations)
-// Returns Map<`type:tmdb_id`, candidate> with affinity + rec_count.
+// Returns Map<`type:tmdb_id`, candidate> with affinity + rec_count + because_title
+// (the strongest-contributing watched title — the "because you watched X" reason;
+// _because_weight is a transient field used only to pick it, not stored).
 function computeAffinity(seeds, recsBySeed, { halfLifeDays = HALF_LIFE_DAYS, nowMs = Date.now() } = {}) {
   const out = new Map();
   for (const seed of seeds) {
@@ -115,9 +118,12 @@ function computeAffinity(seeds, recsBySeed, { halfLifeDays = HALF_LIFE_DAYS, now
     for (const r of recs) {
       const k = key(r.type, r.tmdb_id);
       let c = out.get(k);
-      if (!c) { c = { ...r, affinity: 0, rec_count: 0 }; out.set(k, c); }
+      if (!c) { c = { ...r, affinity: 0, rec_count: 0, because_title: null, _because_weight: -1 }; out.set(k, c); }
       c.affinity += weight;
       c.rec_count += 1;
+      // Strongest contributor wins the reason. Strict `>` + most-recent-first
+      // seed order means ties go to the most recently watched title.
+      if (weight > c._because_weight) { c._because_weight = weight; c.because_title = seed.title || null; }
     }
   }
   return out;
@@ -165,18 +171,18 @@ function upsertCandidates(profileId, candidates) {
   init();
   const conn = db.get();
   const stmt = conn.prepare(`
-    INSERT INTO recommended (profile_id, type, tmdb_id, imdb_id, title, year, primary_genre, genres, vote_average, affinity, rec_count, popularity, poster, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO recommended (profile_id, type, tmdb_id, imdb_id, title, year, primary_genre, genres, vote_average, affinity, rec_count, because_title, popularity, poster, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(profile_id, type, tmdb_id) DO UPDATE SET
       affinity = excluded.affinity, rec_count = excluded.rec_count, popularity = excluded.popularity,
       primary_genre = excluded.primary_genre, genres = excluded.genres, vote_average = excluded.vote_average,
-      title = excluded.title, year = excluded.year, poster = excluded.poster
+      because_title = excluded.because_title, title = excluded.title, year = excluded.year, poster = excluded.poster
   `);
   conn.prepare('BEGIN').run();
   try {
     const now = Date.now();
     for (const c of candidates) {
-      stmt.run(profileId, c.type, c.tmdb_id, c.imdb_id || null, c.title, c.year, c.primary_genre || null, c.genres || null, c.vote_average ?? null, c.affinity, c.rec_count, c.popularity, c.poster || null, now);
+      stmt.run(profileId, c.type, c.tmdb_id, c.imdb_id || null, c.title, c.year, c.primary_genre || null, c.genres || null, c.vote_average ?? null, c.affinity, c.rec_count, c.because_title || null, c.popularity, c.poster || null, now);
     }
     conn.prepare('COMMIT').run();
   } catch (err) { conn.prepare('ROLLBACK').run(); throw err; }
