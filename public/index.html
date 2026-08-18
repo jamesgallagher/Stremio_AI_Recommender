@@ -759,6 +759,7 @@ async function checkSimklStatus(id) {
       sum.innerHTML = '<span style="color:var(--ok)">✓ connected</span>';
       flowEl.innerHTML = `<div class="muted">✓ Connected${r.username ? ` as <b style="color:var(--ok)">${esc(r.username)}</b>` : ''} — verified live. <b>${r.watched_count || 0}</b> watched title(s) in the local store.</div>
         <div style="margin-top:8px"><button class="ghost" onclick="syncSimkl('${id}', this)">Sync watched now</button>
+        <button class="ghost" onclick="buildRecs('${id}', this)" title="Build the recommendation pool from your watched history (TMDB recommendations, recency-weighted)">Build recommendations</button>
         <button class="ghost" onclick="disconnectSimkl('${id}')">Disconnect</button>
         <span class="tres" data-tres="simkl-sync"></span></div>`;
     } else {
@@ -791,6 +792,19 @@ async function connectSimkl(id) {
 async function disconnectSimkl(id) {
   await api(`/profiles/${id}/simkl/disconnect`, { method: 'POST' });
   checkSimklStatus(id);
+}
+
+async function buildRecs(id, btn) {
+  const out = document.querySelector(`[data-id="${id}"] [data-tres="simkl-sync"]`);
+  btn.disabled = true; out.textContent = ' ⟳ building recommendations (TMDB, may take a moment)…'; out.className = 'tres';
+  try {
+    const r = await api(`/profiles/${id}/recommend/build`, { method: 'POST' });
+    out.textContent = r.skipped
+      ? ' — ' + r.reason
+      : ` ✓ ${r.stored} recommendations from ${r.seeds} watched seed(s) (${r.raw} candidates, ${r.kept} after filters)`;
+    out.className = 'tres ' + (r.skipped ? 'err' : 'ok');
+  } catch (e) { out.textContent = ' ✗ ' + e.message; out.className = 'tres err'; }
+  finally { btn.disabled = false; }
 }
 
 async function syncSimkl(id, btn) {

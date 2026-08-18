@@ -14,6 +14,7 @@ const settings = require('./settings');
 const llm = require('./services/llm');
 const simkl = require('./services/simkl');
 const watchedStore = require('./watchedStore');
+const recommendationStore = require('./recommendationStore');
 
 const { version } = require('../package.json');
 
@@ -196,7 +197,7 @@ router.delete('/profiles/:id', (req, res) => {
   if (!config.removeProfile(req.params.id)) return res.status(404).json({ error: 'Profile not found' });
   deviceFlows.delete(req.params.id);
   simklFlows.delete(req.params.id);
-  try { watchedStore.deleteForProfile(req.params.id); } catch (err) { console.warn(`[watched] cleanup failed for ${req.params.id}: ${err.message}`); }
+  try { watchedStore.deleteForProfile(req.params.id); recommendationStore.deleteForProfile(req.params.id); } catch (err) { console.warn(`[store] cleanup failed for ${req.params.id}: ${err.message}`); }
   res.json({ ok: true });
 });
 
@@ -456,6 +457,39 @@ router.post('/profiles/:id/simkl/sync', async (req, res) => {
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
+});
+
+// ---- Recommendation builder (v6 F5) ----
+router.post('/profiles/:id/recommend/build', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  try {
+    res.json(await recommendationStore.buildRecommendations(profile, console));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Read the pool (Advanced tab "view Recommended Movies / Shows" + debugging).
+router.get('/profiles/:id/recommend', (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  res.json({
+    total: recommendationStore.countRecommended(profile.id),
+    movies: recommendationStore.getRecommended(profile.id, { type: 'movie', limit: 40 }),
+    series: recommendationStore.getRecommended(profile.id, { type: 'series', limit: 40 }),
+  });
+});
+
+// "Don't recommend" — the shared suppress endpoint (Advanced tab + in-app link +
+// Mobile Companion all POST here). Writes dont_recommend(reason=user).
+router.post('/profiles/:id/recommend/suppress', (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  const { type, tmdb_id } = req.body || {};
+  if (!type || !tmdb_id) return res.status(400).json({ error: 'type and tmdb_id required' });
+  recommendationStore.addDontRecommend(profile.id, type, tmdb_id, 'user');
+  res.json({ ok: true, total: recommendationStore.countRecommended(profile.id) });
 });
 
 router.post('/profiles/:id/simkl/disconnect', (req, res) => {

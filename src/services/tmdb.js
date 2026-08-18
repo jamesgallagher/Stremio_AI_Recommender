@@ -262,6 +262,41 @@ async function fullMeta(apiKey, type, imdbId, log = console) {
   };
 }
 
+// TMDB per-title "recommendations" — the v6 candidate source (collaborative,
+// current, no hallucination). Returns lightly-normalised items. type is the
+// SOURCE title's type; recommendations are same-type.
+async function getRecommendations(apiKey, type, tmdbId, { page = 1 } = {}) {
+  const isMovie = type === 'movie';
+  const data = await get(apiKey, `${isMovie ? 'movie' : 'tv'}/${tmdbId}/recommendations`, { language: 'en-US', page });
+  return (data.results || []).map((r) => ({
+    type,
+    tmdb_id: String(r.id),
+    title: isMovie ? r.title : r.name,
+    year: parseInt((isMovie ? r.release_date : r.first_air_date) || '', 10) || null,
+    genre_ids: r.genre_ids || [],
+    vote_average: r.vote_average || 0,
+    popularity: r.popularity || 0,
+    poster: r.poster_path || null,
+  }));
+}
+
+// Genre id -> name map (both movie and tv namespaces), fetched once and cached.
+// Recommendations carry genre_ids, not names; we need names for the primary
+// genre and the excluded-genre filter.
+let _genreMap = null;
+async function getGenreMap(apiKey) {
+  if (_genreMap) return _genreMap;
+  const map = {};
+  for (const kind of ['movie', 'tv']) {
+    try {
+      const data = await get(apiKey, `genre/${kind}/list`, { language: 'en-US' });
+      for (const g of data.genres || []) map[g.id] = g.name;
+    } catch { /* leave gaps rather than fail the whole build */ }
+  }
+  _genreMap = map;
+  return map;
+}
+
 // Pick a certification for the watched-store age column. Australia first (our
 // standard), then US, then any non-empty value.
 function pickCertification(results, kind) {
@@ -302,6 +337,8 @@ module.exports = {
   voteFloor,
   genreAndCert,
   pickCertification,
+  getRecommendations,
+  getGenreMap,
   toMeta,
   pickLogo,
   metaByTmdbId,

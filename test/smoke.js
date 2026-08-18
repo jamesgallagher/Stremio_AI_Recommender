@@ -647,6 +647,48 @@ ok('watchedStore: upsert dedupes by simkl_id, exclusion sets, delete (SQLite)', 
   assert.strictEqual(ws.countWatched(pid), 0);
 });
 
+ok('recommendationStore: recency-weighted affinity (the Pirates behaviour)', () => {
+  const rs = require('../src/recommendationStore');
+  const now = Date.parse('2026-08-18T00:00:00Z');
+  const day = 24 * 3600e3;
+  const seeds = [
+    { type: 'movie', tmdb_id: 'S1', watched_at: '2026-08-18T00:00:00Z' },        // today -> weight 1.0
+    { type: 'movie', tmdb_id: 'S2', watched_at: new Date(now - 90 * day).toISOString() }, // 90d -> weight 0.5
+  ];
+  const recsBySeed = new Map([
+    ['movie:S1', [{ type: 'movie', tmdb_id: 'A', title: 'A' }, { type: 'movie', tmdb_id: 'B', title: 'B' }]],
+    ['movie:S2', [{ type: 'movie', tmdb_id: 'A', title: 'A' }, { type: 'movie', tmdb_id: 'C', title: 'C' }]],
+  ]);
+  const out = rs.computeAffinity(seeds, recsBySeed, { halfLifeDays: 90, nowMs: now });
+  // A recommended by both (recent 1.0 + old 0.5 = 1.5); B by recent only (1.0); C by old only (0.5)
+  assert.ok(Math.abs(out.get('movie:A').affinity - 1.5) < 1e-9);
+  assert.strictEqual(out.get('movie:A').rec_count, 2);
+  assert.ok(Math.abs(out.get('movie:B').affinity - 1.0) < 1e-9);
+  assert.ok(Math.abs(out.get('movie:C').affinity - 0.5) < 1e-9);
+  // A (intersection of taste) outranks B, which outranks C
+  assert.ok(out.get('movie:A').affinity > out.get('movie:B').affinity);
+  assert.ok(out.get('movie:B').affinity > out.get('movie:C').affinity);
+});
+
+ok('recommendationStore: upsert, dont_recommend suppresses + drops from pool', () => {
+  const rs = require('../src/recommendationStore');
+  const pid = 'rec-test';
+  rs.upsertCandidates(pid, [
+    { type: 'movie', tmdb_id: '280', title: 'T2', year: 1991, primary_genre: 'Action', affinity: 2.0, rec_count: 2, popularity: 50, poster: null },
+    { type: 'series', tmdb_id: '1399', title: 'GoT', year: 2011, primary_genre: 'Drama', affinity: 1.0, rec_count: 1, popularity: 90, poster: null },
+  ]);
+  assert.strictEqual(rs.countRecommended(pid), 2);
+  assert.strictEqual(rs.getRecommended(pid, { type: 'movie' })[0].title, 'T2');
+  // Suppress the movie -> gone from the pool + in the dont_recommend set
+  rs.addDontRecommend(pid, 'movie', '280', 'user');
+  assert.strictEqual(rs.countRecommended(pid), 1);
+  assert.ok(rs.dontRecommendKeys(pid).has('movie:280'));
+  // A rebuild must NOT re-add a suppressed candidate (build filters on this set)
+  assert.ok(rs.dontRecommendKeys(pid).has('movie:280'));
+  rs.deleteForProfile(pid);
+  assert.strictEqual(rs.countRecommended(pid), 0);
+});
+
 ok('llm: chatUrl joins, extractArray tolerates wrappers, groq model list', () => {
   const llm = require('../src/services/llm');
   assert.strictEqual(llm.chatUrl('http://h:1/v1/'), 'http://h:1/v1/chat/completions');
@@ -1031,6 +1073,20 @@ async function httpTests() {
   assert.strictEqual(st2.watched_count, 0);
   console.log('  ✓ Simkl keys persist (PUT whitelist) + watched sync/count wired to SQLite');
 
+  // Recommendation builder + suppress (no-network paths). Global TMDB key was
+  // set to ROUNDTRIP-TMDB earlier, but there are no watched seeds -> skipped.
+  const build = await (await fetch(`${BASE}/api/profiles/${profile.id}/recommend/build`, { method: 'POST' })).json();
+  assert.strictEqual(build.skipped, true);
+  assert.strictEqual(build.reason, 'no watched titles to seed from');
+  const recView = await (await fetch(`${BASE}/api/profiles/${profile.id}/recommend`)).json();
+  assert.strictEqual(recView.total, 0);
+  // Suppress endpoint validates its input and records a rejection
+  const badSuppress = await fetch(`${BASE}/api/profiles/${profile.id}/recommend/suppress`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  assert.strictEqual(badSuppress.status, 400);
+  const okSuppress = await (await fetch(`${BASE}/api/profiles/${profile.id}/recommend/suppress`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'movie', tmdb_id: '999' }) })).json();
+  assert.strictEqual(okSuppress.ok, true);
+  console.log('  ✓ recommendation build (seedless -> skipped) + view + suppress endpoints');
+
   // Empty cache -> warming-up card, short client cache
   let cat = await (await fetch(`${BASE}/addon/${profile.token}/catalog/movie/ai-recs-movies.json`)).json();
   assert.strictEqual(cat.metas.length, 1);
@@ -1306,7 +1362,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 44 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 45 async/http).`);
   process.exit(0);
 }
 
