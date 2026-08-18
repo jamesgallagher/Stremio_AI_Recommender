@@ -450,6 +450,8 @@ router.post('/profiles/:id/simkl/sync', async (req, res) => {
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
   try {
     const result = await watchedStore.syncFromSimkl(profile, console, { force: !!req.body?.force });
+    // Top up genre/age enrichment for anything newly ingested (best-effort).
+    try { result.enrich = await watchedStore.enrichPending(profile.id, console); } catch (err) { result.enrich = { error: err.message }; }
     res.json(result);
   } catch (err) {
     res.status(400).json({ error: err.message });

@@ -291,6 +291,25 @@ ok('rebuild: recPasses "Anime" exclusion — native tag + ja fallback', () => {
   assert.ok(!rebuild.recPasses(tagged, 'movie', { ...f, excluded_genres: ['Animation'] }, quiet));
 });
 
+ok('tmdb: pickCertification prefers AU, then US, then any (movie + tv)', () => {
+  const t = require('../src/services/tmdb');
+  // Movie release_dates: AU wins over US
+  const movie = [
+    { iso_3166_1: 'US', release_dates: [{ certification: 'R' }] },
+    { iso_3166_1: 'AU', release_dates: [{ certification: 'MA15+' }] },
+  ];
+  assert.strictEqual(t.pickCertification(movie, 'movie'), 'MA15+');
+  // No AU -> US
+  assert.strictEqual(t.pickCertification([{ iso_3166_1: 'US', release_dates: [{ certification: 'PG-13' }] }], 'movie'), 'PG-13');
+  // TV uses .rating; AU preferred
+  const tv = [{ iso_3166_1: 'US', rating: 'TV-14' }, { iso_3166_1: 'AU', rating: 'M' }];
+  assert.strictEqual(t.pickCertification(tv, 'tv'), 'M');
+  // Neither AU nor US -> first non-empty
+  assert.strictEqual(t.pickCertification([{ iso_3166_1: 'GB', rating: '15' }], 'tv'), '15');
+  assert.strictEqual(t.pickCertification([], 'movie'), null);
+  assert.strictEqual(t.pickCertification(undefined, 'tv'), null);
+});
+
 ok('tmdb: pickLogo prefers English, builds URL, handles empty', () => {
   assert.strictEqual(
     tmdb.pickLogo([{ iso_639_1: 'de', file_path: '/de.png' }, { iso_639_1: 'en', file_path: '/en.png' }]),
@@ -612,6 +631,18 @@ ok('watchedStore: upsert dedupes by simkl_id, exclusion sets, delete (SQLite)', 
   assert.ok(sets.tmdb.has('280') && sets.tmdb.has('130065'));
   // Items with no simkl_id are skipped (it's the primary key)
   assert.strictEqual(ws.upsertMany(pid, [{ type: 'movie', title: 'noid', imdb_id: 'ttX' }]), 0);
+
+  // Enrichment: both rows start unenriched; fill-nulls updates only nulls
+  assert.strictEqual(ws.getUnenriched(pid).length, 2);
+  ws.updateEnrichment(pid, 53510, { genre: 'Action', age: 'MA15+' });
+  assert.strictEqual(ws.getUnenriched(pid).length, 1); // one still missing
+  const t2 = ws.getWatched(pid, { type: 'movie' })[0];
+  assert.strictEqual(t2.primary_genre, 'Action');
+  assert.strictEqual(t2.age_classification, 'MA15+');
+  // A null value must not wipe an existing one (COALESCE)
+  ws.updateEnrichment(pid, 53510, { genre: null, age: null });
+  assert.strictEqual(ws.getWatched(pid, { type: 'movie' })[0].primary_genre, 'Action');
+
   ws.deleteForProfile(pid);
   assert.strictEqual(ws.countWatched(pid), 0);
 });

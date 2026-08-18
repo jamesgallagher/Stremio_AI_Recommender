@@ -141,6 +141,7 @@ app.listen(PORT, '0.0.0.0', () => {
 // first (when auto-scrobble is configured), so the exclusion refresh in the
 // same tick picks up whatever it just pushed.
 const scrobble = require('./services/scrobble');
+const watchedStore = require('./watchedStore');
 const TICK_MS = 60 * 60e3;
 function tick() {
   for (const profile of config.listProfiles()) {
@@ -148,6 +149,14 @@ function tick() {
       scrobble.ensureSynced(profile);
       rebuild.ensureFresh(profile);
       rebuild.ensureExclusionsFresh(profile);
+      // v6: pull Simkl watched history (activities-gated — a no-op when nothing
+      // changed) into the local store, then top up genre/age enrichment. Both
+      // are async and fire-and-forget; failures are logged, never fatal.
+      if (profile.simkl_auth?.access_token) {
+        watchedStore.syncFromSimkl(profile)
+          .then(() => watchedStore.enrichPending(profile.id))
+          .catch((err) => console.warn(`[simkl] ${profile.name}: watched sync/enrich failed — ${err.message}`));
+      }
     } catch (err) {
       console.error(`[scheduler] ${profile.name}: ${err.message}`);
     }

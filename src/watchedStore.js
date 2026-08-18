@@ -9,6 +9,10 @@
 // across re-syncs (the upsert never overwrites them with null).
 const db = require('./db');
 const simkl = require('./services/simkl');
+const settings = require('./settings');
+const tmdb = require('./services/tmdb');
+const animeMap = require('./services/animeMap');
+const mal = require('./services/mal');
 
 let ready = false;
 function init() {
@@ -106,6 +110,63 @@ function deleteForProfile(profileId) {
   db.get().prepare('DELETE FROM sync_state WHERE profile_id = ?').run(profileId);
 }
 
+// ---- ingest enrichment: fill primary_genre + age_classification ----
+// Simkl's payload carries neither, so we enrich after ingest. Anime titles get
+// their age band from MAL (v5.2 pipeline); everything else from a TMDB genre +
+// certification lookup. Fill-nulls only (never overwrites an existing value).
+function getUnenriched(profileId, limit = 40) {
+  init();
+  return db.get().prepare(
+    'SELECT * FROM watched WHERE profile_id = ? AND (primary_genre IS NULL OR age_classification IS NULL) ORDER BY watched_at DESC LIMIT ?',
+  ).all(profileId, limit);
+}
+
+function updateEnrichment(profileId, simklId, { genre, age }) {
+  init();
+  db.get().prepare(
+    'UPDATE watched SET primary_genre = COALESCE(?, primary_genre), age_classification = COALESCE(?, age_classification) WHERE profile_id = ? AND simkl_id = ?',
+  ).run(genre || null, age || null, profileId, simklId);
+}
+
+// Enrich rows still missing genre/age. TMDB key is GLOBAL (Server Config).
+// Capped per run so a large initial library enriches over several ticks rather
+// than one long stall; MAL lookups are paced by mal.ratings.
+async function enrichPending(profileId, log = console, { limit = 40 } = {}) {
+  init();
+  const s = settings.getSettings();
+  const tmdbKey = s?.keys?.tmdb_api_key; // non-anime enrichment needs it; anime uses MAL
+  const rows = getUnenriched(profileId, limit);
+  if (!rows.length) return { enriched: 0, remaining: 0 };
+
+  await animeMap.ensureLoaded(log);
+  // Batch the anime MAL lookups: collect mal ids, one ratings() call.
+  const anime = new Map(); // row.simkl_id -> mal id
+  for (const r of rows) {
+    const hit = animeMap.lookup(r.imdb_id, r.tmdb_id);
+    if (hit?.mal) anime.set(r.simkl_id, hit.mal);
+  }
+  const malVerdicts = anime.size ? await mal.ratings([...anime.values()], log) : new Map();
+
+  let enriched = 0;
+  for (const r of rows) {
+    let genre = null; let age = null;
+    if (anime.has(r.simkl_id)) {
+      const v = malVerdicts.get(anime.get(r.simkl_id));
+      genre = 'Anime';
+      age = v?.code || null; // e.g. PG-13 / R / Rx; null if MAL hasn't rated it
+    } else if (r.tmdb_id && tmdbKey) {
+      const gc = await tmdb.genreAndCert(tmdbKey, r.type, r.tmdb_id, log);
+      genre = gc.genre; age = gc.certification;
+    }
+    if (genre || age) { updateEnrichment(profileId, r.simkl_id, { genre, age }); enriched++; }
+  }
+  const remaining = db.get().prepare(
+    'SELECT COUNT(*) AS n FROM watched WHERE profile_id = ? AND (primary_genre IS NULL OR age_classification IS NULL)',
+  ).get(profileId).n;
+  log.log(`[watched] ${profileId}: enriched ${enriched} of ${rows.length} (${remaining} still pending)`);
+  return { enriched, remaining };
+}
+
 function getSyncState(profileId) {
   init();
   return db.get().prepare('SELECT * FROM sync_state WHERE profile_id = ?').get(profileId) || null;
@@ -163,4 +224,7 @@ module.exports = {
   getSyncState,
   setSyncState,
   syncFromSimkl,
+  getUnenriched,
+  updateEnrichment,
+  enrichPending,
 };

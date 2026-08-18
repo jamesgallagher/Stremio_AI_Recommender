@@ -262,9 +262,46 @@ async function fullMeta(apiKey, type, imdbId, log = console) {
   };
 }
 
+// Pick a certification for the watched-store age column. Australia first (our
+// standard), then US, then any non-empty value.
+function pickCertification(results, kind) {
+  if (!Array.isArray(results)) return null;
+  const byCountry = (cc) => results.find((r) => r.iso_3166_1 === cc);
+  const certOf = (entry) => {
+    if (!entry) return null;
+    if (kind === 'movie') {
+      const rd = (entry.release_dates || []).map((d) => d.certification).find((c) => c);
+      return rd || null;
+    }
+    return entry.rating || null;
+  };
+  return certOf(byCountry('AU')) || certOf(byCountry('US')) || (results.map(certOf).find((c) => c) || null);
+}
+
+// Lightweight enrichment lookup: the top genre + a certification, in ONE details
+// call (no images/videos/season batching). Used to fill the watched store's
+// primary_genre / age_classification columns. Returns { genre, certification }.
+async function genreAndCert(apiKey, type, tmdbId, log = console) {
+  try {
+    const isMovie = type === 'movie';
+    const data = await get(apiKey, `${isMovie ? 'movie' : 'tv'}/${tmdbId}`, {
+      language: 'en-US',
+      append_to_response: isMovie ? 'release_dates' : 'content_ratings',
+    });
+    const genre = data.genres?.[0]?.name || null;
+    const results = isMovie ? data.release_dates?.results : data.content_ratings?.results;
+    return { genre, certification: pickCertification(results, isMovie ? 'movie' : 'tv') };
+  } catch (err) {
+    log.warn(`[tmdb] genreAndCert ${type}/${tmdbId} failed: ${err.message}`);
+    return { genre: null, certification: null };
+  }
+}
+
 module.exports = {
   GENRE_ALIASES,
   voteFloor,
+  genreAndCert,
+  pickCertification,
   toMeta,
   pickLogo,
   metaByTmdbId,
