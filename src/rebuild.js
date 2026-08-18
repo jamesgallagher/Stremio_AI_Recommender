@@ -40,7 +40,6 @@ const mal = require('./services/mal');
 
 const STALE_MS = (parseInt(process.env.STALE_HOURS, 10) || 24) * 3600e3;
 const BACKOFF_MS = (parseInt(process.env.BACKOFF_MINUTES, 10) || 30) * 60e3;
-const WATCHED_REFRESH_MS = 60 * 60e3; // exclusion-only refresh cadence
 const MIN_METAS = 5;
 const DEFAULT_LIST_SIZE = 20;
 // Bench (hidden reserve) is always the same size as the displayed list.
@@ -49,7 +48,6 @@ const MAX_EXTRA_PAGES = 8;    // headroom for the larger (50-title) kids lists
 const EXTRA_PAGE_SIZE = 50;
 
 const locks = new Set(); // profile ids currently rebuilding
-const exclusionLocks = new Set(); // profile ids currently refreshing watched sets
 // Per-catalog outcome of each profile's most recent completed rebuild.
 // In-memory: the portal polls status.rebuilding after firing a rebuild (the
 // endpoint returns immediately — a response held open for a multi-minute
@@ -78,32 +76,6 @@ function status(profile) {
     stale: isStale(cache.movie) || isStale(cache.series),
     last_results: lastResults.get(profile.id) || null,
   };
-}
-
-// Fetch the full watched state (both types) and persist the snapshot plus the
-// last_activities timestamps it corresponds to. With force=false the cheap
-// last_activities call runs first and null is returned when nothing was
-// watched since the stored snapshot (callers skip the expensive work).
-// Activity is read BEFORE the watched lists: a play landing in between makes
-// the snapshot look older than it is, so the next hourly check re-fetches —
-// errors in the safe direction.
-async function syncWatched(profile, { force = false } = {}) {
-  const activity = await trakt.getLastActivities(profile);
-  const prev = store.loadCache(profile.id).watched_activity || {};
-  const watchedChanged = force
-    || !(prev.movies === activity.movies && prev.episodes === activity.episodes);
-  const watchlistChanged = prev.watchlist !== activity.watchlist;
-  let watchedByType = null;
-  if (watchedChanged) {
-    watchedByType = {
-      movie: await trakt.getWatchedSets(profile, 'movie'),
-      series: await trakt.getWatchedSets(profile, 'series'),
-    };
-    store.saveWatched(profile.id, 'movie', watchedByType.movie);
-    store.saveWatched(profile.id, 'series', watchedByType.series);
-  }
-  store.saveWatchedActivity(profile.id, activity); // records watchlist stamp too
-  return { watchedByType, watchlistChanged };
 }
 
 // Kids-mode gate: strict Common Sense verification via MDBList.
@@ -231,12 +203,12 @@ function shuffle(arr) {
 // the same fixed sequence. Watched status is ignored by design. Kids-mode age
 // limits still apply — a child profile must never bypass the Common Sense gate
 // via an extra catalog.
-// Watch Later: mirror of the profile's built-in Trakt watchlist, in the
-// user's own order. No taste/rating filters — every item is an explicit user
-// choice — but watched titles are excluded (a watch-later list must not show
-// what's been seen) and the kids-mode CSM gate still applies. Metas enrich
-// via one TMDB details call each; items TMDB can't resolve fall back to a
-// minimal tt-id meta (RPDB fills the poster at serve time).
+// Watch Later: mirror of the profile's Simkl plan-to-watch list, in the user's
+// own order. No taste/rating filters — every item is an explicit user choice —
+// but watched titles are excluded (a watch-later list must not show what's been
+// seen) and the kids-mode age gate still applies. Metas enrich via one TMDB
+// details call each; items TMDB can't resolve fall back to a minimal tt-id meta
+// (RPDB fills the poster at serve time).
 const WATCHLIST_CAP = 100;
 
 // Second age layer for EVERY extra catalog on an age-limited profile — the
@@ -311,10 +283,7 @@ async function buildTraktListCatalog(profile, def, log = console) {
   log.log(`[extra] ${profile.name}/${def.id}: ${items.length} item(s) on ${def.user}/${def.slug}`);
 
   const watchedImdb = def.prune_watched
-    ? new Set([
-      ...(store.loadCache(profile.id).watched?.movie?.imdb || []),
-      ...(store.loadCache(profile.id).watched?.series?.imdb || []),
-    ])
+    ? watchedStore.watchedIdSets(profile.id).imdb
     : new Set();
 
   const picked = [];
@@ -456,61 +425,15 @@ function ensureFresh(profile, log = console) {
     (d) => catalogs.requirementMet(profile, d) && isStale(cache.extras?.[d.id]),
   );
   if (!extrasStale) return false;
-  if (locks.has(profile.id) || exclusionLocks.has(profile.id)) return false;
+  if (locks.has(profile.id)) return false;
   if (Date.now() - (cache.last_attempt_at || 0) < BACKOFF_MS) return false;
   rebuildProfile(profile, log, { extras: true })
     .catch((err) => log.error(`[rebuild] unexpected: ${err.message}`));
   return true;
 }
 
-// Cheap hourly exclusion refresh: one last_activities call, and only when
-// something new was watched, re-fetch the watched sets and prune those titles
-// from the cached lists in place — watched items disappear within the hour
-// instead of waiting for the daily rebuild. Never generates recommendations.
-function ensureExclusionsFresh(profile, log = console) {
-  const cache = store.loadCache(profile.id);
-  if (Date.now() - (cache.watched_synced_at || 0) < WATCHED_REFRESH_MS) return false;
-  if (locks.has(profile.id) || exclusionLocks.has(profile.id)) return false;
-  if (!profile.trakt_auth?.access_token) return false;
-  exclusionLocks.add(profile.id);
-  (async () => {
-    try {
-      const { watchedByType, watchlistChanged } = await syncWatched(profile);
-      if (watchedByType) {
-        const unionImdb = new Set([...watchedByType.movie.imdbIds, ...watchedByType.series.imdbIds]);
-        for (const type of ['movie', 'series']) {
-          const removed = store.pruneWatched(profile.id, type, unionImdb);
-          if (removed > 0) {
-            log.log(`[exclusions] ${profile.name}/${type}: pruned ${removed} newly-watched title(s)`);
-          }
-        }
-      }
-      // Watch Later freshness: when last_activities says the watchlist moved,
-      // rebuild just the watchlist catalogs (no LLM, a handful of API calls) —
-      // titles added from Stremio/Nuvio's long-press appear within the hour.
-      if (watchlistChanged) {
-        for (const def of catalogs.enabledExtras(profile).filter((d) => d.source === 'trakt_watchlist')) {
-          try {
-            const metas = await buildExtraCatalog(profile, def, log);
-            store.swapExtra(profile.id, def.id, metas);
-            log.log(`[watchlist] ${profile.name}/${def.id}: refreshed (${metas.length} titles) — watchlist changed on Trakt`);
-          } catch (err) {
-            log.warn(`[watchlist] ${profile.name}/${def.id}: refresh failed: ${err.message}`);
-          }
-        }
-      }
-    } catch (err) {
-      log.warn(`[exclusions] ${profile.name}: refresh failed: ${err.message}`);
-    } finally {
-      exclusionLocks.delete(profile.id);
-    }
-  })();
-  return true;
-}
-
 module.exports = {
   ensureFresh,
-  ensureExclusionsFresh,
   rebuildProfile,
   buildExtraCatalog,
   status,

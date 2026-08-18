@@ -266,7 +266,6 @@ router.get('/catalog/:type/:catalogId{/:extra}', async (req, res) => {
   }
 
   rebuild.ensureFresh(profile); // SWR: fire-and-forget; this request serves cache
-  rebuild.ensureExclusionsFresh(profile); // hourly watched-set refresh (background)
 
   const cache = store.loadCache(profile.id);
   const entry = extraDef ? cache.extras?.[extraDef.id] : cache[def.type];

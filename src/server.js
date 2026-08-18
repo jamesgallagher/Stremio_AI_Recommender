@@ -134,12 +134,10 @@ app.listen(PORT, '0.0.0.0', () => {
 });
 
 // Scheduler: keep lists warm and pruned so nobody ever waits on a cold open.
-// Checks every profile hourly; ensureFresh() is a no-op unless the cache is
-// past the 24h staleness threshold, and ensureExclusionsFresh() costs one
-// last_activities call per profile when nothing new was watched.
-// ensureSynced() mirrors the profile's Nuvio/Stremio watched history into Trakt
-// first (when auto-scrobble is configured), so the exclusion refresh in the
-// same tick picks up whatever it just pushed.
+// Checks every profile hourly; ensureFresh() is a no-op unless a curated extra
+// catalog is past the 24h staleness threshold. ensureSynced() mirrors the
+// profile's Nuvio/Stremio watched history into Trakt when auto-scrobble is
+// configured.
 const scrobble = require('./services/scrobble');
 const watchedStore = require('./watchedStore');
 const recommendationStore = require('./recommendationStore');
@@ -149,7 +147,6 @@ function tick() {
     try {
       scrobble.ensureSynced(profile);
       rebuild.ensureFresh(profile);
-      rebuild.ensureExclusionsFresh(profile);
       // v6: pull Simkl watched history (activities-gated — a no-op when nothing
       // changed) into the local store, top up genre/age enrichment, then rebuild
       // the recommendation pool if the watched history moved (ensureBuilt is a
