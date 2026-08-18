@@ -135,6 +135,13 @@ function keyField(dataKey, value) {
   </div>`;
 }
 
+// A plain (non-secret) text input — for values that aren't sensitive, like the
+// custom LLM name and URI. No mask, no eye toggle.
+function textField(dataKey, value, placeholder = '') {
+  const v = esc(value || '');
+  return `<input type="text" data-key="${dataKey}" data-orig="${v}" value="${v}" placeholder="${esc(placeholder)}" autocomplete="off" spellcheck="false" ${IGNORE_PW_MANAGERS}>`;
+}
+
 // A key field (grows to fill) with an optional inline Test button; the test
 // result renders on its own line just below. Layout: label, then this row,
 // then any description text.
@@ -434,9 +441,9 @@ function renderServerConfig(data) {
     <details open><summary>LLM — Custom endpoint, then Groq fallback</summary>
       <div style="border-left:2px solid var(--border);padding-left:12px;margin-top:6px">
         <label>Custom LLM name / model <span class="muted">(sent as the model, e.g. qwen3.5:9b)</span></label>
-        ${keyField('custom_name', llmv.custom_name)}
+        ${textField('custom_name', llmv.custom_name, 'qwen3.5:9b')}
         <label>Custom LLM URI <span class="muted">— must support OpenAI v1 (<code>/chat/completions</code>)</span></label>
-        <div class="keyrow">${keyField('custom_uri', llmv.custom_uri)}<button class="ghost mini" onclick="testLlm(this)">Test</button></div>
+        <div class="keyrow">${textField('custom_uri', llmv.custom_uri, 'http://localhost:11434/v1')}<button class="ghost mini" onclick="testLlm(this)">Test</button></div>
         <span class="tres" data-tres="llm"></span>
         <label>Custom LLM API key <span class="muted">(blank for keyless local servers)</span></label>
         ${keyField('custom_api_key', llmv.custom_api_key)}
@@ -480,6 +487,7 @@ async function saveSettings(btn) {
   btn.disabled = true;
   try {
     await api('/settings', { method: 'PUT', body: collectSettings() });
+    dirty = false; // saved — let the auto-refresh resume
     toast('Server config saved');
     load();
   } catch (e) { toast('Save failed: ' + e.message); } finally { btn.disabled = false; }
@@ -776,7 +784,9 @@ function copyText(t) { navigator.clipboard.writeText(t).then(() => toast('Copied
 // it skips whenever there is unsaved input (typing, ticking checkboxes) or a
 // Trakt authorization in progress (PIN on screen).
 let dirty = false;
-document.addEventListener('input', e => { if (e.target.closest('#profiles')) dirty = true; });
+// Any unsaved edit — in a profile OR in Server Config — pauses the auto-refresh
+// so it can't wipe what you're typing before you save.
+document.addEventListener('input', e => { if (e.target.closest('#profiles') || e.target.closest('#serverConfig')) dirty = true; });
 
 function flowActive() {
   return [...document.querySelectorAll('.flow-status')].some(el => el.textContent.trim() !== '');
