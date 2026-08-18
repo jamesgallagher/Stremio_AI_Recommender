@@ -593,6 +593,29 @@ ok('simkl: parseWatchedItems maps the real all-items shape (verified fixtures)',
   assert.deepStrictEqual(simkl.parseWatchedItems(null, 'movies'), []);
 });
 
+ok('watchedStore: upsert dedupes by simkl_id, exclusion sets, delete (SQLite)', () => {
+  const ws = require('../src/watchedStore');
+  const pid = 'ws-test';
+  const n = ws.upsertMany(pid, [
+    { type: 'movie', title: 'Terminator 2', year: 1991, tmdb_id: '280', imdb_id: 'tt0103064', simkl_id: 53510, watched_at: '2026-08-18T03:49:25Z' },
+    { type: 'series', title: '1943', year: 2013, tmdb_id: '130065', imdb_id: 'tt4516770', simkl_id: 1587730, watched_at: '2026-08-18T03:46:48Z' },
+  ]);
+  assert.strictEqual(n, 2);
+  assert.strictEqual(ws.countWatched(pid), 2);
+  // Re-upsert the same simkl_id with a newer date -> UPDATE, not a duplicate row
+  ws.upsertMany(pid, [{ type: 'movie', title: 'Terminator 2', year: 1991, tmdb_id: '280', imdb_id: 'tt0103064', simkl_id: 53510, watched_at: '2026-08-19T00:00:00Z' }]);
+  assert.strictEqual(ws.countWatched(pid), 2);
+  assert.strictEqual(ws.getWatched(pid, { type: 'movie' })[0].watched_at, '2026-08-19T00:00:00Z');
+  // Exclusion sets for de-duping recommendations
+  const sets = ws.watchedIdSets(pid);
+  assert.ok(sets.imdb.has('tt0103064') && sets.imdb.has('tt4516770'));
+  assert.ok(sets.tmdb.has('280') && sets.tmdb.has('130065'));
+  // Items with no simkl_id are skipped (it's the primary key)
+  assert.strictEqual(ws.upsertMany(pid, [{ type: 'movie', title: 'noid', imdb_id: 'ttX' }]), 0);
+  ws.deleteForProfile(pid);
+  assert.strictEqual(ws.countWatched(pid), 0);
+});
+
 ok('llm: chatUrl joins, extractArray tolerates wrappers, groq model list', () => {
   const llm = require('../src/services/llm');
   assert.strictEqual(llm.chatUrl('http://h:1/v1/'), 'http://h:1/v1/chat/completions');
@@ -968,7 +991,14 @@ async function httpTests() {
   const after = (await (await fetch(`${BASE}/api/profiles`)).json()).profiles.find(pp => pp.id === profile.id);
   assert.strictEqual(after.keys.simkl_client_id, 'CID-WL-1');
   assert.strictEqual(after.keys.simkl_client_secret, 'SEC-WL-2');
-  console.log('  ✓ Simkl auth routes + keys persist through the PUT whitelist');
+  // Watched sync with no connected account -> skipped, network-free; status
+  // reports a watched_count from the SQLite store.
+  const sync = await (await fetch(`${BASE}/api/profiles/${profile.id}/simkl/sync`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).json();
+  assert.strictEqual(sync.skipped, true);
+  assert.strictEqual(sync.reason, 'Simkl not connected');
+  const st2 = await (await fetch(`${BASE}/api/profiles/${profile.id}/simkl/status`)).json();
+  assert.strictEqual(st2.watched_count, 0);
+  console.log('  ✓ Simkl keys persist (PUT whitelist) + watched sync/count wired to SQLite');
 
   // Empty cache -> warming-up card, short client cache
   let cat = await (await fetch(`${BASE}/addon/${profile.token}/catalog/movie/ai-recs-movies.json`)).json();
@@ -1245,7 +1275,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 43 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 44 async/http).`);
   process.exit(0);
 }
 

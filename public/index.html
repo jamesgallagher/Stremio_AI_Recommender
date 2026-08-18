@@ -757,8 +757,10 @@ async function checkSimklStatus(id) {
     const r = await api(`/profiles/${id}/simkl/status`);
     if (r.connected) {
       sum.innerHTML = '<span style="color:var(--ok)">✓ connected</span>';
-      flowEl.innerHTML = `<div class="muted">✓ Connected${r.username ? ` as <b style="color:var(--ok)">${esc(r.username)}</b>` : ''} — verified live.</div>
-        <div style="margin-top:8px"><button class="ghost" onclick="disconnectSimkl('${id}')">Disconnect</button></div>`;
+      flowEl.innerHTML = `<div class="muted">✓ Connected${r.username ? ` as <b style="color:var(--ok)">${esc(r.username)}</b>` : ''} — verified live. <b>${r.watched_count || 0}</b> watched title(s) in the local store.</div>
+        <div style="margin-top:8px"><button class="ghost" onclick="syncSimkl('${id}', this)">Sync watched now</button>
+        <button class="ghost" onclick="disconnectSimkl('${id}')">Disconnect</button>
+        <span class="tres" data-tres="simkl-sync"></span></div>`;
     } else {
       const needsReconnect = (r.reason || '').includes('reconnect');
       sum.innerHTML = needsReconnect ? '<span style="color:var(--err)">— reconnect</span>' : '';
@@ -789,6 +791,19 @@ async function connectSimkl(id) {
 async function disconnectSimkl(id) {
   await api(`/profiles/${id}/simkl/disconnect`, { method: 'POST' });
   checkSimklStatus(id);
+}
+
+async function syncSimkl(id, btn) {
+  const out = document.querySelector(`[data-id="${id}"] [data-tres="simkl-sync"]`);
+  btn.disabled = true; out.textContent = ' ⟳ syncing…'; out.className = 'tres';
+  try {
+    const r = await api(`/profiles/${id}/simkl/sync`, { method: 'POST', body: { force: true } });
+    if (r.skipped) out.textContent = ' — ' + (r.reason === 'unchanged' ? `up to date (${r.count} titles)` : r.reason);
+    else out.textContent = ` ✓ ${r.total} watched title(s) (movies ${r.breakdown.movies}, shows ${r.breakdown.shows}, anime ${r.breakdown.anime})`;
+    out.className = 'tres ok';
+    checkSimklStatus(id);
+  } catch (e) { out.textContent = ' ✗ ' + e.message; out.className = 'tres err'; }
+  finally { btn.disabled = false; }
 }
 
 async function diagnose(id, btn) {

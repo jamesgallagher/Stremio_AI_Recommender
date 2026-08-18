@@ -13,6 +13,7 @@ const crypto = require('./services/crypto');
 const settings = require('./settings');
 const llm = require('./services/llm');
 const simkl = require('./services/simkl');
+const watchedStore = require('./watchedStore');
 
 const { version } = require('../package.json');
 
@@ -194,6 +195,8 @@ router.put('/profiles/:id', (req, res) => {
 router.delete('/profiles/:id', (req, res) => {
   if (!config.removeProfile(req.params.id)) return res.status(404).json({ error: 'Profile not found' });
   deviceFlows.delete(req.params.id);
+  simklFlows.delete(req.params.id);
+  try { watchedStore.deleteForProfile(req.params.id); } catch (err) { console.warn(`[watched] cleanup failed for ${req.params.id}: ${err.message}`); }
   res.json({ ok: true });
 });
 
@@ -430,12 +433,27 @@ router.get('/profiles/:id/simkl/status', async (req, res) => {
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
   const flow = simklFlows.get(profile.id);
   const check = await simkl.checkConnection(profile.keys.simkl_client_id, profile.simkl_auth?.access_token);
+  let watched_count = 0;
+  try { watched_count = watchedStore.countWatched(profile.id); } catch { /* store may be empty */ }
   res.json({
     connected: check.valid,
     username: check.username || profile.simkl_auth?.username || null,
     reason: check.valid ? null : check.reason,
+    watched_count,
     flow: flow ? { state: flow.state, user_code: flow.user_code, verification_url: flow.verification_url, error: flow.error } : null,
   });
+});
+
+// Manual watched-history sync from Simkl (also runs in the background later).
+router.post('/profiles/:id/simkl/sync', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  try {
+    const result = await watchedStore.syncFromSimkl(profile, console, { force: !!req.body?.force });
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 router.post('/profiles/:id/simkl/disconnect', (req, res) => {
