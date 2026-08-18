@@ -184,6 +184,35 @@ a *target*, not a mandate:
   every row.** Rows where age couldn't be determined are marked and **excluded
   for age-limited profiles (fail-closed)**, never assumed safe.
 
+**SHIPPED — v6.9.0-beta.** The AI catalogs (`ai-recs-movies` / `ai-recs-series`)
+now serve from the recommendationStore pool instead of the Trakt rebuild — this
+is where Trakt leaves the recommendation path.
+
+- **Build vs serve split (decided 2026-08, revised from F5).** Match-STRENGTH is
+  baked at build (top-5/title by TMDB relevance + a vote-count noise gate);
+  USER PREFERENCES (rating floor, excluded genres, recency) now apply at SERVE
+  time over a fuller stored pool. Changing a filter takes effect with **no
+  rebuild and no TMDB refetch**. The pool stores `vote_average` + the full genre
+  CSV (incl. the `Anime` pseudo-genre, tagged at build) for this.
+- **Genre balance = round-robin** across `primary_genre` buckets, strongest
+  bucket leading, rows already affinity-DESC. Naturally backfills from deep
+  genres once shallow ones exhaust; **never force-fills** past what's available
+  (`selectServe` → `balanceByGenre` in recommendationStore).
+- **Age.** NSFW blacklist + anime band + LLM ACB stay baked at BUILD (fail-closed
+  for kids — the authoritative gate). Serve adds a **cheap band re-check** using
+  the stored `age_classification`, a safety net for an age limit *lowered between
+  builds*. Unclassified rows are kept at serve because they were already
+  LLM-vetted at build.
+- **Rebuild trigger.** The pool rebuilds only when watched history moved (new
+  seeds) or it's empty — `rec_state.built_at` vs `watchedStore.newestWatchedMs`
+  (`ensureBuilt`). Filter changes never trigger a rebuild. Fires from the hourly
+  tick (Simkl profiles) and fire-and-forget on catalog open.
+- **DEFERRED cleanup:** the Trakt *code* (trakt.js, the Trakt engine in
+  rebuild.js, Watch Later, scrobble→Trakt) is still present — it powers the
+  MDBList extras, search age-gate helpers, and the meta blacklist. Ripping it
+  out fully is its own slice (touches config/portal/UI); AI recs no longer use
+  it as of this version.
+
 ### F4 — n/a (numbering skip, confirmed intentional)
 
 ### F7/F8/F9 — New catalog sources (investigation below)

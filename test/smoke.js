@@ -687,6 +687,51 @@ ok('recommendationStore: selectStrong gates on votes only (NOT rating), caps at 
   assert.strictEqual(rs.selectStrong([mk('M', 7, 60, false, 'movie')]).length, 0);
 });
 
+ok('recommendationStore: selectServe applies rating/genre/recency at serve time', () => {
+  const rs = require('../src/recommendationStore');
+  const mk = (o) => ({ imdb_id: 'tt' + o.id, tmdb_id: o.id, title: o.id, year: o.year || 2024, primary_genre: o.g, genres: o.genres || o.g, vote_average: o.va ?? 8, age_classification: o.age || null, affinity: o.aff ?? 1 });
+  const rows = [
+    mk({ id: 'A', g: 'Drama' }),
+    mk({ id: 'B', g: 'Horror' }),                          // excluded primary genre
+    mk({ id: 'C', g: 'Drama', va: 4 }),                    // below rating floor
+    mk({ id: 'D', g: 'Action', genres: 'Action,Horror' }), // excluded SECONDARY genre
+    mk({ id: 'E', g: 'Drama', year: 1990 }),               // too old
+  ];
+  const out = rs.selectServe(rows, { min_rating: 6, excluded_genres: ['Horror'], max_age_years: 5 }, { nowYear: 2026 });
+  assert.deepStrictEqual(out.map((r) => r.tmdb_id), ['A']);
+  // no filters -> all pass
+  assert.strictEqual(rs.selectServe(rows, {}, { nowYear: 2026 }).length, 5);
+  // unrated (vote_average 0) is KEPT despite a rating floor — "no rating" isn't "bad"
+  assert.strictEqual(rs.selectServe([mk({ id: 'Z', g: 'Drama', va: 0 })], { min_rating: 9 }, { nowYear: 2026 }).length, 1);
+  // rows without a tt id are never servable
+  assert.strictEqual(rs.selectServe([{ tmdb_id: 'X', primary_genre: 'Drama', genres: 'Drama', vote_average: 8, year: 2024 }], {}, { nowYear: 2026 }).length, 0);
+});
+
+ok('recommendationStore: selectServe age re-check drops classified titles above the band', () => {
+  const rs = require('../src/recommendationStore');
+  const mk = (id, age) => ({ imdb_id: 'tt' + id, tmdb_id: id, title: id, year: 2020, primary_genre: 'Anime', genres: 'Anime', vote_average: 8, age_classification: age, affinity: 1 });
+  const rows = [mk('G', 'G'), mk('R', 'R'), mk('U', null)];
+  // age_limit 12 -> judgementAge 13; 'R' (17+) dropped, 'G' (0) kept, unclassified kept
+  assert.deepStrictEqual(rs.selectServe(rows, { age_limit: 12 }, { nowYear: 2026 }).map((r) => r.tmdb_id).sort(), ['G', 'U']);
+  // no age limit -> nothing age-dropped
+  assert.strictEqual(rs.selectServe(rows, {}, { nowYear: 2026 }).length, 3);
+  assert.strictEqual(rs.certMinAge('R'), 17);
+  assert.strictEqual(rs.certMinAge('unknown-code'), null);
+});
+
+ok('recommendationStore: balanceByGenre round-robins and never force-fills', () => {
+  const rs = require('../src/recommendationStore');
+  const mk = (id, g, aff) => ({ imdb_id: 'tt' + id, primary_genre: g, affinity: aff });
+  const rows = [
+    mk('a1', 'Drama', 9), mk('a2', 'Drama', 8), mk('a3', 'Drama', 7),
+    mk('b1', 'Action', 6), mk('c1', 'Comedy', 5),
+  ];
+  // strongest bucket leads, then round-robin across genres before returning to Drama
+  assert.deepStrictEqual(rs.balanceByGenre(rows, 10).map((r) => r.imdb_id), ['tta1', 'ttb1', 'ttc1', 'tta2', 'tta3']);
+  assert.strictEqual(rs.balanceByGenre(rows, 3).length, 3);   // limit caps output
+  assert.strictEqual(rs.balanceByGenre(rows, 99).length, 5);  // never force-fills past what's available
+});
+
 ok('recommendationStore: upsert, dont_recommend suppresses + drops from pool', () => {
   const rs = require('../src/recommendationStore');
   const pid = 'rec-test';
@@ -1112,22 +1157,25 @@ async function httpTests() {
   assert.strictEqual(reset.total, 0);
   console.log('  ✓ recommendation build/view/suppress/reset endpoints');
 
-  // Empty cache -> warming-up card, short client cache
+  // Empty pool -> warming-up card, short client cache
+  const recStore = require('../src/recommendationStore');
+  const wStore = require('../src/watchedStore');
   let cat = await (await fetch(`${BASE}/addon/${profile.token}/catalog/movie/ai-recs-movies.json`)).json();
   assert.strictEqual(cat.metas.length, 1);
   assert.ok(cat.metas[0].name.includes('warming up') || cat.metas[0].name.includes('List warming up'));
   assert.strictEqual(cat.cacheMaxAge, 300);
-  console.log('  ✓ empty cache serves warming-up card');
+  console.log('  ✓ empty pool serves warming-up card');
 
-  // Seed cache, then catalog serves it instantly
-  store.swapCatalog(profile.id, 'movie', [
-    { id: 'tt0111161', type: 'movie', name: 'Test Movie', poster: null, description: '', releaseInfo: '2024' },
-  ], [], 'llm');
+  // Seed the recommendation pool, then the catalog serves it instantly (no rebuild)
+  recStore.upsertCandidates(profile.id, [
+    { type: 'movie', tmdb_id: '999001', imdb_id: 'tt0111161', title: 'Test Movie', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 9.0, affinity: 2.0, rec_count: 1, popularity: 10, poster: 'https://image.tmdb.org/t/p/w500/x.jpg' },
+  ]);
   cat = await (await fetch(`${BASE}/addon/${profile.token}/catalog/movie/ai-recs-movies.json`)).json();
   assert.strictEqual(cat.metas[0].id, 'tt0111161');
+  assert.strictEqual(cat.metas[0].releaseInfo, '2024');
   assert.strictEqual(cat.cacheMaxAge, 3600); // short hint so pruned lists appear fast
   assert.strictEqual(cat.staleRevalidate, 43200);
-  console.log('  ✓ seeded cache served with SWR headers');
+  console.log('  ✓ seeded pool served with SWR headers');
 
   // ---- Metadata service ----
   // Seed the meta cache so this stays a no-network test.
@@ -1160,20 +1208,14 @@ async function httpTests() {
   assert.strictEqual(cat.metas[0].poster, 'https://api.ratingposterdb.com/t0-testkey/imdb/poster-default/tt0111161.jpg?fallback=true');
   console.log('  ✓ RPDB poster substitution at serve time');
 
-  // Serve-time watched pruning: watched snapshot removes titles immediately
-  store.saveWatched(profile.id, 'movie', { imdbIds: new Set(['tt0111161']), tmdbIds: new Set() });
+  // Serve-time watched pruning: a title in the watched store is removed at serve
+  // time even though it's still in the pool. Cross-type too — a title logged as a
+  // SHOW never shows in the movie catalog (IMDb ids are global; types can disagree).
+  wStore.upsertMany(profile.id, [{ type: 'series', title: 'Test Movie', year: 2024, tmdb_id: '999002', imdb_id: 'tt0111161', simkl_id: 424242, watched_at: '2026-08-18T00:00:00Z' }]);
   cat = await (await fetch(`${BASE}/addon/${profile.token}/catalog/movie/ai-recs-movies.json`)).json();
   assert.strictEqual(cat.metas.length, 0);
-  console.log('  ✓ serve-time watched pruning');
-  store.saveWatched(profile.id, 'movie', { imdbIds: new Set(), tmdbIds: new Set() });
-
-  // Cross-type pruning: a title Trakt logged as a SHOW never shows in the
-  // movie catalog either (IMDb IDs are global; Trakt/TMDB types can disagree)
-  store.saveWatched(profile.id, 'series', { imdbIds: new Set(['tt0111161']), tmdbIds: new Set() });
-  cat = await (await fetch(`${BASE}/addon/${profile.token}/catalog/movie/ai-recs-movies.json`)).json();
-  assert.strictEqual(cat.metas.length, 0);
-  console.log('  ✓ cross-type serve-time pruning');
-  store.saveWatched(profile.id, 'series', { imdbIds: new Set(), tmdbIds: new Set() });
+  console.log('  ✓ cross-type serve-time watched pruning');
+  wStore.deleteForProfile(profile.id);
 
   // Diagnose endpoint requires Trakt auth
   res = await fetch(`${BASE}/api/profiles/${profile.id}/diagnose`);
@@ -1387,7 +1429,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 45 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 44 async/http).`);
   process.exit(0);
 }
 

@@ -104,6 +104,15 @@ function watchedIdSets(profileId) {
   return { imdb, tmdb };
 }
 
+// Most-recent watch time (ms) for a profile, or 0 if nothing watched. Drives
+// the pool's rebuild trigger: new watched history = new seeds = rebuild.
+function newestWatchedMs(profileId) {
+  init();
+  const row = db.get().prepare('SELECT MAX(watched_at) AS m FROM watched WHERE profile_id = ?').get(profileId);
+  const ms = row?.m ? Date.parse(row.m) : NaN;
+  return Number.isNaN(ms) ? 0 : ms;
+}
+
 function deleteForProfile(profileId) {
   init();
   db.get().prepare('DELETE FROM watched WHERE profile_id = ?').run(profileId);
@@ -220,6 +229,7 @@ module.exports = {
   getWatched,
   countWatched,
   watchedIdSets,
+  newestWatchedMs,
   deleteForProfile,
   getSyncState,
   setSyncState,

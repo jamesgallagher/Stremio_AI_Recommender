@@ -1,21 +1,30 @@
-// Recommendation store + builder (v6, feature F5). Weekly-ish: for each watched
-// title, pull TMDB's per-title /recommendations, aggregate into candidates
-// scored by RECENCY-WEIGHTED AFFINITY (a recent watch steers harder than an old
-// one — the "watched Pirates 1 today → Pirates 2 tops the list" behaviour),
-// apply the deterministic filters, and upsert into the `recommended` table.
+// Recommendation store + builder + serve engine (v6, features F5/F6).
 //
-// Two tables, mirroring the design: `recommended` (the candidate pool, with a
-// lifecycle for decay later) and `dont_recommend` (user rejections + decay-outs;
-// excluded from every build/serve). The age gate + genre-balanced serve are the
-// next slices — this builds and filters the pool; nothing serves it yet.
+// BUILD (background): for each watched title, pull TMDB's per-title
+// /recommendations, aggregate into candidates scored by RECENCY-WEIGHTED
+// AFFINITY (a recent watch steers harder than an old one — the "watched
+// Pirates 1 today → Pirates 2 tops the list" behaviour), keep the strongest
+// few per title, resolve tt ids + posters, age-gate, and upsert a FULL pool
+// (rating + full genre list stored, NOT pre-filtered by user preference).
+//
+// SERVE (request path, cheap, no network): selectServe applies the user's
+// preferences (rating floor, excluded genres, recency) + a cheap age-band
+// re-check over the stored pool, then genre-balances the result — so changing
+// a filter takes effect immediately with no rebuild.
+//
+// Tables: `recommended` (the candidate pool, with a decay lifecycle),
+// `dont_recommend` (user rejections + decay-outs, excluded from build/serve),
+// and `rec_state` (last build time, the rebuild trigger).
 const db = require('./db');
 const settings = require('./settings');
 const tmdb = require('./services/tmdb');
+const animeMap = require('./services/animeMap');
 const watchedStore = require('./watchedStore');
 
 const HALF_LIFE_DAYS = 90;  // recency weight = 0.5 ^ (days_since_watched / this)
 const SEED_CAP = 60;        // use the N most-recent watched titles as seeds
 const STORE_CAP = 300;      // keep the top-N candidates by affinity
+const SERVE_LIMIT = 100;    // max titles in a served, genre-balanced catalog
 const DAY_MS = 24 * 3600e3;
 
 // Per-source-title selection: TMDB returns ~20 recs already in RELEVANCE order
@@ -75,6 +84,11 @@ function init() {
       reason     TEXT,                    -- 'user' | 'decayed'
       at         INTEGER,
       PRIMARY KEY (profile_id, type, tmdb_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS rec_state (
+      profile_id TEXT PRIMARY KEY,
+      built_at   INTEGER                  -- last successful pool build (rebuild trigger)
     );
   `);
   // Migrate older beta DBs that predate the serve-time-filter columns. ADD COLUMN
@@ -141,6 +155,7 @@ function deleteForProfile(profileId) {
   init();
   db.get().prepare('DELETE FROM recommended WHERE profile_id = ?').run(profileId);
   db.get().prepare('DELETE FROM dont_recommend WHERE profile_id = ?').run(profileId);
+  db.get().prepare('DELETE FROM rec_state WHERE profile_id = ?').run(profileId);
 }
 
 // Upsert candidates, preserving the lifecycle columns (created_at, first_shown_at,
@@ -218,6 +233,7 @@ function resetRecommendations(profileId) {
   init();
   db.get().prepare('DELETE FROM recommended WHERE profile_id = ?').run(profileId);
   db.get().prepare('DELETE FROM dont_recommend WHERE profile_id = ?').run(profileId);
+  db.get().prepare('DELETE FROM rec_state WHERE profile_id = ?').run(profileId);
   return { cleared: true };
 }
 
@@ -272,10 +288,148 @@ async function buildRecommendations(profile, log = console) {
   }
   kept.sort((a, b) => b.affinity - a.affinity || b.popularity - a.popularity);
   const top = kept.slice(0, STORE_CAP);
-  upsertCandidates(profile.id, top);
 
-  log.log(`[rec] ${profile.name}: ${seeds.length} seed(s), ${rawFetched} raw recs → top-${PER_TITLE_CAP}/title → ${candidates.size} unique → ${kept.length} after de-dupe → stored ${top.length} (total ${countRecommended(profile.id)})`);
-  return { seeds: seeds.length, raw: rawFetched, strong: candidates.size, kept: kept.length, stored: top.length, total: countRecommended(profile.id) };
+  // Dress the survivors for Stremio: resolve the tt id (catalogs need it) and a
+  // full poster URL, and tag the Anime pseudo-genre so serve-time exclusion is a
+  // pure string check. No tt id -> not servable -> dropped. This is the only
+  // heavy step (one light TMDB call each); it runs in the background build.
+  await animeMap.ensureLoaded(log);
+  const servable = [];
+  for (let i = 0; i < top.length; i += 8) {
+    const chunk = top.slice(i, i + 8);
+    await Promise.all(chunk.map(async (c) => {
+      const imdb = await tmdb.imdbFor(tmdbKey, c.type, c.tmdb_id);
+      if (!imdb) return;                       // Stremio needs a tt id
+      c.imdb_id = imdb;
+      c.poster = tmdb.posterUrl(c.poster);     // bare path -> full URL
+      if (animeMap.isAnime(imdb, c.tmdb_id) && !c.genres.split(',').includes('Anime')) {
+        c.genres = c.genres ? `Anime,${c.genres}` : 'Anime';
+      }
+      servable.push(c);
+    }));
+  }
+  upsertCandidates(profile.id, servable);
+  setBuiltAt(profile.id);
+
+  log.log(`[rec] ${profile.name}: ${seeds.length} seed(s), ${rawFetched} raw recs → top-${PER_TITLE_CAP}/title → ${candidates.size} unique → ${kept.length} after de-dupe → ${servable.length} servable → stored (total ${countRecommended(profile.id)})`);
+  return { seeds: seeds.length, raw: rawFetched, strong: candidates.size, kept: kept.length, stored: servable.length, total: countRecommended(profile.id) };
+}
+
+// ---- build state ----
+function setBuiltAt(profileId, at = Date.now()) {
+  init();
+  db.get().prepare(`
+    INSERT INTO rec_state (profile_id, built_at) VALUES (?, ?)
+    ON CONFLICT(profile_id) DO UPDATE SET built_at = excluded.built_at
+  `).run(profileId, at);
+}
+
+function getBuiltAt(profileId) {
+  init();
+  return db.get().prepare('SELECT built_at FROM rec_state WHERE profile_id = ?').get(profileId)?.built_at || 0;
+}
+
+// ---- serve-time selection (F6) ----
+// Cheap classification -> minimum age, for the serve-time band re-check. Keyed
+// by MAL band codes (the only classifications ageGatePool stamps) plus a few
+// common certs. Unknown -> null -> KEPT: an unrated title is not "too old",
+// same rule the build-time gate uses. This re-check is a safety net for a
+// LOWERED age limit between builds; the authoritative gate is still at build.
+const CERT_MIN_AGE = { G: 0, PG: 8, 'PG-13': 13, R: 17, 'R+': 17 };
+function certMinAge(cert) {
+  return cert && cert in CERT_MIN_AGE ? CERT_MIN_AGE[cert] : null;
+}
+
+// Round-robin across primary_genre buckets: take the strongest remaining title
+// from each genre in turn, so one prolific genre can't dominate the row. Rows
+// arrive affinity DESC, so each bucket is already strongest-first. NEVER
+// force-fills — if the balanced set is smaller than `limit`, that's the honest
+// size (quality over quantity), not padded with weak matches.
+function balanceByGenre(rows, limit = SERVE_LIMIT) {
+  const buckets = new Map();
+  for (const r of rows) {
+    const g = r.primary_genre || 'Other';
+    if (!buckets.has(g)) buckets.set(g, []);
+    buckets.get(g).push(r);
+  }
+  // Rotate genres strongest-bucket-first for a stable, quality-led order.
+  const order = [...buckets.entries()]
+    .sort((a, b) => (b[1][0]?.affinity || 0) - (a[1][0]?.affinity || 0))
+    .map(([g]) => g);
+  const out = [];
+  let progressed = true;
+  while (out.length < limit && progressed) {
+    progressed = false;
+    for (const g of order) {
+      const bucket = buckets.get(g);
+      if (bucket && bucket.length) {
+        out.push(bucket.shift());
+        progressed = true;
+        if (out.length >= limit) break;
+      }
+    }
+  }
+  return out;
+}
+
+// PURE serve-time selection over stored pool rows. Applies USER PREFERENCES
+// (rating floor, excluded genres, recency) + a cheap age-band re-check, then
+// balances across genres. Exported for testing. Nothing here touches the network.
+function selectServe(rows, filters = {}, { nowYear = new Date().getFullYear(), limit = SERVE_LIMIT } = {}) {
+  const minRating = filters.min_rating || 0;
+  const excluded = new Set(filters.excluded_genres || []);
+  const maxAge = filters.max_age_years || 0;
+  const judge = (filters.age_limit || 0) + 1;
+  const kids = (filters.age_limit || 0) > 0;
+
+  const passed = (rows || []).filter((r) => {
+    if (!r.imdb_id) return false;                                             // not servable
+    if (minRating > 0 && r.vote_average > 0 && r.vote_average < minRating) return false; // rating floor (0 = unknown -> kept)
+    const genres = (r.genres || '').split(',').filter(Boolean);
+    if (genres.some((g) => excluded.has(g))) return false;                    // excluded genre (full list, incl. Anime)
+    if (maxAge > 0 && r.year && r.year < nowYear - maxAge) return false;      // recency
+    if (kids) { const m = certMinAge(r.age_classification); if (m !== null && m > judge) return false; } // lowered-limit safety net
+    return true;
+  });
+  return balanceByGenre(passed, limit);
+}
+
+// Build Stremio catalog metas for a profile's AI recommendations of one type.
+// Cache-only + cheap (no external calls) — safe for the addon request path.
+function serveRecommendations(profile, type, { limit = SERVE_LIMIT } = {}) {
+  init();
+  const rows = getRecommended(profile.id, { type, limit: 100000 });
+  return selectServe(rows, profile.filters || {}, { limit }).map((r) => ({
+    id: r.imdb_id,
+    type,
+    name: r.title,
+    poster: r.poster || null,
+    releaseInfo: r.year ? String(r.year) : null,
+    genres: (r.genres || '').split(',').filter(Boolean),
+  }));
+}
+
+// Background rebuild trigger. The pool only needs rebuilding when there are new
+// SEEDS (watched history moved since the last build) or it's empty — user-filter
+// changes now apply at serve time, so they never trigger a rebuild. Serialized
+// per profile with an in-memory lock.
+const buildLocks = new Set();
+function needsBuild(profileId) {
+  if (countRecommended(profileId) === 0) return true;
+  return watchedStore.newestWatchedMs(profileId) > getBuiltAt(profileId);
+}
+async function ensureBuilt(profile, log = console) {
+  init();
+  if (buildLocks.has(profile.id)) return { skipped: 'locked' };
+  if (!needsBuild(profile.id)) return { skipped: 'fresh' };
+  buildLocks.add(profile.id);
+  try {
+    const r = await buildRecommendations(profile, log);
+    if (!r.skipped) await ageGatePool(profile, log);
+    return r;
+  } finally {
+    buildLocks.delete(profile.id);
+  }
 }
 
 module.exports = {
@@ -284,6 +438,8 @@ module.exports = {
   selectStrong,
   buildRecommendations,
   ageGatePool,
+  ensureBuilt,
+  needsBuild,
   resetRecommendations,
   upsertCandidates,
   getRecommended,
@@ -291,6 +447,13 @@ module.exports = {
   dontRecommendKeys,
   addDontRecommend,
   deleteForProfile,
+  selectServe,
+  balanceByGenre,
+  certMinAge,
+  serveRecommendations,
+  setBuiltAt,
+  getBuiltAt,
   HALF_LIFE_DAYS,
   PER_TITLE_CAP,
+  SERVE_LIMIT,
 };

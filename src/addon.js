@@ -6,6 +6,8 @@ const config = require('./config');
 const store = require('./store');
 const rebuild = require('./rebuild');
 const catalogs = require('./catalogs');
+const recommendationStore = require('./recommendationStore');
+const watchedStore = require('./watchedStore');
 const tmdb = require('./services/tmdb');
 const llm = require('./services/groq');
 const animeMap = require('./services/animeMap');
@@ -58,7 +60,7 @@ function manifestFor(profile, baseUrl = '') {
     id: `au.com.jscc.airecommender.${profile.id.substring(0, 8)}`,
     version,
     name: `AI Recommender — ${profile.name}`,
-    description: `Personalized movie & series recommendations for ${profile.name}, generated from Trakt watch history via AI.`,
+    description: `Personalized movie & series recommendations for ${profile.name}, generated from Simkl watch history.`,
     ...(baseUrl ? { logo: `${baseUrl}/logo.png` } : {}),
     types: ['movie', 'series'],
     idPrefixes: ['tt'],
@@ -233,6 +235,36 @@ router.get('/catalog/:type/:catalogId{/:extra}', async (req, res) => {
   const extra = (req.params.extra || '').replace(/\.json$/, '');
   const skip = parseInt((extra.match(/skip=(\d+)/) || [])[1] || '0', 10);
 
+  // v6 AI recommendations: served from the recommendationStore pool (built in
+  // the background from Simkl history + TMDB). Genre-balanced and filtered at
+  // SERVE time — rating floor, excluded genres, recency, age band — so changing
+  // a filter takes effect immediately with no rebuild. Cache-only, no network.
+  if (aiCatalog) {
+    // SWR: fire-and-forget background build when the watched history moved
+    // (no-op when fresh/locked). This request serves the current pool.
+    if (profile.simkl_auth?.access_token) {
+      recommendationStore.ensureBuilt(profile).catch((err) => console.warn(`[rec] ${profile.name}: background build failed — ${err.message}`));
+    }
+    const metas = recommendationStore.serveRecommendations(profile, def.type);
+    if (!metas.length) {
+      const description = !profile.simkl_auth?.access_token
+        ? 'This profile has not connected Simkl yet — open the configure portal to connect it and build your recommendations.'
+        : 'Your recommendations are being generated — check back in a minute or two, or press "Build recommendations" in the configure portal.';
+      return res.json({ metas: skip > 0 ? [] : [errorCard(def.type, description)], cacheMaxAge: 5 * 60 });
+    }
+    // Serve-time watched prune: the pool excludes watched at build, this catches
+    // titles watched since. Union of both types — IMDb ids are global and
+    // Simkl/TMDB can disagree on movie vs show.
+    const watched = watchedStore.watchedIdSets(profile.id);
+    const pruned = metas.filter((m) => !watched.imdb.has(m.id));
+    const sliced = skip > 0 ? pruned.slice(skip) : pruned;
+    return res.json({
+      metas: applyRpdb(sliced, profile.keys.rpdb_api_key),
+      cacheMaxAge: 3600,
+      staleRevalidate: 12 * 3600,
+    });
+  }
+
   rebuild.ensureFresh(profile); // SWR: fire-and-forget; this request serves cache
   rebuild.ensureExclusionsFresh(profile); // hourly watched-set refresh (background)
 
@@ -247,28 +279,22 @@ router.get('/catalog/:type/:catalogId{/:extra}', async (req, res) => {
       return res.json({ metas: [], cacheMaxAge: 5 * 60 });
     }
     // Nothing cached yet (first install / not onboarded) — friendly card, short client cache
-    const description = extraDef
-      ? (extraDef.source === 'trakt_watchlist'
-        ? (!profile.trakt_auth?.access_token
-          ? 'Watch Later mirrors your Trakt watchlist — connect Trakt in the configure portal.'
-          : 'Your Trakt watchlist is empty — long-press a title in Stremio/Nuvio and add it to your watchlist, or add one on trakt.tv.')
-        : (profile.keys.mdblist_api_key
-          ? 'This list is being generated — check back in a minute or two.'
-          : 'This catalog needs an MDBList API key — add one in the configure portal.'))
-      : (!profile.trakt_auth?.access_token
-        ? 'This profile has not connected Trakt yet. Open the configure portal to finish setup.'
-        : (!profile.keys.groq_api_key
-          ? 'This profile has no Groq API key — AI recommendations are disabled until one is added in the configure portal.'
-          : 'Your recommendations are being generated — check back in a minute or two.'));
+    const description = extraDef.source === 'trakt_watchlist'
+      ? (!profile.trakt_auth?.access_token
+        ? 'Watch Later mirrors your Trakt watchlist — connect Trakt in the configure portal.'
+        : 'Your Trakt watchlist is empty — long-press a title in Stremio/Nuvio and add it to your watchlist, or add one on trakt.tv.')
+      : (profile.keys.mdblist_api_key
+        ? 'This list is being generated — check back in a minute or two.'
+        : 'This catalog needs an MDBList API key — add one in the configure portal.');
     return res.json({ metas: skip > 0 ? [] : [errorCard(def.type, description)], cacheMaxAge: 5 * 60 });
   }
 
-  // Serve-time watched pruning — AI catalogs AND Watch Later (a watch-later
-  // list must not show what's been seen); curated MDBList extras ignore
-  // watched status by design. Union of both types: IMDb IDs are global, and
-  // Trakt/TMDB sometimes disagree on whether a title is a movie or a show.
+  // Serve-time watched pruning — Watch Later only (a watch-later list must not
+  // show what's been seen); curated MDBList extras ignore watched status by
+  // design. Union of both types: IMDb IDs are global, and Trakt/TMDB sometimes
+  // disagree on whether a title is a movie or a show.
   let served = entry.metas;
-  if (!extraDef || extraDef.source === 'trakt_watchlist') {
+  if (extraDef.source === 'trakt_watchlist') {
     const watchedImdb = new Set([
       ...(cache.watched?.movie?.imdb || []),
       ...(cache.watched?.series?.imdb || []),

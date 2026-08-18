@@ -282,6 +282,26 @@ async function getRecommendations(apiKey, type, tmdbId, { page = 1 } = {}) {
   }));
 }
 
+// tmdb id -> imdb tt id, via the LIGHTEST possible call (external_ids only, no
+// images/credits). Used to make stored recommendation-pool candidates servable
+// to Stremio, which needs tt ids. Returns null when TMDB has no imdb id (those
+// candidates can't be served and are dropped from the pool).
+async function imdbFor(apiKey, type, tmdbId, log = console) {
+  try {
+    const base = type === 'series' ? `tv/${tmdbId}` : `movie/${tmdbId}`;
+    const data = await get(apiKey, `${base}/external_ids`);
+    return data.imdb_id || null;
+  } catch (err) {
+    log.warn(`[tmdb] external_ids ${type}/${tmdbId} failed: ${err.message}`);
+    return null;
+  }
+}
+
+// Full poster URL from a bare TMDB poster_path (what getRecommendations stores).
+function posterUrl(posterPath) {
+  return posterPath ? `${IMG}/w500${posterPath}` : null;
+}
+
 // Genre id -> name map (both movie and tv namespaces), fetched once and cached.
 // Recommendations carry genre_ids, not names; we need names for the primary
 // genre and the excluded-genre filter.
@@ -340,6 +360,8 @@ module.exports = {
   genreAndCert,
   pickCertification,
   getRecommendations,
+  imdbFor,
+  posterUrl,
   getGenreMap,
   toMeta,
   pickLogo,
