@@ -916,16 +916,28 @@ async function httpTests() {
   // Clear the global LLM so the kids gate below fails closed.
   require('../src/settings').updateSettings({ llm: { custom_uri: '', custom_name: '', custom_api_key: '', groq_api_key: '', groq_api_key_backup: '' } });
   assert.strictEqual(require('../src/settings').hasLlm(), false);
-  const def = require('../src/catalogs').getExtra('mdb-kids-movies');
+  const kids = require('../src/catalogs').getExtra('mdb-kids-movies');    // age_band 12
+  const action = require('../src/catalogs').getExtra('mdb-action-movies'); // no band
   const metas = [{ id: 'tt1', name: 'A' }, { id: 'tt2', name: 'B' }];
   const quiet = { log() {}, warn() {} };
+  // effectiveAgeLimit: a banded catalog applies its band always; a plain one follows the profile
+  assert.strictEqual(rebuildMod.effectiveAgeLimit({ filters: { age_limit: 0 } }, action), 0);  // plain + adult = ungated
+  assert.strictEqual(rebuildMod.effectiveAgeLimit({ filters: { age_limit: 0 } }, kids), 12);    // banded + adult = band
+  assert.strictEqual(rebuildMod.effectiveAgeLimit({ filters: { age_limit: 8 } }, kids), 8);     // min(12, 8)
+  assert.strictEqual(rebuildMod.effectiveAgeLimit({ filters: { age_limit: 15 } }, kids), 12);   // min(12, 15)
+  // A plain catalog on an adult profile passes through untouched (no LLM needed)
   assert.deepStrictEqual(
-    await rebuildMod.applyExtraAgeGate({ name: 'Adult', filters: { age_limit: 0 }, keys: {} }, def, metas, quiet),
-    metas); // no age limit -> passthrough
+    await rebuildMod.applyExtraAgeGate({ name: 'Adult', filters: { age_limit: 0 }, keys: {} }, action, metas, quiet),
+    metas);
+  // A BANDED kids catalog gates even an adult profile -> needs the LLM -> fail-closed
   await assert.rejects(
-    () => rebuildMod.applyExtraAgeGate({ name: 'Kid', filters: { age_limit: 8 }, keys: {} }, def, metas, quiet),
+    () => rebuildMod.applyExtraAgeGate({ name: 'Adult', filters: { age_limit: 0 }, keys: {} }, kids, metas, quiet),
     /No LLM configured/);
-  console.log('  ✓ extra-catalog age gate: passthrough for adults, fail-closed for kids');
+  // A plain catalog on a kid profile also gates -> fail-closed
+  await assert.rejects(
+    () => rebuildMod.applyExtraAgeGate({ name: 'Kid', filters: { age_limit: 8 }, keys: {} }, action, metas, quiet),
+    /No LLM configured/);
+  console.log('  ✓ extra-catalog age gate: band applied always, plain gated only for kids, fail-closed');
 
   await new Promise(r => setTimeout(r, 400)); // let server bind
 
@@ -1255,15 +1267,29 @@ async function httpTests() {
   assert.ok(ecat.metas[0].description.includes('MDBList'));
   console.log('  ✓ unbuilt extra catalog serves setup card');
 
-  // Seeded extra catalog is served, and watched status does NOT prune it
+  // v6: curated extras DO de-dupe against the Simkl-backed watched store, EXCEPT
+  // Christmas (re-watchables). Seed one watched + one unwatched into Action.
+  const wStore3 = require('../src/watchedStore');
   store.swapExtra(p2.id, 'mdb-action-movies', [
-    { id: 'tt0111161', type: 'movie', name: 'Action Pick', poster: null, description: '', releaseInfo: '2020' },
+    { id: 'tt0111161', type: 'movie', name: 'Seen Action', poster: null, description: '', releaseInfo: '2020' },
+    { id: 'tt0068646', type: 'movie', name: 'Unseen Action', poster: null, description: '', releaseInfo: '1972' },
   ]);
-  store.saveWatched(p2.id, 'movie', { imdbIds: new Set(['tt0111161']), tmdbIds: new Set() });
+  wStore3.upsertMany(p2.id, [{ type: 'movie', title: 'Seen Action', year: 2020, tmdb_id: '9333', imdb_id: 'tt0111161', simkl_id: 9333, watched_at: '2026-08-18T00:00:00Z' }]);
   ecat = await (await fetch(`${BASE}/addon/${p2.token}/catalog/movie/mdb-action-movies.json`)).json();
-  assert.strictEqual(ecat.metas.length, 1); // watched, but extras ignore watched status
-  assert.strictEqual(ecat.metas[0].id, 'tt0111161');
-  console.log('  ✓ extra catalog served from cache, watched status ignored');
+  assert.deepStrictEqual(ecat.metas.map(m => m.id), ['tt0068646']); // watched pruned
+  console.log('  ✓ curated extra de-dupes watched titles');
+  // Christmas is exempt (dedupe_watched:false): the watched title still shows
+  await fetch(`${BASE}/api/profiles/${p2.id}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ catalogs: { 'mdb-christmas-movies': true, 'mdb-action-movies': true, 'mdb-popular-series': true } }),
+  });
+  store.swapExtra(p2.id, 'mdb-christmas-movies', [
+    { id: 'tt0111161', type: 'movie', name: 'Seen Xmas', poster: null, description: '', releaseInfo: '2020' },
+  ]);
+  const xcat = await (await fetch(`${BASE}/addon/${p2.token}/catalog/movie/mdb-christmas-movies.json`)).json();
+  assert.deepStrictEqual(xcat.metas.map(m => m.id), ['tt0111161']); // NOT pruned — re-watchable
+  console.log('  ✓ Christmas exempt from watched de-dupe');
+  wStore3.deleteForProfile(p2.id);
 
   // Wrong type for a known extra id -> 404
   res = await fetch(`${BASE}/addon/${p2.token}/catalog/series/mdb-action-movies.json`);

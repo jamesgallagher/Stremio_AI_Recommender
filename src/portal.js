@@ -110,7 +110,10 @@ router.get('/genres', (req, res) => {
 router.get('/catalogs', (req, res) => {
   res.json({
     catalogs: catalogs.EXTRA_CATALOGS.map(
-      ({ id, type, name, min_imdb, source, default_on, target }) => ({ id, type, name, min_imdb, source, default_on: !!default_on, target: target || 20 }),
+      ({ id, type, name, min_imdb, source, default_on, target, min_profile_age, age_band, dedupe_watched }) => ({
+        id, type, name, min_imdb, source, default_on: !!default_on, target: target || 20,
+        min_profile_age: min_profile_age || 0, age_band: age_band || 0, dedupe_watched: dedupe_watched !== false,
+      }),
     ),
   });
 });

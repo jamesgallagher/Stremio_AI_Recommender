@@ -641,16 +641,20 @@ diverged from AniList), global/per-profile config split + LLM chain, explicit
 "Don't recommend" (portal), "because you watched X" debug line, and the **rate
 governor** (v6-ui.md §Rate governance).
 
-**NEXT — Catalog overhaul (this is the next slice).** Two parts, in order:
-1. **Registry** — replace the current curated set with the intended list
-   (real, verified MDBList URLs — the registry table above may be stale; confirm
-   each slug against the live API with the global key before committing, the
-   `official/…/popular` shape especially).
-2. **Behavioural (the "what's included" rules)** — the locked catalog rules:
-   de-dupe curated lists against the local watched table **except Christmas**
-   (per-catalog `dedupe_watched`, default true), and apply the **kids age-band
-   always** (even on adult profiles), effective gate `min(catalog_band,
-   profile.age_limit)`. Route the curated fetches through the rate governor.
+**DONE — Catalog overhaul (v6.17.0 / v6.18.0-beta).** Both parts shipped:
+1. **Registry** — re-sourced to the design list + kept Thriller. Every user/slug
+   verified against the live MDBList API (401 = valid) before committing; IDs
+   kept stable. Added Rom-Com/War/Horror. **Popular diverged** from the doc:
+   `official/*/popular` 404 on the user-list API (built-in dynamic lists), so
+   both use `linaspurinis/top-watched-{movies,shows}-of-the-week` instead.
+2. **Behavioural** — serve-time de-dupe against the Simkl watched store for every
+   catalog EXCEPT `dedupe_watched:false` (Christmas); `age_band` applied ALWAYS
+   (Kids 12, Anime 13), effective `min(band, profile.age_limit)` — so those rows
+   need an LLM to build even on an adult profile. Curated fetches already route
+   through the rate governor (mdblist wired in v6.16). Rules surfaced in the
+   portal (`/api/catalogs` + Catalogs-tab badges: "age-gated N+", "keeps watched").
+   *Band values (Kids 12, Anime 13) are the design-proposed defaults — adjust in
+   catalogs.js if you want a different bracket.*
 
 **STILL NOT BUILT after that:** recommendation **decay** (streak-based implicit
 rejection — columns exist, no logic runs), **Mobile Companion** (needs a Simkl

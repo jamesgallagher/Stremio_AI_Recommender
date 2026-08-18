@@ -288,12 +288,13 @@ router.get('/catalog/:type/:catalogId{/:extra}', async (req, res) => {
     return res.json({ metas: skip > 0 ? [] : [errorCard(def.type, description)], cacheMaxAge: 5 * 60 });
   }
 
-  // Serve-time watched pruning — Watch Later only (a watch-later list must not
-  // show what's been seen); curated MDBList extras ignore watched status by
-  // design. Uses the Simkl-backed watched store; IMDb IDs are global, so a title
-  // Simkl/TMDB disagree on (movie vs show) is still pruned.
+  // Serve-time watched pruning (v6): de-dupe against the Simkl-backed watched
+  // store — Watch Later always, and every curated list EXCEPT those flagged
+  // dedupe_watched:false (Christmas re-watchables). IMDb IDs are global, so a
+  // title Simkl/TMDB disagree on (movie vs show) is still pruned. Graceful when
+  // there's nothing watched — the list serves in full.
   let served = entry.metas;
-  if (extraDef.source === 'simkl_plantowatch') {
+  if (extraDef.dedupe_watched !== false) {
     const watchedImdb = watchedStore.watchedIdSets(profile.id).imdb;
     served = served.filter((m) => !watchedImdb.has(m.id));
   }

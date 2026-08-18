@@ -215,18 +215,36 @@ const WATCHLIST_CAP = 100;
 // CSM gate. Adult profiles are untouched (no LLM call). FAIL-CLOSED: without a
 // Groq key, or if the gate errors, the caller keeps the previous list rather
 // than publishing an unvetted one to a child.
+// Catalog-level age band (v6): a catalog carrying `age_band` (Trending Kids 12,
+// Anime TV-14 13) is gated to that band ALWAYS — even on an adult profile — so
+// the row is trustworthy on its own, not only when a profile sets a limit.
+// Effective band = min(catalog band, profile limit) when the profile is itself
+// limited; otherwise just the catalog band. Ordinary catalogs (no age_band) keep
+// the old behaviour: gated only for age-limited profiles.
+function effectiveAgeLimit(profile, def) {
+  const profileLimit = profile.filters?.age_limit || 0;
+  const band = def.age_band || 0;
+  if (!band) return profileLimit;
+  return profileLimit > 0 ? Math.min(band, profileLimit) : band;
+}
+
 async function applyExtraAgeGate(profile, def, metas, log = console) {
-  const ageLimit = profile.filters?.age_limit || 0;
+  const limit = effectiveAgeLimit(profile, def);
+  // The gate stack reads the age limit off the profile's filters, so run it
+  // against the EFFECTIVE limit (a banded catalog on an adult profile still gets
+  // gated). A no-op clone when the effective limit already equals the profile's.
+  const gateProfile = limit === (profile.filters?.age_limit || 0)
+    ? profile : { ...profile, filters: { ...profile.filters, age_limit: limit } };
   // The NSFW blacklist is NOT conditional on an age limit — it runs for adult
   // profiles too, and needs no Groq key, so it goes before both early exits.
-  let list = await applyAnimeGate(metas, profile, log);
-  if (ageLimit <= 0 || !list.length) return list;
+  let list = await applyAnimeGate(metas, gateProfile, log);
+  if (limit <= 0 || !list.length) return list;
   metas = list;
   if (!settings.hasLlm()) {
-    throw new Error(`No LLM configured — required for the kids age check on "${def.name}" (set a Custom LLM or Groq key in Server Config)`);
+    throw new Error(`No LLM configured — required for the age check on "${def.name}" (set a Custom LLM or Groq key in Server Config)`);
   }
   const vetoed = await llm.ageGate(
-    def.type, judgementAge(profile.filters),
+    def.type, judgementAge(gateProfile.filters),
     // Genres matter: judging "Berserk" on a truncated overview alone is a
     // much weaker signal than judging it as Action/Horror/Fantasy. They were
     // being stripped before the gate saw them (cleanMetas ran too early).
@@ -238,7 +256,7 @@ async function applyExtraAgeGate(profile, def, metas, log = console) {
   );
   const out = metas.filter((m) => !vetoed.has(m.id));
   if (vetoed.size) {
-    log.log(`[extra] ${profile.name}/${def.id}: AI age gate removed ${vetoed.size} of ${metas.length}`);
+    log.log(`[extra] ${profile.name}/${def.id}: AI age gate removed ${vetoed.size} of ${metas.length} (band ${limit})`);
   }
   return out;
 }
@@ -394,6 +412,7 @@ module.exports = {
   isRebuilding,
   applyCsmGate,
   applyExtraAgeGate,
+  effectiveAgeLimit,
   cleanMetas,
   judgementAge,
   applyAnimeGate,
