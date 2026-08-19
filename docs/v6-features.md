@@ -657,8 +657,20 @@ governor** (v6-ui.md §Rate governance).
    *Band values (Kids 12, Anime 13) are the design-proposed defaults — adjust in
    catalogs.js if you want a different bracket.*
 
-**STILL NOT BUILT after that:** recommendation **decay** (streak-based implicit
-rejection — columns exist, no logic runs), **Mobile Companion** (needs a Simkl
-`plantowatch` *write*), the **in-app meta "🚫 Don't recommend" link**, the
-**tabbed profile UI**, and cleanup of the vestigial `engine`/`rating_source`
+**DONE — Recommendation decay (v6.19.0-beta).** Streak-based implicit rejection,
+params confirmed by James: **60-day** window, **14-day** fall-off gap resets the
+streak, **90-day** cooldown before a decayed title can return, must be shown on
+**≥8 distinct days** to decay, impressions counted **once/day/title** at serve
+time, opening a title's **/meta** page = soft reset (spares it), explicit 🚫 =
+permanent. `recommended` gained `streak_started_at`/`times_shown_in_streak`/
+`last_shown_at`; `serveRecommendations` records impressions; `applyDecay` runs on
+the hourly tick → `dont_recommend(reason=decayed)`; `dontRecommendKeys` expires
+decayed entries after cooldown. Streak state shown in the View-recommendations
+debug panel. **Engagement via Simkl `watching`/`plantowatch` → `engaged_at` is
+reserved** (column + gate in place) but not yet wired — the /meta soft-reset is
+the interest signal for now.
+
+**STILL NOT BUILT:** **Mobile Companion** (needs a Simkl `plantowatch` *write* +
+`watching`/plantowatch → engaged), the **in-app meta "🚫 Don't recommend" link**,
+the **tabbed profile UI**, and cleanup of the vestigial `engine`/`rating_source`
 config fields.

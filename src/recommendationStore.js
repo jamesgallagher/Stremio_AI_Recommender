@@ -27,6 +27,18 @@ const STORE_CAP = 300;      // keep the top-N candidates by affinity
 const SERVE_LIMIT = 100;    // max titles in a served, genre-balanced catalog
 const DAY_MS = 24 * 3600e3;
 
+// ---- Recommendation decay (v6, params confirmed 2026-08-19) ----
+// A recommendation the user is repeatedly SHOWN but never engages with is an
+// implicit rejection — it decays out. Decay tracks a VISIBLE STREAK (consecutive
+// days shown), not wall-clock age: a title out-competed by newer picks falls off
+// and gets a clean slate if it climbs back, so only the genuinely-ignored-while-
+// persistently-shown titles die. Impressions are counted once per day per title.
+// Manual "Don't recommend" (🚫) is the permanent force-out for anyone impatient.
+const DECAY_WINDOW_MS = 60 * DAY_MS;   // sustained visibility before a title may decay
+const FALLOFF_GAP_MS = 14 * DAY_MS;    // no impression this long → streak resets
+const DECAY_COOLDOWN_MS = 90 * DAY_MS; // a decayed title may return to the pool after this
+const DECAY_MIN_DAYS = 8;              // must be shown on ≥ this many distinct days to decay
+
 // Per-source-title selection: TMDB returns ~20 recs already in RELEVANCE order
 // (strongest match first). Keeping all 20 makes the matching mushy, so we keep
 // only the strongest few PER title — the top N in TMDB's own order, gated only
@@ -70,9 +82,12 @@ function init() {
       because_title TEXT,                 -- strongest-contributing watched title (debug "why")
       popularity  REAL,
       poster      TEXT,
-      first_shown_at INTEGER,             -- decay lifecycle (later slice)
-      times_shown INTEGER DEFAULT 0,
-      engaged_at  INTEGER,
+      first_shown_at INTEGER,             -- first-ever impression (informational)
+      times_shown INTEGER DEFAULT 0,      -- all-time distinct days shown (informational)
+      streak_started_at INTEGER,          -- start of the current continuous impression run
+      times_shown_in_streak INTEGER DEFAULT 0, -- distinct days shown in the current streak
+      last_shown_at INTEGER,              -- last impression (fall-off detection + day de-dupe)
+      engaged_at  INTEGER,                -- real interest signal → decay off (reserved)
       created_at  INTEGER,
       PRIMARY KEY (profile_id, type, tmdb_id)
     );
@@ -94,7 +109,8 @@ function init() {
   `);
   // Migrate older beta DBs that predate the serve-time-filter columns. ADD COLUMN
   // throws "duplicate column" once present, so each is best-effort.
-  for (const [col, decl] of [['genres', 'TEXT'], ['vote_average', 'REAL'], ['because_title', 'TEXT']]) {
+  for (const [col, decl] of [['genres', 'TEXT'], ['vote_average', 'REAL'], ['because_title', 'TEXT'],
+    ['streak_started_at', 'INTEGER'], ['times_shown_in_streak', 'INTEGER DEFAULT 0'], ['last_shown_at', 'INTEGER']]) {
     try { db.get().exec(`ALTER TABLE recommended ADD COLUMN ${col} ${decl}`); } catch { /* already present */ }
   }
   ready = true;
@@ -129,18 +145,26 @@ function computeAffinity(seeds, recsBySeed, { halfLifeDays = HALF_LIFE_DAYS, now
   return out;
 }
 
-function dontRecommendKeys(profileId) {
+// Titles to suppress from build + serve. Explicit user rejections are permanent;
+// DECAYED entries expire after the cooldown so a decayed title gets another
+// chance if it's still relevant on a later build.
+function dontRecommendKeys(profileId, nowMs = Date.now()) {
   init();
-  const rows = db.get().prepare('SELECT type, tmdb_id FROM dont_recommend WHERE profile_id = ?').all(profileId);
-  return new Set(rows.map((r) => key(r.type, r.tmdb_id)));
+  const rows = db.get().prepare('SELECT type, tmdb_id, reason, at FROM dont_recommend WHERE profile_id = ?').all(profileId);
+  const out = new Set();
+  for (const r of rows) {
+    if (r.reason === 'decayed' && r.at && (nowMs - r.at) > DECAY_COOLDOWN_MS) continue; // cooldown expired → allow back
+    out.add(key(r.type, r.tmdb_id));
+  }
+  return out;
 }
 
-function addDontRecommend(profileId, type, tmdbId, reason = 'user') {
+function addDontRecommend(profileId, type, tmdbId, reason = 'user', at = Date.now()) {
   init();
   db.get().prepare(`
     INSERT INTO dont_recommend (profile_id, type, tmdb_id, reason, at) VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(profile_id, type, tmdb_id) DO UPDATE SET reason = excluded.reason, at = excluded.at
-  `).run(profileId, type, String(tmdbId), reason, Date.now());
+  `).run(profileId, type, String(tmdbId), reason, at);
   // If it was in the pool, drop it now.
   db.get().prepare('DELETE FROM recommended WHERE profile_id = ? AND type = ? AND tmdb_id = ?').run(profileId, type, String(tmdbId));
 }
@@ -401,11 +425,14 @@ function selectServe(rows, filters = {}, { nowYear = new Date().getFullYear(), l
 }
 
 // Build Stremio catalog metas for a profile's AI recommendations of one type.
-// Cache-only + cheap (no external calls) — safe for the addon request path.
+// Cache-only + cheap (local writes only, no external calls) — safe for the addon
+// request path. Records one impression per served title (fuels decay).
 function serveRecommendations(profile, type, { limit = SERVE_LIMIT } = {}) {
   init();
   const rows = getRecommended(profile.id, { type, limit: 100000 });
-  return selectServe(rows, profile.filters || {}, { limit }).map((r) => ({
+  const picked = selectServe(rows, profile.filters || {}, { limit });
+  recordImpressions(profile.id, picked);
+  return picked.map((r) => ({
     id: r.imdb_id,
     type,
     name: r.title,
@@ -413,6 +440,78 @@ function serveRecommendations(profile, type, { limit = SERVE_LIMIT } = {}) {
     releaseInfo: r.year ? String(r.year) : null,
     genres: (r.genres || '').split(',').filter(Boolean),
   }));
+}
+
+// ---- decay lifecycle (v6) ----
+const dayOf = (ms) => Math.floor((ms || 0) / DAY_MS);
+
+// PURE: given a pool row's current streak state + now, compute the updated
+// impression columns. Counts at most once per calendar day; a gap longer than
+// the fall-off resets the streak (a fresh chance for an out-competed title).
+function impressionStep(row, nowMs = Date.now()) {
+  const last = row.last_shown_at || 0;
+  const fellOff = !last || (nowMs - last) > FALLOFF_GAP_MS;
+  const newDay = dayOf(last) !== dayOf(nowMs);
+  return {
+    streak_started_at: fellOff ? nowMs : (row.streak_started_at || nowMs),
+    times_shown_in_streak: fellOff ? 1 : (row.times_shown_in_streak || 0) + (newDay ? 1 : 0),
+    last_shown_at: nowMs,
+    times_shown: (row.times_shown || 0) + (newDay ? 1 : 0),
+    first_shown_at: row.first_shown_at || nowMs,
+  };
+}
+
+// PURE: does this row qualify to decay out? Persistently shown (streak past the
+// window, on ≥ the day floor) AND never engaged. Watched titles never reach here
+// — they're excluded from the pool at build. Exported for testing.
+function shouldDecay(row, nowMs = Date.now()) {
+  if (row.engaged_at) return false;
+  if (!row.streak_started_at) return false;
+  if ((nowMs - row.streak_started_at) <= DECAY_WINDOW_MS) return false;
+  return (row.times_shown_in_streak || 0) >= DECAY_MIN_DAYS;
+}
+
+// Record one impression per served title (batched, day-de-duped so pagination /
+// prefetch don't inflate the count).
+function recordImpressions(profileId, rows, nowMs = Date.now()) {
+  if (!rows || !rows.length) return;
+  init();
+  const conn = db.get();
+  const stmt = conn.prepare(`UPDATE recommended SET
+      streak_started_at = ?, times_shown_in_streak = ?, last_shown_at = ?, times_shown = ?, first_shown_at = ?
+    WHERE profile_id = ? AND type = ? AND tmdb_id = ?`);
+  conn.prepare('BEGIN').run();
+  try {
+    for (const r of rows) {
+      const u = impressionStep(r, nowMs);
+      stmt.run(u.streak_started_at, u.times_shown_in_streak, u.last_shown_at, u.times_shown, u.first_shown_at, profileId, r.type, String(r.tmdb_id));
+    }
+    conn.prepare('COMMIT').run();
+  } catch (err) { conn.prepare('ROLLBACK').run(); throw err; }
+}
+
+// Move every decay-qualifying title to dont_recommend(reason='decayed'). Runs on
+// the hourly tick. Returns { decayed }.
+function applyDecay(profileId, { nowMs = Date.now(), log = console } = {}) {
+  init();
+  const rows = db.get().prepare(
+    'SELECT type, tmdb_id, streak_started_at, times_shown_in_streak, engaged_at FROM recommended WHERE profile_id = ?',
+  ).all(profileId);
+  let decayed = 0;
+  for (const r of rows) {
+    if (shouldDecay(r, nowMs)) { addDontRecommend(profileId, r.type, r.tmdb_id, 'decayed', nowMs); decayed++; }
+  }
+  if (decayed) log.log(`[decay] ${profileId}: ${decayed} title(s) decayed out (shown ${DECAY_MIN_DAYS}+ days over ${DECAY_WINDOW_MS / DAY_MS}d, never engaged)`);
+  return { decayed };
+}
+
+// Soft engagement: opening a title's detail page (/meta) resets its streak clock
+// (light interest — not a permanent 'engaged'), so an actively-opened title won't
+// decay. No-op when the title isn't in this profile's pool.
+function noteMetaOpen(profileId, type, imdbId, nowMs = Date.now()) {
+  init();
+  db.get().prepare('UPDATE recommended SET streak_started_at = ?, times_shown_in_streak = 0 WHERE profile_id = ? AND type = ? AND imdb_id = ?')
+    .run(nowMs, profileId, type, imdbId);
 }
 
 // Background rebuild trigger. The pool only needs rebuilding when there are new
@@ -459,7 +558,16 @@ module.exports = {
   serveRecommendations,
   setBuiltAt,
   getBuiltAt,
+  impressionStep,
+  shouldDecay,
+  recordImpressions,
+  applyDecay,
+  noteMetaOpen,
   HALF_LIFE_DAYS,
   PER_TITLE_CAP,
   SERVE_LIMIT,
+  DECAY_WINDOW_MS,
+  FALLOFF_GAP_MS,
+  DECAY_COOLDOWN_MS,
+  DECAY_MIN_DAYS,
 };

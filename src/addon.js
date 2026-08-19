@@ -172,6 +172,11 @@ router.get('/meta/:type/:id', async (req, res) => {
     return res.status(404).json({ error: 'Not available' });
   }
 
+  // Decay: opening a title's detail page is a soft interest signal — reset its
+  // streak so an actively-opened recommendation won't decay out. No-op unless
+  // it's in this profile's pool.
+  try { recommendationStore.noteMetaOpen(profile.id, type, id); } catch { /* never fail a title open */ }
+
   const cached = store.loadMeta(type, id);
   if (cached) {
     return res.json({ meta: applyRpdb([cached], profile.keys.rpdb_api_key)[0], cacheMaxAge: 43200 });

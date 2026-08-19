@@ -641,6 +641,64 @@ ok('recommendationStore: upsert, dont_recommend suppresses + drops from pool', (
   rs.deleteForProfile(pid);
 });
 
+ok('recommendationStore: decay — impressionStep counts once/day + resets on fall-off; shouldDecay gates', () => {
+  const rs = require('../src/recommendationStore');
+  const DAY = 24 * 3600e3;
+  const t0 = Date.parse('2026-01-01T00:00:00Z');
+  // First impression -> fresh streak of 1
+  let s = rs.impressionStep({}, t0);
+  assert.strictEqual(s.times_shown_in_streak, 1);
+  assert.strictEqual(s.streak_started_at, t0);
+  // Same calendar day -> count unchanged
+  s = rs.impressionStep({ streak_started_at: t0, times_shown_in_streak: 1, last_shown_at: t0, times_shown: 1 }, t0 + 3600e3);
+  assert.strictEqual(s.times_shown_in_streak, 1);
+  // Next day -> +1, same streak
+  s = rs.impressionStep({ streak_started_at: t0, times_shown_in_streak: 1, last_shown_at: t0, times_shown: 1 }, t0 + DAY);
+  assert.strictEqual(s.times_shown_in_streak, 2);
+  assert.strictEqual(s.streak_started_at, t0);
+  // Fall-off gap (>14d) -> streak resets to a fresh 1
+  s = rs.impressionStep({ streak_started_at: t0, times_shown_in_streak: 9, last_shown_at: t0, times_shown: 9 }, t0 + 20 * DAY);
+  assert.strictEqual(s.times_shown_in_streak, 1);
+  assert.strictEqual(s.streak_started_at, t0 + 20 * DAY);
+  // shouldDecay: past the 60d window AND >= 8-day floor AND not engaged
+  const base = { streak_started_at: t0, times_shown_in_streak: 8 };
+  assert.strictEqual(rs.shouldDecay(base, t0 + 61 * DAY), true);
+  assert.strictEqual(rs.shouldDecay(base, t0 + 40 * DAY), false); // inside window
+  assert.strictEqual(rs.shouldDecay({ streak_started_at: t0, times_shown_in_streak: 7 }, t0 + 61 * DAY), false); // below floor
+  assert.strictEqual(rs.shouldDecay({ ...base, engaged_at: t0 }, t0 + 61 * DAY), false); // engaged
+  assert.strictEqual(rs.shouldDecay({ times_shown_in_streak: 8 }, t0 + 61 * DAY), false); // no streak
+});
+
+ok('recommendationStore: decay — record → decay-out → cooldown expiry; meta open spares a title', () => {
+  const rs = require('../src/recommendationStore');
+  const DAY = 24 * 3600e3;
+  const pid = 'decay-test';
+  const now = Date.parse('2026-06-01T00:00:00Z');
+  const quiet = { log() {} };
+  rs.upsertCandidates(pid, [
+    { type: 'movie', tmdb_id: '1', imdb_id: 'tt1', title: 'Ignored', year: 2020, primary_genre: 'Drama', genres: 'Drama', vote_average: 7, affinity: 1, rec_count: 1, popularity: 1, poster: null },
+    { type: 'movie', tmdb_id: '2', imdb_id: 'tt2', title: 'Opened', year: 2020, primary_genre: 'Drama', genres: 'Drama', vote_average: 7, affinity: 1, rec_count: 1, popularity: 1, poster: null },
+  ]);
+  // Impressions on 8 distinct days for both titles
+  for (let d = 0; d < 8; d++) {
+    rs.recordImpressions(pid, rs.getRecommended(pid, { type: 'movie', limit: 100 }), now + d * DAY);
+  }
+  assert.strictEqual(rs.getRecommended(pid, { type: 'movie' }).find((r) => r.tmdb_id === '1').times_shown_in_streak, 8);
+  // Inside the window -> nothing decays
+  assert.strictEqual(rs.applyDecay(pid, { nowMs: now + 30 * DAY, log: quiet }).decayed, 0);
+  assert.strictEqual(rs.countRecommended(pid), 2);
+  // tt2's detail page is opened late -> streak resets, so it survives the sweep
+  rs.noteMetaOpen(pid, 'movie', 'tt2', now + 59 * DAY);
+  const res = rs.applyDecay(pid, { nowMs: now + 61 * DAY, log: quiet });
+  assert.strictEqual(res.decayed, 1);
+  assert.strictEqual(rs.countRecommended(pid), 1);
+  assert.strictEqual(rs.getRecommended(pid, { type: 'movie' })[0].tmdb_id, '2'); // Opened survived
+  // Decayed title is suppressed now, but returns after the 90-day cooldown
+  assert.ok(rs.dontRecommendKeys(pid, now + 61 * DAY).has('movie:1'));
+  assert.ok(!rs.dontRecommendKeys(pid, now + 61 * DAY + 91 * DAY).has('movie:1'));
+  rs.deleteForProfile(pid);
+});
+
 ok('llm: chatUrl joins, extractArray tolerates wrappers, groq model list', () => {
   const llm = require('../src/services/llm');
   assert.strictEqual(llm.chatUrl('http://h:1/v1/'), 'http://h:1/v1/chat/completions');

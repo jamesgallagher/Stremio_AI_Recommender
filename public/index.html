@@ -761,7 +761,10 @@ async function viewRecs(id, btn) {
       <span class="grow">${esc(r.title || '?')} <span class="muted">(${r.year || '?'}) · ${esc(r.primary_genre || '—')} · aff ${(r.affinity || 0).toFixed(2)}${r.age_classification ? ' · ' + esc(r.age_classification) : ''}</span>
         ${r.because_title
           ? `<div class="muted" style="font-size:11px">↳ because you watched <b style="color:var(--text)">${esc(r.because_title)}</b>${r.rec_count > 1 ? ` (+${r.rec_count - 1} more watched title${r.rec_count > 2 ? 's' : ''})` : ''}</div>`
-          : `<div class="muted" style="font-size:11px">↳ reason not recorded — rebuild to populate</div>`}</span>
+          : `<div class="muted" style="font-size:11px">↳ reason not recorded — rebuild to populate</div>`}
+        ${r.streak_started_at
+          ? `<div class="muted" style="font-size:11px">↳ decay: shown ${r.times_shown_in_streak || 0}/8 days · ${Math.floor((Date.now() - r.streak_started_at) / 86400000)}/60 days into window${r.engaged_at ? ' · engaged (decay off)' : ''}</div>`
+          : ''}</span>
       <button class="ghost mini" title="Don't recommend" onclick="suppressRec('${id}','${r.type}','${r.tmdb_id}',this)">🚫</button></div>`;
     const section = (list, label) => `<div style="margin-top:8px"><b>${label} (${list.length})</b>${list.map(row).join('') || '<div class="muted">none</div>'}</div>`;
     panel.innerHTML = `<div class="muted">${d.total} in the pool (top 40 of each shown)</div>${section(d.movies, 'Movies')}${section(d.series, 'Shows')}`;
