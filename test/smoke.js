@@ -896,6 +896,11 @@ require('../src/server');
 const BASE = `http://localhost:${process.env.PORT}`;
 
 async function httpTests() {
+  // The migrateFromProfiles unit test above seeds the GLOBAL settings with
+  // JAMES-* lookup keys. Now that the addon reads GLOBAL keys, clear them so the
+  // addon-serve tests start from a known "no keys" baseline (tests that need a
+  // key set it explicitly).
+  require('../src/settings').updateSettings({ keys: { tmdb_api_key: '', mdblist_api_key: '', rpdb_api_key: '' } });
   // Async unit check: fully-cached CSM lookups must answer without network
   // (the dummy key would fail loudly on any request).
   const mdblist = require('../src/services/mdblist');
@@ -1178,14 +1183,15 @@ async function httpTests() {
   assert.strictEqual(res.status, 404);
   console.log('  ✓ meta rejects non-tt ids, unknown types, missing key');
 
-  // RPDB: setting a key rewrites poster URLs at serve time (no rebuild)
-  await fetch(`${BASE}/api/profiles/${profile.id}`, {
+  // RPDB is a GLOBAL key (Server Config) — setting it rewrites poster URLs at
+  // serve time (no rebuild).
+  await fetch(`${BASE}/api/settings`, {
     method: 'PUT', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ keys: { rpdb_api_key: 't0-testkey' } }),
   });
   cat = await (await fetch(`${BASE}/addon/${profile.token}/catalog/movie/ai-recs-movies.json`)).json();
   assert.strictEqual(cat.metas[0].poster, 'https://api.ratingposterdb.com/t0-testkey/imdb/poster-default/tt0111161.jpg?fallback=true');
-  console.log('  ✓ RPDB poster substitution at serve time');
+  console.log('  ✓ RPDB poster substitution at serve time (global key)');
 
   // Serve-time watched pruning: a title in the watched store is removed at serve
   // time even though it's still in the pool. Cross-type too — a title logged as a

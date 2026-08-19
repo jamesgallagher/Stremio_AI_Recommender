@@ -77,10 +77,11 @@ function enabledExtras(profile) {
   return EXTRA_CATALOGS.filter((d) => isEnabled(profile, d) && ageAppropriate(profile, d));
 }
 
-// The profile-side prerequisite for a catalog's data source.
+// The prerequisite for a catalog's data source. Simkl is per-profile; the
+// MDBList key is global (Server Config), with a per-profile fallback.
 function requirementMet(profile, def) {
   if (def.source === 'simkl_plantowatch') return !!profile.simkl_auth?.access_token;
-  return !!profile.keys.mdblist_api_key;
+  return !!require('./settings').keyFor(profile, 'mdblist_api_key');
 }
 
 module.exports = { EXTRA_CATALOGS, getExtra, isEnabled, enabledExtras, ageAppropriate, requirementMet };

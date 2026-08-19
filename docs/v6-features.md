@@ -681,6 +681,14 @@ via `pollStatus()` too, so nothing you're viewing is yanked. Also fixed a latent
 crash: `saveFilters` still read the removed `engine`/`rating_source` selectors and
 threw on every filter save.
 
+**Layout refinements (v6.21.0-beta):** top bar with a **profile selector** (one
+card shown at a time) + a **Server Config toggle** (Server Config collapses once
+complete, reveals on demand). **Per-profile Keys tab removed** — lookup keys are
+GLOBAL now (`settings.keyFor()` resolves global first, per-profile fallback; the
+addon/catalogs/rebuild all read it). Recommendations folded into an **Advanced**
+tab alongside Rebuild + Delete. (RPDB is a global key now too, so its poster
+substitution reads the Server Config key.)
+
 **STILL NOT BUILT:** **Mobile Companion** (needs a Simkl `plantowatch` *write* +
 `watching`/plantowatch → engaged), the **in-app meta "🚫 Don't recommend" link**,
 and cleanup of the now-vestigial `engine`/`rating_source` config fields (server-

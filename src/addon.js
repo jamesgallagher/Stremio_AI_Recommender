@@ -3,6 +3,7 @@
 // background rebuild (fire-and-forget) via rebuild.ensureFresh.
 const express = require('express');
 const config = require('./config');
+const settings = require('./settings');
 const store = require('./store');
 const rebuild = require('./rebuild');
 const catalogs = require('./catalogs');
@@ -119,12 +120,12 @@ async function handleSearch(profile, type, extraStr, res) {
   const raw = (extraStr.match(/search=([^&]+)/) || [])[1] || '';
   let query = '';
   try { query = decodeURIComponent(raw).trim(); } catch { query = raw.trim(); }
-  if (query.length < 2 || !profile.keys.tmdb_api_key) {
+  if (query.length < 2 || !settings.keyFor(profile, 'tmdb_api_key')) {
     return res.json({ metas: [], cacheMaxAge: 300 });
   }
   const kids = (profile.filters.age_limit || 0) > 0;
   try {
-    let metas = await tmdb.searchTitles(profile.keys.tmdb_api_key, type, query, kids ? 10 : 20);
+    let metas = await tmdb.searchTitles(settings.keyFor(profile, 'tmdb_api_key'), type, query, kids ? 10 : 20);
     // NSFW blacklist + anime age band — runs for ADULT searches too, since the
     // blacklist is not tied to an age limit.
     metas = await rebuild.applyAnimeGate(metas, profile, console);
@@ -140,7 +141,7 @@ async function handleSearch(profile, type, extraStr, res) {
       metas = metas.filter((m) => !vetoed.has(m.id));
     }
     console.log(`[search] ${profile.name}/${type} "${query}": ${metas.length} result(s)${kids ? ' (age-gated)' : ''}`);
-    return res.json({ metas: applyRpdb(rebuild.cleanMetas(metas), profile.keys.rpdb_api_key), cacheMaxAge: 3600 });
+    return res.json({ metas: applyRpdb(rebuild.cleanMetas(metas), settings.keyFor(profile, 'rpdb_api_key')), cacheMaxAge: 3600 });
   } catch (err) {
     console.warn(`[search] ${profile.name}/${type} "${query}" failed (${err.message}) — returning no results${kids ? ' (fail-closed)' : ''}`);
     return res.json({ metas: [], cacheMaxAge: 300 });
@@ -179,11 +180,11 @@ router.get('/meta/:type/:id', async (req, res) => {
 
   const cached = store.loadMeta(type, id);
   if (cached) {
-    return res.json({ meta: applyRpdb([cached], profile.keys.rpdb_api_key)[0], cacheMaxAge: 43200 });
+    return res.json({ meta: applyRpdb([cached], settings.keyFor(profile, 'rpdb_api_key'))[0], cacheMaxAge: 43200 });
   }
-  if (!profile.keys.tmdb_api_key) return res.status(404).json({ error: 'TMDB key not configured' });
+  if (!settings.keyFor(profile, 'tmdb_api_key')) return res.status(404).json({ error: 'TMDB key not configured' });
   try {
-    const result = await tmdb.fullMeta(profile.keys.tmdb_api_key, type, id, console);
+    const result = await tmdb.fullMeta(settings.keyFor(profile, 'tmdb_api_key'), type, id, console);
     if (!result) return res.status(404).json({ error: 'Not found' });
 
     // Anime series: prefer Cinemeta's episode numbering. TMDB numbers anime by
@@ -204,7 +205,7 @@ router.get('/meta/:type/:id', async (req, res) => {
     const eps = result.meta.videos ? ` (${result.meta.videos.length} episodes)` : '';
     console.log(`[meta] ${profile.name}/${type} ${id}: built${eps}`);
     return res.json({
-      meta: applyRpdb([result.meta], profile.keys.rpdb_api_key)[0],
+      meta: applyRpdb([result.meta], settings.keyFor(profile, 'rpdb_api_key'))[0],
       cacheMaxAge: Math.floor(result.ttlMs / 1000),
     });
   } catch (err) {
@@ -264,7 +265,7 @@ router.get('/catalog/:type/:catalogId{/:extra}', async (req, res) => {
     const pruned = metas.filter((m) => !watched.imdb.has(m.id));
     const sliced = skip > 0 ? pruned.slice(skip) : pruned;
     return res.json({
-      metas: applyRpdb(sliced, profile.keys.rpdb_api_key),
+      metas: applyRpdb(sliced, settings.keyFor(profile, 'rpdb_api_key')),
       cacheMaxAge: 3600,
       staleRevalidate: 12 * 3600,
     });
@@ -287,7 +288,7 @@ router.get('/catalog/:type/:catalogId{/:extra}', async (req, res) => {
       ? (!profile.simkl_auth?.access_token
         ? 'Watch Later mirrors your Simkl plan-to-watch list — connect Simkl in the configure portal.'
         : 'Your Simkl plan-to-watch list is empty — add titles on simkl.com or from your player, and they appear here.')
-      : (profile.keys.mdblist_api_key
+      : (settings.keyFor(profile, 'mdblist_api_key')
         ? 'This list is being generated — check back in a minute or two.'
         : 'This catalog needs an MDBList API key — add one in the configure portal.');
     return res.json({ metas: skip > 0 ? [] : [errorCard(def.type, description)], cacheMaxAge: 5 * 60 });
@@ -305,7 +306,7 @@ router.get('/catalog/:type/:catalogId{/:extra}', async (req, res) => {
   }
 
   const sliced = skip > 0 ? served.slice(skip) : served;
-  const metas = applyRpdb(sliced, profile.keys.rpdb_api_key);
+  const metas = applyRpdb(sliced, settings.keyFor(profile, 'rpdb_api_key'));
   res.json({
     metas,
     cacheMaxAge: 3600, // short client hint so pruned/rebuilt lists appear quickly

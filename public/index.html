@@ -92,20 +92,24 @@
 <body>
 <div class="wrap">
   <h1><img src="logo.svg" alt="" class="brand">AI Recommender</h1>
-  <div class="sub">Admin portal — each section below manages one family member's addon: their keys, Simkl link, filters, and install URL. <span id="ver"></span></div>
+  <div class="sub">Admin portal — pick a family member above to manage their addon (Simkl link, filters, catalogs, install URL). Shared keys live in Server Config. <span id="ver"></span></div>
 
   <div id="lockBanner" style="display:none;background:var(--err);color:#fff;padding:12px 14px;border-radius:8px;margin:10px 0;font-size:14px">
     🔒 <b>Secrets are locked.</b> profiles.json holds encrypted secrets but <code>SECRET_KEY</code> is missing or wrong on the server, so API keys and Simkl tokens can't be read. Recommendations keep serving from cache, but <b>editing is disabled</b> until you restore the correct key. <b>Nothing was changed or lost</b> — set the right <code>SECRET_KEY</code> and restart.
   </div>
 
-  <div id="serverConfig"></div>
-
-  <div class="card">
-    <div class="row">
-      <input type="text" id="newName" class="grow" placeholder="New profile name (e.g. James)">
-      <button onclick="addProfile()">Add profile</button>
+  <div class="card" id="topbar">
+    <div class="row" style="flex-wrap:wrap;gap:8px">
+      <label style="margin:0;font-size:13px;color:var(--muted)">Profile</label>
+      <select id="userSelect" onchange="selectUser(this.value)" style="min-width:170px"></select>
+      <input type="text" id="newName" placeholder="New profile name" style="max-width:200px">
+      <button onclick="addProfile()">Add</button>
+      <div class="grow"></div>
+      <button class="ghost" id="serverCfgBtn" onclick="toggleServerConfig()">⚙ Server Config</button>
     </div>
   </div>
+
+  <div id="serverConfig"></div>
 
   <div id="profiles"></div>
 </div>
@@ -218,28 +222,20 @@ function render(profiles) {
   });
   container.innerHTML = profiles.map(p => {
     const installUrl = p.install_url;
-    // RPDB is optional — excluded from the required-keys gate
-    // Groq is only required for kids profiles (AI age goalkeeper)
-    const keysOk = p.keys_set.tmdb_api_key && (p.filters.age_limit > 0 ? p.keys_set.groq_api_key : true);
-    const simklKeysOk = p.keys_set.simkl_client_id; // PIN flow needs only the Client ID
     return `
     <div class="card" data-id="${p.id}" data-active-tab="${activeMap[p.id] || 'simkl'}">
       <div class="row">
         <h2>${esc(p.name)}</h2> <span class="hdr-badge">${statusBadge(p)}</span>
-        <div class="grow"></div>
-        <button class="ghost btn-rebuild" onclick="rebuildNow('${p.id}', this)" ${p.simkl_connected && !p.status.rebuilding ? '' : 'disabled'}>${p.status.rebuilding ? 'Rebuilding…' : 'Rebuild now'}</button>
-        <button class="danger" onclick="delProfile('${p.id}')">Delete</button>
       </div>
       <div class="status-line">${statusLine(p)}</div>
 
       <div class="tabs">
         <button class="tab-btn" data-tab="simkl" onclick="switchTab(this,'simkl')">Simkl</button>
-        <button class="tab-btn" data-tab="recs" onclick="switchTab(this,'recs')">Recommendations</button>
-        <button class="tab-btn" data-tab="keys" onclick="switchTab(this,'keys')">Keys</button>
         <button class="tab-btn" data-tab="filters" onclick="switchTab(this,'filters')">Filters</button>
         <button class="tab-btn" data-tab="catalogs" onclick="switchTab(this,'catalogs')">Catalogs</button>
         <button class="tab-btn" data-tab="scrobble" onclick="switchTab(this,'scrobble')">Scrobble</button>
         <button class="tab-btn" data-tab="install" onclick="switchTab(this,'install')">Install</button>
+        <button class="tab-btn" data-tab="advanced" onclick="switchTab(this,'advanced')">Advanced</button>
       </div>
 
       <div class="tab-panel" data-tab="simkl">
@@ -255,31 +251,6 @@ function render(profiles) {
           <button class="ghost" onclick="checkSimklStatus('${p.id}')">Check connection</button></div>
         <div class="simkl-flow" data-sid="${p.id}" style="margin-top:12px; padding-top:10px; border-top:1px solid var(--border)">
           <span class="muted">Save the Client ID, then <b>Check connection</b> to verify live against Simkl.</span>
-        </div>
-      </div>
-
-      <div class="tab-panel" data-tab="keys">
-        <div class="muted" style="margin-top:4px">Per-profile API keys (TMDB, Groq, MDBList, RPDB). Create each while signed in as <b>${esc(p.name)}</b>'s account on that service.</div>
-        <div class="keys-list">
-          <div><label>TMDB API Key
-              <a class="getkey" href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">get key ↗</a></label>
-            ${keyRow(p.id, 'tmdb_api_key', p.keys.tmdb_api_key, 'tmdb')}
-            <div class="muted" style="font-size:11px;margin-top:3px">Accepts either a v3 API key or a v4 Read Access Token (Bearer) — same account, either works; the token keeps the key out of request URLs.</div></div>
-          <div><label>Groq API Key
-              <a class="getkey" href="https://console.groq.com/keys" target="_blank" rel="noopener">get key ↗</a></label>
-            ${keyRow(p.id, 'groq_api_key', p.keys.groq_api_key, 'groq')}
-            <div class="muted" style="font-size:11px;margin-top:3px">Required only for kids profiles (age limit set) — powers the AI age check. Adult profiles never call the LLM. Free tier at console.groq.com. Model: openai/gpt-oss-120b (override with the GROQ_MODELS env var).</div></div>
-          <div><label>MDBList API Key
-              <a class="getkey" href="https://mdblist.com/preferences/" target="_blank" rel="noopener">get key ↗</a></label>
-            ${keyRow(p.id, 'mdblist_api_key', p.keys.mdblist_api_key, 'mdblist')}
-            <div class="muted" style="font-size:11px;margin-top:3px">Required — powers the extra (MDBList) catalogs. Free key: sign in at mdblist.com → Preferences (1,000 requests/day; lookups are cached, so daily use is a fraction of that).</div></div>
-          <div><label>RPDB API Key <span class="muted">(optional)</span>
-              <a class="getkey" href="https://ratingposterdb.com/" target="_blank" rel="noopener">get key ↗</a></label>
-            ${keyRow(p.id, 'rpdb_api_key', p.keys.rpdb_api_key, 'rpdb')}
-            <div class="muted" style="font-size:11px;margin-top:3px">Pre-set with the free-tier key (t0-free-rpdb) — posters show ratings out of the box. Paste a personal key here to upgrade tiers. Applies immediately, no rebuild.</div></div>
-        </div>
-        <div style="margin-top:10px">
-          <button onclick="saveKeys('${p.id}')">Save</button>
         </div>
       </div>
 
@@ -314,7 +285,7 @@ function render(profiles) {
               </select>
             </div>
             <div class="muted" style="font-size:11px;margin-top:3px">At build time an AI pass removes anything unsuitable for this age (anime also gets its MAL band), judged one year above the limit because classification brackets are coarse. A cheap band re-check runs again at serve time. Requires the Groq/LLM key.</div>
-            ${p.filters.age_limit > 0 && !p.keys_set.groq_api_key ? '<div style="color:var(--err);font-size:12px;margin-top:4px">⚠ Age limit is on but no Groq key is set — rebuilds will fail until you add one.</div>' : ''}
+            ${p.filters.age_limit > 0 && !p.keys_set.groq_api_key ? '<div style="color:var(--err);font-size:12px;margin-top:4px">⚠ Age limit is on but no LLM is configured — set a Custom LLM or Groq key in Server Config, or rebuilds fail.</div>' : ''}
           </div>
         </div>
         <label>Excluded genres <span class="muted">(ticked = never recommended)</span></label>
@@ -333,7 +304,7 @@ function render(profiles) {
           ${catsFor(p).map(c => `<label><input type="checkbox" data-catalog="${esc(c.id)}" ${catOn(p, c) ? 'checked' : ''}>${esc(c.name)}<span class="muted" style="font-size:11px">${c.type === 'series' ? 'series' : 'movies'}${c.source === 'simkl_plantowatch' ? ' · Simkl plan-to-watch' : ''}${c.min_profile_age ? ' · ' + c.min_profile_age + '+ only' : ''}${c.age_band ? ' · age-gated ' + c.age_band + '+' : ''}${c.min_imdb ? ' · IMDb ≥ ' + c.min_imdb : ''}${c.target && c.target !== 20 ? ' · ' + c.target + ' titles' : ''}${c.dedupe_watched === false ? ' · keeps watched' : ''}</span></label>`).join('')}
         </div>
         ${catsFor(p).some(c => catOn(p, c) && c.source === 'simkl_plantowatch') && !p.simkl_connected ? '<div style="color:var(--err);font-size:12px;margin-top:6px">⚠ Watch Later is enabled but Simkl is not connected — it cannot build until this profile connects Simkl.</div>' : ''}
-        ${catsFor(p).some(c => catOn(p, c) && c.source === 'mdblist') && !p.keys_set.mdblist_api_key ? '<div style="color:var(--err);font-size:12px;margin-top:6px">⚠ Curated catalogs are enabled but no MDBList key is set — they cannot build until you add one (API keys section).</div>' : ''}
+        ${catsFor(p).some(c => catOn(p, c) && c.source === 'mdblist') && !p.keys_set.mdblist_api_key ? '<div style="color:var(--err);font-size:12px;margin-top:6px">⚠ Curated catalogs are enabled but no MDBList key is set — add one in Server Config (they cannot build without it).</div>' : ''}
         <div style="margin-top:10px" class="row">
           <button onclick="saveCatalogs('${p.id}')">Save catalogs</button>
           <span class="muted"> — newly enabled lists build in the background; they appear in Stremio/Nuvio after the app refreshes the addon manifest (or reinstall the addon)</span>
@@ -391,12 +362,18 @@ function render(profiles) {
         <div class="muted" style="margin-top:6px">Paste the URL in Stremio → Addons → Add addon. This link is ${esc(p.name)}'s personal list — don't share it outside the family.</div>
       </div>
 
-      <div class="tab-panel" data-tab="recs">
-        <div class="muted" style="margin-top:4px">The AI recommendation pool for <b>${esc(p.name)}</b> — built from Simkl watched history (TMDB recommendations, recency-weighted). Inspect why each title is here, or reset it.</div>
-        <div style="margin-top:10px" class="row">
-          <button class="ghost" onclick="buildRecs('${p.id}', this)" title="Build the recommendation pool from watched history">Build recommendations</button>
-          <button class="ghost" onclick="viewRecs('${p.id}', this)">View recommendations</button>
-          <button class="ghost" onclick="resetRecs('${p.id}', this)" title="Wipe the pool and your 'don't recommend' flags">Reset recommendations</button>
+      <div class="tab-panel" data-tab="advanced">
+        <div style="margin-top:4px" class="row">
+          <button class="ghost btn-rebuild" onclick="rebuildNow('${p.id}', this)" ${p.simkl_connected && !p.status.rebuilding ? '' : 'disabled'}>${p.status.rebuilding ? 'Rebuilding…' : 'Rebuild now'}</button>
+          <button class="danger" onclick="delProfile('${p.id}')">Delete profile</button>
+        </div>
+        <div class="muted" style="font-size:11px;margin-top:4px">Rebuild re-runs the extra catalogs (and the pool if watched history moved). Delete removes this profile and stops its install link immediately.</div>
+
+        <div style="margin-top:16px"><b>Recommendation pool</b> <span class="muted" style="font-size:11px">— built from Simkl watched history (TMDB recommendations, recency-weighted)</span></div>
+        <div style="margin-top:8px" class="row">
+          <button class="ghost" onclick="buildRecs('${p.id}', this)" title="Build the recommendation pool from watched history">Build</button>
+          <button class="ghost" onclick="viewRecs('${p.id}', this)">View</button>
+          <button class="ghost" onclick="resetRecs('${p.id}', this)" title="Wipe the pool and your 'don't recommend' flags">Reset</button>
         </div>
         <span class="tres" data-tres="recs"></span>
         ${p.simkl_connected ? '' : '<div class="muted" style="margin-top:6px">Connect Simkl (Simkl tab) first — the pool builds from watched history.</div>'}
@@ -509,8 +486,11 @@ async function saveSettings(btn) {
     await api('/settings', { method: 'PUT', body: collectSettings() });
     dirty = false;
     toast('Server config saved');
-    renderServerConfig(await api('/settings')); // re-render only the server-config block
-    pollStatus(); // profile badges may flip (LLM now configured)
+    const s = await api('/settings');
+    cfgComplete = !!s.complete;
+    renderServerConfig(s); // re-render only the server-config block
+    applyServerConfigVisibility();
+    pollStatus(); // profile badges/warnings may flip (keys/LLM now configured)
   } catch (e) { toast('Save failed: ' + e.message); } finally { btn.disabled = false; }
 }
 
@@ -559,21 +539,56 @@ async function testLlm(btn) {
   } finally { btn.disabled = false; }
 }
 
+// ---- profile selection + server-config visibility ----
+let PROFILES = [];
+let SELECTED = null;
+let cfgComplete = false;   // Server Config is fully set up
+let cfgForced = false;     // user clicked "Server Config" to reveal it anyway
+
+function selectedProfile() { return PROFILES.find(p => p.id === SELECTED) || null; }
+function renderSelected() { const p = selectedProfile(); render(p ? [p] : []); }
+function selectUser(id) { SELECTED = id; renderSelected(); }
+
+function renderTopBar() {
+  const sel = $('#userSelect');
+  if (!sel) return;
+  sel.innerHTML = PROFILES.length
+    ? PROFILES.map(p => `<option value="${p.id}" ${p.id === SELECTED ? 'selected' : ''}>${esc(p.name)}</option>`).join('')
+    : '<option value="">— no profiles yet —</option>';
+}
+
+// Once Server Config is complete it collapses out of the way; the ⚙ button in
+// the top bar reveals it on demand. Incomplete config always shows (it needs you).
+function applyServerConfigVisibility() {
+  const show = cfgForced || !cfgComplete;
+  $('#serverConfig').style.display = show ? '' : 'none';
+  const btn = $('#serverCfgBtn');
+  if (btn) btn.textContent = show ? (cfgComplete ? '⚙ Hide Server Config' : '⚙ Server Config — setup needed') : '⚙ Server Config';
+}
+function toggleServerConfig() { cfgForced = !cfgForced; applyServerConfigVisibility(); }
+
 async function load() {
   if (!GENRES.length) GENRES = (await api('/genres')).genres;
   if (!CATALOG_DEFS.length) CATALOG_DEFS = (await api('/catalogs')).catalogs;
   if (!$('#ver').textContent) $('#ver').textContent = `· v${(await api('/version')).version}`;
-  renderServerConfig(await api('/settings'));
+  const settings = await api('/settings');
+  cfgComplete = !!settings.complete;
+  renderServerConfig(settings);
+  applyServerConfigVisibility();
   const { profiles, secrets_locked } = await api('/profiles');
   $('#lockBanner').style.display = secrets_locked ? 'block' : 'none';
-  render(profiles);
+  PROFILES = profiles;
+  if (!SELECTED || !profiles.find(p => p.id === SELECTED)) SELECTED = profiles[0]?.id || null;
+  renderTopBar();
+  renderSelected();
 }
 
 async function addProfile() {
   const name = $('#newName').value.trim();
   if (!name) return toast('Enter a name first');
-  await api('/profiles', { method: 'POST', body: { name } });
+  const { profile } = await api('/profiles', { method: 'POST', body: { name } });
   $('#newName').value = '';
+  SELECTED = profile?.id || SELECTED; // jump to the new profile
   load();
 }
 
@@ -897,15 +912,16 @@ async function pollStatus() {
   let data;
   try { data = await api('/profiles'); } catch { return; }
   $('#lockBanner').style.display = data.secrets_locked ? 'block' : 'none';
-  const cards = [...$('#profiles').querySelectorAll('.card[data-id]')];
-  const ids = new Set(data.profiles.map(p => p.id));
-  if (cards.length !== data.profiles.length || cards.some(c => !ids.has(c.dataset.id))) {
-    return render(data.profiles); // add/delete elsewhere -> one full render
-  }
-  const byId = new Map(data.profiles.map(p => [p.id, p]));
-  for (const card of cards) {
-    const p = byId.get(card.dataset.id);
-    if (!p) continue;
+  PROFILES = data.profiles;
+  // Profile SET changed elsewhere (add/delete) -> refresh the selector + card once.
+  const shown = $('#profiles').querySelector('.card[data-id]')?.dataset.id;
+  const setChanged = !SELECTED || !data.profiles.find(p => p.id === SELECTED);
+  if (setChanged) { if (!data.profiles.find(p => p.id === SELECTED)) SELECTED = data.profiles[0]?.id || null; renderTopBar(); return renderSelected(); }
+  if (shown !== SELECTED) { renderTopBar(); return renderSelected(); }
+  // Otherwise update only the visible card's volatile bits in place.
+  const p = data.profiles.find(x => x.id === SELECTED);
+  const card = $('#profiles').querySelector(`.card[data-id="${SELECTED}"]`);
+  if (p && card) {
     const badge = card.querySelector('.hdr-badge'); if (badge) badge.innerHTML = statusBadge(p);
     const line = card.querySelector('.status-line'); if (line) line.innerHTML = statusLine(p);
     const rb = card.querySelector('.btn-rebuild');

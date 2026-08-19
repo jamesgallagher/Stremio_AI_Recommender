@@ -70,13 +70,15 @@ function publicProfile(p, req) {
       rpdb_api_key: p.keys.rpdb_api_key || '',
       mdblist_api_key: p.keys.mdblist_api_key || '',
     },
+    // Lookup keys are GLOBAL (Server Config) now — reflect the effective key
+    // (global, with a per-profile fallback) so per-profile warnings are correct.
     keys_set: {
       simkl_client_id: !!p.keys.simkl_client_id,
       simkl_client_secret: !!p.keys.simkl_client_secret,
-      tmdb_api_key: !!p.keys.tmdb_api_key,
-      groq_api_key: !!p.keys.groq_api_key,
-      rpdb_api_key: !!p.keys.rpdb_api_key,
-      mdblist_api_key: !!p.keys.mdblist_api_key,
+      tmdb_api_key: !!settings.keyFor(p, 'tmdb_api_key'),
+      groq_api_key: !!settings.keyFor(p, 'groq_api_key'),
+      rpdb_api_key: !!settings.keyFor(p, 'rpdb_api_key'),
+      mdblist_api_key: !!settings.keyFor(p, 'mdblist_api_key'),
     },
     keys_preview: {
       tmdb_api_key: redactKey(p.keys.tmdb_api_key),

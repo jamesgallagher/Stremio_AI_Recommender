@@ -149,6 +149,15 @@ function hasLlm(s = getSettings()) {
   return llmChain(s).length > 0;
 }
 
+// Effective lookup key for a profile. Keys are GLOBAL (Server Config) in v6; a
+// per-profile key is honoured only as a fallback for older profiles that still
+// carry one. `field` is a keys field (tmdb/mdblist/rpdb_api_key) or groq_api_key.
+function keyFor(profile, field) {
+  const s = getSettings();
+  const global = field === 'groq_api_key' ? s?.llm?.groq_api_key : s?.keys?.[field];
+  return global || profile?.keys?.[field] || '';
+}
+
 module.exports = {
   blankSettings,
   getSettings,
@@ -157,6 +166,7 @@ module.exports = {
   isComplete,
   llmChain,
   hasLlm,
+  keyFor,
   settingsLocked,
   DEFAULT_RPDB_KEY,
   LLM_SECRET_FIELDS,

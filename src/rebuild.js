@@ -291,7 +291,7 @@ async function buildExtraCatalog(profile, def, log = console) {
   if (def.source === 'simkl_plantowatch') {
     return cleanMetas(await applyExtraAgeGate(profile, def, await buildWatchlistCatalog(profile, def, log), log));
   }
-  const key = profile.keys.mdblist_api_key;
+  const key = settings.keyFor(profile, 'mdblist_api_key');
   if (!key) throw new Error('MDBList API key is required for extra catalogs');
   const target = def.target || EXTRA_LIST_TARGET;
   const collected = [];
