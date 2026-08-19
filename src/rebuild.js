@@ -354,14 +354,17 @@ async function buildExtraCatalog(profile, def, log = console) {
 // Rebuilds a profile's EXTRA catalogs (MDBList curated + the remaining
 // list-backed catalogs). The AI recommendation catalogs are built separately by
 // recommendationStore (v6) — this pipeline no longer touches them.
-async function rebuildProfile(profile, log = console, opts = {}) {
+async function rebuildProfile(profile, log = console, opts = {}, onProgress = () => {}) {
   if (locks.has(profile.id)) return { skipped: 'locked' };
   locks.add(profile.id);
   const results = {};
   try {
     store.markAttempt(profile.id);
     if (opts.extras !== false) {
-      for (const def of catalogs.enabledExtras(profile)) {
+      const defs = catalogs.enabledExtras(profile);
+      let done = 0;
+      onProgress(0, `Rebuilding ${defs.length} extra catalog(s)…`);
+      for (const def of defs) {
         try {
           const metas = await buildExtraCatalog(profile, def, log);
           // Watch Later is a mirror, not a generated list: any size — even
@@ -379,6 +382,8 @@ async function rebuildProfile(profile, log = console, opts = {}) {
           results[def.id] = { ok: false, error: err.message };
           log.warn(`[extra] ${profile.name}/${def.id} failed: ${err.message} — kept previous list`);
         }
+        done++;
+        onProgress((done / (defs.length || 1)) * 100, `Rebuilt ${done}/${defs.length} catalogs (${def.name})`);
       }
     }
   } finally {
@@ -399,7 +404,7 @@ function ensureFresh(profile, log = console) {
   if (!extrasStale) return false;
   if (locks.has(profile.id)) return false;
   if (Date.now() - (cache.last_attempt_at || 0) < BACKOFF_MS) return false;
-  rebuildProfile(profile, log, { extras: true })
+  require('./jobs').enqueue(profile.id, 'extras', (progress) => rebuildProfile(profile, log, { extras: true }, progress))
     .catch((err) => log.error(`[rebuild] unexpected: ${err.message}`));
   return true;
 }

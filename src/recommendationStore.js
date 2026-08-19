@@ -227,13 +227,14 @@ function hardDrop(profileId, type, tmdbId) {
 //   2. LLM ACB pass (age-limited profiles only) — remove-only, per type.
 // Failures are deleted from the pool (re-evaluated on the next build, not a
 // permanent user rejection). TMDB `adult` porn was already dropped at build.
-async function ageGatePool(profile, log = console) {
+async function ageGatePool(profile, log = console, onProgress = () => {}) {
   init();
   const rebuild = require('./rebuild');   // lazy — heavy module, avoids load-order surprises
   const groq = require('./services/groq');
   const rows = getRecommended(profile.id, { limit: 100000 });
   if (!rows.length) return { dropped: 0, vetoed: 0, remain: 0 };
   const limit = profile.filters?.age_limit || 0;
+  onProgress(0, 'Age-gating the pool…');
 
   // 1. NSFW + anime band. Shape candidates as the metas applyAnimeGate expects.
   const metas = rows.map((r) => ({ id: r.imdb_id || r.tmdb_id, _tmdb_id: r.tmdb_id, name: r.title, _rtype: r.type }));
@@ -246,6 +247,7 @@ async function ageGatePool(profile, log = console) {
   // 2. LLM ACB pass — kids only, remove-only, per type.
   let vetoed = 0;
   if (limit > 0) {
+    onProgress(50, 'Age-checking with the LLM…');
     for (const type of ['movie', 'series']) {
       const survivors = getRecommended(profile.id, { type, limit: 100000 });
       if (!survivors.length) continue;
@@ -270,7 +272,7 @@ function resetRecommendations(profileId) {
 // Build the recommendation pool for a profile. Fetches TMDB recs per watched
 // seed, scores by affinity, applies deterministic filters, upserts the top N.
 // The caller runs ageGatePool() after this to make the pool age-safe.
-async function buildRecommendations(profile, log = console) {
+async function buildRecommendations(profile, log = console, onProgress = () => {}) {
   init();
   const s = settings.getSettings();
   const tmdbKey = s?.keys?.tmdb_api_key;
@@ -286,8 +288,13 @@ async function buildRecommendations(profile, log = console) {
   // lever — ~5/title instead of ~20. User-preference filters (rating floor,
   // excluded genres, recency) are NOT applied here — they run at serve time over
   // this stored pool, so changing one takes effect with no rebuild.
+  // Progress model: phase A (fetch recs per watched seed) is the first half of
+  // the bar; phase B (resolve tt id + poster per stored candidate) is the second
+  // half — the slow part. seeds = "shows + movies to scan", as the user sees it.
   const recsBySeed = new Map();
   let rawFetched = 0;
+  let seedsDone = 0;
+  onProgress(0, `Scanning ${seeds.length} watched title(s) for recommendations…`);
   for (let i = 0; i < seeds.length; i += 5) {
     const chunk = seeds.slice(i, i + 5);
     await Promise.all(chunk.map(async (w) => {
@@ -296,7 +303,9 @@ async function buildRecommendations(profile, log = console) {
         rawFetched += recs.length;
         recsBySeed.set(key(w.type, w.tmdb_id), selectStrong(recs));
       } catch (err) { log.warn(`[rec] recs for ${w.title} failed: ${err.message}`); }
+      seedsDone++;
     }));
+    onProgress((seedsDone / seeds.length) * 50, `Scanned ${seedsDone}/${seeds.length} watched titles`);
   }
 
   const candidates = computeAffinity(seeds, recsBySeed);
@@ -325,18 +334,23 @@ async function buildRecommendations(profile, log = console) {
   // heavy step (one light TMDB call each); it runs in the background build.
   await animeMap.ensureLoaded(log);
   const servable = [];
+  let resolvedDone = 0;
+  onProgress(50, `Resolving ${top.length} recommendation(s)…`);
   for (let i = 0; i < top.length; i += 8) {
     const chunk = top.slice(i, i + 8);
     await Promise.all(chunk.map(async (c) => {
       const imdb = await tmdb.imdbFor(tmdbKey, c.type, c.tmdb_id);
-      if (!imdb) return;                       // Stremio needs a tt id
-      c.imdb_id = imdb;
-      c.poster = tmdb.posterUrl(c.poster);     // bare path -> full URL
-      if (animeMap.isAnime(imdb, c.tmdb_id) && !c.genres.split(',').includes('Anime')) {
-        c.genres = c.genres ? `Anime,${c.genres}` : 'Anime';
+      if (imdb) {
+        c.imdb_id = imdb;
+        c.poster = tmdb.posterUrl(c.poster);     // bare path -> full URL
+        if (animeMap.isAnime(imdb, c.tmdb_id) && !c.genres.split(',').includes('Anime')) {
+          c.genres = c.genres ? `Anime,${c.genres}` : 'Anime';
+        }
+        servable.push(c);
       }
-      servable.push(c);
+      resolvedDone++;
     }));
+    onProgress(50 + (resolvedDone / (top.length || 1)) * 50, `Resolved ${resolvedDone}/${top.length} recommendations`);
   }
   upsertCandidates(profile.id, servable);
   setBuiltAt(profile.id);
@@ -514,27 +528,31 @@ function noteMetaOpen(profileId, type, imdbId, nowMs = Date.now()) {
     .run(nowMs, profileId, type, imdbId);
 }
 
-// Background rebuild trigger. The pool only needs rebuilding when there are new
-// SEEDS (watched history moved since the last build) or it's empty — user-filter
-// changes now apply at serve time, so they never trigger a rebuild. Serialized
-// per profile with an in-memory lock.
-const buildLocks = new Set();
+// The pool only needs rebuilding when there are new SEEDS (watched history moved
+// since the last build) or it's empty — user-filter changes now apply at serve
+// time, so they never trigger a rebuild.
 function needsBuild(profileId) {
   if (countRecommended(profileId) === 0) return true;
   return watchedStore.newestWatchedMs(profileId) > getBuiltAt(profileId);
 }
+
+// Build the pool NOW (buildRecommendations + ageGatePool) with progress. This is
+// the unit of work the job queue runs; callers should route it through
+// jobs.enqueue so builds serialise + report a percentage. Exported so the portal
+// and the tick share one implementation.
+async function buildPool(profile, log = console, onProgress = () => {}) {
+  init();
+  const r = await buildRecommendations(profile, log, (pct, label) => onProgress(pct * 0.85, label)); // 0–85%
+  if (!r.skipped) await ageGatePool(profile, log, (pct, label) => onProgress(85 + pct * 0.15, label)); // 85–100%
+  return r;
+}
+
+// Background trigger from the tick: enqueue a pool build only when it's needed.
 async function ensureBuilt(profile, log = console) {
   init();
-  if (buildLocks.has(profile.id)) return { skipped: 'locked' };
   if (!needsBuild(profile.id)) return { skipped: 'fresh' };
-  buildLocks.add(profile.id);
-  try {
-    const r = await buildRecommendations(profile, log);
-    if (!r.skipped) await ageGatePool(profile, log);
-    return r;
-  } finally {
-    buildLocks.delete(profile.id);
-  }
+  const jobs = require('./jobs');
+  return jobs.enqueue(profile.id, 'recs', (progress) => buildPool(profile, log, progress));
 }
 
 module.exports = {
@@ -543,6 +561,7 @@ module.exports = {
   selectStrong,
   buildRecommendations,
   ageGatePool,
+  buildPool,
   ensureBuilt,
   needsBuild,
   resetRecommendations,

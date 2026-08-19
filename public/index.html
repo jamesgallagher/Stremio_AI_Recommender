@@ -203,7 +203,13 @@ function statusBadge(p) {
   const b = p.simkl_connected
     ? '<span class="badge ok">Simkl connected</span>'
     : (simklKeysOk ? '<span class="badge warn">Simkl not authorized</span>' : '<span class="badge err">Simkl Client ID required</span>');
-  return b + (p.status.rebuilding ? ' <span class="badge warn">rebuilding…</span>' : '');
+  const j = p.status.job;
+  let rb = '';
+  if (p.status.rebuilding) {
+    const tag = j && j.state === 'queued' ? 'queued' : (j && typeof j.pct === 'number' ? j.pct + '%' : '…');
+    rb = ` <span class="badge warn">rebuilding ${tag}</span>`;
+  }
+  return b + rb;
 }
 function statusLine(p) {
   return `${catalogLine('🎬 Movies', p.status.movie)} &nbsp;·&nbsp; ${catalogLine('📺 Series', p.status.series)}`;
@@ -784,17 +790,43 @@ async function disconnectSimkl(id) {
   checkSimklStatus(id);
 }
 
+// Poll a profile's job progress (1.5s) until it finishes, calling onUpdate with
+// each snapshot. Shared by Build (recs) and Rebuild now (extras).
+async function trackJob(id, onUpdate) {
+  const deadline = Date.now() + 20 * 60e3;
+  while (Date.now() < deadline) {
+    let job;
+    try { ({ job } = await api(`/profiles/${id}/job`)); } catch { return null; }
+    onUpdate(job);
+    if (!job || job.state === 'done' || job.state === 'error') return job;
+    await new Promise(r => setTimeout(r, 1500));
+  }
+  return null;
+}
+
+function jobLabel(j) {
+  if (!j) return ' ⟳ starting…';
+  if (j.state === 'queued') return ' ⏳ queued — waiting for the current rebuild to finish';
+  if (j.state === 'running') return ` ⟳ ${j.label || 'building'} — ${j.pct || 0}%`;
+  return '';
+}
+
 async function buildRecs(id, btn) {
   const out = document.querySelector(`[data-id="${id}"] [data-tres="recs"]`);
-  btn.disabled = true; out.textContent = ' ⟳ building recommendations (TMDB, may take a moment)…'; out.className = 'tres';
+  btn.disabled = true; out.className = 'tres'; out.textContent = ' ⟳ starting…';
   try {
-    const r = await api(`/profiles/${id}/recommend/build`, { method: 'POST' });
-    out.textContent = r.skipped
-      ? ' — ' + r.reason
-      : ` ✓ ${r.stored} recommendations from ${r.seeds} watched seed(s) (${r.raw} candidates, ${r.kept} after filters)`;
-    out.className = 'tres ' + (r.skipped ? 'err' : 'ok');
+    await api(`/profiles/${id}/recommend/build`, { method: 'POST' }); // 202 — runs on the queue
+    const job = await trackJob(id, j => { out.textContent = jobLabel(j) || out.textContent; });
+    if (job && job.state === 'error') { out.textContent = ' ✗ ' + (job.error || 'build failed'); out.className = 'tres err'; }
+    else {
+      const r = job && job.result;
+      out.textContent = r
+        ? (r.skipped ? ' — ' + r.reason : ` ✓ ${r.stored} recommendations from ${r.seeds} watched seed(s)`)
+        : ' ✓ recommendation pool rebuilt';
+      out.className = 'tres ok';
+    }
   } catch (e) { out.textContent = ' ✗ ' + e.message; out.className = 'tres err'; }
-  finally { btn.disabled = false; }
+  finally { btn.disabled = false; pollStatus(); }
 }
 
 // View the recommendation pool (until the Advanced tab exists). Each row has a
@@ -856,45 +888,31 @@ async function syncSimkl(id, btn) {
 }
 
 async function rebuildNow(id, btn) {
-  // The endpoint returns 202 immediately (a rebuild runs for minutes — a
-  // response held open that long is killed by proxies like Cloudflare Tunnel,
-  // which faked "Rebuild failed" for builds that finished fine). Poll the
-  // server's rebuilding flag — an active check on the actual job — and read
-  // the per-catalog results once it completes.
+  // 202 + queue: the rebuild runs on the global job queue (one at a time) and
+  // reports progress. Poll /job for the percentage; the button shows it live.
   btn.disabled = true;
   btn.textContent = 'Rebuilding…';
   try {
-    await api(`/profiles/${id}/rebuild`, { method: 'POST' }); // 202: job started
-    const deadline = Date.now() + 15 * 60e3;
-    let status = null;
-    let wait = 2000; // quick first check catches instant failures; then relax
-    while (Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, wait));
-      wait = 5000;
-      const { profiles } = await api('/profiles');
-      const p = profiles.find(x => x.id === id);
-      if (!p) throw new Error('profile no longer exists');
-      status = p.status;
-      if (!status.rebuilding) break;
-    }
-    if (!status || status.rebuilding) {
-      throw new Error('still running after 15 min — check the container logs');
-    }
-    const results = status.last_results && status.last_results.results;
-    if (results) {
-      const allOk = Object.values(results).every(r => r.ok);
-      const parts = Object.entries(results).map(([t, r]) => `${t}: ${r.ok ? r.count + ' titles ✓' : '✗ ' + r.error}`);
-      toast(parts.join(' · '));
-      btn.textContent = allOk ? '✓ Rebuilt' : '⚠ Partial — see message';
-    } else {
-      toast('Rebuild finished');
+    await api(`/profiles/${id}/rebuild`, { method: 'POST' }); // 202: enqueued
+    const job = await trackJob(id, j => {
+      if (!j) return;
+      btn.textContent = j.state === 'queued' ? 'Queued…' : `Rebuilding ${j.pct || 0}%`;
+    });
+    if (job && job.state === 'error') { toast('Rebuild failed: ' + (job.error || '')); btn.textContent = '✗ Failed'; }
+    else {
+      const results = job && job.result;
+      if (results && typeof results === 'object' && !results.skipped) {
+        const parts = Object.entries(results).filter(([, r]) => r && typeof r === 'object' && 'ok' in r)
+          .map(([t, r]) => `${t}: ${r.ok ? r.count + ' titles ✓' : '✗ ' + r.error}`);
+        if (parts.length) toast(parts.join(' · '));
+      }
       btn.textContent = '✓ Rebuilt';
     }
   } catch (err) {
     toast('Rebuild failed: ' + err.message);
     btn.textContent = '✗ Failed';
   }
-  pollStatus(); // refresh the badge/button from server state — non-destructive
+  pollStatus(); // refresh the badge from server state — non-destructive
 }
 
 function copyText(t) { navigator.clipboard.writeText(t).then(() => toast('Copied')); }
@@ -925,7 +943,12 @@ async function pollStatus() {
     const badge = card.querySelector('.hdr-badge'); if (badge) badge.innerHTML = statusBadge(p);
     const line = card.querySelector('.status-line'); if (line) line.innerHTML = statusLine(p);
     const rb = card.querySelector('.btn-rebuild');
-    if (rb) { rb.disabled = !(p.simkl_connected && !p.status.rebuilding); rb.textContent = p.status.rebuilding ? 'Rebuilding…' : 'Rebuild now'; }
+    if (rb) {
+      rb.disabled = !(p.simkl_connected && !p.status.rebuilding);
+      const j = p.status.job;
+      rb.textContent = !p.status.rebuilding ? 'Rebuild now'
+        : (j && j.state === 'queued' ? 'Queued…' : `Rebuilding ${(j && j.pct) || 0}%`);
+    }
   }
 }
 

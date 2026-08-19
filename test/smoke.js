@@ -901,6 +901,27 @@ async function httpTests() {
   // addon-serve tests start from a known "no keys" baseline (tests that need a
   // key set it explicitly).
   require('../src/settings').updateSettings({ keys: { tmdb_api_key: '', mdblist_api_key: '', rpdb_api_key: '' } });
+
+  // Job queue: runs ONE AT A TIME (FIFO), reports progress, dedups same (profile,kind).
+  {
+    const jobs = require('../src/jobs');
+    jobs._reset();
+    const order = []; let live = 0; let maxLive = 0;
+    const mk = (jid, kind) => jobs.enqueue(jid, kind, async (progress) => {
+      live++; maxLive = Math.max(maxLive, live); progress(50, 'half');
+      await new Promise(r => setTimeout(r, 15)); order.push(`${jid}:${kind}`); live--; return { jid };
+    });
+    const a = mk('p1', 'recs'); const b = mk('p2', 'extras');
+    assert.strictEqual(mk('p1', 'recs'), a); // dedup: same in-flight promise, not a 2nd job
+    await Promise.all([a, b]);
+    assert.strictEqual(maxLive, 1); // never ran concurrently
+    assert.deepStrictEqual(order, ['p1:recs', 'p2:extras']); // FIFO
+    assert.strictEqual(jobs.snapshot('p2').state, 'done');
+    assert.strictEqual(jobs.snapshot('p2').result.jid, 'p2');
+    jobs._reset();
+    console.log('  ✓ jobs: global queue serializes, reports progress, dedups');
+  }
+
   // Async unit check: fully-cached CSM lookups must answer without network
   // (the dummy key would fail loudly on any request).
   const mdblist = require('../src/services/mdblist');
@@ -1124,11 +1145,20 @@ async function httpTests() {
   assert.strictEqual(st2.watched_count, 0);
   console.log('  ✓ Simkl keys persist (PUT whitelist) + watched sync/count wired to SQLite');
 
-  // Recommendation builder + suppress (no-network paths). Global TMDB key was
-  // set to ROUNDTRIP-TMDB earlier, but there are no watched seeds -> skipped.
-  const build = await (await fetch(`${BASE}/api/profiles/${profile.id}/recommend/build`, { method: 'POST' })).json();
-  assert.strictEqual(build.skipped, true);
-  assert.strictEqual(build.reason, 'no watched titles to seed from');
+  // Recommendation builder + suppress (no-network paths). The build is enqueued
+  // on the job queue and answered 202; poll /job until it finishes. No watched
+  // seeds -> the job's result is skipped.
+  const started = await fetch(`${BASE}/api/profiles/${profile.id}/recommend/build`, { method: 'POST' });
+  assert.strictEqual(started.status, 202);
+  let job = null;
+  for (let i = 0; i < 40; i++) {
+    await new Promise(r => setTimeout(r, 50));
+    job = (await (await fetch(`${BASE}/api/profiles/${profile.id}/job`)).json()).job;
+    if (job && (job.state === 'done' || job.state === 'error')) break;
+  }
+  assert.strictEqual(job.state, 'done');
+  assert.strictEqual(job.result.skipped, true);
+  assert.strictEqual(job.result.reason, 'no watched titles to seed from');
   const recView = await (await fetch(`${BASE}/api/profiles/${profile.id}/recommend`)).json();
   assert.strictEqual(recView.total, 0);
   // Suppress endpoint validates its input and records a rejection
@@ -1425,7 +1455,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 43 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 44 async/http).`);
   process.exit(0);
 }
 

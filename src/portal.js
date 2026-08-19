@@ -4,6 +4,7 @@ const express = require('express');
 const config = require('./config');
 const store = require('./store');
 const rebuild = require('./rebuild');
+const jobs = require('./jobs');
 const catalogs = require('./catalogs');
 const tmdb = require('./services/tmdb');
 const mdblistService = require('./services/mdblist');
@@ -100,7 +101,13 @@ function publicProfile(p, req) {
       nuvio_profile_name: p.scrobble?.nuvio_profile_name || '',
       encryption_available: crypto.encryptionAvailable(),
     },
-    status: rebuild.status(p),
+    // status.rebuilding now reflects the JOB QUEUE (a queued/running build), and
+    // status.job carries the live progress (pct + label) for the percentage UI.
+    status: (() => {
+      const st = rebuild.status(p);
+      const job = jobs.snapshot(p.id);
+      return { ...st, job, rebuilding: st.rebuilding || jobs.isBusy(p.id) };
+    })(),
   };
 }
 
@@ -347,19 +354,21 @@ router.post('/profiles/:id/simkl/sync', async (req, res) => {
 });
 
 // ---- Recommendation builder (v6 F5) ----
-router.post('/profiles/:id/recommend/build', async (req, res) => {
+// Build the pool: enqueued on the global job queue (one rebuild at a time) and
+// answered 202 immediately — the build runs for minutes and reports progress via
+// GET /:id/job, which the portal polls for the percentage.
+router.post('/profiles/:id/recommend/build', (req, res) => {
   const profile = config.getProfile(req.params.id);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
-  try {
-    const result = await recommendationStore.buildRecommendations(profile, console);
-    if (!result.skipped) {
-      try { result.age = await recommendationStore.ageGatePool(profile, console); }
-      catch (err) { result.age = { error: err.message }; }
-    }
-    res.json(result);
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+  const jobs = require('./jobs');
+  jobs.enqueue(profile.id, 'recs', (progress) => recommendationStore.buildPool(profile, console, progress))
+    .catch((err) => console.warn(`[rec] ${profile.name}: pool build failed — ${err.message}`));
+  res.status(202).json({ started: true, job: jobs.snapshot(profile.id) });
+});
+
+// Lightweight progress poll for the active/last rebuild job of this profile.
+router.get('/profiles/:id/job', (req, res) => {
+  res.json({ job: require('./jobs').snapshot(req.params.id) });
 });
 
 // Reset: wipe the pool + the user's don't-recommend flags (Advanced section later).
@@ -420,12 +429,12 @@ router.post('/profiles/:id/rebuild', (req, res) => {
   if (!buildable) {
     return res.status(400).json({ error: 'Connect Simkl first' });
   }
-  if (rebuild.isRebuilding(profile.id)) {
-    return res.status(409).json({ error: 'A rebuild is already running for this profile — try again in a minute' });
-  }
-  rebuild.rebuildProfile(profile)
+  // Route through the global queue: one rebuild at a time, with progress. A
+  // duplicate 'extras' request for this profile joins the in-flight one.
+  const jobs = require('./jobs');
+  jobs.enqueue(profile.id, 'extras', (progress) => rebuild.rebuildProfile(profile, console, { extras: true }, progress))
     .catch((err) => console.error(`[rebuild] ${profile.name}: ${err.message}`));
-  res.status(202).json({ started: true });
+  res.status(202).json({ started: true, job: jobs.snapshot(profile.id) });
 });
 
 // ---- Auto-scrobble ----

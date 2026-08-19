@@ -689,6 +689,16 @@ addon/catalogs/rebuild all read it). Recommendations folded into an **Advanced**
 tab alongside Rebuild + Delete. (RPDB is a global key now too, so its poster
 substitution reads the Server Config key.)
 
+**Rebuild queue + progress (v6.22.0-beta):** a global job queue (`src/jobs.js`)
+runs rebuilds **one at a time** in FIFO order — a heavy pool scan and an extras
+rebuild (or a second one from another tab) queue instead of racing. A duplicate
+(same profile+kind) joins the in-flight job. `buildRecommendations` /
+`ageGatePool` / `rebuildProfile` report progress (0–100 + label); the portal
+polls `GET /profiles/:id/job` and shows **"rebuilding X%"** (e.g. "Scanned 5/11
+watched titles — 19%"). `/recommend/build` + `/rebuild` are 202-async and route
+through the queue; the tick's `ensureBuilt`/`ensureFresh` do too. *(Scrobble
+"full rebuild" is NOT yet on the queue — separate subsystem.)*
+
 **STILL NOT BUILT:** **Mobile Companion** (needs a Simkl `plantowatch` *write* +
 `watching`/plantowatch → engaged), the **in-app meta "🚫 Don't recommend" link**,
 and cleanup of the now-vestigial `engine`/`rating_source` config fields (server-
