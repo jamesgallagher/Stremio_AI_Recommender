@@ -1257,6 +1257,14 @@ async function httpTests() {
   assert.deepStrictEqual(updated.filters.excluded_genres, ['Horror', 'Reality']);
   console.log('  ✓ PUT /api/profiles/:id filters');
 
+  // User email (Mobile Companion) round-trips + trims
+  const withEmail = (await (await fetch(`${BASE}/api/profiles/${profile.id}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: '  James@Example.com  ' }),
+  })).json()).profile;
+  assert.strictEqual(withEmail.email, 'James@Example.com');
+  console.log('  ✓ user email stored on the profile');
+
   // Rebuild without Simkl or any enabled catalog -> clean 400
   res = await fetch(`${BASE}/api/profiles/${profile.id}/rebuild`, { method: 'POST' });
   assert.strictEqual(res.status, 400);
@@ -1455,7 +1463,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 44 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 45 async/http).`);
   process.exit(0);
 }
 

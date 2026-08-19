@@ -91,6 +91,7 @@ function publicProfile(p, req) {
     // /simkl/status (the portal calls it on the Simkl tab open).
     simkl_connected: !!p.simkl_auth?.access_token,
     simkl_username: p.simkl_auth?.username || null,
+    email: p.email || '', // user email — Mobile Companion passwordless login (stored only for now)
     // Auto-scrobble config — password is never returned, only whether it's set.
     scrobble: {
       enabled: !!p.scrobble?.enabled,
@@ -143,6 +144,7 @@ router.post('/profiles', (req, res) => {
 router.put('/profiles/:id', (req, res) => {
   const patch = {};
   if (req.body.name !== undefined) patch.name = req.body.name;
+  if (req.body.email !== undefined) patch.email = req.body.email;
   if (req.body.filters) patch.filters = req.body.filters;
   if (req.body.catalogs) patch.catalogs = req.body.catalogs;
   if (req.body.keys) {

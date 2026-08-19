@@ -80,6 +80,7 @@ function newProfile(name) {
       mdblist_api_key: '', // required: extra catalogs + Common Sense age checks
     },
     simkl_auth: null, // v6: { access_token, connected_at } — Simkl PIN token
+    email: '', // the user's email — for the future Mobile Companion passwordless login
     filters: { ...DEFAULT_FILTERS },
     catalogs: {}, // extra-catalog toggles by id; absent/false = off. AI catalogs are always on.
     scrobble: { ...DEFAULT_SCROBBLE },
@@ -118,6 +119,7 @@ function applyMigrations(p) {
   if (p.keys.simkl_client_id === undefined) p.keys.simkl_client_id = '';
   if (p.keys.simkl_client_secret === undefined) p.keys.simkl_client_secret = '';
   if (p.simkl_auth === undefined) p.simkl_auth = null;
+  if (p.email === undefined) p.email = '';
   if (p.catalogs === undefined) p.catalogs = {};
   if (p.scrobble === undefined) p.scrobble = { ...DEFAULT_SCROBBLE };
 }
@@ -210,6 +212,7 @@ function updateProfile(id, patch) {
     const profile = data.profiles.find((p) => p.id === id);
     if (!profile) return;
     if (patch.name !== undefined) profile.name = String(patch.name);
+    if (patch.email !== undefined) profile.email = String(patch.email || '').trim();
     if (patch.keys) Object.assign(profile.keys, patch.keys);
     if (patch.filters) {
       const f = patch.filters;

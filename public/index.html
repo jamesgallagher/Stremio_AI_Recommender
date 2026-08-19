@@ -246,14 +246,17 @@ function render(profiles) {
 
       <div class="tab-panel" data-tab="simkl">
         <div class="muted" style="margin-top:4px">v6 tracker. Create a Simkl API app for <b>${esc(p.name)}</b> (redirect URI can be anything), paste the Client ID (and Secret), Save, then Connect. The status below is verified <b>live</b> against Simkl.</div>
-        <div class="keys-list">
+        <label style="margin-top:12px">User email <span class="muted">— for the Mobile Companion (passwordless login, coming soon)</span></label>
+        <input type="email" data-email value="${esc(p.email || '')}" placeholder="name@example.com" autocomplete="off" spellcheck="false" ${IGNORE_PW_MANAGERS}>
+        <div class="muted" style="font-size:11px;margin-top:3px">Stored for now. The companion app will email a one-time passcode to this address so <b>${esc(p.name)}</b> can manage their recommendations from a phone.</div>
+        <div class="keys-list" style="margin-top:12px">
           <div><label>Client ID
               <a class="getkey" href="https://simkl.com/settings/developer/new/" target="_blank" rel="noopener">get key ↗</a></label>
             ${keyRow(p.id, 'simkl_client_id', p.keys.simkl_client_id)}</div>
           <div><label>Client Secret <span class="muted">(optional for PIN)</span></label>
             ${keyRow(p.id, 'simkl_client_secret', p.keys.simkl_client_secret)}</div>
         </div>
-        <div style="margin-top:10px"><button onclick="saveKeys('${p.id}')">Save</button>
+        <div style="margin-top:10px"><button onclick="saveSimkl('${p.id}')">Save</button>
           <button class="ghost" onclick="checkSimklStatus('${p.id}')">Check connection</button></div>
         <div class="simkl-flow" data-sid="${p.id}" style="margin-top:12px; padding-top:10px; border-top:1px solid var(--border)">
           <span class="muted">Save the Client ID, then <b>Check connection</b> to verify live against Simkl.</span>
@@ -619,6 +622,15 @@ async function saveKeys(id, silent = false) {
   });
   if (Object.keys(keys).length) await api('/profiles/' + id, { method: 'PUT', body: { keys } });
   if (!silent) { dirty = false; toast('Keys saved'); pollStatus(); }
+}
+
+// Simkl tab Save: the user email (Mobile Companion login) + the Simkl client keys.
+async function saveSimkl(id) {
+  const card = document.querySelector(`[data-id="${id}"]`);
+  const email = (card.querySelector('[data-email]')?.value || '').trim();
+  await api('/profiles/' + id, { method: 'PUT', body: { email } });
+  await saveKeys(id, true); // persist the Simkl Client ID/Secret silently
+  dirty = false; toast('Saved'); pollStatus();
 }
 
 async function testKey(id, service, btn) {
