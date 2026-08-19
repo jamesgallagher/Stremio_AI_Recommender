@@ -69,6 +69,14 @@
   .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   @media (max-width: 640px) { .cols { grid-template-columns: 1fr; } }
   details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin: 12px 0 4px; }
+  /* Profile tabs — one card, tab bar + panels; switching is pure show/hide (no re-render) */
+  .tabs { display: flex; flex-wrap: wrap; gap: 2px; margin-top: 14px; border-bottom: 1px solid var(--border); }
+  .tab-btn { background: transparent; border: 0; border-bottom: 2px solid transparent; border-radius: 0;
+    color: var(--muted); padding: 8px 12px; font-size: 13px; cursor: pointer; margin: 0; }
+  .tab-btn:hover { color: var(--text); background: transparent; }
+  .tab-btn.active { color: var(--text); border-bottom-color: var(--accent); }
+  .tab-panel { display: none; padding-top: 14px; }
+  .tab-panel.active { display: block; }
   .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
     background: var(--card2); border: 1px solid var(--accent); border-radius: 10px; padding: 10px 18px; font-size: 13px; display: none; }
   .getkey { color: var(--accent); font-size: 11px; text-decoration: none; margin-left: 6px; }
@@ -184,16 +192,29 @@ function catalogLine(label, entry) {
   return `${label}: ${entry.count} titles (${src}, ${fmtAge(entry.generated_at)})`;
 }
 
+// Volatile status badge + line — recomputed by the non-destructive poll so the
+// page never re-renders just to refresh a badge.
+function statusBadge(p) {
+  const simklKeysOk = p.keys_set.simkl_client_id;
+  const b = p.simkl_connected
+    ? '<span class="badge ok">Simkl connected</span>'
+    : (simklKeysOk ? '<span class="badge warn">Simkl not authorized</span>' : '<span class="badge err">Simkl Client ID required</span>');
+  return b + (p.status.rebuilding ? ' <span class="badge warn">rebuilding…</span>' : '');
+}
+function statusLine(p) {
+  return `${catalogLine('🎬 Movies', p.status.movie)} &nbsp;·&nbsp; ${catalogLine('📺 Series', p.status.series)}`;
+}
+
 function render(profiles) {
   const container = $('#profiles');
-  // Preserve which sections are open across re-renders (auto-refresh must
-  // never yank the page out from under the user)
-  const openMap = {};
-  const diagMap = {};
+  // Preserve the active tab + any open recs list across a FULL re-render (only
+  // add/delete/save trigger one — the periodic status poll is non-destructive).
+  const activeMap = {};
+  const recsMap = {};
   container.querySelectorAll('.card[data-id]').forEach(card => {
-    openMap[card.dataset.id] = [...card.querySelectorAll('details')].map(d => d.open);
-    const diag = card.querySelector('.diag');
-    if (diag && diag.style.display === 'block') diagMap[card.dataset.id] = diag.innerHTML;
+    activeMap[card.dataset.id] = card.dataset.activeTab || 'simkl';
+    const panel = card.querySelector('.recs-panel');
+    if (panel && panel.style.display === 'block') recsMap[card.dataset.id] = panel.innerHTML;
   });
   container.innerHTML = profiles.map(p => {
     const installUrl = p.install_url;
@@ -201,26 +222,28 @@ function render(profiles) {
     // Groq is only required for kids profiles (AI age goalkeeper)
     const keysOk = p.keys_set.tmdb_api_key && (p.filters.age_limit > 0 ? p.keys_set.groq_api_key : true);
     const simklKeysOk = p.keys_set.simkl_client_id; // PIN flow needs only the Client ID
-    const badge = p.simkl_connected
-      ? '<span class="badge ok">Simkl connected</span>'
-      : (simklKeysOk ? '<span class="badge warn">Simkl not authorized</span>' : '<span class="badge err">Simkl Client ID required</span>');
-    const rebuilding = p.status.rebuilding ? '<span class="badge warn">rebuilding…</span>' : '';
     return `
-    <div class="card" data-id="${p.id}">
+    <div class="card" data-id="${p.id}" data-active-tab="${activeMap[p.id] || 'simkl'}">
       <div class="row">
-        <h2>${esc(p.name)}</h2> ${badge} ${rebuilding}
+        <h2>${esc(p.name)}</h2> <span class="hdr-badge">${statusBadge(p)}</span>
         <div class="grow"></div>
-        <button class="ghost" onclick="rebuildNow('${p.id}', this)" ${p.simkl_connected && !p.status.rebuilding ? '' : 'disabled'}>${p.status.rebuilding ? 'Rebuilding…' : 'Rebuild now'}</button>
+        <button class="ghost btn-rebuild" onclick="rebuildNow('${p.id}', this)" ${p.simkl_connected && !p.status.rebuilding ? '' : 'disabled'}>${p.status.rebuilding ? 'Rebuilding…' : 'Rebuild now'}</button>
         <button class="danger" onclick="delProfile('${p.id}')">Delete</button>
       </div>
-      <div class="status-line">
-        ${catalogLine('🎬 Movies', p.status.movie)} &nbsp;·&nbsp; ${catalogLine('📺 Series', p.status.series)}
-      </div>
-      <div class="diag"></div>
+      <div class="status-line">${statusLine(p)}</div>
 
-      <details ontoggle="if(this.open) checkSimklStatus('${p.id}')">
-        <summary>Simkl — account &amp; authorization <span class="simkl-sum" data-sid="${p.id}">${simklKeysOk ? '' : '— Client ID required'}</span></summary>
-        <div class="muted" style="margin-top:8px">v6 tracker. Create a Simkl API app for <b>${esc(p.name)}</b> (redirect URI can be anything), paste the Client ID (and Secret), Save, then Connect. The status below is verified <b>live</b> against Simkl each time you open this section.</div>
+      <div class="tabs">
+        <button class="tab-btn" data-tab="simkl" onclick="switchTab(this,'simkl')">Simkl</button>
+        <button class="tab-btn" data-tab="recs" onclick="switchTab(this,'recs')">Recommendations</button>
+        <button class="tab-btn" data-tab="keys" onclick="switchTab(this,'keys')">Keys</button>
+        <button class="tab-btn" data-tab="filters" onclick="switchTab(this,'filters')">Filters</button>
+        <button class="tab-btn" data-tab="catalogs" onclick="switchTab(this,'catalogs')">Catalogs</button>
+        <button class="tab-btn" data-tab="scrobble" onclick="switchTab(this,'scrobble')">Scrobble</button>
+        <button class="tab-btn" data-tab="install" onclick="switchTab(this,'install')">Install</button>
+      </div>
+
+      <div class="tab-panel" data-tab="simkl">
+        <div class="muted" style="margin-top:4px">v6 tracker. Create a Simkl API app for <b>${esc(p.name)}</b> (redirect URI can be anything), paste the Client ID (and Secret), Save, then Connect. The status below is verified <b>live</b> against Simkl.</div>
         <div class="keys-list">
           <div><label>Client ID
               <a class="getkey" href="https://simkl.com/settings/developer/new/" target="_blank" rel="noopener">get key ↗</a></label>
@@ -228,15 +251,15 @@ function render(profiles) {
           <div><label>Client Secret <span class="muted">(optional for PIN)</span></label>
             ${keyRow(p.id, 'simkl_client_secret', p.keys.simkl_client_secret)}</div>
         </div>
-        <div style="margin-top:10px"><button onclick="saveKeys('${p.id}')">Save</button></div>
+        <div style="margin-top:10px"><button onclick="saveKeys('${p.id}')">Save</button>
+          <button class="ghost" onclick="checkSimklStatus('${p.id}')">Check connection</button></div>
         <div class="simkl-flow" data-sid="${p.id}" style="margin-top:12px; padding-top:10px; border-top:1px solid var(--border)">
-          <span class="muted">Open this section to check the live connection status…</span>
+          <span class="muted">Save the Client ID, then <b>Check connection</b> to verify live against Simkl.</span>
         </div>
-      </details>
+      </div>
 
-      <details>
-        <summary>API keys — TMDB, Groq, MDBList &amp; RPDB ${p.keys_set.tmdb_api_key && (p.filters.age_limit > 0 || p.filters.engine === 'ai' ? p.keys_set.groq_api_key : true) ? '✓' : '— required'}</summary>
-        <div class="muted" style="margin-top:8px">Create each key while signed in as <b>${esc(p.name)}</b>'s account on that service.</div>
+      <div class="tab-panel" data-tab="keys">
+        <div class="muted" style="margin-top:4px">Per-profile API keys (TMDB, Groq, MDBList, RPDB). Create each while signed in as <b>${esc(p.name)}</b>'s account on that service.</div>
         <div class="keys-list">
           <div><label>TMDB API Key
               <a class="getkey" href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">get key ↗</a></label>
@@ -258,10 +281,9 @@ function render(profiles) {
         <div style="margin-top:10px">
           <button onclick="saveKeys('${p.id}')">Save</button>
         </div>
-      </details>
+      </div>
 
-      <details>
-        <summary>Filters — min rating ${p.filters.min_rating},${p.filters.max_age_years > 0 ? 'last ' + p.filters.max_age_years + ' years' : 'any year'}, ${p.filters.list_size} titles${p.filters.age_limit > 0 ? ', age ' + p.filters.age_limit + '+ limit' : ''}${p.filters.excluded_genres.length ? ', ' + p.filters.excluded_genres.length + ' genres excluded' : ''}</summary>
+      <div class="tab-panel" data-tab="filters">
         <div class="muted" style="margin-bottom:8px;font-size:11px">Rating floor, excluded genres and recency apply at <b>serve time</b> over the stored pool — change one and it takes effect immediately, no rebuild.</div>
         <div class="cols">
           <div><label>Minimum rating</label>
@@ -301,11 +323,10 @@ function render(profiles) {
         </div>
         <div style="margin-top:10px"><button onclick="saveFilters('${p.id}')">Save filters</button>
         <span class="muted"> — applies on next rebuild (or hit Rebuild now)</span></div>
-      </details>
+      </div>
 
-      <details>
-        <summary>Catalogs — AI + ${catsFor(p).filter(c => catOn(p, c)).length} extra</summary>
-        <div class="muted" style="margin-top:8px">The two AI catalogs are always on. <b>Watch Later</b> mirrors this profile's Simkl plan-to-watch list — on by default, refreshed daily, watched titles drop off. The curated MDBList lists refresh daily and <b>drop titles you've already watched</b> (except <b>Christmas</b>, a re-watchable, marked "keeps watched"); popular charts are unfiltered, the rest drop titles rated below IMDb 6, and the kids lists carry 50 titles (MDBList key required). The <b>Kids</b> and <b>Anime TV-14</b> rows are <b>age-gated to their band always</b> (even on adult profiles), so they need a Groq/LLM key to build. On profiles with an age limit, <b>every</b> extra catalog also passes the anime/NSFW gate and the AI age check — the list is kept unpublished if either can't run.</div>
+      <div class="tab-panel" data-tab="catalogs">
+        <div class="muted" style="margin-top:4px">The two AI catalogs are always on. <b>Watch Later</b> mirrors this profile's Simkl plan-to-watch list — on by default, refreshed daily, watched titles drop off. The curated MDBList lists refresh daily and <b>drop titles you've already watched</b> (except <b>Christmas</b>, a re-watchable, marked "keeps watched"); popular charts are unfiltered, the rest drop titles rated below IMDb 6, and the kids lists carry 50 titles (MDBList key required). The <b>Kids</b> and <b>Anime TV-14</b> rows are <b>age-gated to their band always</b> (even on adult profiles), so they need a Groq/LLM key to build. On profiles with an age limit, <b>every</b> extra catalog also passes the anime/NSFW gate and the AI age check — the list is kept unpublished if either can't run.</div>
         <div class="cats">
           <label class="locked"><input type="checkbox" checked disabled>Movies recommended for you</label>
           <label class="locked"><input type="checkbox" checked disabled>Series recommended for you</label>
@@ -317,11 +338,10 @@ function render(profiles) {
           <button onclick="saveCatalogs('${p.id}')">Save catalogs</button>
           <span class="muted"> — newly enabled lists build in the background; they appear in Stremio/Nuvio after the app refreshes the addon manifest (or reinstall the addon)</span>
         </div>
-      </details>
+      </div>
 
-      <details>
-        <summary>Auto scrobble ${p.scrobble.enabled ? '✓ ' + p.scrobble.provider + (p.scrobble.provider === 'nuvio' && p.scrobble.nuvio_profile_name ? ' · ' + esc(p.scrobble.nuvio_profile_name) : '') : '— off'}</summary>
-        <div class="muted" style="margin-top:8px">Mirror <b>${esc(p.name)}</b>'s <b>Nuvio</b> or <b>Stremio</b> watched history into their Simkl account hourly — so marks made in the app reach Simkl and feed recommendations, even if the app's own tracker session drops. Per account, kept isolated from other profiles.</div>
+      <div class="tab-panel" data-tab="scrobble">
+        <div class="muted" style="margin-top:4px">Mirror <b>${esc(p.name)}</b>'s <b>Nuvio</b> or <b>Stremio</b> watched history into their Simkl account hourly — so marks made in the app reach Simkl and feed recommendations, even if the app's own tracker session drops. Per account, kept isolated from other profiles.</div>
         ${p.scrobble.encryption_available ? '' : '<div style="color:var(--err);font-size:12px;margin-top:6px">⚠ SCROBBLE_KEY is not set on the server — you can test credentials but not save a password. Set the SCROBBLE_KEY environment variable (any long random string) on the container, then reload.</div>'}
         <label style="margin-top:10px;display:flex;align-items:center;gap:8px;color:var(--text);font-size:14px">
           <input type="checkbox" data-scrobble="enabled" ${p.scrobble.enabled ? 'checked' : ''}> Auto-scrobble watched content to Simkl
@@ -359,10 +379,9 @@ function render(profiles) {
           <button class="ghost" onclick="syncScrobble('${p.id}', this, true)" title="Re-push this account's entire watched history to Simkl, ignoring what's already there (Simkl re-marks them watched — harmless)">Full rebuild</button>` : ''}
           <span class="muted"> — runs hourly; needs Simkl connected above</span>
         </div>
-      </details>
+      </div>
 
-      <details>
-        <summary>Install in Stremio / Nuvio</summary>
+      <div class="tab-panel" data-tab="install">
         ${p.external_url_set ? '' : `<div style="color:var(--warn);font-size:12px;margin:6px 0">⚠ EXTERNAL_URL is not set — this link uses the address you opened this page from, which Stremio clients outside your network can't reach. Set the EXTERNAL_URL variable to your public hostname (e.g. your Cloudflare Tunnel URL).</div>`}
         <div class="install">${esc(installUrl)}</div>
         <div style="margin-top:8px" class="row">
@@ -370,21 +389,43 @@ function render(profiles) {
           <a href="${esc(installUrl.replace(/^https?:\/\//, 'stremio://'))}"><button class="ghost">Open in Stremio</button></a>
         </div>
         <div class="muted" style="margin-top:6px">Paste the URL in Stremio → Addons → Add addon. This link is ${esc(p.name)}'s personal list — don't share it outside the family.</div>
-      </details>
+      </div>
+
+      <div class="tab-panel" data-tab="recs">
+        <div class="muted" style="margin-top:4px">The AI recommendation pool for <b>${esc(p.name)}</b> — built from Simkl watched history (TMDB recommendations, recency-weighted). Inspect why each title is here, or reset it.</div>
+        <div style="margin-top:10px" class="row">
+          <button class="ghost" onclick="buildRecs('${p.id}', this)" title="Build the recommendation pool from watched history">Build recommendations</button>
+          <button class="ghost" onclick="viewRecs('${p.id}', this)">View recommendations</button>
+          <button class="ghost" onclick="resetRecs('${p.id}', this)" title="Wipe the pool and your 'don't recommend' flags">Reset recommendations</button>
+        </div>
+        <span class="tres" data-tres="recs"></span>
+        ${p.simkl_connected ? '' : '<div class="muted" style="margin-top:6px">Connect Simkl (Simkl tab) first — the pool builds from watched history.</div>'}
+        <div class="recs-panel diag" style="display:none;margin-top:10px"></div>
+      </div>
     </div>`;
   }).join('') || '<div class="card muted">No profiles yet — add one above.</div>';
-  // Restore open sections + diagnose results
+  // Restore the active tab + any open recs list, and check Simkl status for the
+  // card whose Simkl tab is showing.
   container.querySelectorAll('.card[data-id]').forEach(card => {
-    (openMap[card.dataset.id] || []).forEach((wasOpen, i) => {
-      const d = card.querySelectorAll('details')[i];
-      if (d && wasOpen) d.open = true;
-    });
-    if (diagMap[card.dataset.id]) {
-      const diag = card.querySelector('.diag');
-      diag.innerHTML = diagMap[card.dataset.id];
-      diag.style.display = 'block';
+    activateTab(card, activeMap[card.dataset.id] || 'simkl', { silent: true });
+    if (recsMap[card.dataset.id]) {
+      const panel = card.querySelector('.recs-panel');
+      panel.innerHTML = recsMap[card.dataset.id];
+      panel.style.display = 'block';
     }
   });
+}
+
+// Apply a tab as active on a card. `silent` skips the Simkl live-check (used on
+// re-render restore so we don't fire a check for every card every time).
+function activateTab(card, name, { silent = false } = {}) {
+  card.dataset.activeTab = name;
+  card.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  card.querySelectorAll('.tab-panel').forEach(pn => pn.classList.toggle('active', pn.dataset.tab === name));
+  if (!silent && name === 'simkl') checkSimklStatus(card.dataset.id);
+}
+function switchTab(btn, name) {
+  activateTab(btn.closest('.card'), name);
 }
 
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -466,9 +507,10 @@ async function saveSettings(btn) {
   btn.disabled = true;
   try {
     await api('/settings', { method: 'PUT', body: collectSettings() });
-    dirty = false; // saved — let the auto-refresh resume
+    dirty = false;
     toast('Server config saved');
-    load();
+    renderServerConfig(await api('/settings')); // re-render only the server-config block
+    pollStatus(); // profile badges may flip (LLM now configured)
   } catch (e) { toast('Save failed: ' + e.message); } finally { btn.disabled = false; }
 }
 
@@ -555,7 +597,7 @@ async function saveKeys(id, silent = false) {
     if (v !== (i.dataset.orig || '')) keys[i.dataset.key] = v;
   });
   if (Object.keys(keys).length) await api('/profiles/' + id, { method: 'PUT', body: { keys } });
-  if (!silent) { dirty = false; toast('Keys saved'); load(); }
+  if (!silent) { dirty = false; toast('Keys saved'); pollStatus(); }
 }
 
 async function testKey(id, service, btn) {
@@ -579,9 +621,7 @@ async function saveFilters(id) {
   const card = document.querySelector(`[data-id="${id}"]`);
   const ageOn = card.querySelector('[data-filter=age_limit_on]').checked;
   const filters = {
-    engine: card.querySelector('[data-filter=engine]').value,
     min_rating: parseFloat(card.querySelector('[data-filter=min_rating]').value),
-    rating_source: card.querySelector('[data-filter=rating_source]').value,
     vote_count_floor: parseInt(card.querySelector('[data-filter=vote_count_floor]').value, 10),
     max_age_years: parseInt(card.querySelector('[data-filter=max_age_years]').value, 10),
     list_size: parseInt(card.querySelector('[data-filter=list_size]').value, 10),
@@ -590,8 +630,8 @@ async function saveFilters(id) {
   };
   await api('/profiles/' + id, { method: 'PUT', body: { filters } });
   dirty = false;
-  toast('Filters saved — applies on next rebuild');
-  load();
+  toast('Filters saved — applies at serve time (rating/genre/recency) or next rebuild');
+  pollStatus();
 }
 
 async function saveCatalogs(id) {
@@ -601,7 +641,7 @@ async function saveCatalogs(id) {
   await api('/profiles/' + id, { method: 'PUT', body: { catalogs } });
   dirty = false;
   toast('Catalogs saved — enabled lists build in the background');
-  load();
+  pollStatus();
 }
 
 // ---- Auto scrobble ----
@@ -660,7 +700,7 @@ async function saveScrobble(id) {
     await api('/profiles/' + id, { method: 'PUT', body: { scrobble } });
     dirty = false;
     toast('Auto-scrobble saved');
-    load();
+    pollStatus();
   } catch (err) {
     toast('Save failed: ' + err.message);
   }
@@ -690,23 +730,16 @@ async function syncScrobble(id, btn, full) {
 async function checkSimklStatus(id) {
   const card = document.querySelector(`[data-id="${id}"]`);
   const flowEl = card.querySelector('.simkl-flow');
-  const sum = card.querySelector('.simkl-sum');
+  if (!flowEl) return;
   flowEl.innerHTML = '<span class="muted">⟳ Checking Simkl…</span>';
   try {
     const r = await api(`/profiles/${id}/simkl/status`);
     if (r.connected) {
-      sum.innerHTML = '<span style="color:var(--ok)">✓ connected</span>';
       flowEl.innerHTML = `<div class="muted">✓ Connected${r.username ? ` as <b style="color:var(--ok)">${esc(r.username)}</b>` : ''} — verified live. <b>${r.watched_count || 0}</b> watched title(s) in the local store.</div>
-        <div style="margin-top:8px"><button class="ghost" onclick="syncSimkl('${id}', this)">Sync watched now</button>
-        <button class="ghost" onclick="buildRecs('${id}', this)" title="Build the recommendation pool from your watched history (TMDB recommendations, recency-weighted)">Build recommendations</button>
-        <button class="ghost" onclick="viewRecs('${id}', this)">View recommendations</button>
-        <button class="ghost" onclick="resetRecs('${id}', this)" title="Wipe the recommendation pool and your 'don't recommend' flags">Reset recommendations</button>
+        <div style="margin-top:8px" class="row"><button class="ghost" onclick="syncSimkl('${id}', this)">Sync watched now</button>
         <button class="ghost" onclick="disconnectSimkl('${id}')">Disconnect</button>
-        <span class="tres" data-tres="simkl-sync"></span></div>
-        <div class="recs-panel diag" style="display:none"></div>`;
+        <span class="tres" data-tres="simkl-sync"></span></div>`;
     } else {
-      const needsReconnect = (r.reason || '').includes('reconnect');
-      sum.innerHTML = needsReconnect ? '<span style="color:var(--err)">— reconnect</span>' : '';
       flowEl.innerHTML = `<div><button onclick="connectSimkl('${id}')">Connect Simkl</button>${r.reason ? ` <span class="muted">— ${esc(r.reason)}</span>` : ''}</div>
         <div class="flow-status" style="margin-top:10px"></div>`;
     }
@@ -737,7 +770,7 @@ async function disconnectSimkl(id) {
 }
 
 async function buildRecs(id, btn) {
-  const out = document.querySelector(`[data-id="${id}"] [data-tres="simkl-sync"]`);
+  const out = document.querySelector(`[data-id="${id}"] [data-tres="recs"]`);
   btn.disabled = true; out.textContent = ' ⟳ building recommendations (TMDB, may take a moment)…'; out.className = 'tres';
   try {
     const r = await api(`/profiles/${id}/recommend/build`, { method: 'POST' });
@@ -773,7 +806,7 @@ async function viewRecs(id, btn) {
 
 async function resetRecs(id, btn) {
   if (!confirm('Wipe the recommendation pool AND your "don\'t recommend" flags for this profile? The pool rebuilds from watched history on the next build.')) return;
-  const out = document.querySelector(`[data-id="${id}"] [data-tres="simkl-sync"]`);
+  const out = document.querySelector(`[data-id="${id}"] [data-tres="recs"]`);
   btn.disabled = true; out.textContent = ' ⟳ resetting…'; out.className = 'tres';
   try {
     await api(`/profiles/${id}/recommend/reset`, { method: 'POST' });
@@ -846,25 +879,42 @@ async function rebuildNow(id, btn) {
     toast('Rebuild failed: ' + err.message);
     btn.textContent = '✗ Failed';
   }
-  setTimeout(load, 2500); // re-render from server state -> "Rebuild now", enabled
+  pollStatus(); // refresh the badge/button from server state — non-destructive
 }
 
 function copyText(t) { navigator.clipboard.writeText(t).then(() => toast('Copied')); }
 
-// Auto-refresh keeps status lines fresh, but must NEVER interrupt the user:
-// it skips whenever there is unsaved input (typing, ticking checkboxes) or a
-// Simkl authorization in progress (PIN on screen).
-let dirty = false;
-// Any unsaved edit — in a profile OR in Server Config — pauses the auto-refresh
-// so it can't wipe what you're typing before you save.
+// The status heartbeat. Deliberately NON-DESTRUCTIVE: it updates ONLY the header
+// badge, the movies/series status line, and the rebuild button in place — it
+// never rebuilds the cards, so viewing recommendations, typing a key, or a Simkl
+// PIN flow is never yanked out from under you (the old 30s full re-render was the
+// cause of the "I was looking at the list, then bam — gone" refreshes). A full
+// render happens only when the profile SET changes (add/delete).
+let dirty = false; // retained: save handlers still clear it; harmless with the poll
 document.addEventListener('input', e => { if (e.target.closest('#profiles') || e.target.closest('#serverConfig')) dirty = true; });
 
-function flowActive() {
-  return [...document.querySelectorAll('.flow-status')].some(el => el.textContent.trim() !== '');
+async function pollStatus() {
+  let data;
+  try { data = await api('/profiles'); } catch { return; }
+  $('#lockBanner').style.display = data.secrets_locked ? 'block' : 'none';
+  const cards = [...$('#profiles').querySelectorAll('.card[data-id]')];
+  const ids = new Set(data.profiles.map(p => p.id));
+  if (cards.length !== data.profiles.length || cards.some(c => !ids.has(c.dataset.id))) {
+    return render(data.profiles); // add/delete elsewhere -> one full render
+  }
+  const byId = new Map(data.profiles.map(p => [p.id, p]));
+  for (const card of cards) {
+    const p = byId.get(card.dataset.id);
+    if (!p) continue;
+    const badge = card.querySelector('.hdr-badge'); if (badge) badge.innerHTML = statusBadge(p);
+    const line = card.querySelector('.status-line'); if (line) line.innerHTML = statusLine(p);
+    const rb = card.querySelector('.btn-rebuild');
+    if (rb) { rb.disabled = !(p.simkl_connected && !p.status.rebuilding); rb.textContent = p.status.rebuilding ? 'Rebuilding…' : 'Rebuild now'; }
+  }
 }
 
 load();
-setInterval(() => { if (!dirty && !flowActive()) load(); }, 30000);
+setInterval(pollStatus, 30000);
 </script>
 </body>
 </html>

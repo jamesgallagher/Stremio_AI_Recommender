@@ -670,7 +670,18 @@ debug panel. **Engagement via Simkl `watching`/`plantowatch` → `engaged_at` is
 reserved** (column + gate in place) but not yet wired — the /meta soft-reset is
 the interest signal for now.
 
+**DONE — Tabbed profile UI + non-destructive refresh (v6.20.0-beta).** Each
+profile card is now a tab bar (Simkl · Recommendations · Keys · Filters ·
+Catalogs · Scrobble · Install), one card rendered once; switching tabs is pure
+show/hide. The 30s **destructive full re-render** — which wiped the recs list,
+the Simkl status, and typed input every cycle — is replaced by a **non-destructive
+`pollStatus()`** that updates only the header badge / status line / rebuild button
+in place; a full render happens only when the profile SET changes. Saves refresh
+via `pollStatus()` too, so nothing you're viewing is yanked. Also fixed a latent
+crash: `saveFilters` still read the removed `engine`/`rating_source` selectors and
+threw on every filter save.
+
 **STILL NOT BUILT:** **Mobile Companion** (needs a Simkl `plantowatch` *write* +
 `watching`/plantowatch → engaged), the **in-app meta "🚫 Don't recommend" link**,
-the **tabbed profile UI**, and cleanup of the vestigial `engine`/`rating_source`
-config fields.
+and cleanup of the now-vestigial `engine`/`rating_source` config fields (server-
+side only — the UI selectors are already gone).
