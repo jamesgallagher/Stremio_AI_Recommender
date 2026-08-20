@@ -212,11 +212,22 @@ async function syncFromSimkl(profile, log = console, { force = false } = {}) {
   const dateFrom = force ? undefined : (prev?.simkl_activities_all || undefined); // undefined => Phase 1 full pull
   let upserted = 0;
   const breakdown = {};
+  // Movies are only ever 'completed'. For shows/anime we ALSO pull 'watching':
+  // an in-progress show is the user's strongest, most CURRENT taste signal, and
+  // Simkl files a partly-watched show under 'watching', not 'completed'. Pulling
+  // completed-only left a heavy series watcher's library almost invisible to the
+  // engine (only fully-finished shows seeded), and let a show they're actively
+  // watching be recommended back (it was absent from the watched de-dupe set).
+  const STATUSES = { movies: ['completed'], shows: ['completed', 'watching'], anime: ['completed', 'watching'] };
   for (const type of ['movies', 'shows', 'anime']) { // sequential per Simkl's rules
-    const items = await simkl.getAllItems(profile, type, { dateFrom });
-    const parsed = simkl.parseWatchedItems(items, type);
-    upserted += upsertMany(profile.id, parsed);
-    breakdown[type] = parsed.length;
+    let n = 0;
+    for (const status of STATUSES[type]) {
+      const items = await simkl.getAllItems(profile, type, { status, dateFrom });
+      const parsed = simkl.parseWatchedItems(items, type);
+      upserted += upsertMany(profile.id, parsed);
+      n += parsed.length;
+    }
+    breakdown[type] = n;
   }
   setSyncState(profile.id, all);
   log.log(`[simkl] ${profile.name}: watched sync ${dateFrom ? 'delta' : 'initial'} — movies ${breakdown.movies}, shows ${breakdown.shows}, anime ${breakdown.anime} (total in store: ${countWatched(profile.id)})`);

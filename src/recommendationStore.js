@@ -22,7 +22,12 @@ const animeMap = require('./services/animeMap');
 const watchedStore = require('./watchedStore');
 
 const HALF_LIFE_DAYS = 90;  // recency weight = 0.5 ^ (days_since_watched / this)
-const SEED_CAP = 60;        // use the N most-recent watched titles as seeds
+// PER-TYPE seed caps: the N most-recent watched titles of each type seed recs.
+// Movies get a higher cap (deeper back-catalogue); series (shows + anime, which
+// share the `series` type) get their own so a run of freshly-watched shows can't
+// crowd movies out and vice versa.
+const SEED_CAP = { movie: 150, series: 100 };
+const seedCapFor = (type) => SEED_CAP[type] ?? 100;
 const STORE_CAP = 300;      // keep the top-N candidates by affinity
 const SERVE_LIMIT = 100;    // max titles in a served, genre-balanced catalog
 const DAY_MS = 24 * 3600e3;
@@ -279,8 +284,15 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
   if (!tmdbKey) return { skipped: true, reason: 'no TMDB key in Server Config' };
 
   const filters = profile.filters || {};
-  const seedsAll = watchedStore.getWatched(profile.id).filter((w) => w.tmdb_id); // most-recent first
-  const seeds = seedsAll.slice(0, SEED_CAP);
+  // Seed PER TYPE so neither can starve the other: the SEED_CAP most-recent
+  // MOVIES and the SEED_CAP most-recent SERIES, gathered independently. A single
+  // shared cap let a run of freshly-watched shows crowd movies out of the seed
+  // set (and vice versa) — acute now that in-progress shows carry fresh
+  // watched_at. Re-merged newest-first so computeAffinity's recency tie-break holds.
+  const seedTs = (w) => { const t = w.watched_at ? Date.parse(w.watched_at) : NaN; return Number.isNaN(t) ? 0 : t; };
+  const seeds = ['movie', 'series']
+    .flatMap((t) => watchedStore.getWatched(profile.id, { type: t }).filter((w) => w.tmdb_id).slice(0, seedCapFor(t)))
+    .sort((a, b) => seedTs(b) - seedTs(a));
   if (!seeds.length) return { skipped: true, reason: 'no watched titles to seed from' };
 
   // Fetch recommendations per seed, then keep only the STRONGEST few per title
