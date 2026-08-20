@@ -22,6 +22,8 @@
 //   simkl_post  <1/s    (HARD 1 POST/s write cap — suspension risk if exceeded)
 //   mdblist     ~4/s    (free tier ~1000/day; dayCalls tracked for visibility)
 //   jikan       ~57/min (cap 60/min, also 3/s burst) — MAL age lookups
+//   anilist     ~30/min — AniList fallback when Jikan is down (cap 90/min, but
+//               they degrade it to 30/min under load; pace to the low ceiling)
 //   groq        ~28/min (cap ~30 RPM) — honours Retry-After on 429
 const LIMITS = {
   tmdb: { minIntervalMs: 25 },
@@ -29,6 +31,7 @@ const LIMITS = {
   simkl_post: { minIntervalMs: 1100 },
   mdblist: { minIntervalMs: 250, dailyCap: 1000 },
   jikan: { minIntervalMs: 1050 },
+  anilist: { minIntervalMs: 2000 },
   groq: { minIntervalMs: 2100 },
 };
 

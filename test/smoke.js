@@ -370,6 +370,23 @@ ok('mal: rating classification, NSFW blacklist, and age banding', () => {
   assert.strictEqual(mal.blockedForAge({ minAge: 17 }, 0), false);  // adult profile
 });
 
+ok('anilist: fallback maps isAdult/genre to the blacklist, else unrated', () => {
+  const anilist = require('../src/services/anilist');
+  const mal = require('../src/services/mal');
+  // isAdult -> terminal blacklist (mirrors MAL Rx)
+  assert.strictEqual(anilist.parseMedia({ isAdult: true, genres: [] }).adult, true);
+  // Hentai/Erotica genre is a second adult signal, same as MAL
+  assert.strictEqual(anilist.parseMedia({ isAdult: false, genres: ['Hentai'] }).adult, true);
+  // Non-adult carries NO age band — minAge null means "LLM decides", never a drop
+  const safe = anilist.parseMedia({ isAdult: false, genres: ['Action', 'Sci-Fi'] });
+  assert.strictEqual(safe.adult, false);
+  assert.strictEqual(safe.minAge, null);
+  assert.strictEqual(safe.adultish, false);
+  assert.strictEqual(anilist.parseMedia(null), null);
+  // A non-adult AniList verdict must not be blocked by the age gate at any limit
+  assert.strictEqual(mal.blockedForAge(safe, 14), false);
+});
+
 ok('rebuild: judgement age is one year above the limit (off when no limit)', () => {
   assert.strictEqual(rebuild.judgementAge({ age_limit: 13 }), 14);
   assert.strictEqual(rebuild.judgementAge({ age_limit: 8 }), 9);

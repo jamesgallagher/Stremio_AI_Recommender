@@ -10,8 +10,13 @@
 //   * AGE: only a KNOWN rating ABOVE the limit drops a title. A missing rating
 //     falls through to the LLM, NEVER to deletion. "No rating" is not "too
 //     old" — conflating those is what emptied the kids catalogs under CSM.
+//
+// SOURCE CHAIN (v6.26): Jikan is community-run and genuinely flaky. Per id the
+// lookup falls Jikan -> AniList (same MAL id; NSFW blacklist only, no age band)
+// -> stale cache -> unrated. So an outage degrades to, at worst, "LLM decides".
 const store = require('../store');
 const governor = require('./governor');
+const anilist = require('./anilist');
 
 const API = 'https://api.jikan.moe/v4';
 const USER_AGENT = 'AI-Recommender/1.0 (+https://github.com/jamesgallagher/Stremio_AI_Recommender)';
@@ -107,18 +112,37 @@ async function fetchRating(malId) {
   throw lastErr;
 }
 
+// A cache entry is a definitive HIT — no live lookup needed — when it is a
+// fresh MAL verdict, OR any adult verdict (terminal for every profile, so it
+// never needs refreshing regardless of source or age). An AniList non-adult
+// verdict is deliberately NOT a hit: we re-attempt MAL each run to upgrade it
+// to a real age band, but keep it as a fallback if MAL is still down.
+// (Legacy entries have no `source` — treated as MAL, so old caches still hit.)
+function isDefinitiveHit(entry, now) {
+  if (!entry) return false;
+  if (entry.verdict && entry.verdict.adult) return true;
+  return entry.source !== 'anilist' && now - entry.at < TTL_MS;
+}
+
 // Ratings for many MAL ids. Returns Map<malId, verdict|null>. null means
 // "unknown", which callers MUST treat as "fall through to the LLM", never as
-// a reason to drop. A Jikan outage therefore degrades to today's behaviour.
+// a reason to drop. Lookup order per miss: Jikan -> AniList (same MAL id) ->
+// stale cache -> unrated. A rating source outage therefore degrades to, at
+// worst, today's behaviour, and usually not even that.
 async function ratings(malIds, log = console) {
   const out = new Map();
   const now = Date.now();
   const cache = store.loadAnimeRatings();
   const misses = [];
+  const fallback = new Map(); // id -> stale/soft verdict, used only if live lookups fail
   for (const id of new Set(malIds)) {
     const hit = cache[`mal:${id}`];
-    if (hit && now - hit.at < TTL_MS) out.set(id, hit.verdict);
-    else misses.push(id);
+    if (isDefinitiveHit(hit, now)) { out.set(id, hit.verdict); continue; }
+    // An expired or AniList-sourced entry is still worth keeping: age
+    // classifications are static, so a stale band beats no band if MAL and
+    // AniList are both down this run.
+    if (hit && hit.verdict) fallback.set(id, hit.verdict);
+    misses.push(id);
   }
   if (!misses.length) return out;
 
@@ -126,24 +150,39 @@ async function ratings(malIds, log = console) {
   if (misses.length > LOOKUP_CAP) {
     log.warn(`[mal] ${misses.length} uncached titles — looking up ${LOOKUP_CAP} this run, the rest next time`);
   }
-  const fetched = new Map();
+  const fetched = new Map(); // id -> { verdict, source } to persist
   for (const id of queue) {
     try {
-      fetched.set(id, await fetchRating(id));
-    } catch (err) {
-      // Unknown, not blocked. The LLM still reviews it.
-      log.warn(`[mal] lookup ${id} failed (${err.message}) — treated as unrated`);
-      fetched.set(id, null);
+      fetched.set(id, { verdict: await fetchRating(id), source: 'mal' });
+    } catch (malErr) {
+      // Jikan is down/flaky. Second pass: AniList, by the same MAL id. It can
+      // still enforce the NSFW blacklist even when Jikan can't answer.
+      try {
+        const verdict = await anilist.fetchRating(id);
+        fetched.set(id, { verdict, source: 'anilist' });
+        log.log(`[mal] ${id}: Jikan failed (${malErr.message}) — AniList answered${verdict.adult ? ' (adult-blocked)' : ''}`);
+      } catch (aniErr) {
+        // Both sources down. Prefer a stale cached verdict over nothing — an
+        // expired band is almost certainly still correct. Else unrated -> LLM.
+        if (fallback.has(id)) {
+          out.set(id, fallback.get(id));
+          log.warn(`[mal] ${id}: Jikan+AniList failed — using stale cached verdict`);
+        } else {
+          out.set(id, null);
+          log.warn(`[mal] lookup ${id} failed (Jikan: ${malErr.message}; AniList: ${aniErr.message}) — treated as unrated`);
+        }
+      }
     }
     await sleep(RATE_DELAY_MS);
   }
 
+  // Persist what we fetched. Do NOT blanket-prune expired entries: an expired
+  // entry we couldn't refresh is our fallback, and dropping it is exactly how a
+  // source outage used to throw away good ratings. A successful lookup here
+  // overwrites its own entry; the rest are left to serve as fallback.
   const merged = store.loadAnimeRatings();
-  for (const [key, entry] of Object.entries(merged)) {
-    if (now - entry.at >= TTL_MS) delete merged[key];
-  }
-  for (const [id, verdict] of fetched) {
-    if (verdict !== null) merged[`mal:${id}`] = { verdict, at: now };
+  for (const [id, { verdict, source }] of fetched) {
+    if (verdict !== null) merged[`mal:${id}`] = { verdict, at: now, source };
     out.set(id, verdict);
   }
   store.saveAnimeRatings(merged);
