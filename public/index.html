@@ -770,8 +770,10 @@ async function checkSimklStatus(id) {
     if (r.connected) {
       flowEl.innerHTML = `<div class="muted">✓ Connected${r.username ? ` as <b style="color:var(--ok)">${esc(r.username)}</b>` : ''} — verified live. <b>${r.watched_count || 0}</b> watched title(s) in the local store.</div>
         <div style="margin-top:8px" class="row"><button class="ghost" onclick="syncSimkl('${id}', this)">Sync watched now</button>
+        <button class="ghost" onclick="importTrakt('${id}')" title="One-time: upload your Trakt data-export ZIP to push its watched history into this Simkl account, then resync">Import from Trakt</button>
         <button class="ghost" onclick="disconnectSimkl('${id}')">Disconnect</button>
-        <span class="tres" data-tres="simkl-sync"></span></div>`;
+        <span class="tres" data-tres="simkl-sync"></span></div>
+        <div class="muted" style="font-size:11px;margin-top:6px">Moving from Trakt? <b>Import from Trakt</b> takes your Trakt export .zip (request it at Trakt → Settings → <i>Your data</i>), pushes any watches Simkl doesn't already have — earliest play only, no rewatches — then pulls the updated history back in.</div>`;
     } else {
       flowEl.innerHTML = `<div><button onclick="connectSimkl('${id}')">Connect Simkl</button>${r.reason ? ` <span class="muted">— ${esc(r.reason)}</span>` : ''}</div>
         <div class="flow-status" style="margin-top:10px"></div>`;
@@ -897,6 +899,41 @@ async function syncSimkl(id, btn) {
     checkSimklStatus(id);
   } catch (e) { out.textContent = ' ✗ ' + e.message; out.className = 'tres err'; }
   finally { btn.disabled = false; }
+}
+
+// One-time Trakt → Simkl import. Pick the Trakt export .zip, POST it as a raw
+// body (not JSON — the api() helper stringifies, so we fetch directly), then
+// poll the job like Build/Rebuild. The server pushes to Simkl then resyncs.
+function importTrakt(id) {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.zip,application/zip';
+  input.onchange = () => { const f = input.files && input.files[0]; if (f) uploadTraktZip(id, f); };
+  input.click();
+}
+
+async function uploadTraktZip(id, file) {
+  const out = document.querySelector(`[data-id="${id}"] [data-tres="simkl-sync"]`);
+  if (!confirm(`Import "${file.name}" into this profile's Simkl account?\n\nThis pushes your Trakt watched history to Simkl (items already there are skipped, earliest play only — no rewatches), then resyncs the app. A large history can take a few minutes.`)) return;
+  out.className = 'tres'; out.textContent = ` ⟳ uploading ${file.name}…`;
+  try {
+    const res = await fetch(`/api/profiles/${id}/simkl/import-trakt`, {
+      method: 'POST', headers: { 'Content-Type': 'application/zip' }, body: file,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || res.statusText);
+    const job = await trackJob(id, j => { out.textContent = jobLabel(j) || out.textContent; });
+    if (job && job.state === 'error') { out.textContent = ' ✗ ' + (job.error || 'import failed'); out.className = 'tres err'; }
+    else {
+      const r = job && job.result;
+      out.textContent = r
+        ? ` ✓ imported ${r.imported} of ${r.collapsed} watches (${r.alreadyInSimkl} already in Simkl)${r.resync ? ` · ${r.resync.total} watched titles now in the app` : ''}`
+        : ' ✓ import complete';
+      out.className = 'tres ok';
+      toast('Trakt import complete 🎉');
+      checkSimklStatus(id);
+    }
+  } catch (e) { out.textContent = ' ✗ ' + e.message; out.className = 'tres err'; }
 }
 
 async function rebuildNow(id, btn) {

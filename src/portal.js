@@ -13,6 +13,7 @@ const crypto = require('./services/crypto');
 const settings = require('./settings');
 const llm = require('./services/llm');
 const simkl = require('./services/simkl');
+const traktImport = require('./services/traktImport');
 const watchedStore = require('./watchedStore');
 const recommendationStore = require('./recommendationStore');
 
@@ -354,6 +355,39 @@ router.post('/profiles/:id/simkl/sync', async (req, res) => {
     res.status(400).json({ error: err.message });
   }
 });
+
+// ---- One-time Trakt → Simkl import ----
+// The user uploads their Trakt data-export ZIP; we push its watched history into
+// this profile's Simkl account, then resync so the app's watched store reflects
+// it. Runs on the global job queue (fire-and-forget, polled via /job) because a
+// full library is minutes of paced 1-POST/s writes — far past Cloudflare's ~100s
+// origin cap if held open. The ZIP arrives as a raw body (express.raw); the JSON
+// body parser above skips it because the content-type isn't application/json.
+router.post('/profiles/:id/simkl/import-trakt',
+  express.raw({ type: ['application/zip', 'application/x-zip-compressed', 'application/octet-stream'], limit: '250mb' }),
+  (req, res) => {
+    const profile = config.getProfile(req.params.id);
+    if (!profile) return res.status(404).json({ error: 'Profile not found' });
+    if (!profile.simkl_auth?.access_token) return res.status(400).json({ error: 'Connect Simkl first' });
+    const zip = req.body;
+    if (!Buffer.isBuffer(zip) || zip.length === 0) {
+      return res.status(400).json({ error: 'No ZIP file received — upload your Trakt data export .zip' });
+    }
+    if (jobs.isBusy(profile.id)) {
+      return res.status(409).json({ error: 'A build or import is already running for this profile — let it finish first' });
+    }
+    jobs.enqueue(profile.id, 'trakt-import', async (progress) => {
+      const imported = await traktImport.importFromZip(profile, zip, console, progress);
+      // Pull the now-updated Simkl history into the local watched store, then top
+      // up genre/age enrichment — same as the "Sync watched now" path.
+      progress(92, 'Syncing watched history from Simkl');
+      const sync = await watchedStore.syncFromSimkl(profile, console, { force: true });
+      try { await watchedStore.enrichPending(profile.id, console); } catch { /* best-effort */ }
+      progress(100, 'Done');
+      return { ...imported, resync: { total: sync.total, breakdown: sync.breakdown } };
+    }).catch((err) => console.error(`[trakt-import] ${profile.name}: ${err.message}`));
+    res.status(202).json({ started: true, job: jobs.snapshot(profile.id) });
+  });
 
 // ---- Recommendation builder (v6 F5) ----
 // Build the pool: enqueued on the global job queue (one rebuild at a time) and
