@@ -17,6 +17,17 @@ if (!GROQ_MODELS.length) GROQ_MODELS.push(...DEFAULT_GROQ_MODELS);
 const CHAT_PATH = '/chat/completions';
 const chatUrl = (base) => `${String(base).replace(/\/+$/, '')}${CHAT_PATH}`;
 
+// Per-request timeout. The age gate runs on the SEARCH request path with no
+// timeout of its own — a hung provider (queue-stuck Groq, a dead/overloaded
+// local box) used to block the whole search until Stremio abandoned it and a
+// kids profile fail-closed to nothing. So each call is bounded and a timeout is
+// just another fall-through in the chain. Groq is fast, so it's held to a tight
+// bound; a local model can legitimately take far longer, so Custom gets a much
+// larger default. Both are env-overridable (a slow local box, a bad network).
+const GROQ_TIMEOUT_MS = Number(process.env.GROQ_TIMEOUT_MS) || 8000;
+const CUSTOM_TIMEOUT_MS = Number(process.env.CUSTOM_LLM_TIMEOUT_MS) || 25000;
+const timeoutFor = (provider) => (provider.type === 'groq' ? GROQ_TIMEOUT_MS : CUSTOM_TIMEOUT_MS);
+
 // One request to one model on one provider. Returns the message content string.
 // Groq: strict json_object + reasoning_effort:low on gpt-oss (proven in v5.2.1).
 // Custom: minimal body (model/messages/temperature) for maximum local-server
@@ -33,9 +44,26 @@ async function callProvider(provider, model, messages, { temperature = 0 } = {})
   const headers = { 'Content-Type': 'application/json' };
   if (provider.apiKey) headers.Authorization = `Bearer ${provider.apiKey}`;
 
-  // Only Groq is rate-governed — the local Custom LLM has no quota to respect.
-  const doFetch = () => fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
-  const res = isGroq ? await governor.schedule('groq', doFetch) : await doFetch();
+  // The abort timer starts when the fetch actually fires (inside doFetch), NOT
+  // when the call is queued — otherwise a call waiting behind the Groq governor
+  // would time out before it ever ran. Only Groq is rate-governed; the local
+  // Custom LLM has no quota to respect.
+  const timeoutMs = timeoutFor(provider);
+  const doFetch = () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    return fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: controller.signal })
+      .finally(() => clearTimeout(timer));
+  };
+  let res;
+  try {
+    res = isGroq ? await governor.schedule('groq', doFetch) : await doFetch();
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error(`${provider.label || provider.type}/${model} timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  }
   if (!res.ok) {
     const detail = (await res.text().catch(() => '')).slice(0, 200);
     const err = new Error(`${provider.label || provider.type}/${model} failed (${res.status})${detail ? `: ${detail}` : ''}`);

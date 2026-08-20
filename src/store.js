@@ -198,6 +198,27 @@ function saveAnimeRatings(entries) {
   writeJsonAtomic(ANIME_RATINGS_FILE, entries);
 }
 
+// ---- Age-gate verdicts (v6.28) ----
+// The LLM age gate on the SEARCH request path re-judges the same titles
+// endlessly: every keystroke re-queries TMDB, and a kids search keeps
+// re-surfacing the same candidates (typing "g"→"ga"→"game" all return Game of
+// Thrones). A title's suitability at a given age is a stable fact, so a
+// definitive verdict is cached FOREVER — after the first judgement, only NEW
+// titles ever reach the LLM, which is what stops the Groq governor queue from
+// piling up faster than it drains. Entries: { "movie:12:tt0944947": false } —
+// key is `${type}:${age}:${id}`, value is the boolean `ok` verdict. Only real
+// LLM verdicts land here; a fail-closed drop (timeout / whole-chain failure) is
+// never cached, so it is retried next time rather than stuck.
+const AGE_VERDICTS_FILE = path.join(CACHE_DIR, 'age-verdicts.json');
+
+function loadAgeVerdicts() {
+  return readJson(AGE_VERDICTS_FILE, {});
+}
+
+function saveAgeVerdicts(entries) {
+  writeJsonAtomic(AGE_VERDICTS_FILE, entries);
+}
+
 function markAttempt(profileId) {
   const cache = loadCache(profileId);
   cache.last_attempt_at = Date.now();
@@ -230,6 +251,8 @@ module.exports = {
   saveAnimeIndex,
   loadAnimeRatings,
   saveAnimeRatings,
+  loadAgeVerdicts,
+  saveAgeVerdicts,
   markAttempt,
   deleteCache,
 };

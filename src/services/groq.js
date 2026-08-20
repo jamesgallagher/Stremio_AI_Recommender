@@ -9,6 +9,7 @@
 // two entry points below take no apiKey — the chain is resolved from settings.
 const llm = require('./llm');
 const settings = require('../settings');
+const store = require('../store');
 
 function buildAgePrompt(type, ageLimit, titles) {
   const kind = type === 'series' ? 'TV series' : 'movies';
@@ -80,21 +81,59 @@ const CURATOR_SYSTEM = 'You are a film and television curator with broad knowled
 // per-provider quirks (gpt-oss reasoning_effort, etc.) are handled in llm.chat.
 async function ageGate(type, ageLimit, titles, log = console) {
   if (!titles.length) return new Set();
-  const validIds = new Set(titles.map((t) => t.id));
-  const prompt = buildAgePrompt(type, ageLimit, titles);
-  log.log(`[llm] full age-gate prompt for ${type}:\n----- PROMPT START -----\n${prompt}\n----- PROMPT END -----`);
-  const minVerdicts = Math.ceil(titles.length * 0.6);
+
+  // Persistent verdict cache first: a title's suitability at a given age is a
+  // stable fact, so a title judged once is never re-sent to the LLM. This is the
+  // fix for the search hang — without it, every keystroke re-judged the same
+  // candidates and the Groq governor queue grew faster than it drained. Only
+  // NEW titles fall through to the LLM below.
+  const cache = store.loadAgeVerdicts();
+  const cacheKey = (id) => `${type}:${ageLimit}:${id}`;
+  const vetoed = new Set();
+  const uncached = [];
+  let hits = 0;
+  for (const t of titles) {
+    const v = cache[cacheKey(t.id)];
+    if (v === true) { hits++; continue; }          // known suitable — keep
+    if (v === false) { hits++; vetoed.add(t.id); continue; } // known unsuitable — drop
+    uncached.push(t);
+  }
+
+  if (!uncached.length) {
+    log.log(`[llm] ${type}: age gate — ${vetoed.size} of ${titles.length} vetoed (all ${hits} cached)`);
+    if (vetoed.size) {
+      const names = titles.filter((t) => vetoed.has(t.id)).map((t) => t.title).join(', ');
+      log.log(`[llm] ${type}: age-gate vetoed: ${names}`);
+    }
+    return vetoed;
+  }
+
+  const validIds = new Set(uncached.map((t) => t.id));
+  const prompt = buildAgePrompt(type, ageLimit, uncached);
+  log.log(`[llm] full age-gate prompt for ${type} (${uncached.length} new, ${hits} cached):\n----- PROMPT START -----\n${prompt}\n----- PROMPT END -----`);
+  const minVerdicts = Math.ceil(uncached.length * 0.6);
   const validate = (text) => {
     const verdicts = parseVerdicts(text, validIds);
-    if (verdicts.size < minVerdicts) throw new Error(`only ${verdicts.size}/${titles.length} verdicts`);
+    if (verdicts.size < minVerdicts) throw new Error(`only ${verdicts.size}/${uncached.length} verdicts`);
     return verdicts;
   };
   const verdicts = await llm.chat(
     settings.llmChain(), [{ role: 'user', content: prompt }],
     { temperature: 0, system: REVIEWER_SYSTEM, validate }, log,
   );
-  const vetoed = new Set([...verdicts.entries()].filter(([, ok]) => !ok).map(([id]) => id));
-  log.log(`[llm] ${type}: age gate — ${vetoed.size} of ${titles.length} vetoed`);
+
+  // Persist every definitive verdict (both directions — a veto is as stable as a
+  // pass, and re-judging the vetoes is most of the cost). A title the model
+  // OMITTED gets no verdict: not cached, not vetoed — kept, exactly as before.
+  let changed = false;
+  for (const [id, ok] of verdicts) {
+    cache[cacheKey(id)] = ok;
+    changed = true;
+    if (!ok) vetoed.add(id);
+  }
+  if (changed) store.saveAgeVerdicts(cache);
+
+  log.log(`[llm] ${type}: age gate — ${vetoed.size} of ${titles.length} vetoed (${hits} cached, ${uncached.length} judged)`);
   if (vetoed.size) {
     const names = titles.filter((t) => vetoed.has(t.id)).map((t) => t.title).join(', ');
     log.log(`[llm] ${type}: age-gate vetoed: ${names}`);
