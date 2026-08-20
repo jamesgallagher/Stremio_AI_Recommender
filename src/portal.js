@@ -16,6 +16,7 @@ const simkl = require('./services/simkl');
 const traktImport = require('./services/traktImport');
 const watchedStore = require('./watchedStore');
 const recommendationStore = require('./recommendationStore');
+const dontRecommend = require('./dontRecommend');
 
 const { version } = require('../package.json');
 const USER_AGENT = `AI-Recommender/1.0 (+https://github.com/jamesgallagher/Stremio_AI_Recommender)`;
@@ -440,15 +441,21 @@ router.get('/profiles/:id/recommend', (req, res) => {
   });
 });
 
-// "Don't recommend" — the shared suppress endpoint (Advanced tab + in-app link +
-// Mobile Companion all POST here). Writes dont_recommend(reason=user).
-router.post('/profiles/:id/recommend/suppress', (req, res) => {
+// "Don't recommend" — the configure-portal + Mobile Companion entry point.
+// Delegates to the shared dontRecommend.suppress() (the same logic the in-player
+// GET /addon/:token/dnr link uses), so a rejection behaves identically wherever
+// it's tapped. Accepts a tmdb_id (Advanced tab has it) OR an imdb_id (the
+// Companion app has the tt id from the catalog); at least one is required.
+router.post('/profiles/:id/recommend/suppress', async (req, res) => {
   const profile = config.getProfile(req.params.id);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
-  const { type, tmdb_id } = req.body || {};
-  if (!type || !tmdb_id) return res.status(400).json({ error: 'type and tmdb_id required' });
-  recommendationStore.addDontRecommend(profile.id, type, tmdb_id, 'user');
-  res.json({ ok: true, total: recommendationStore.countRecommended(profile.id) });
+  const { type, tmdb_id, imdb_id, title } = req.body || {};
+  if (!type || (!tmdb_id && !imdb_id)) return res.status(400).json({ error: 'type and tmdb_id (or imdb_id) required' });
+  const result = await dontRecommend.suppress(profile, { type, tmdbId: tmdb_id, imdbId: imdb_id, title }, console);
+  if (!result.ok) {
+    return res.status(result.reason === 'bad-type' ? 400 : 422).json({ error: `could not suppress (${result.reason})` });
+  }
+  res.json({ ok: true, title: result.title, total: recommendationStore.countRecommended(profile.id) });
 });
 
 router.post('/profiles/:id/simkl/disconnect', (req, res) => {

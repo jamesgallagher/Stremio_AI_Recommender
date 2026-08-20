@@ -8,6 +8,7 @@ const store = require('./store');
 const rebuild = require('./rebuild');
 const catalogs = require('./catalogs');
 const recommendationStore = require('./recommendationStore');
+const dontRecommend = require('./dontRecommend');
 const watchedStore = require('./watchedStore');
 const tmdb = require('./services/tmdb');
 const llm = require('./services/groq');
@@ -54,6 +55,60 @@ function applyRpdb(metas, rpdbKey) {
 function hasContent(profile, def) {
   if (def.source !== 'simkl_plantowatch') return true;
   return (store.loadCache(profile.id).extras?.[def.id]?.metas || []).length > 0;
+}
+
+// The in-player "Don't recommend" control. Stremio & Nuvio render a meta's
+// `links` as tappable chips beneath the detail page; a link whose url is an
+// external http(s) address opens the device's browser, which hits our public
+// GET /dnr route — no typing, no auth prompt (a player can't answer one). The
+// link is injected at SERVE time, per-profile (like the RPDB poster swap): the
+// cached meta is profile-agnostic, and the link has to carry THIS profile's
+// token + the title's id, which are exactly "the user profile and the title".
+function withDnrLink(meta, req) {
+  if (!meta || !meta.id || !meta.type) return meta;
+  const url = `${baseUrl(req)}${req.baseUrl}/dnr/${meta.type}/${encodeURIComponent(meta.id)}`;
+  const link = { name: 'Don’t recommend', category: 'AI Recommender', url };
+  return { ...meta, links: [...(meta.links || []), link] };
+}
+
+// Confirmation page shown when the /dnr link is opened in the device browser.
+// Self-contained (no external assets — a TV/phone browser may be offline-ish or
+// sandboxed) and theme-aware. This presentation is addon-specific; the SHARED
+// piece is dontRecommend.suppress(), which the Companion app calls with its own
+// native UI instead of this page.
+function dnrPage({ ok, title }, profile) {
+  const safe = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const name = safe(title || 'This title');
+  const who = safe(profile.name);
+  const heading = ok ? `${name} won’t be recommended again` : 'Couldn’t update recommendations';
+  const detail = ok
+    ? `Removed from ${who}’s recommendations. You can close this tab.`
+    : `We couldn’t match this title to ${who}’s recommendations. You can close this tab and try again from the recommendations row.`;
+  const glyph = ok ? '✓' : '!';
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${ok ? 'Removed from recommendations' : 'Not updated'}</title>
+<style>
+  :root { color-scheme: light dark; }
+  html,body { margin:0; height:100%; }
+  body { display:grid; place-items:center; padding:24px;
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background:#0f1115; color:#e7e9ee; }
+  @media (prefers-color-scheme: light) { body { background:#f4f5f7; color:#1a1d24; } }
+  .card { max-width:420px; text-align:center; padding:32px 28px; border-radius:16px;
+    background:rgba(255,255,255,.04); box-shadow:0 10px 40px rgba(0,0,0,.35); }
+  @media (prefers-color-scheme: light) { .card { background:#fff; box-shadow:0 10px 40px rgba(0,0,0,.08); } }
+  .badge { width:64px; height:64px; margin:0 auto 20px; border-radius:50%;
+    display:grid; place-items:center; font-size:32px; font-weight:700; color:#fff;
+    background:${ok ? '#8b5cf6' : '#c2410c'}; }
+  h1 { font-size:20px; margin:0 0 8px; }
+  p { margin:0; opacity:.75; }
+</style></head><body><div class="card">
+  <div class="badge">${glyph}</div>
+  <h1>${heading}</h1>
+  <p>${detail}</p>
+</div></body></html>`;
 }
 
 function manifestFor(profile, baseUrl = '') {
@@ -148,6 +203,33 @@ async function handleSearch(profile, type, extraStr, res) {
   }
 }
 
+// In-player "Don't recommend". A plain GET the device browser opens from the
+// meta link — no interaction, no auth beyond the profile token already in the
+// path (the router.use above resolves it or 404s). GET-with-side-effect is
+// deliberate: a browser link can only GET, and the action is idempotent (repeat
+// taps are harmless — addDontRecommend upserts). Delegates to the shared
+// dontRecommend.suppress() so the in-player path, the portal, and the Companion
+// app can't drift apart; always answers with a human confirmation page (200),
+// never a raw error a TV browser would render as a broken page.
+router.get('/dnr/:type/:id', async (req, res) => {
+  const profile = req.profile;
+  const { type } = req.params;
+  const id = req.params.id.replace(/\.json$/, '');
+  const isImdb = id.startsWith('tt');
+  let result;
+  try {
+    result = await dontRecommend.suppress(
+      profile,
+      { type, imdbId: isImdb ? id : null, tmdbId: isImdb ? null : id },
+      console,
+    );
+  } catch (err) {
+    console.warn(`[dnr] ${profile.name}/${type} ${id} failed: ${err.message}`);
+    result = { ok: false, reason: 'error', title: null };
+  }
+  res.set('Cache-Control', 'no-store').type('html').send(dnrPage(result, profile));
+});
+
 // Metadata service. This exists so a device can run THIS addon plus a stream
 // addon and nothing else: before it, a third-party metadata addon was required
 // for playback, and that addon answered search UNFILTERED alongside our gated
@@ -180,7 +262,7 @@ router.get('/meta/:type/:id', async (req, res) => {
 
   const cached = store.loadMeta(type, id);
   if (cached) {
-    return res.json({ meta: applyRpdb([cached], settings.keyFor(profile, 'rpdb_api_key'))[0], cacheMaxAge: 43200 });
+    return res.json({ meta: withDnrLink(applyRpdb([cached], settings.keyFor(profile, 'rpdb_api_key'))[0], req), cacheMaxAge: 43200 });
   }
   if (!settings.keyFor(profile, 'tmdb_api_key')) return res.status(404).json({ error: 'TMDB key not configured' });
   try {
@@ -205,7 +287,7 @@ router.get('/meta/:type/:id', async (req, res) => {
     const eps = result.meta.videos ? ` (${result.meta.videos.length} episodes)` : '';
     console.log(`[meta] ${profile.name}/${type} ${id}: built${eps}`);
     return res.json({
-      meta: applyRpdb([result.meta], settings.keyFor(profile, 'rpdb_api_key'))[0],
+      meta: withDnrLink(applyRpdb([result.meta], settings.keyFor(profile, 'rpdb_api_key'))[0], req),
       cacheMaxAge: Math.floor(result.ttlMs / 1000),
     });
   } catch (err) {

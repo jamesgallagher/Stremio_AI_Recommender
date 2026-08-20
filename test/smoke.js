@@ -1220,6 +1220,36 @@ async function httpTests() {
   assert.strictEqual(meta.cacheMaxAge, 43200);
   console.log('  ✓ /meta/:type/:id.json serves cached meta with episodes');
 
+  // ---- In-player "Don't recommend" ----
+  // The served meta carries a tappable link that opens our public GET /dnr route
+  // (Stremio/Nuvio render it as a chip; opening it launches the device browser).
+  assert.ok(Array.isArray(meta.meta.links), 'meta should carry links');
+  const dnrLink = meta.meta.links.find((l) => l.category === 'AI Recommender');
+  assert.ok(dnrLink, 'meta should include a Don’t recommend link');
+  assert.strictEqual(dnrLink.url, `${BASE}/addon/${profile.token}/dnr/series/tt0944947`);
+
+  // Opening the link is a plain browser GET — no auth, no interaction. It records
+  // the rejection and returns a human confirmation page. Use a throwaway pooled
+  // title so the shared tt0111161 fixture the later tests rely on stays put.
+  recStore.upsertCandidates(profile.id, [
+    { type: 'movie', tmdb_id: '999777', imdb_id: 'tt0133093', title: 'Suppress Me', year: 1999, primary_genre: 'Action', genres: 'Action', vote_average: 8, affinity: 1, rec_count: 1, popularity: 1, poster: null },
+  ]);
+  const dnrRes = await fetch(`${BASE}/addon/${profile.token}/dnr/movie/tt0133093`);
+  assert.strictEqual(dnrRes.status, 200);
+  assert.match(dnrRes.headers.get('content-type') || '', /text\/html/);
+  const dnrHtml = await dnrRes.text();
+  assert.match(dnrHtml, /Suppress Me/);            // resolved title, HTML-escaped, in the message
+  assert.match(dnrHtml, /recommended/);
+  // Recorded as a permanent user rejection and dropped from the pool (no rebuild),
+  // while the untouched fixture survives for the tests below.
+  assert.ok(recStore.dontRecommendKeys(profile.id).has('movie:999777'));
+  assert.ok(!recStore.getRecommended(profile.id, { type: 'movie' }).some((r) => r.imdb_id === 'tt0133093'));
+  assert.ok(recStore.getRecommended(profile.id, { type: 'movie' }).some((r) => r.imdb_id === 'tt0111161'));
+  // An unknown profile token is refused at /dnr too (shared router guard)
+  const dnrBadTok = await fetch(`${BASE}/addon/deadbeef/dnr/movie/tt0133093`);
+  assert.strictEqual(dnrBadTok.status, 404);
+  console.log('  ✓ in-player Don’t recommend: meta link + GET suppresses (shared path)');
+
   // Non-tt ids and unknown types are ours to reject, not to guess at
   res = await fetch(`${BASE}/addon/${profile.token}/meta/series/kitsu:123.json`);
   assert.strictEqual(res.status, 404);
