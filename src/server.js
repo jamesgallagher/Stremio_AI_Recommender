@@ -141,10 +141,16 @@ app.listen(PORT, '0.0.0.0', () => {
 const scrobble = require('./services/scrobble');
 const watchedStore = require('./watchedStore');
 const recommendationStore = require('./recommendationStore');
+const jobs = require('./jobs');
 const TICK_MS = 60 * 60e3;
 function tick() {
   for (const profile of config.listProfiles()) {
     try {
+      // A rebuild or a Trakt import in flight is already moving this profile's
+      // watched history and pool. Skip the tick's opportunistic sync/build so we
+      // don't kick off a build off a half-finished import (the mid-import
+      // activities bump would otherwise pull a partial history and rebuild on it).
+      if (jobs.isBusy(profile.id)) continue;
       scrobble.ensureSynced(profile);
       rebuild.ensureFresh(profile);
       // v6: pull Simkl watched history (activities-gated — a no-op when nothing

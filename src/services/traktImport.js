@@ -268,12 +268,12 @@ async function importFromZip(profile, zipBuffer, log = console, progress = () =>
     throw new Error('Simkl is not connected for this profile');
   }
 
-  progress(2, 'Reading Trakt export');
+  progress(3, 'Reading Trakt export');
   const rows = extractWatchHistory(zipBuffer);
   const watches = collapseToEarliest(rows);
   log.log(`[trakt-import] ${profile.name}: parsed ${rows.length} history rows -> ${watches.length} unique watches`);
 
-  progress(12, 'Reading Simkl history');
+  progress(8, 'Reading Simkl history');
   const existing = await getExistingKeys(profile);
   log.log(`[trakt-import] ${profile.name}: Simkl already has ${existing.size} id-keys on record`);
 
@@ -286,8 +286,9 @@ async function importFromZip(profile, zipBuffer, log = console, progress = () =>
   for (let i = 0; i < batches.length; i++) {
     await simkl.addToHistory(profile, buildPayload(batches[i])); // governed 1 POST/s
     postRequests++;
-    // Reserve 12–90% of the bar for the import POSTs (the long, paced phase).
-    progress(12 + Math.round(((i + 1) / batches.length) * 78), `Importing to Simkl (batch ${i + 1}/${batches.length})`);
+    // 10–100% of THIS phase's bar for the POSTs (the long, paced phase). The
+    // caller bands this whole 0–100 into its overall progress.
+    progress(10 + Math.round(((i + 1) / batches.length) * 90), `Importing to Simkl (batch ${i + 1}/${batches.length})`);
   }
 
   const result = {

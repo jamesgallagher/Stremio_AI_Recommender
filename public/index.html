@@ -927,7 +927,7 @@ async function uploadTraktZip(id, file) {
     else {
       const r = job && job.result;
       out.textContent = r
-        ? ` ✓ imported ${r.imported} of ${r.collapsed} watches (${r.alreadyInSimkl} already in Simkl)${r.resync ? ` · ${r.resync.total} watched titles now in the app` : ''}`
+        ? ` ✓ imported ${r.imported} of ${r.collapsed} watches (${r.alreadyInSimkl} already in Simkl)${r.resync ? ` · ${r.resync.total} watched titles in the app` : ''}${r.rebuilt ? ` · rebuilt ${r.rebuilt.stored} recommendations` : ''}`
         : ' ✓ import complete';
       out.className = 'tres ok';
       toast('Trakt import complete 🎉');

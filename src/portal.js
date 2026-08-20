@@ -377,14 +377,28 @@ router.post('/profiles/:id/simkl/import-trakt',
       return res.status(409).json({ error: 'A build or import is already running for this profile — let it finish first' });
     }
     jobs.enqueue(profile.id, 'trakt-import', async (progress) => {
-      const imported = await traktImport.importFromZip(profile, zip, console, progress);
+      // Band each phase's own 0–100 into the overall bar so the last phase (the
+      // pool rebuild) is included — the whole point: the rebuild runs HERE, after
+      // the full import + resync, on the complete watched store, not off a
+      // partial mid-import sync the scheduler happened to catch.
+      const band = (lo, hi) => (p, label) => progress(lo + ((hi - lo) * p) / 100, label);
+
+      const imported = await traktImport.importFromZip(profile, zip, console, band(0, 68));
       // Pull the now-updated Simkl history into the local watched store, then top
       // up genre/age enrichment — same as the "Sync watched now" path.
-      progress(92, 'Syncing watched history from Simkl');
+      progress(70, 'Syncing watched history from Simkl');
       const sync = await watchedStore.syncFromSimkl(profile, console, { force: true });
       try { await watchedStore.enrichPending(profile.id, console); } catch { /* best-effort */ }
-      progress(100, 'Done');
-      return { ...imported, resync: { total: sync.total, breakdown: sync.breakdown } };
+      // Rebuild the recommendation pool directly (not via jobs.enqueue — we're
+      // already inside a job; enqueuing would deadlock behind ourselves) so it's
+      // deterministic and built from the COMPLETE imported history.
+      progress(76, 'Rebuilding recommendations');
+      const built = await recommendationStore.buildPool(profile, console, band(78, 100));
+      return {
+        ...imported,
+        resync: { total: sync.total, breakdown: sync.breakdown },
+        rebuilt: built && !built.skipped ? { stored: built.stored, seeds: built.seeds } : null,
+      };
     }).catch((err) => console.error(`[trakt-import] ${profile.name}: ${err.message}`));
     res.status(202).json({ started: true, job: jobs.snapshot(profile.id) });
   });
