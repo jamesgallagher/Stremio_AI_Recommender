@@ -64,23 +64,47 @@ function parseAnime(data) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function fetchRating(malId, retryOn429 = true) {
-  const res = await governor.schedule('jikan', () => fetch(`${API}/anime/${encodeURIComponent(malId)}`, {
-    headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
-  }));
-  if (res.status === 404) return { code: null, minAge: null, adult: false, adultish: false };
-  if (res.status === 429 && retryOn429) {
-    // One backoff, then give up and let the title go to the LLM unrated. A
-    // rate limit must never turn into a wrong verdict in either direction.
-    await sleep(3000);
-    return fetchRating(malId, false);
+// Jikan sits behind Cloudflare and is genuinely flaky: 429s (rate) plus 5xx
+// gateway errors (502/503/504) come in bursts, and a torn keep-alive socket
+// surfaces as a network-level "fetch failed". All three are TRANSIENT, so we
+// retry a couple of times before giving up. Giving up still means "unrated ->
+// LLM decides", never a wrong verdict — retry just stops a Jikan hiccup from
+// dumping a whole seed batch to the LLM unclassified.
+const MAX_ATTEMPTS = 3;
+const RETRY_BACKOFF_MS = 3000;
+const REQUEST_TIMEOUT_MS = 10000; // fail a hung socket fast so the retry can fire
+
+async function fetchRating(malId) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await governor.schedule('jikan', () => fetch(`${API}/anime/${encodeURIComponent(malId)}`, {
+        headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      }));
+      if (res.status === 404) return { code: null, minAge: null, adult: false, adultish: false };
+      // 429 (rate) and 5xx (gateway) are transient — back off and retry.
+      if (res.status === 429 || res.status >= 500) {
+        lastErr = new Error(`Jikan anime/${malId} failed (${res.status})`);
+        lastErr.status = res.status;
+        if (attempt < MAX_ATTEMPTS) { await sleep(RETRY_BACKOFF_MS); continue; }
+        throw lastErr;
+      }
+      if (!res.ok) {
+        const err = new Error(`Jikan anime/${malId} failed (${res.status})`);
+        err.status = res.status;
+        throw err; // 4xx (not 404/429) is not transient — don't retry
+      }
+      return parseAnime((await res.json())?.data);
+    } catch (err) {
+      // Network-level failure (fetch failed / timeout / socket reset): transient.
+      if (err.status && err.status < 500 && err.status !== 429) throw err;
+      lastErr = err;
+      if (attempt < MAX_ATTEMPTS) { await sleep(RETRY_BACKOFF_MS); continue; }
+      throw lastErr;
+    }
   }
-  if (!res.ok) {
-    const err = new Error(`Jikan anime/${malId} failed (${res.status})`);
-    err.status = res.status;
-    throw err;
-  }
-  return parseAnime((await res.json())?.data);
+  throw lastErr;
 }
 
 // Ratings for many MAL ids. Returns Map<malId, verdict|null>. null means
