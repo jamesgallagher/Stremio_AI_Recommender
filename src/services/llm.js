@@ -40,6 +40,14 @@ async function callProvider(provider, model, messages, { temperature = 0 } = {})
   if (isGroq) {
     body.response_format = { type: 'json_object' };
     if (/^openai\/gpt-oss/.test(model)) body.reasoning_effort = 'low';
+  } else {
+    // Local reasoning models (Qwen3.x "thinking", etc.) otherwise emit thousands
+    // of chain-of-thought tokens before the answer — a 6-title age gate measured
+    // at 65s / ~4300 output tokens, vs ~0.6s / ~30 tokens with thinking OFF, for
+    // IDENTICAL verdicts. The gate is a yes/no classification that needs no
+    // deliberation, so thinking is disabled. Servers that don't recognise
+    // chat_template_kwargs (llama.cpp, vLLM both do) ignore the unknown field.
+    body.chat_template_kwargs = { enable_thinking: false };
   }
   const headers = { 'Content-Type': 'application/json' };
   if (provider.apiKey) headers.Authorization = `Bearer ${provider.apiKey}`;
