@@ -939,6 +939,37 @@ async function httpTests() {
     console.log('  ✓ jobs: global queue serializes, reports progress, dedups');
   }
 
+  // Circuit breaker: a service that opts in (jikan) trips after N failures and
+  // then fails fast without touching the network; a service without a breaker
+  // (tmdb) never opens. This is what stops us pounding a down Jikan.
+  {
+    const gov = require('../src/services/governor');
+    gov._reset();
+    for (let i = 0; i < 5; i++) gov.noteOutcome('jikan', false); // threshold = 5
+    assert.strictEqual(gov.isOpen('jikan'), true);
+    let called = false;
+    await assert.rejects(
+      () => gov.schedule('jikan', () => { called = true; return { status: 200 }; }),
+      (e) => e.circuitOpen === true,
+    );
+    assert.strictEqual(called, false); // fn never ran while open
+    // A success (half-open probe) closes it again.
+    gov.noteOutcome('jikan', true);
+    assert.strictEqual(gov.isOpen('jikan'), false);
+    // A breaker-less service is immune no matter how many failures.
+    for (let i = 0; i < 20; i++) gov.noteOutcome('tmdb', false);
+    assert.strictEqual(gov.isOpen('tmdb'), false);
+    // A run of failures through schedule (thrown) trips the breaker too.
+    gov._reset();
+    for (let i = 0; i < 5; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      await assert.rejects(() => gov.schedule('anilist', () => { throw new Error('fetch failed'); }));
+    }
+    assert.strictEqual(gov.isOpen('anilist'), true);
+    gov._reset();
+    console.log('  ✓ governor: circuit breaker trips, fails fast, and recovers');
+  }
+
   // Async unit check: fully-cached CSM lookups must answer without network
   // (the dummy key would fail loudly on any request).
   const mdblist = require('../src/services/mdblist');
@@ -1510,7 +1541,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 45 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 46 async/http).`);
   process.exit(0);
 }
 

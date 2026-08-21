@@ -69,6 +69,15 @@ function parseAnime(data) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// undici reports every connection-level failure as the opaque "fetch failed";
+// the actual reason lives on err.cause (ECONNRESET, UND_ERR_CONNECT_TIMEOUT,
+// ENOTFOUND, …). Dig it out so an outage is diagnosable from the logs.
+function jikanReason(err) {
+  const cause = err && err.cause;
+  if (cause && (cause.code || cause.message)) return `${err.message}: ${cause.code || cause.message}`;
+  return err ? err.message : 'unknown';
+}
+
 // Jikan sits behind Cloudflare and is genuinely flaky: 429s (rate) plus 5xx
 // gateway errors (502/503/504) come in bursts, and a torn keep-alive socket
 // surfaces as a network-level "fetch failed". All three are TRANSIENT, so we
@@ -102,8 +111,11 @@ async function fetchRating(malId) {
       }
       return parseAnime((await res.json())?.data);
     } catch (err) {
-      // Network-level failure (fetch failed / timeout / socket reset): transient.
+      // Breaker is open (Jikan is down) — don't retry, fall through to AniList now.
+      if (err.circuitOpen) throw err;
+      // Non-transient 4xx (not 404/429): don't retry.
       if (err.status && err.status < 500 && err.status !== 429) throw err;
+      // Network-level failure (fetch failed / timeout / socket reset): transient.
       lastErr = err;
       if (attempt < MAX_ATTEMPTS) { await sleep(RETRY_BACKOFF_MS); continue; }
       throw lastErr;
@@ -151,6 +163,7 @@ async function ratings(malIds, log = console) {
     log.warn(`[mal] ${misses.length} uncached titles — looking up ${LOOKUP_CAP} this run, the rest next time`);
   }
   const fetched = new Map(); // id -> { verdict, source } to persist
+  let firstOpenLog = true;   // log the "circuit open" note once, not per title
   for (const id of queue) {
     try {
       fetched.set(id, { verdict: await fetchRating(id), source: 'mal' });
@@ -160,7 +173,15 @@ async function ratings(malIds, log = console) {
       try {
         const verdict = await anilist.fetchRating(id);
         fetched.set(id, { verdict, source: 'anilist' });
-        log.log(`[mal] ${id}: Jikan failed (${malErr.message}) — AniList answered${verdict.adult ? ' (adult-blocked)' : ''}`);
+        // Surface the real reason Jikan failed — "fetch failed" hides the cause
+        // (ECONNRESET, connect timeout, etc.); the breaker note tells us it's
+        // down rather than a one-off. Only log per-id detail while the breaker
+        // is still closed, so an outage doesn't spam one line per title.
+        if (malErr.circuitOpen) {
+          if (firstOpenLog) { log.warn('[mal] Jikan circuit open — routing to AniList until it recovers'); firstOpenLog = false; }
+        } else {
+          log.log(`[mal] ${id}: Jikan failed (${jikanReason(malErr)}) — AniList answered${verdict.adult ? ' (adult-blocked)' : ''}`);
+        }
       } catch (aniErr) {
         // Both sources down. Prefer a stale cached verdict over nothing — an
         // expired band is almost certainly still correct. Else unrated -> LLM.
@@ -169,7 +190,7 @@ async function ratings(malIds, log = console) {
           log.warn(`[mal] ${id}: Jikan+AniList failed — using stale cached verdict`);
         } else {
           out.set(id, null);
-          log.warn(`[mal] lookup ${id} failed (Jikan: ${malErr.message}; AniList: ${aniErr.message}) — treated as unrated`);
+          log.warn(`[mal] lookup ${id} failed (Jikan: ${jikanReason(malErr)}; AniList: ${aniErr.message}) — treated as unrated`);
         }
       }
     }

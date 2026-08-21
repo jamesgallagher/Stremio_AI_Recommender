@@ -30,8 +30,8 @@ const LIMITS = {
   simkl_get: { minIntervalMs: 120 },
   simkl_post: { minIntervalMs: 1100 },
   mdblist: { minIntervalMs: 250, dailyCap: 1000 },
-  jikan: { minIntervalMs: 1050 },
-  anilist: { minIntervalMs: 2000 },
+  jikan: { minIntervalMs: 1050, breaker: { threshold: 5, cooldownMs: 60000 } },
+  anilist: { minIntervalMs: 2000, breaker: { threshold: 5, cooldownMs: 60000 } },
   groq: { minIntervalMs: 2100 },
 };
 
@@ -42,10 +42,35 @@ const states = new Map();
 function stateFor(service) {
   let s = states.get(service);
   if (!s) {
-    s = { nextAt: 0, backoffUntil: 0, calls: 0, throttled: 0, lastThrottledAt: 0, day: 0, dayCalls: 0 };
+    s = { nextAt: 0, backoffUntil: 0, calls: 0, throttled: 0, lastThrottledAt: 0, day: 0, dayCalls: 0, fails: 0, openUntil: 0, tripped: 0 };
     states.set(service, s);
   }
   return s;
+}
+
+// Circuit breaker (opt-in per service via LIMITS.breaker). When a service fails
+// N times in a row — connection errors or 5xx, i.e. "it's down", NOT 429 which
+// is just rate — the breaker OPENS for a cooldown and schedule() fails fast
+// without calling the network or consuming a slot. This stops us from pounding a
+// dead endpoint (Jikan behind Cloudflare drops connections under sustained
+// retries, which keeps both it and us down) and makes the run fall straight
+// through to the fallback. After the cooldown the next call is a half-open
+// probe: success closes the breaker, failure re-opens it.
+function isOpen(service, nowMs = Date.now()) {
+  const s = states.get(service);
+  return !!s && s.openUntil > nowMs;
+}
+
+function noteOutcome(service, ok, nowMs = Date.now()) {
+  const lim = LIMITS[service];
+  if (!lim || !lim.breaker) return;
+  const s = stateFor(service);
+  if (ok) { s.fails = 0; s.openUntil = 0; return; }
+  s.fails += 1;
+  if (s.fails >= lim.breaker.threshold && s.openUntil <= nowMs) {
+    s.openUntil = nowMs + lim.breaker.cooldownMs;
+    s.tripped += 1;
+  }
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -87,12 +112,27 @@ function noteResponse(service, res, nowMs = Date.now()) {
 }
 
 // The one entry point: pace, run fn (which returns a fetch Response), note 429.
+// Also drives the circuit breaker for services that opt in: an open breaker
+// fails fast (no slot, no network); otherwise the outcome (2xx-4xx reachable
+// vs 5xx/thrown down) is recorded. 429 is rate, not down — never a breaker fail.
 async function schedule(service, fn) {
+  const lim = LIMITS[service] || {};
+  if (lim.breaker && isOpen(service)) {
+    const err = new Error(`${service} circuit open — skipping (cooldown)`);
+    err.circuitOpen = true;
+    throw err;
+  }
   const wait = reserve(service);
   if (wait > 0) await sleep(wait);
-  const res = await fn();
-  noteResponse(service, res);
-  return res;
+  try {
+    const res = await fn();
+    noteResponse(service, res);
+    noteOutcome(service, !(res && typeof res.status === 'number' && res.status >= 500));
+    return res;
+  } catch (err) {
+    noteOutcome(service, false); // connection-level failure = the service is down
+    throw err;
+  }
 }
 
 // Diagnostics snapshot (for the Advanced tab, later): per-service call totals,
@@ -108,6 +148,9 @@ function stats(nowMs = Date.now()) {
       throttled: s.throttled,
       backing_off: s.backoffUntil > nowMs,
       backoff_ms_left: Math.max(0, s.backoffUntil - nowMs),
+      circuit_open: s.openUntil > nowMs,
+      circuit_ms_left: Math.max(0, s.openUntil - nowMs),
+      tripped: s.tripped,
     };
   }
   return out;
@@ -115,4 +158,4 @@ function stats(nowMs = Date.now()) {
 
 function _reset() { states.clear(); }
 
-module.exports = { schedule, reserve, noteResponse, stats, LIMITS, _reset };
+module.exports = { schedule, reserve, noteResponse, noteOutcome, isOpen, stats, LIMITS, _reset };
