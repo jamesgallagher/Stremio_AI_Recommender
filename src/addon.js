@@ -188,7 +188,7 @@ async function handleSearch(profile, type, extraStr, res) {
       const vetoed = await llm.ageGate(
         type, rebuild.judgementAge(profile.filters),
         metas.map((m) => ({
-          id: m.id, title: m.name, year: m.releaseInfo,
+          id: m.id, cacheId: m._tmdb_id, title: m.name, year: m.releaseInfo,
           genres: m._genre_names, certification: m._certification, overview: m.description,
         })),
         console,

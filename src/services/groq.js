@@ -73,12 +73,20 @@ const REVIEWER_SYSTEM = 'You are a strict parental-guidance reviewer for Austral
 const CURATOR_SYSTEM = 'You are a film and television curator with broad knowledge of world cinema, TV and anime. Reply with raw JSON only.';
 
 // Run the age gate over `titles` ([{id,title,year,genres,certification,
-// overview}]). Returns the Set of VETOED ids. Requires verdicts for >= 60% of
-// the list (a thinner response is rejected and the chain falls through to the
-// next provider/model); throws when the WHOLE chain fails — kids-mode callers
-// treat that as fail-closed: keep the previous list rather than serve an
-// unverified one. Provider order (Custom → Groq primary → Groq backup) and the
-// per-provider quirks (gpt-oss reasoning_effort, etc.) are handled in llm.chat.
+// overview, cacheId?}]). Returns the Set of VETOED ids (matched on `id`).
+// Requires verdicts for >= 60% of the list (a thinner response is rejected and
+// the chain falls through to the next provider/model); throws when the WHOLE
+// chain fails — kids-mode callers treat that as fail-closed: keep the previous
+// list rather than serve an unverified one. Provider order (Custom → Groq
+// primary → Groq backup) and the per-provider quirks (gpt-oss reasoning_effort,
+// etc.) are handled in llm.chat.
+//
+// The verdict CACHE is keyed on `cacheId ?? id`. Callers pass the TMDB id as
+// `cacheId` so all three gate sites (search + extra-catalog on IMDb ids, the
+// nightly pool rebuild on TMDB ids) share ONE cache space — the rebuild's
+// verdicts then pre-warm the request-path search cache and vice versa. `id`
+// stays whatever the caller matches its own list on, so the returned veto Set
+// is unaffected.
 async function ageGate(type, ageLimit, titles, log = console) {
   if (!titles.length) return new Set();
 
@@ -88,12 +96,12 @@ async function ageGate(type, ageLimit, titles, log = console) {
   // candidates and the Groq governor queue grew faster than it drained. Only
   // NEW titles fall through to the LLM below.
   const cache = store.loadAgeVerdicts();
-  const cacheKey = (id) => `${type}:${ageLimit}:${id}`;
+  const keyOf = (t) => `${type}:${ageLimit}:${t.cacheId ?? t.id}`;
   const vetoed = new Set();
   const uncached = [];
   let hits = 0;
   for (const t of titles) {
-    const v = cache[cacheKey(t.id)];
+    const v = cache[keyOf(t)];
     if (v === true) { hits++; continue; }          // known suitable — keep
     if (v === false) { hits++; vetoed.add(t.id); continue; } // known unsuitable — drop
     uncached.push(t);
@@ -125,10 +133,13 @@ async function ageGate(type, ageLimit, titles, log = console) {
   // Persist every definitive verdict (both directions — a veto is as stable as a
   // pass, and re-judging the vetoes is most of the cost). A title the model
   // OMITTED gets no verdict: not cached, not vetoed — kept, exactly as before.
+  // Verdicts come back keyed on the prompt `id`, so map each back to its cache
+  // key (which may be the caller's cacheId) before storing.
+  const keyById = new Map(uncached.map((t) => [t.id, keyOf(t)]));
   let changed = false;
   for (const [id, ok] of verdicts) {
-    cache[cacheKey(id)] = ok;
-    changed = true;
+    const k = keyById.get(id);
+    if (k) { cache[k] = ok; changed = true; }
     if (!ok) vetoed.add(id);
   }
   if (changed) store.saveAgeVerdicts(cache);

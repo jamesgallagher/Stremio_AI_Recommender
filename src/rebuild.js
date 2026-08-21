@@ -249,7 +249,7 @@ async function applyExtraAgeGate(profile, def, metas, log = console) {
     // much weaker signal than judging it as Action/Horror/Fantasy. They were
     // being stripped before the gate saw them (cleanMetas ran too early).
     metas.map((m) => ({
-      id: m.id, title: m.name, year: m.releaseInfo,
+      id: m.id, cacheId: m._tmdb_id, title: m.name, year: m.releaseInfo,
       genres: m._genre_names, certification: m._certification, overview: m.description,
     })),
     log,
