@@ -387,6 +387,13 @@ function render(profiles) {
         <span class="tres" data-tres="recs"></span>
         ${p.simkl_connected ? '' : '<div class="muted" style="margin-top:6px">Connect Simkl (Simkl tab) first — the pool builds from watched history.</div>'}
         <div class="recs-panel diag" style="display:none;margin-top:10px"></div>
+
+        <div style="margin-top:20px;padding-top:14px;border-top:1px solid var(--border)"><b>Recently watched</b> <span class="muted" style="font-size:11px">— last 50 movies + 50 series, newest first, read <b>live from Simkl</b> (the authority, not the local store)</span></div>
+        <div style="margin-top:8px" class="row">
+          <button class="ghost" onclick="viewWatched('${p.id}', this)" ${p.simkl_connected ? '' : 'disabled'} title="Fetch recent watched history straight from Simkl">View watched</button>
+        </div>
+        ${p.simkl_connected ? '' : '<div class="muted" style="margin-top:6px">Connect Simkl (Simkl tab) first.</div>'}
+        <div class="watched-panel diag" style="display:none;margin-top:10px"></div>
       </div>
     </div>`;
   }).join('') || '<div class="card muted">No profiles yet — add one above.</div>';
@@ -862,6 +869,28 @@ async function viewRecs(id, btn) {
       <button class="ghost mini" title="Don't recommend" onclick="suppressRec('${id}','${r.type}','${r.tmdb_id}',this)">🚫</button></div>`;
     const section = (list, label) => `<div style="margin-top:8px"><b>${label} (${list.length})</b>${list.map(row).join('') || '<div class="muted">none</div>'}</div>`;
     panel.innerHTML = `<div class="muted">${d.total} in the pool (top 40 of each shown)</div>${section(d.movies, 'Movies')}${section(d.series, 'Shows')}`;
+  } catch (e) { panel.innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`; }
+}
+
+// Debug: recent watched history straight from Simkl (the authority). Two
+// separate lists — Movies and Series — each newest-first, up to 50.
+async function viewWatched(id, btn) {
+  const panel = document.querySelector(`[data-id="${id}"] .watched-panel`);
+  panel.style.display = 'block';
+  panel.innerHTML = '<span class="muted">loading live from Simkl…</span>';
+  try {
+    const d = await api(`/profiles/${id}/watched/simkl`);
+    const when = (iso) => {
+      const t = iso ? Date.parse(iso) : NaN;
+      if (Number.isNaN(t)) return 'date unknown';
+      return new Date(t).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+    };
+    const row = (r, i) => `<div style="display:flex;gap:8px;align-items:baseline;padding:3px 0">
+      <span class="muted" style="min-width:22px;text-align:right">${i + 1}.</span>
+      <span class="grow">${esc(r.title || '?')} <span class="muted">(${r.year || '?'})</span></span>
+      <span class="muted" style="font-size:11px;white-space:nowrap">${when(r.watched_at)}</span></div>`;
+    const section = (list, label) => `<div style="margin-top:8px"><b>${label} (${list.length})</b>${list.map(row).join('') || '<div class="muted">none</div>'}</div>`;
+    panel.innerHTML = `${section(d.movies, 'Movies')}${section(d.series, 'Series')}`;
   } catch (e) { panel.innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`; }
 }
 

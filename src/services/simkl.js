@@ -146,6 +146,35 @@ function parseWatchedItems(items, type) {
   return (Array.isArray(items) ? items : []).map((it) => parseWatchedItem(it, type)).filter(Boolean);
 }
 
+// ---- recent watched history (debug view) ----
+// LIVE from Simkl — the authority — bypassing the local watched store and the
+// Nuvio/Stremio scrobble view entirely. Returns items newest-first, capped at
+// `limit`. Movies come from the 'movies' section; series merge Simkl's two
+// separate sections ('shows' + 'anime'). We pull both 'completed' and (for
+// series) 'watching', since Simkl files an in-progress show under 'watching' —
+// that's still "recently watched" for a debug list. De-dupes across sections/
+// statuses by simkl_id, keeping the most recent watch time.
+function watchedMs(iso) { const t = iso ? Date.parse(iso) : NaN; return Number.isNaN(t) ? 0 : t; }
+
+async function getRecentWatched(profile, kind, { limit = 50 } = {}) {
+  const sections = kind === 'movie' ? ['movies'] : ['shows', 'anime'];
+  const statuses = kind === 'movie' ? ['completed'] : ['completed', 'watching'];
+  const byId = new Map();
+  for (const section of sections) { // sequential per Simkl's rules
+    for (const status of statuses) {
+      const items = await getAllItems(profile, section, { status });
+      for (const it of parseWatchedItems(items, section)) {
+        const key = it.simkl_id != null ? `s:${it.simkl_id}` : `k:${it.type}:${it.tmdb_id || it.imdb_id || it.title}`;
+        const prev = byId.get(key);
+        if (!prev || watchedMs(it.watched_at) > watchedMs(prev.watched_at)) byId.set(key, it);
+      }
+    }
+  }
+  return [...byId.values()]
+    .sort((a, b) => watchedMs(b.watched_at) - watchedMs(a.watched_at))
+    .slice(0, limit);
+}
+
 // ---- watched-history write (v6, auto-scrobble destination) ----
 // POST missing watched items to Simkl's history. The body shape matches what
 // scrobble.computeDelta already builds:
@@ -187,6 +216,7 @@ module.exports = {
   authedGet,
   getActivities,
   getAllItems,
+  getRecentWatched,
   getPlanToWatch,
   addToHistory,
   parseWatchedItem,

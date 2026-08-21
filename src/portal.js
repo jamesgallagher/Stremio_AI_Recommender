@@ -441,6 +441,27 @@ router.get('/profiles/:id/recommend', (req, res) => {
   });
 });
 
+// Debug (Advanced tab): the last 50 watched movies + 50 watched series, newest
+// first, read LIVE from Simkl — the authority — not the local watched store or
+// the Nuvio/Stremio scrobble view. Live call; may take a moment on a big
+// library. Two independent lists; short libraries just return what they have.
+router.get('/profiles/:id/watched/simkl', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  if (!profile.keys.simkl_client_id || !profile.simkl_auth?.access_token) {
+    return res.status(400).json({ error: 'Simkl is not connected for this profile' });
+  }
+  try {
+    const [movies, series] = await Promise.all([
+      simkl.getRecentWatched(profile, 'movie', { limit: 50 }),
+      simkl.getRecentWatched(profile, 'series', { limit: 50 }),
+    ]);
+    res.json({ movies, series });
+  } catch (err) {
+    res.status(502).json({ error: `Simkl read failed — ${err.message}` });
+  }
+});
+
 // "Don't recommend" — the configure-portal + Mobile Companion entry point.
 // Delegates to the shared dontRecommend.suppress() (the same logic the in-player
 // GET /addon/:token/dnr link uses), so a rejection behaves identically wherever
