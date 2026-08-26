@@ -20,7 +20,9 @@ body {
   background: var(--bg); color: var(--text);
   -webkit-text-size-adjust: 100%;
 }
-.view[hidden], #shell[hidden] { display: none; }
+/* hidden must always win, even over ID-specific display rules (e.g. #view-login
+   sets display:grid, which would otherwise out-rank a class/attribute selector). */
+[hidden] { display: none !important; }
 
 /* Inputs are >=16px so iOS doesn't zoom on focus; controls are >=44px tall. */
 input, button {

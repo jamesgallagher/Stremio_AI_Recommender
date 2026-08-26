@@ -627,7 +627,10 @@ async function httpTests() {
     assert.ok(css.includes('@media (min-width: 768px)'), 'has a desktop breakpoint');
     assert.ok(css.includes('env(safe-area-inset'), 'uses safe-area insets');
     assert.ok(css.includes('max-width'), 'has a max-width container');
-    console.log('  ✓ shell: styles.css public + responsive contract present');
+    // [hidden] must be enforced with !important, or the ID-specific #view-login
+    // display rule out-ranks it and the login screen never actually hides.
+    assert.ok(/\[hidden\][^}]*display:\s*none\s*!important/.test(css), 'hidden is enforced with !important');
+    console.log('  ✓ shell: styles.css responsive contract + [hidden] enforced');
   }
 
   // Config endpoint (public) returns app name + version.
