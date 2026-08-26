@@ -69,10 +69,13 @@
     try {
       const res = await apiFetch('/auth/verify', { method: 'POST', body: JSON.stringify({ email: state.pendingEmail, code }) });
       if (!res.ok) { setMsg('That code is invalid or expired.', 'err'); return; }
-      const data = await res.json();
-      state.authed = true; state.profile = data.profile;
+      // Success: the session cookie is set from the response HEADERS (which have
+      // arrived — status is 200). Do NOT read the POST response body — some
+      // proxies stall a POST body even when GET bodies deliver fine. Confirm the
+      // session and load the profile with GET /me, then render.
+      setMsg('Signed in — loading…', 'ok');
       if (location.hash === '#/login' || !location.hash) location.hash = '#/recs';
-      render();
+      await boot();
     } catch { setMsg('Something went wrong — try again.', 'err'); }
     finally { els.verify.disabled = false; }
   });
@@ -166,10 +169,10 @@
         method: 'POST',
         body: JSON.stringify({ type: r.type, imdb_id: r.id, tmdb_id: r.tmdb_id, title: r.title, year: r.year }),
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) { setAddMsg(data.error || 'Could not add.', 'err'); sEls.add.disabled = false; return; }
-      sEls.add.textContent = '✓ Added to watchlist';
-      setAddMsg('Added to your Simkl Watch Later.', 'ok');
+      // Don't read the POST body (proxy may stall it) — act on the status.
+      if (res.ok) { sEls.add.textContent = '✓ Added to watchlist'; setAddMsg('Added to your Simkl Watch Later.', 'ok'); return; }
+      setAddMsg(res.status === 400 ? 'Connect Simkl in the portal first.' : 'Could not add — try again.', 'err');
+      sEls.add.disabled = false;
     } catch { setAddMsg('Could not add — try again.', 'err'); sEls.add.disabled = false; }
   }
 
@@ -287,8 +290,10 @@
     if (btn) btn.disabled = true;
     try {
       const res = await apiFetch('/watchlist', { method: 'POST', body: JSON.stringify({ type: r.type, imdb_id: r.id, tmdb_id: r.tmdb_id, title: r.title, year: r.year }) });
-      const d = await res.json().catch(() => ({}));
-      showSnack(res.ok ? ('Added “' + (r.title || 'title') + '” to Watch Later') : (d.error || 'Could not add'), null);
+      // Don't read the POST body (proxy may stall it) — act on the status.
+      if (res.ok) showSnack('Added “' + (r.title || 'title') + '” to Watch Later', null);
+      else if (res.status === 400) showSnack('Couldn’t add — connect Simkl in the portal first', null);
+      else showSnack('Couldn’t add — try again', null);
     } catch { showSnack('Could not add — try again.', null); }
     finally { if (btn) btn.disabled = false; }
   }
@@ -329,12 +334,14 @@
     renderActive();
   }));
 
-  // ---- boot ----
-  (async function boot() {
+  // ---- boot ---- (declaration so the verify flow can reuse it)
+  async function boot() {
     try {
       const res = await apiFetch('/me');
       if (res.ok) { state.authed = true; state.profile = (await res.json()).profile; }
-    } catch { /* offline → login */ }
+      else { state.authed = false; state.profile = null; }
+    } catch { state.authed = false; state.profile = null; }
     render();
-  })();
+  }
+  boot();
 })();
