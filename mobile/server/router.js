@@ -58,18 +58,33 @@ const appUrl = () => (process.env.EXTERNAL_URL ? `${process.env.EXTERNAL_URL.rep
 // maps to exactly one profile. Internal errors are swallowed to keep the response
 // generic (no account enumeration by status or timing).
 router.post('/api/auth/request', async (req, res) => {
+  const email = (req.body || {}).email;
+  const who = String(email || '').trim().toLowerCase() || '(no email)';
   try {
-    await auth.requestOtp((req.body || {}).email, { appUrl: appUrl() });
+    const r = await auth.requestOtp(email, { appUrl: appUrl() });
+    console.log(`[mobile] auth/request for ${who} -> issued=${r.issued} reason=${r.reason}`);
   } catch (err) {
-    console.warn(`[mobile] auth/request error: ${err.message}`);
+    console.warn(`[mobile] auth/request errored for ${who}: ${err.message}`);
   }
   res.json({ ok: true });
 });
 
 router.post('/api/auth/verify', (req, res) => {
   const { email, code } = req.body || {};
-  const result = auth.verifyOtp(email, code);
-  if (!result.ok) return res.status(401).json({ error: 'Invalid or expired code' });
+  const who = String(email || '').trim().toLowerCase() || '(no email)';
+  let result;
+  try {
+    result = auth.verifyOtp(email, code);
+  } catch (err) {
+    console.error(`[mobile] verify errored for ${who}: ${err.message}`);
+    return res.status(503).json({ error: 'Verification failed — please try again' });
+  }
+  if (!result.ok) {
+    // Diagnostic: reason is one of no-code | bad-code | expired | locked | no-profile.
+    console.warn(`[mobile] verify DENIED for ${who} — reason=${result.reason} codeLen=${String(code || '').length}`);
+    return res.status(401).json({ error: 'Invalid or expired code' });
+  }
+  console.log(`[mobile] verify OK for ${who} -> ${result.profile.name}`);
   setSessionCookie(res, result.token);
   res.json({ ok: true, profile: result.profile });
 });

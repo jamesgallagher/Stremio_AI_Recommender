@@ -28,7 +28,7 @@ app.set('trust proxy', true); // correct req.protocol/host behind Cloudflare Tun
 // docker logs ai-recommender  (or the Unraid log button) shows these.
 app.use((req, res, next) => {
   res.on('finish', () => {
-    if (res.statusCode >= 400 || req.originalUrl.startsWith('/api')) {
+    if (res.statusCode >= 400 || req.originalUrl.startsWith('/api') || req.originalUrl.startsWith('/mobile/api')) {
       console.log(`[http] ${new Date().toISOString()} ${req.method} ${req.originalUrl} -> ${res.statusCode}`);
     }
   });
