@@ -647,6 +647,16 @@ async function httpTests() {
     console.log('  ✓ shell: SPA fallback does not swallow /mobile/api/*');
   }
 
+  // Per-session API must never be browser-cached (an ETag/304 on /me made login
+  // look broken on Chromium/Brave — a 304 surfaces to fetch as not-ok).
+  {
+    const cfgRes = await fetch(`${BASE}/mobile/api/config`);
+    assert.strictEqual(cfgRes.headers.get('cache-control'), 'no-store');
+    const meRes = await fetch(`${BASE}/mobile/api/me`);
+    assert.strictEqual(meRes.headers.get('cache-control'), 'no-store'); // even on the 401
+    console.log('  ✓ shell: /mobile/api responses are Cache-Control: no-store');
+  }
+
   // ---- Step 3: search + watchlist boundaries (no network) ----
   async function sessionCookieFor(email) {
     const send = capturingSender();

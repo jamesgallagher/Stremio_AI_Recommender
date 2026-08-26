@@ -16,11 +16,19 @@
   };
 
   async function apiFetch(path, opts = {}) {
-    return fetch(API + path, {
-      credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
-      ...opts,
-    });
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 20000); // never hang forever
+    try {
+      return await fetch(API + path, {
+        ...opts,
+        credentials: 'same-origin',
+        cache: 'no-store', // per-session API — don't cache or send conditional (If-None-Match) requests
+        signal: ctrl.signal,
+        headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+      });
+    } finally {
+      clearTimeout(timer);
+    }
   }
   const setMsg = (text, kind) => { els.msg.textContent = text || ''; els.msg.className = 'msg' + (kind ? ' ' + kind : ''); };
 

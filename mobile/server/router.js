@@ -13,6 +13,14 @@ const handlers = require('./handlers');
 const router = express.Router();
 router.use(express.json());
 
+// Never let the browser cache the per-session API. An ETag/304 on /me or
+// /recommendations made login look broken on some browsers (a 304 surfaces to
+// fetch as not-ok, so boot() thought the user was signed out).
+router.use('/api', (req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  next();
+});
+
 const COOKIE = 'mobile_sid';
 // Secure cookies need HTTPS (production runs behind the Cloudflare Tunnel).
 // MOBILE_INSECURE_COOKIE=1 drops Secure for bare-HTTP LAN testing only.
