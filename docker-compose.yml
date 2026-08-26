@@ -21,3 +21,9 @@ services:
       # - STALE_HOURS=24        # cache staleness threshold
       # - BACKOFF_MINUTES=30    # retry backoff after a failed rebuild
       # - SECRET_KEY=change-me-to-a-long-random-string  # encrypts all stored secrets at rest (API keys, Trakt tokens, scrobble passwords)
+      # --- Mobile Companion app (/mobile) — passwordless OTP login (Brevo SMTP relay) ---
+      # - BREVO_SMTP_LOGIN=9xxxxxx@smtp-brevo.com # Brevo SMTP username (SMTP & API -> SMTP)
+      # - BREVO_SMTP_KEY=xsmtpsib-...             # Brevo SMTP key, used as the SMTP password
+      # - MOBILE_MAIL_FROM=no-reply@example.com   # verified Brevo sender address
+      # - MOBILE_MAIL_FROM_NAME=AI Recommender
+      # - MOBILE_SESSION_DAYS=30                   # mobile session lifetime (default 30)

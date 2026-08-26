@@ -3,6 +3,13 @@
 process.env.DATA_DIR = require('os').tmpdir() + '/ai-rec-test-' + Date.now();
 process.env.PORT = '7311';
 process.env.SECRET_KEY = process.env.SECRET_KEY || 'test-secret-key-do-not-use-in-prod';
+// Hermetic: src/server requires dotenv, which loads a developer's real .env when
+// present. Pin the vars the tests assume (empty, not deleted — dotenv won't
+// override an already-set var): admin creds OFF (open portal), and no
+// EXTERNAL_URL so install/dnr links use the request host (localhost:7311).
+process.env.ADMIN_USER = '';
+process.env.ADMIN_PASSWORD = '';
+process.env.EXTERNAL_URL = '';
 
 const assert = require('assert');
 const fs = require('fs');

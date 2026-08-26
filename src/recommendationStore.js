@@ -174,6 +174,17 @@ function addDontRecommend(profileId, type, tmdbId, reason = 'user', at = Date.no
   db.get().prepare('DELETE FROM recommended WHERE profile_id = ? AND type = ? AND tmdb_id = ?').run(profileId, type, String(tmdbId));
 }
 
+// Undo a USER rejection (Mobile Companion "Undo" after a swipe-remove). Scoped to
+// reason='user' so it can NEVER resurrect a decayed-out title mid-cooldown — the
+// decay lifecycle stays intact. Returns the number of flags cleared (0 or 1).
+// Clears the flag only; the pool row (deleted on suppress) returns on the next
+// build. The Companion re-inserts the row optimistically for instant UX.
+function removeDontRecommend(profileId, type, tmdbId) {
+  init();
+  const r = db.get().prepare("DELETE FROM dont_recommend WHERE profile_id = ? AND type = ? AND tmdb_id = ? AND reason = 'user'").run(profileId, type, String(tmdbId));
+  return Number(r.changes || 0);
+}
+
 function getRecommended(profileId, { type, limit = 100 } = {}) {
   init();
   return type
@@ -582,6 +593,7 @@ module.exports = {
   countRecommended,
   dontRecommendKeys,
   addDontRecommend,
+  removeDontRecommend,
   deleteForProfile,
   selectServe,
   balanceByGenre,

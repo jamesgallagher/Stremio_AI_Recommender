@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1117">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>AI Recommender</title>
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="icon" type="image/svg+xml" href="/logo.svg">
+<link rel="apple-touch-icon" href="/logo.png">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- ===== Login ===== -->
+  <section id="view-login" class="view">
+    <div class="card stack">
+      <div class="brandmark">
+        <img src="/logo.svg" alt="" onerror="this.style.display='none'">
+        <h1>AI Recommender</h1>
+      </div>
+      <p class="sub">Sign in with the email on your profile — we'll send a one-time code.</p>
+
+      <!-- Step A: email -->
+      <div id="login-email-step">
+        <label for="email">Email</label>
+        <input id="email" type="email" inputmode="email" autocomplete="email" placeholder="you@example.com">
+        <div style="margin-top:12px">
+          <button id="send-code" class="block">Send code</button>
+        </div>
+      </div>
+
+      <!-- Step B: code -->
+      <div id="login-code-step" hidden>
+        <label for="code">6-digit code</label>
+        <input id="code" type="tel" inputmode="numeric" autocomplete="one-time-code"
+               maxlength="6" pattern="[0-9]*" placeholder="••••••">
+        <div class="stack" style="margin-top:12px">
+          <button id="verify-code" class="block">Verify &amp; sign in</button>
+          <button id="back-to-email" class="ghost block">Use a different email</button>
+        </div>
+      </div>
+
+      <p id="login-msg" class="msg" role="status" aria-live="polite"></p>
+    </div>
+  </section>
+
+  <!-- ===== App shell (authed) ===== -->
+  <div id="shell" hidden>
+    <header class="topbar">
+      <span class="brand">AI Recommender</span>
+      <span class="spacer"></span>
+      <span id="profile-name" class="profile"></span>
+      <button id="logout" class="ghost">Log out</button>
+    </header>
+
+    <nav class="tabbar" role="tablist">
+      <button class="tab" data-route="recs" role="tab">Recommendations</button>
+      <button class="tab" data-route="search" role="tab">Search</button>
+    </nav>
+
+    <main id="content" class="container">
+      <section id="view-recs" class="view">
+        <div id="recs-tabs" class="segmented recs-tabs" role="tablist" aria-label="Recommendation type">
+          <button class="seg active" data-rtype="movie" role="tab">Movies <span class="badge" id="badge-movie"></span></button>
+          <button class="seg" data-rtype="series" role="tab">Shows <span class="badge" id="badge-series"></span></button>
+        </div>
+        <p id="recs-msg" class="msg" role="status" aria-live="polite"></p>
+        <div id="recs-list" class="recs-list"></div>
+        <p id="recs-hint" class="sub hint-line" hidden>Tip: swipe a row right to remove, left to add to Watch Later — or use the buttons.</p>
+      </section>
+      <section id="view-search" class="view" hidden>
+        <div class="searchbar">
+          <div class="segmented" role="tablist" aria-label="Search type">
+            <button class="seg active" data-stype="movie" role="tab">Movies</button>
+            <button class="seg" data-stype="series" role="tab">Shows</button>
+          </div>
+          <input id="search-input" type="search" inputmode="search" autocomplete="off"
+                 placeholder="Search movies…" aria-label="Search">
+        </div>
+        <p id="search-msg" class="msg" role="status" aria-live="polite"></p>
+        <div id="search-results" class="results"></div>
+      </section>
+    </main>
+  </div>
+
+  <!-- ===== Title detail sheet (search) ===== -->
+  <div id="detail-sheet" class="sheet" hidden>
+    <div class="sheet-backdrop" data-close></div>
+    <div class="sheet-panel card" role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+      <button id="sheet-close" class="ghost sheet-close" data-close aria-label="Close">✕</button>
+      <div class="sheet-head">
+        <img id="sheet-poster" class="sheet-poster" alt="">
+        <div>
+          <h2 id="sheet-title"></h2>
+          <p id="sheet-meta" class="sub"></p>
+        </div>
+      </div>
+      <p id="sheet-synopsis" class="sheet-synopsis"></p>
+      <button id="sheet-add" class="block">➕ Add to watchlist</button>
+      <p id="sheet-add-msg" class="msg" role="status" aria-live="polite"></p>
+    </div>
+  </div>
+
+  <!-- ===== Undo snackbar (swipe-remove) ===== -->
+  <div id="snackbar" class="snackbar" hidden>
+    <span id="snackbar-text"></span>
+    <button id="snackbar-undo" class="link">Undo</button>
+  </div>
+
+</div>
+
+<script src="ui.js"></script>
+<script src="swipe.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -208,6 +208,42 @@ async function getPlanToWatch(profile, kind) {
   return out;
 }
 
+// ---- plan-to-watch WRITE (v6, Mobile Companion "add to watchlist") ----
+// PURE: build the /sync/add-to-list body from watchlist item(s). Each becomes
+// { to, ids:{ imdb?, tmdb? } }, filed under movies or shows by media kind; an
+// item with no usable id is skipped. Exported for tests. `to` defaults to
+// 'plantowatch' (the Watch Later list this app writes to).
+function buildAddToListBody(items, to = 'plantowatch') {
+  const movies = [];
+  const shows = [];
+  for (const it of Array.isArray(items) ? items : [items]) {
+    if (!it) continue;
+    const ids = {};
+    if (it.imdb_id) ids.imdb = String(it.imdb_id);
+    if (it.tmdb_id != null && it.tmdb_id !== '') ids.tmdb = String(it.tmdb_id);
+    if (!ids.imdb && !ids.tmdb) continue; // need at least one id for Simkl to match
+    (it.type === 'series' ? shows : movies).push({ to, ids });
+  }
+  return { movies, shows };
+}
+
+// Add title(s) to the profile's Simkl plan-to-watch list. Rate-governed at the
+// hard 1-POST/s Simkl write cap, exactly like addToHistory. Simkl de-dupes
+// re-adds, so a double-tap is harmless. Requires the profile's Simkl connection.
+async function addToPlanToWatch(profile, items) {
+  const clientId = profile.keys.simkl_client_id;
+  const token = profile.simkl_auth?.access_token;
+  if (!clientId || !token) throw new Error('Simkl is not connected for this profile');
+  const body = buildAddToListBody(items, 'plantowatch');
+  if (!body.movies.length && !body.shows.length) return { skipped: true, added: {} };
+  const res = await governor.schedule('simkl_post', () => fetch(withParams(clientId, '/sync/add-to-list'), {
+    method: 'POST', headers: headers(token), body: JSON.stringify(body),
+  }));
+  if (res.status === 401 || res.status === 403) throw new Error('Simkl token rejected — reconnect the account');
+  if (!res.ok) throw new Error(`Simkl POST /sync/add-to-list failed (${res.status})`);
+  return res.json().catch(() => ({}));
+}
+
 module.exports = {
   startPinFlow,
   pollPin,
@@ -219,6 +255,8 @@ module.exports = {
   getRecentWatched,
   getPlanToWatch,
   addToHistory,
+  buildAddToListBody,
+  addToPlanToWatch,
   parseWatchedItem,
   parseWatchedItems,
   withParams,

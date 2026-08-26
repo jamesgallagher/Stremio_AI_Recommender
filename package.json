@@ -1,18 +1,20 @@
 {
   "name": "ai-recommender",
-  "version": "6.32.0-beta",
+  "version": "6.33.0-beta",
   "description": "Self-hosted Stremio/Nuvio AI recommendation addon — Simkl + TMDB recommendations + custom/Groq LLM, per-family-profile",
   "main": "src/server.js",
   "scripts": {
     "start": "node --experimental-sqlite src/server.js",
-    "test": "node --experimental-sqlite test/smoke.js"
+    "test": "node --experimental-sqlite test/smoke.js && node --experimental-sqlite mobile/test/mobile.smoke.js",
+    "test:mobile": "node --experimental-sqlite mobile/test/mobile.smoke.js"
   },
   "engines": {
     "node": ">=22"
   },
   "dependencies": {
     "dotenv": "^17.3.1",
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "nodemailer": "^9.0.5"
   },
   "license": "MIT",
   "private": true

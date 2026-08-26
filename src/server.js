@@ -54,6 +54,12 @@ app.use((req, res, next) => {
 // Stremio/Nuvio cannot answer login prompts)
 app.use('/addon/:token', addon.router);
 
+// Mobile Companion app (/mobile): passwordless OTP login + per-profile views.
+// Has its own OTP session auth — deliberately NOT behind the admin Basic Auth
+// below (family members are not admins). See mobile/README.md.
+const mobile = require('../mobile/server/router');
+app.use('/mobile', mobile.router);
+
 // Admin auth: HTTP Basic, enabled when ADMIN_USER + ADMIN_PASSWORD are set.
 // Protects the portal and its API only.
 const crypto = require('crypto');
@@ -142,6 +148,7 @@ const scrobble = require('./services/scrobble');
 const watchedStore = require('./watchedStore');
 const recommendationStore = require('./recommendationStore');
 const jobs = require('./jobs');
+const mobileOtpStore = require('../mobile/server/otpStore');
 const TICK_MS = 60 * 60e3;
 function tick() {
   for (const profile of config.listProfiles()) {
@@ -171,6 +178,11 @@ function tick() {
       console.error(`[scheduler] ${profile.name}: ${err.message}`);
     }
   }
+  // Mobile Companion housekeeping: drop expired OTP codes + sessions.
+  try {
+    const pruned = mobileOtpStore.pruneExpired();
+    if (pruned.otp || pruned.sessions) console.log(`[mobile] pruned ${pruned.otp} expired OTP(s), ${pruned.sessions} session(s)`);
+  } catch (err) { console.warn(`[mobile] prune failed: ${err.message}`); }
 }
 setInterval(tick, TICK_MS);
 
