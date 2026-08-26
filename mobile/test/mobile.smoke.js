@@ -654,7 +654,14 @@ async function httpTests() {
     assert.strictEqual(cfgRes.headers.get('cache-control'), 'no-store');
     const meRes = await fetch(`${BASE}/mobile/api/me`);
     assert.strictEqual(meRes.headers.get('cache-control'), 'no-store'); // even on the 401
-    console.log('  ✓ shell: /mobile/api responses are Cache-Control: no-store');
+    // Static bundle is no-store too (no ETag), so a deploy is never masked by a
+    // stale cached app.js.
+    const jsRes = await fetch(`${BASE}/mobile/app.js`);
+    assert.strictEqual(jsRes.headers.get('cache-control'), 'no-store');
+    assert.strictEqual(jsRes.headers.get('etag'), null);
+    const htmlRes = await fetch(`${BASE}/mobile/`);
+    assert.strictEqual(htmlRes.headers.get('cache-control'), 'no-store');
+    console.log('  ✓ shell: all /mobile responses (api + static bundle) are no-store, no etag');
   }
 
   // ---- Step 3: search + watchlist boundaries (no network) ----

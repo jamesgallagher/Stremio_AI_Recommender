@@ -27,9 +27,13 @@ app.set('trust proxy', true); // correct req.protocol/host behind Cloudflare Tun
 // Request logging: all /api calls and every error response, with timestamps.
 // docker logs ai-recommender  (or the Unraid log button) shows these.
 app.use((req, res, next) => {
+  const start = Date.now();
   res.on('finish', () => {
     if (res.statusCode >= 400 || req.originalUrl.startsWith('/api') || req.originalUrl.startsWith('/mobile/api')) {
-      console.log(`[http] ${new Date().toISOString()} ${req.method} ${req.originalUrl} -> ${res.statusCode}`);
+      // Duration is server-side handling time (receive → response flushed to the
+      // socket); it excludes tunnel transit, so a fast time here + a slow client
+      // means the delay is in the network/proxy, not the app.
+      console.log(`[http] ${new Date().toISOString()} ${req.method} ${req.originalUrl} -> ${res.statusCode} (${Date.now() - start}ms)`);
     }
   });
   next();

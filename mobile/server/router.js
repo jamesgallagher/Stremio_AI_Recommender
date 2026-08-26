@@ -13,10 +13,12 @@ const handlers = require('./handlers');
 const router = express.Router();
 router.use(express.json());
 
-// Never let the browser cache the per-session API. An ETag/304 on /me or
-// /recommendations made login look broken on some browsers (a 304 surfaces to
-// fetch as not-ok, so boot() thought the user was signed out).
-router.use('/api', (req, res, next) => {
+// Never cache ANYTHING under /mobile. The per-session API must always be fresh,
+// AND forcing fresh SPA assets (index.html/app.js/…) means a new deploy is never
+// masked by a stale cached bundle — the cause of "still broken after I deployed"
+// (the browser kept running old app.js). Static + fallback also disable
+// etag/last-modified below so there are no conditional requests at all.
+router.use((req, res, next) => {
   res.set('Cache-Control', 'no-store');
   next();
 });
@@ -132,7 +134,11 @@ router.get('/api/config', (req, res) => {
 // /configure. The DATA under /api/* above is what requires a session; the shell
 // itself is public. Registered AFTER the API routes so it can never shadow them.
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
-router.use(express.static(PUBLIC_DIR));
+router.use(express.static(PUBLIC_DIR, {
+  etag: false,
+  lastModified: false,
+  setHeaders: (res) => res.set('Cache-Control', 'no-store'), // always serve the latest bundle
+}));
 
 // SPA fallback: a client-side deep link (e.g. /mobile/search) has no matching
 // file — serve index.html so the front-end router takes over. Never for /api/*
@@ -140,7 +146,9 @@ router.use(express.static(PUBLIC_DIR));
 router.use((req, res, next) => {
   if (req.method !== 'GET') return next();
   if (req.path.startsWith('/api/')) return next();
-  res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
+  res.sendFile(path.join(PUBLIC_DIR, 'index.html'), {
+    etag: false, lastModified: false, headers: { 'Cache-Control': 'no-store' },
+  });
 });
 
 module.exports = { router, requireSession, readCookie, setSessionCookie, clearSessionCookie, COOKIE };
