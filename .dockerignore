@@ -5,3 +5,6 @@ test
 DESIGN.md
 .env
 *.md
+# Mobile Companion: ship only server/ + public/, not docs or tests.
+mobile/docs
+mobile/test

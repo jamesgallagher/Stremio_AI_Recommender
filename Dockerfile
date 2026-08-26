@@ -4,6 +4,9 @@ COPY package*.json ./
 RUN npm ci --omit=dev || npm install --omit=dev
 COPY src ./src
 COPY public ./public
+# Mobile Companion app (mounted at /mobile by src/server.js). Runtime code +
+# static SPA; docs/ and test/ are excluded via .dockerignore.
+COPY mobile ./mobile
 ENV NODE_ENV=production \
     PORT=7000 \
     DATA_DIR=/data
