@@ -80,6 +80,11 @@ async function sendOtpEmail({ to, code, ttlMinutes = 60, appUrl = '' }, send = d
   }
   const msg = buildOtpMessage({ to, from: mailFrom(), fromName: process.env.MOBILE_MAIL_FROM_NAME, code, ttlMinutes, appUrl });
   const info = await send(msg);
+  // Debug: dump exactly what the transport returned, then a concise success line.
+  // This is Brevo's SMTP relay (nodemailer), so the "OK" is the SMTP 250 reply in
+  // `info.response` — the equivalent of an HTTP 200 for the API path.
+  console.log('[mobile] BREVO RESPONSE:', info);
+  console.log(`[mobile] BREVO: OTP email sent to ${to}, OK — ${(info && info.response) || 'accepted'}${info && info.messageId ? ` (messageId ${info.messageId})` : ''}`);
   return { sent: true, id: info?.messageId };
 }
 

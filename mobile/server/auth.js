@@ -63,6 +63,10 @@ async function requestOtp(email, { nowMs = Date.now(), sendMail = mail.sendOtpEm
     return { ok: true, issued: false, reason };
   }
 
+  // Debug: a matched request. Server-side log only — the HTTP response stays
+  // generic (no account enumeration), so this never leaks to the client.
+  console.log(`[mobile] OTP request made for ${profile.name} using email address ${String(email || '').trim()}`);
+
   otpStore.purgeUnusedOtps(norm, nowMs);        // one live code per email
   const code = generateCode();
   otpStore.insertOtp({ email: norm, profileId: profile.id, code, createdAt: nowMs, expiresAt: nowMs + OTP_TTL_MS });
@@ -73,7 +77,7 @@ async function requestOtp(email, { nowMs = Date.now(), sendMail = mail.sendOtpEm
   // would open (match = slow, miss = instant). A failed send is logged; the user
   // can request a resend.
   Promise.resolve(sendMail({ to: profile.email, code, ttlMinutes: OTP_TTL_MIN, appUrl }))
-    .catch((err) => console.warn(`[mobile] OTP email to ${norm} failed: ${err.message}`));
+    .catch((err) => console.warn(`[mobile] BREVO: OTP email to ${profile.email} FAILED — ${err.message}`));
   return { ok: true, issued: true, reason: 'sent' };
 }
 
