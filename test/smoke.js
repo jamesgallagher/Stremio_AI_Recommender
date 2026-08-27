@@ -169,7 +169,7 @@ ok('config: profile CRUD + filter clamping', () => {
   assert.ok(p.token.length === 32);
   assert.strictEqual(p.filters.min_rating, 6.0); // v4: Trakt 60% floor start point
   assert.strictEqual(p.filters.max_age_years, 0); // v4: all years by default
-  assert.strictEqual(p.filters.rating_source, 'trakt');
+  assert.ok(!('rating_source' in p.filters)); // retired in v6.34 — floor always prefers IMDb
   assert.strictEqual(p.keys.rpdb_api_key, 't0-free-rpdb'); // free RPDB key pre-set
   assert.strictEqual(p.filters.age_limit, 0); // age gate off by default
   assert.strictEqual(p.filters.list_size, 20); // fill-to-quota default

@@ -21,14 +21,15 @@ const { EXTRA_CATALOGS } = require('./catalogs');
 const DEFAULT_RPDB_KEY = 't0-free-rpdb';
 
 const DEFAULT_FILTERS = {
-  min_rating: 6.0, // v4 default: Trakt 60% == 6.0 as the floor start point
-  rating_source: 'trakt', // 'trakt' (built-in, free) | 'imdb' (via MDBList)
-  vote_count_floor: 1000, // noise gate on Trakt votes; series use 1/5 of this
-  max_age_years: 0, // recency window; 0 = no limit (v4 default: all years)
+  min_rating: 6.0, // IMDb rating floor (0–10); prefers the poster's IMDb rating, TMDB fallback
+  vote_count_floor: 1000, // hard build gate on TMDB vote count; series use 1/5 of this
+  max_age_years: 0, // recency window (movies only); 0 = no limit (v4 default: all years)
   excluded_genres: [], // portal genre names, e.g. ["Horror", "Anime"]
   age_limit: 0, // Common Sense age gate; 0 = off. >0 requires MDBList + Groq
   list_size: 20, // displayed titles per catalog (+ an equal-sized hidden bench)
-  // Which engine generates candidates (v5):
+  // Which engine generates candidates (v5). RESERVED — not wired in v6 (the
+  // recommendationStore/TMDB path is used unconditionally); kept because engine
+  // selection is planned to return in a future version.
   //   'trakt' — Trakt /recommendations. Collaborative filtering: strong for an
   //             adult with deep history, but structurally blind to age. A 13yo
   //             anime watcher's nearest neighbours are ADULT anime watchers,
@@ -99,11 +100,10 @@ function applyMigrations(p) {
   if (p.filters.age_limit === undefined) p.filters.age_limit = 0;
   if (p.filters.list_size === undefined) p.filters.list_size = 20;
   if (p.filters.vote_count_floor === undefined) p.filters.vote_count_floor = 1000;
-  // v4: 'tmdb' rating source retired (recommendations carry no TMDB rating);
-  // default is Trakt's own rating.
-  if (p.filters.rating_source === undefined || p.filters.rating_source === 'tmdb') {
-    p.filters.rating_source = 'trakt';
-  }
+  // rating_source (Trakt vs IMDb rating floor) retired in v6.34 — the rating
+  // floor now always prefers the poster's IMDb rating (TMDB fallback), so the
+  // toggle is moot. Strip it from existing profiles, like other retired fields.
+  if (p.filters.rating_source !== undefined) delete p.filters.rating_source;
   // v4 one-time migration (decided 2026-07-22): relax the recency window to
   // "all years" — Trakt recommendations span decades. The flag persists on
   // the next profile write; users can re-tighten in the portal afterwards.
@@ -221,7 +221,6 @@ function updateProfile(id, patch) {
       if (Array.isArray(f.excluded_genres)) profile.filters.excluded_genres = f.excluded_genres.map(String);
       if (f.age_limit !== undefined) profile.filters.age_limit = Math.max(0, parseInt(f.age_limit, 10) || 0);
       if (f.list_size !== undefined) profile.filters.list_size = Math.min(50, Math.max(5, parseInt(f.list_size, 10) || 20));
-      if (f.rating_source !== undefined) profile.filters.rating_source = f.rating_source === 'imdb' ? 'imdb' : 'trakt';
       if (f.vote_count_floor !== undefined) profile.filters.vote_count_floor = Math.max(0, parseInt(f.vote_count_floor, 10) || 0);
       if (f.engine !== undefined) profile.filters.engine = ENGINES.includes(f.engine) ? f.engine : 'trakt';
     }
