@@ -463,6 +463,22 @@ function certMinAge(cert) {
   return cert && cert in CERT_MIN_AGE ? CERT_MIN_AGE[cert] : null;
 }
 
+// PURE: does a stored row satisfy the profile's age BAND? For an age-limited
+// profile a title whose classification maps to a minimum age above the
+// judgement age (age_limit + 1) is rejected; everything passes for an
+// unlimited (adult) profile, and an unrated title (min age null) is never "too
+// old". This is the cheap cert/MAL re-check selectServe already ran inline —
+// extracted so the Companion's "entire recommendations list" view can reuse it,
+// keeping that view vetted-only for a kids profile even though it isn't
+// genre-balanced or size-limited. NOT a substitute for the build-time LLM gate
+// (the pool is already LLM-vetted); this is the same lowered-limit safety net.
+function passesAgeBand(row, filters = {}) {
+  const limit = filters.age_limit || 0;
+  if (limit <= 0) return true;
+  const m = certMinAge(row.age_classification);
+  return m === null || m <= limit + 1;
+}
+
 // Round-robin across primary_genre buckets: take the strongest remaining title
 // from each genre in turn, so one prolific genre can't dominate the row. Rows
 // arrive affinity DESC, so each bucket is already strongest-first. NEVER
@@ -502,8 +518,6 @@ function selectServe(rows, filters = {}, { nowYear = new Date().getFullYear(), l
   const minRating = filters.min_rating || 0;
   const excluded = new Set(filters.excluded_genres || []);
   const maxAge = filters.max_age_years || 0;
-  const judge = (filters.age_limit || 0) + 1;
-  const kids = (filters.age_limit || 0) > 0;
 
   const passed = (rows || []).filter((r) => {
     if (!r.imdb_id) return false;                                             // not servable
@@ -517,7 +531,7 @@ function selectServe(rows, filters = {}, { nowYear = new Date().getFullYear(), l
     // Recency window — MOVIES ONLY. Series run for years from an old first-air
     // date, so a recency cut-off would wrongly drop still-running shows.
     if (maxAge > 0 && r.type === 'movie' && r.year && r.year < nowYear - maxAge) return false;
-    if (kids) { const m = certMinAge(r.age_classification); if (m !== null && m > judge) return false; } // lowered-limit safety net
+    if (!passesAgeBand(r, filters)) return false;                            // lowered-limit safety net (adult profile: always true)
     return true;
   });
   return balanceByGenre(passed, limit);
@@ -667,6 +681,7 @@ module.exports = {
   needsBuild,
   resetRecommendations,
   upsertCandidates,
+  setAgeClassification,
   purgeBelowVoteFloor,
   getRecommended,
   countRecommended,
@@ -677,6 +692,7 @@ module.exports = {
   selectServe,
   balanceByGenre,
   certMinAge,
+  passesAgeBand,
   listSizeFor,
   serveRecommendations,
   setBuiltAt,

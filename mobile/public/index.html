@@ -56,6 +56,7 @@
       <span class="brand">AI Recommender</span>
       <span class="spacer"></span>
       <span id="profile-name" class="profile"></span>
+      <button id="open-settings" class="ghost icon-btn" aria-label="Settings" title="Settings">⚙</button>
       <button id="logout" class="ghost">Log out</button>
     </header>
 
@@ -85,6 +86,83 @@
         </div>
         <p id="search-msg" class="msg" role="status" aria-live="polite"></p>
         <div id="search-results" class="results"></div>
+      </section>
+
+      <section id="view-settings" class="view" hidden>
+        <div class="settings-head">
+          <h1>Settings</h1>
+          <button id="settings-done" class="ghost" type="button">Done</button>
+        </div>
+        <p id="settings-msg" class="msg" role="status" aria-live="polite"></p>
+
+        <div class="card stack">
+          <div class="field">
+            <label for="set-min-rating">Minimum rating</label>
+            <select id="set-min-rating" data-filter="min_rating">
+              <option value="0">No minimum</option>
+              <option value="5">≥ 5.0</option>
+              <option value="5.5">≥ 5.5</option>
+              <option value="6">≥ 6.0</option>
+              <option value="6.5">≥ 6.5</option>
+              <option value="7">≥ 7.0</option>
+              <option value="7.5">≥ 7.5</option>
+              <option value="8">≥ 8.0</option>
+              <option value="8.5">≥ 8.5</option>
+              <option value="9">≥ 9.0</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="set-recency">Recency <span class="muted">(movies only)</span></label>
+            <select id="set-recency" data-filter="max_age_years">
+              <option value="0">No limit</option>
+              <option value="1">Last 1 year</option>
+              <option value="2">Last 2 years</option>
+              <option value="5">Last 5 years</option>
+              <option value="10">Last 10 years</option>
+              <option value="20">Last 20 years</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="set-list-size">List size <span class="muted">(per catalog)</span></label>
+            <select id="set-list-size" data-filter="list_size">
+              <option value="10">10 titles</option>
+              <option value="15">15 titles</option>
+              <option value="20">20 titles</option>
+              <option value="25">25 titles</option>
+              <option value="30">30 titles</option>
+              <option value="40">40 titles</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="set-vote-floor">Minimum vote count <span class="muted">(applies on next rebuild)</span></label>
+            <select id="set-vote-floor" data-filter="vote_count_floor">
+              <option value="0">No minimum</option>
+              <option value="250">250+</option>
+              <option value="500">500+</option>
+              <option value="1000">1,000+</option>
+              <option value="2500">2,500+</option>
+              <option value="5000">5,000+</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label>Excluded genres <span class="muted">(ticked = never recommended)</span></label>
+            <div id="set-genres" class="genres"></div>
+          </div>
+        </div>
+
+        <div class="card stack" style="margin-top:12px">
+          <label class="toggle-row" for="set-catalog-only">
+            <input type="checkbox" id="set-catalog-only">
+            <span>Only show my catalog items</span>
+          </label>
+          <p class="sub">On (default), this list mirrors your Stremio catalog. Turn it off to browse your entire recommendations list.</p>
+        </div>
+
+        <button id="settings-save" class="block" type="button" style="margin-top:14px">Save changes</button>
       </section>
     </main>
   </div>

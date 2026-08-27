@@ -71,6 +71,8 @@ h1 { font-size: 22px; margin: 4px 0; }
 .topbar .brand { font-weight: 700; }
 .topbar .spacer { flex: 1; }
 .topbar .profile { color: var(--muted); font-size: 13px; max-width: 45vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Settings cog sits between the profile name and Log out. */
+.icon-btn { min-height: 40px; min-width: 40px; padding: 6px 8px; font-size: 18px; line-height: 1; }
 
 #content {
   /* leave room for the fixed bottom tab bar + the phone's home indicator */
@@ -186,6 +188,29 @@ input[type=search]:focus { border-color: var(--accent); }
 .rec-save:hover { background: #2bbd86; }
 .rec-remove { background: transparent; border: 1px solid var(--border); color: var(--muted); }
 .rec-remove:hover { color: var(--err); border-color: var(--err); background: transparent; }
+
+/* ---- Settings (Step 5) ---- */
+select {
+  width: 100%; min-height: 46px; padding: 10px 12px; border-radius: 10px;
+  border: 1px solid var(--border); background: var(--card2); color: var(--text);
+  font-size: 16px; outline: none; appearance: none; -webkit-appearance: none;
+}
+select:focus { border-color: var(--accent); }
+.settings-head { display: flex; align-items: center; justify-content: space-between; margin: 12px 0 4px; }
+.settings-head h1 { margin: 0; }
+.field { margin-top: 4px; }
+.field + .field { margin-top: 12px; }
+.field > label { margin-top: 0; }
+/* Excluded-genre grid — mirrors the /configure portal: ticked = never shown. */
+.genres { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 6px; margin-top: 6px; }
+.genres label {
+  display: flex; align-items: center; gap: 8px; margin: 0; font-size: 14px; color: var(--text);
+  min-height: 40px; padding: 4px 10px; border: 1px solid var(--border); border-radius: 8px; cursor: pointer;
+}
+.genres label:has(input:checked) { border-color: var(--err); color: var(--err); }
+.genres input { width: 18px; height: 18px; accent-color: var(--err); }
+.toggle-row { display: flex; align-items: center; gap: 10px; margin: 0; font-size: 15px; color: var(--text); cursor: pointer; }
+.toggle-row input { width: 20px; height: 20px; accent-color: var(--accent); }
 
 /* ---- Undo snackbar ---- */
 .snackbar[hidden] { display: none; }

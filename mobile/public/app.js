@@ -11,7 +11,7 @@
     emailStep: $('login-email-step'), codeStep: $('login-code-step'),
     email: $('email'), code: $('code'),
     send: $('send-code'), verify: $('verify-code'), back: $('back-to-email'),
-    logout: $('logout'), profileName: $('profile-name'), msg: $('login-msg'),
+    logout: $('logout'), openSettings: $('open-settings'), profileName: $('profile-name'), msg: $('login-msg'),
     content: $('content'),
   };
 
@@ -43,6 +43,7 @@
     els.content.querySelectorAll('.view').forEach((v) => { v.hidden = v.id !== 'view-' + view; });
     document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.route === view));
     if (view === 'recs') loadRecs();
+    if (view === 'settings') loadSettings();
   }
 
   // ---- login flow ----
@@ -87,7 +88,7 @@
   els.logout.addEventListener('click', async () => {
     try { await apiFetch('/auth/logout', { method: 'POST' }); } catch { /* ignore */ }
     state.authed = false; state.profile = null; state.pendingEmail = '';
-    recs.loaded = false; recs.cache = { movie: [], series: [] }; hideSnack();
+    recs.loaded = false; recs.data = { movie: null, series: null }; hideSnack();
     showEmailStep();
     location.hash = '#/login';
     render();
@@ -186,8 +187,13 @@
   sEls.add.addEventListener('click', addToWatchlist);
   sEls.sheet.querySelectorAll('[data-close]').forEach((el) => el.addEventListener('click', closeSheet));
 
-  // ---- recommendations (Step 4) ----
-  const recs = { type: 'movie', cache: { movie: [], series: [] }, loaded: false, undo: null, snackTimer: null };
+  // ---- recommendations (Step 4/5) ----
+  // recs.data[type] = { view, items, display, benchExhausted } | null
+  //   view          'catalog' (mirror of the Stremio row) | 'all' (entire pool)
+  //   items         the visible `display` titles PLUS a hidden on-deck bench
+  //   display       how many to actually show (the profile's list_size)
+  //   benchExhausted no more bench to promote from (don't refetch on removal)
+  const recs = { type: 'movie', data: { movie: null, series: null }, loaded: false, undo: null, snackTimer: null };
   const rEls = {
     segs: document.querySelectorAll('#recs-tabs .seg'),
     list: $('recs-list'), msg: $('recs-msg'), hint: $('recs-hint'),
@@ -195,6 +201,17 @@
     snackbar: $('snackbar'), snackText: $('snackbar-text'), snackUndo: $('snackbar-undo'),
   };
   const setRecsMsg = (t, kind) => { rEls.msg.textContent = t || ''; rEls.msg.className = 'msg' + (kind ? ' ' + kind : ''); };
+
+  // Shape a /recommendations response into recs.data. In catalog view the bench
+  // is items beyond `display`; a response with no bench (or the 'all' view)
+  // starts exhausted, so a removal just shrinks the list honestly.
+  function toRecData(resp) {
+    const items = (resp && resp.items) || [];
+    const view = (resp && resp.view) || 'catalog';
+    const display = (resp && typeof resp.display_count === 'number') ? resp.display_count : items.length;
+    return { view, items, display, benchExhausted: view !== 'catalog' || items.length <= display };
+  }
+  const visibleItems = (d) => (d ? d.items.slice(0, d.display) : []);
 
   async function loadRecs() {
     if (recs.loaded) { renderActive(); return; }
@@ -204,20 +221,26 @@
         apiFetch('/recommendations?type=movie').then((r) => r.json()).catch(() => ({})),
         apiFetch('/recommendations?type=series').then((r) => r.json()).catch(() => ({})),
       ]);
-      recs.cache = { movie: (m && m.items) || [], series: (s && s.items) || [] };
+      recs.data = { movie: toRecData(m), series: toRecData(s) };
       recs.loaded = true;
       updateBadges();
       renderActive();
     } catch { setRecsMsg('Could not load recommendations — try again.', 'err'); }
   }
 
+  function countFor(type) {
+    const d = recs.data[type];
+    if (!d) return '';
+    const n = Math.min(d.display, d.items.length);
+    return n ? String(n) : '';
+  }
   function updateBadges() {
-    rEls.badgeMovie.textContent = recs.cache.movie.length ? String(recs.cache.movie.length) : '';
-    rEls.badgeSeries.textContent = recs.cache.series.length ? String(recs.cache.series.length) : '';
+    rEls.badgeMovie.textContent = countFor('movie');
+    rEls.badgeSeries.textContent = countFor('series');
   }
 
   function renderActive() {
-    const items = recs.cache[recs.type] || [];
+    const items = visibleItems(recs.data[recs.type]);
     rEls.list.innerHTML = '';
     if (!items.length) {
       setRecsMsg(recs.type === 'series' ? 'No show recommendations yet — watch something and they’ll appear.' : 'No movie recommendations yet — watch something and they’ll appear.');
@@ -227,6 +250,27 @@
     const frag = document.createDocumentFragment();
     items.forEach((r) => frag.appendChild(buildRecRow(r)));
     rEls.list.appendChild(frag);
+  }
+
+  // Promotion: append one row to the active list (the title that just slid into
+  // the visible window from the top of the bench). No-op off the active tab.
+  function appendRecRow(type, r) {
+    if (type !== recs.type || !r) return;
+    rEls.list.appendChild(buildRecRow(r));
+  }
+
+  // Bench consumed — refetch the same view to see if the pool still has more
+  // (it may, beyond the buffer we fetched, or after suppressions settled).
+  async function refillBench(type) {
+    const prev = recs.data[type];
+    const view = prev ? prev.view : 'catalog';
+    try {
+      const resp = await apiFetch('/recommendations?type=' + type + '&view=' + view).then((r) => r.json()).catch(() => null);
+      if (!resp) return;
+      recs.data[type] = toRecData(resp);
+      updateBadges();
+      if (type === recs.type) renderActive();
+    } catch (_) { /* keep the shrunken list — not fatal */ }
   }
 
   function buildRecRow(r) {
@@ -301,20 +345,35 @@
   async function removeRec(r, row) {
     row.classList.add('removing');
     setTimeout(() => row.remove(), 200);
-    recs.cache[r.type] = (recs.cache[r.type] || []).filter((x) => x.id !== r.id);
+    const d = recs.data[r.type];
+    let needRefill = false;
+    if (d) {
+      const idx = d.items.findIndex((x) => x.id === r.id);
+      if (idx !== -1) d.items.splice(idx, 1);
+      // One in, one out: in catalog view, promote the top of the bench into the
+      // freed slot; when the bench is spent, top it up after the server settles.
+      if (d.view === 'catalog') {
+        if (d.items.length >= d.display) appendRecRow(r.type, d.items[d.display - 1]);
+        else needRefill = !d.benchExhausted;
+      }
+    }
     updateBadges();
     try {
       await apiFetch('/recommend/suppress', { method: 'POST', body: JSON.stringify({ type: r.type, imdb_id: r.id, tmdb_id: r.tmdb_id, title: r.title }) });
       showSnack('Removed “' + (r.title || 'title') + '”', () => undoRemove(r));
+      if (needRefill) await refillBench(r.type);
     } catch { showSnack('Could not remove — try again.', null); }
   }
 
   async function undoRemove(r) {
     hideSnack();
     try { await apiFetch('/recommend/unsuppress', { method: 'POST', body: JSON.stringify({ type: r.type, tmdb_id: r.tmdb_id }) }); } catch (_) { /* ignore */ }
-    recs.cache[r.type] = [r, ...(recs.cache[r.type] || []).filter((x) => x.id !== r.id)];
-    updateBadges();
-    if (recs.type === r.type) renderActive();
+    const d = recs.data[r.type];
+    if (d) {
+      d.items = [r, ...d.items.filter((x) => x.id !== r.id)]; // back to the top; a promoted bench title slides back
+      updateBadges();
+      if (recs.type === r.type) renderActive();
+    }
   }
 
   function showSnack(text, onUndo) {
@@ -333,6 +392,77 @@
     rEls.segs.forEach((s) => s.classList.toggle('active', s === seg));
     renderActive();
   }));
+
+  // ---- settings (Step 5) ----
+  const setEls = {
+    msg: $('settings-msg'),
+    minRating: $('set-min-rating'), recency: $('set-recency'), listSize: $('set-list-size'),
+    voteFloor: $('set-vote-floor'), genres: $('set-genres'), catalogOnly: $('set-catalog-only'),
+    save: $('settings-save'), done: $('settings-done'),
+  };
+  const setSettingsMsg = (t, kind) => { setEls.msg.textContent = t || ''; setEls.msg.className = 'msg' + (kind ? ' ' + kind : ''); };
+
+  // Set a <select> to a value, falling back to its first option if the value
+  // isn't one of the presets (e.g. a hand-edited profile).
+  function setSelect(sel, value) {
+    const v = String(value);
+    sel.value = [...sel.options].some((o) => o.value === v) ? v : (sel.options[0] ? sel.options[0].value : '');
+  }
+
+  function renderGenres(genres, excluded) {
+    const set = new Set((excluded || []).map(String));
+    setEls.genres.innerHTML = '';
+    const frag = document.createDocumentFragment();
+    (genres || []).forEach((g) => {
+      const label = document.createElement('label');
+      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.value = g; cb.checked = set.has(g);
+      const span = document.createElement('span'); span.textContent = g;
+      label.appendChild(cb); label.appendChild(span);
+      frag.appendChild(label);
+    });
+    setEls.genres.appendChild(frag);
+  }
+
+  async function loadSettings() {
+    setSettingsMsg('Loading…');
+    try {
+      const res = await apiFetch('/settings');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { setSettingsMsg(data.error || 'Could not load settings.', 'err'); return; }
+      const f = data.filters || {};
+      setSelect(setEls.minRating, f.min_rating != null ? f.min_rating : 0);
+      setSelect(setEls.recency, f.max_age_years != null ? f.max_age_years : 0);
+      setSelect(setEls.listSize, f.list_size != null ? f.list_size : 20);
+      setSelect(setEls.voteFloor, f.vote_count_floor != null ? f.vote_count_floor : 1000);
+      setEls.catalogOnly.checked = data.catalog_only !== false;
+      renderGenres(data.genres, f.excluded_genres);
+      setSettingsMsg('');
+    } catch { setSettingsMsg('Could not load settings — try again.', 'err'); }
+  }
+
+  async function saveSettings() {
+    setEls.save.disabled = true; setSettingsMsg('Saving…');
+    const payload = {
+      min_rating: parseFloat(setEls.minRating.value),
+      max_age_years: parseInt(setEls.recency.value, 10),
+      list_size: parseInt(setEls.listSize.value, 10),
+      vote_count_floor: parseInt(setEls.voteFloor.value, 10),
+      excluded_genres: [...setEls.genres.querySelectorAll('input:checked')].map((i) => i.value),
+      catalog_only: setEls.catalogOnly.checked,
+    };
+    try {
+      const res = await apiFetch('/settings', { method: 'POST', body: JSON.stringify(payload) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { setSettingsMsg(data.error || 'Could not save — try again.', 'err'); return; }
+      setSettingsMsg('Saved. Your list updates the next time it loads.', 'ok');
+      recs.loaded = false; // filters/view changed — the Recommendations tab refetches on next visit
+    } catch { setSettingsMsg('Could not save — try again.', 'err'); }
+    finally { setEls.save.disabled = false; }
+  }
+
+  setEls.save.addEventListener('click', saveSettings);
+  setEls.done.addEventListener('click', () => { location.hash = '#/recs'; });
+  els.openSettings.addEventListener('click', () => { location.hash = '#/settings'; });
 
   // ---- boot ---- (declaration so the verify flow can reuse it)
   async function boot() {

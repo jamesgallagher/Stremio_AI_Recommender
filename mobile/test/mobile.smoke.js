@@ -501,9 +501,128 @@ async function unitTests() {
     const A = 'iso-A-' + Date.now(); const B = 'iso-B-' + Date.now();
     recommendationStore.upsertCandidates(A, [mkCand({ imdb_id: 'ttA', tmdb_id: '603', title: 'A-movie' })]);
     const res = fakeRes();
-    handlers.recommendationsHandler({ query: { type: 'movie' }, profile: { id: B } }, res);
+    handlers.recommendationsHandler({ query: { type: 'movie' }, profile: { id: B, filters: {}, companion: { catalog_only: false } } }, res);
     assert.deepStrictEqual(res.body.items, []); // B sees nothing of A's pool
     recommendationStore.deleteForProfile(A);
+  });
+
+  // ---- Step 5: catalog vs entire-list views + settings ----
+
+  await ok('recs: passesAgeBand keeps unrated/in-band, drops over-band for kids, adult keeps all', () => {
+    const adult = {}; const kid = { age_limit: 8 };
+    assert.strictEqual(recommendationStore.passesAgeBand({ age_classification: 'R' }, adult), true);  // no limit
+    assert.strictEqual(recommendationStore.passesAgeBand({ age_classification: 'R' }, kid), false);   // 17 > 9
+    assert.strictEqual(recommendationStore.passesAgeBand({ age_classification: 'PG' }, kid), true);   // 8 <= 9
+    assert.strictEqual(recommendationStore.passesAgeBand({ age_classification: null }, kid), true);   // unrated -> kept
+  });
+
+  await ok('recs: catalog view = served selection, display_count = list_size, first rows == Stremio prefix', () => {
+    const pid = 'rec5-cat-' + Date.now();
+    const rows = [];
+    for (let i = 0; i < 8; i++) rows.push(mkCand({ tmdb_id: String(100 + i), imdb_id: 'tt10' + i, title: 'M' + i, affinity: 8 - i }));
+    recommendationStore.upsertCandidates(pid, rows); // one genre -> balance is pure affinity order
+    const profile = { id: pid, filters: { list_size: 5 }, companion: { catalog_only: true } }; // 5 = the list_size floor
+    const res = fakeRes();
+    handlers.recommendationsHandler({ query: { type: 'movie' }, profile }, res);
+    assert.strictEqual(res.body.view, 'catalog');
+    assert.strictEqual(res.body.display_count, 5);
+    const serve = recommendationStore.serveRecommendations(profile, 'movie', { limit: 5 }).map((m) => m.id);
+    assert.deepStrictEqual(res.body.items.slice(0, 5).map((r) => r.id), serve); // phone mirrors Stremio exactly
+    assert.ok(res.body.items.length > 5, 'carries a hidden on-deck bench beyond display_count');
+    recommendationStore.deleteForProfile(pid);
+  });
+
+  await ok('recs: entire-list view returns the whole pool (adult) and is age-band filtered (kids)', () => {
+    const pid = 'rec5-all-' + Date.now();
+    recommendationStore.upsertCandidates(pid, [
+      mkCand({ tmdb_id: '201', imdb_id: 'tt201', title: 'Kiddo', affinity: 3 }),
+      mkCand({ tmdb_id: '202', imdb_id: 'tt202', title: 'Grown', affinity: 2 }),
+    ]);
+    recommendationStore.setAgeClassification(pid, 'movie', '202', 'R'); // 17+
+    let res = fakeRes();
+    handlers.recommendationsHandler({ query: { type: 'movie', view: 'all' }, profile: { id: pid, filters: {} } }, res);
+    assert.strictEqual(res.body.view, 'all');
+    assert.deepStrictEqual(res.body.items.map((r) => r.id).sort(), ['tt201', 'tt202']); // adult: whole pool
+    assert.strictEqual(res.body.display_count, res.body.items.length);
+    res = fakeRes();
+    handlers.recommendationsHandler({ query: { type: 'movie', view: 'all' }, profile: { id: pid, filters: { age_limit: 8 } } }, res);
+    assert.deepStrictEqual(res.body.items.map((r) => r.id), ['tt201']); // kids: R-rated dropped (vetted-only)
+    recommendationStore.deleteForProfile(pid);
+  });
+
+  await ok('recs: default view follows companion.catalog_only; explicit ?view overrides it', () => {
+    const pid = 'rec5-pref-' + Date.now();
+    recommendationStore.upsertCandidates(pid, [mkCand({ tmdb_id: '301', imdb_id: 'tt301', title: 'P' })]);
+    const base = { id: pid, filters: {} };
+    let res = fakeRes();
+    handlers.recommendationsHandler({ query: { type: 'movie' }, profile: { ...base, companion: { catalog_only: false } } }, res);
+    assert.strictEqual(res.body.view, 'all');
+    res = fakeRes();
+    handlers.recommendationsHandler({ query: { type: 'movie' }, profile: { ...base, companion: { catalog_only: true } } }, res);
+    assert.strictEqual(res.body.view, 'catalog');
+    res = fakeRes();
+    handlers.recommendationsHandler({ query: { type: 'movie', view: 'all' }, profile: { ...base, companion: { catalog_only: true } } }, res);
+    assert.strictEqual(res.body.view, 'all'); // explicit override wins
+    recommendationStore.deleteForProfile(pid);
+  });
+
+  await ok('recs: removing a catalog title promotes the next bench title (one in, one out)', () => {
+    const pid = 'rec5-oneout-' + Date.now();
+    const rows = [];
+    for (let i = 0; i < 8; i++) rows.push(mkCand({ tmdb_id: String(400 + i), imdb_id: 'tt40' + i, title: 'T' + i, affinity: 8 - i }));
+    recommendationStore.upsertCandidates(pid, rows);
+    const profile = { id: pid, filters: { list_size: 5 }, companion: { catalog_only: true } };
+    let res = fakeRes();
+    handlers.recommendationsHandler({ query: { type: 'movie' }, profile }, res);
+    assert.deepStrictEqual(res.body.items.slice(0, 5).map((r) => r.id), ['tt400', 'tt401', 'tt402', 'tt403', 'tt404']); // visible 5
+    recommendationStore.addDontRecommend(pid, 'movie', '402', 'user');                        // remove one in the middle
+    res = fakeRes();
+    handlers.recommendationsHandler({ query: { type: 'movie' }, profile }, res);
+    assert.deepStrictEqual(res.body.items.slice(0, 5).map((r) => r.id), ['tt400', 'tt401', 'tt403', 'tt404', 'tt405']); // tt405 promoted from the bench
+    recommendationStore.deleteForProfile(pid);
+  });
+
+  await ok('settings: toCompanionFilters exposes the 5 editable filters, never the age gate', () => {
+    const out = handlers.toCompanionFilters({ min_rating: 6, vote_count_floor: 1000, max_age_years: 5, excluded_genres: ['Horror'], list_size: 20, age_limit: 8, engine: 'trakt' });
+    assert.deepStrictEqual(Object.keys(out).sort(), ['excluded_genres', 'list_size', 'max_age_years', 'min_rating', 'vote_count_floor']);
+    assert.ok(!('age_limit' in out), 'age gate never exposed');
+    assert.deepStrictEqual(out.excluded_genres, ['Horror']);
+    assert.deepStrictEqual(handlers.toCompanionFilters({}).excluded_genres, []); // always an array
+  });
+
+  await ok('settings: GET returns editable filters + genres + catalog_only, hides the age gate', () => {
+    const p = config.addProfile('SetGet');
+    config.updateProfile(p.id, { filters: { min_rating: 7, age_limit: 8 } });
+    const res = fakeRes();
+    handlers.settingsGetHandler({ profile: config.getProfile(p.id) }, res);
+    assert.strictEqual(res.body.filters.min_rating, 7);
+    assert.ok(!('age_limit' in res.body.filters), 'age gate absent');
+    assert.strictEqual(res.body.catalog_only, true); // default
+    assert.ok(Array.isArray(res.body.genres) && res.body.genres.length > 0);
+  });
+
+  await ok('settings: POST whitelists — writes filters + pref, the age gate is immutable', () => {
+    const p = config.addProfile('SetPost');
+    config.updateProfile(p.id, { filters: { age_limit: 8 } }); // an age-limited (kids) profile
+    const res = fakeRes();
+    handlers.settingsPostHandler({
+      profile: config.getProfile(p.id),
+      body: { min_rating: 7.5, list_size: 30, catalog_only: false, age_limit: 0 }, // age_limit MUST be ignored
+    }, res);
+    assert.strictEqual(res.body.ok, true);
+    const after = config.getProfile(p.id);
+    assert.strictEqual(after.filters.min_rating, 7.5);        // written
+    assert.strictEqual(after.filters.list_size, 30);          // written
+    assert.strictEqual(after.companion.catalog_only, false);  // written
+    assert.strictEqual(after.filters.age_limit, 8, 'age gate untouched by the Companion');
+    assert.ok(!('age_limit' in res.body.filters), 'response never echoes the age gate');
+  });
+
+  await ok('settings: POST with only forbidden/unknown keys -> 400 (age gate alone cannot write)', () => {
+    const p = config.addProfile('SetEmpty');
+    const res = fakeRes();
+    handlers.settingsPostHandler({ profile: config.getProfile(p.id), body: { age_limit: 0, foo: 'bar' } }, res);
+    assert.strictEqual(res.statusCode, 400);
   });
 }
 
@@ -720,6 +839,39 @@ async function httpTests() {
     const sup = await fetch(`${BASE}/mobile/api/recommend/suppress`, { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({ type: 'movie', tmdb_id: '603' }) });
     assert.strictEqual(sup.status, 200);
     console.log('  ✓ recommendations returns items[] for the session profile; suppress works over HTTP');
+  }
+
+  // ---- Step 5: settings (editable filters, age gate hidden + immutable) ----
+  {
+    assert.strictEqual((await fetch(`${BASE}/mobile/api/settings`)).status, 401);
+    assert.strictEqual((await fetch(`${BASE}/mobile/api/settings`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 401);
+    console.log('  ✓ settings require a session');
+
+    const email = uniqEmail(); const p = seedProfile('S5 User', email);
+    config.updateProfile(p.id, { filters: { age_limit: 8 } }); // a kids profile, set in the backend
+    const cookie = await sessionCookieFor(email);
+
+    const getBody = await (await fetch(`${BASE}/mobile/api/settings`, { headers: { Cookie: cookie } })).json();
+    assert.ok(!('age_limit' in getBody.filters), 'GET never exposes the age gate');
+    assert.strictEqual(getBody.catalog_only, true);
+    assert.ok(Array.isArray(getBody.genres) && getBody.genres.length > 0);
+
+    // Try to disable the age gate + change a real filter + the view pref in one POST.
+    const postRes = await fetch(`${BASE}/mobile/api/settings`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ age_limit: 0, min_rating: 7.5, catalog_only: false }),
+    });
+    assert.strictEqual(postRes.status, 200);
+    const after = config.getProfile(p.id);
+    assert.strictEqual(after.filters.age_limit, 8, 'age gate is immutable over HTTP');
+    assert.strictEqual(after.filters.min_rating, 7.5);
+    assert.strictEqual(after.companion.catalog_only, false);
+    console.log('  ✓ settings: GET hides the age gate; POST writes filters/pref but the age gate is immutable');
+
+    // catalog_only now false -> the default recommendations view is the entire list.
+    const recBody = await (await fetch(`${BASE}/mobile/api/recommendations?type=movie`, { headers: { Cookie: cookie } })).json();
+    assert.strictEqual(recBody.view, 'all');
+    console.log('  ✓ recs: default view follows the saved catalog_only pref over HTTP');
   }
 
   console.log(`\nAll mobile checks passed (${passed} unit + http).`);

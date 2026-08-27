@@ -2,12 +2,21 @@
 // router, so they read `req.profile` (the signed-in profile) and NEVER a
 // client-supplied profile id — that's the isolation guarantee.
 const settings = require('../../src/settings');
+const config = require('../../src/config');
 const tmdb = require('../../src/services/tmdb');
 const simkl = require('../../src/services/simkl');
 const recommendationStore = require('../../src/recommendationStore');
+const watchedStore = require('../../src/watchedStore');
 const dontRecommend = require('../../src/dontRecommend');
 
 const TYPES = ['movie', 'series'];
+
+// Filters the Companion is allowed to READ and WRITE. The age gate
+// (filters.age_limit) is deliberately ABSENT — it is never returned, never
+// rendered, and never writable through the phone (it stays a backend-only
+// control). The server still USES the profile's age limit internally for the
+// vetted-only "entire list" view; it just never leaves the server.
+const COMPANION_FILTERS = ['min_rating', 'vote_count_floor', 'max_age_years', 'excluded_genres', 'list_size'];
 const SEARCH_LIMIT = 10;
 const SEARCH_LIMIT_MAX = 12; // search does 1 + N detail calls — keep it light
 
@@ -64,10 +73,16 @@ async function watchlistHandler(req, res) {
   }
 }
 
-// ---- Step 4: recommendations tabs + swipe ----
+// ---- Step 4/5: recommendations tabs + swipe ----
 
-const RECS_LIMIT = 200;      // "all items" — the whole pool per type (paginate if it grows)
-const RECS_LIMIT_MAX = 500;
+const POOL_LIMIT = 500;      // hard cap when reading the whole pool for a type
+// Catalog view carries the served list PLUS a hidden on-deck bench, so removing
+// a title can promote the next one ("one in, one out, from the top of the
+// bench") with no round-trip. The bench is a slice of the SAME genre-balanced
+// selection Stremio serves — selectServe(N) is a strict prefix of
+// selectServe(N + k) — so the first `display_count` rows ARE the Stremio
+// catalog, and the extra rows are just the promotion buffer.
+const CATALOG_BENCH = 40;
 
 // PURE: map a `recommended` pool row -> the mobile Rec DTO. Exported for tests.
 function toRecDTO(row) {
@@ -85,15 +100,45 @@ function toRecDTO(row) {
   };
 }
 
-// GET /api/recommendations?type=movie|series[&limit=]
-// Returns the RAW stored pool for the type (a curation/management view — the
-// portal's Advanced tab shows the same table), newest/affinity order.
+// GET /api/recommendations?type=movie|series[&view=catalog|all]
+// view=catalog (the default, or the profile's companion.catalog_only pref when
+// ?view is omitted): the SERVED catalog — exactly what Stremio shows — plus a
+// hidden on-deck bench for instant one-in-one-out promotion. `display_count` is
+// how many the phone actually shows (the profile's list_size); rows beyond that
+// are the bench.
+// view=all: the whole recommendation pool ("entire recommendations list"),
+// age-band-filtered for an age-limited profile so it stays vetted-only.
 function recommendationsHandler(req, res) {
   const type = TYPES.includes(req.query && req.query.type) ? req.query.type : 'movie';
-  let limit = parseInt(req.query && req.query.limit, 10) || RECS_LIMIT;
-  limit = Math.min(RECS_LIMIT_MAX, Math.max(1, limit));
-  const rows = recommendationStore.getRecommended(req.profile.id, { type, limit });
-  res.json({ type, items: rows.map(toRecDTO).filter((r) => r && r.id) });
+  const profile = req.profile;
+  const filters = profile.filters || {};
+
+  // Default view follows the saved preference; an explicit ?view=… overrides it.
+  const catalogOnly = profile.companion ? profile.companion.catalog_only !== false : true;
+  const requested = req.query && req.query.view;
+  const view = (requested === 'catalog' || requested === 'all') ? requested : (catalogOnly ? 'catalog' : 'all');
+
+  const rows = recommendationStore.getRecommended(profile.id, { type, limit: POOL_LIMIT });
+
+  if (view === 'all') {
+    // Entire pool, vetted-only for an age-limited profile (adult: passesAgeBand
+    // is always true). No genre-balance, no size cap — the honest full set.
+    const items = rows
+      .filter((r) => recommendationStore.passesAgeBand(r, filters))
+      .map(toRecDTO).filter((r) => r && r.id);
+    return res.json({ type, view, items, display_count: items.length });
+  }
+
+  // Catalog view: the served selection (+ bench), watched-pruned like the addon
+  // does (the pool excludes watched at build; this catches titles watched since)
+  // so the phone mirrors the Stremio row exactly.
+  const displayCount = recommendationStore.listSizeFor(profile);
+  const picked = recommendationStore.selectServe(rows, filters, { limit: displayCount + CATALOG_BENCH });
+  const watchedImdb = watchedStore.watchedIdSets(profile.id).imdb;
+  const items = picked
+    .filter((r) => !watchedImdb.has(r.imdb_id))
+    .map(toRecDTO).filter((r) => r && r.id);
+  res.json({ type, view, items, display_count: displayCount });
 }
 
 // POST /api/recommend/suppress  { type, tmdb_id?, imdb_id?, title? }  (swipe-right)
@@ -119,8 +164,57 @@ function unsuppressHandler(req, res) {
   res.json({ ok: true, restored });
 }
 
+// ---- Step 5: settings (editable filters + Companion view pref) ----
+
+// PURE: pull only the Companion-editable filters out of a profile's filters,
+// with safe fallbacks. The age gate is NEVER included. Exported for tests.
+function toCompanionFilters(f = {}) {
+  const out = {};
+  for (const k of COMPANION_FILTERS) {
+    out[k] = k === 'excluded_genres' ? (Array.isArray(f[k]) ? f[k] : []) : (f[k] ?? null);
+  }
+  return out;
+}
+const catalogOnlyOf = (profile) => (profile.companion ? profile.companion.catalog_only !== false : true);
+
+// GET /api/settings — the editable filter set + genre options + view pref.
+// Deliberately omits filters.age_limit (see COMPANION_FILTERS): the age gate is
+// never shown or accessible through the Companion.
+function settingsGetHandler(req, res) {
+  res.json({
+    filters: toCompanionFilters(req.profile.filters || {}),
+    catalog_only: catalogOnlyOf(req.profile),
+    genres: Object.keys(tmdb.GENRE_ALIASES).sort(),
+  });
+}
+
+// POST /api/settings — write the editable filters + view pref. STRICT whitelist:
+// only COMPANION_FILTERS + catalog_only are ever forwarded to updateProfile, so
+// a crafted body can never reach the age gate (age_limit is dropped even if
+// present). Serve-time filters take effect on the next fetch; vote_count_floor
+// applies on the next rebuild (same as the portal).
+function settingsPostHandler(req, res) {
+  const b = req.body || {};
+  const patch = {};
+  const filterPatch = {};
+  for (const k of COMPANION_FILTERS) if (b[k] !== undefined) filterPatch[k] = b[k];
+  if (Object.keys(filterPatch).length) patch.filters = filterPatch; // age_limit can never be a key here
+  if (b.catalog_only !== undefined) patch.companion = { catalog_only: !!b.catalog_only };
+  if (!patch.filters && !patch.companion) return res.status(400).json({ error: 'Nothing to update' });
+
+  let updated;
+  try {
+    updated = config.updateProfile(req.profile.id, patch); // validates + clamps each field
+  } catch (err) {
+    return res.status(423).json({ error: `Could not save — ${err.message}` });
+  }
+  if (!updated) return res.status(404).json({ error: 'Profile not found' });
+  res.json({ ok: true, filters: toCompanionFilters(updated.filters || {}), catalog_only: catalogOnlyOf(updated) });
+}
+
 module.exports = {
   toTitleDTO, searchHandler, watchlistHandler,
   toRecDTO, recommendationsHandler, suppressHandler, unsuppressHandler,
-  TYPES, SEARCH_LIMIT, SEARCH_LIMIT_MAX,
+  toCompanionFilters, settingsGetHandler, settingsPostHandler,
+  TYPES, COMPANION_FILTERS, SEARCH_LIMIT, SEARCH_LIMIT_MAX,
 };

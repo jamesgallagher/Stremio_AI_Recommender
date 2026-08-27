@@ -119,9 +119,11 @@ router.get('/api/me', requireSession, (req, res) => {
 // ---- feature data (session-guarded) ----
 router.get('/api/search', requireSession, handlers.searchHandler);       // Step 3: TMDB search
 router.post('/api/watchlist', requireSession, handlers.watchlistHandler); // Step 3: add to Simkl plan-to-watch
-router.get('/api/recommendations', requireSession, handlers.recommendationsHandler);   // Step 4: Movies/Shows tabs
+router.get('/api/recommendations', requireSession, handlers.recommendationsHandler);   // Step 4/5: catalog or entire-list view
 router.post('/api/recommend/suppress', requireSession, handlers.suppressHandler);      // Step 4: swipe-right remove
 router.post('/api/recommend/unsuppress', requireSession, handlers.unsuppressHandler);  // Step 4: undo a remove
+router.get('/api/settings', requireSession, handlers.settingsGetHandler);              // Step 5: editable filters + view pref
+router.post('/api/settings', requireSession, handlers.settingsPostHandler);            // Step 5: save filters + view pref
 
 // ---- app config (public) ----
 // A single source for the SPA's app name/version, no session needed.

@@ -55,6 +55,14 @@ const DEFAULT_SCROBBLE = {
 };
 const SCROBBLE_PROVIDERS = ['nuvio', 'stremio'];
 
+// Mobile Companion per-profile view preferences. Deliberately SEPARATE from
+// `filters` so a view toggle can never leak into recommendation logic. Set from
+// the Companion's settings cog; the age gate (filters.age_limit) is NEVER
+// exposed or writable there.
+//   catalog_only: true  -> the recs list mirrors the served Stremio catalog
+//                          (default); false -> the whole recommendation pool.
+const DEFAULT_COMPANION = { catalog_only: true };
+
 // Secret fields sealed at rest. The scrobble password_enc is already its own
 // AES blob and the install token is deliberately excluded (see header).
 const SECRET_KEY_FIELDS = ['simkl_client_id', 'simkl_client_secret', 'tmdb_api_key', 'groq_api_key', 'rpdb_api_key', 'mdblist_api_key'];
@@ -85,6 +93,7 @@ function newProfile(name) {
     filters: { ...DEFAULT_FILTERS },
     catalogs: {}, // extra-catalog toggles by id; absent/false = off. AI catalogs are always on.
     scrobble: { ...DEFAULT_SCROBBLE },
+    companion: { ...DEFAULT_COMPANION }, // Mobile Companion view prefs (not recommendation filters)
     created_at: Date.now(),
   };
 }
@@ -122,6 +131,9 @@ function applyMigrations(p) {
   if (p.email === undefined) p.email = '';
   if (p.catalogs === undefined) p.catalogs = {};
   if (p.scrobble === undefined) p.scrobble = { ...DEFAULT_SCROBBLE };
+  // Mobile Companion prefs (v6.35): default new + older profiles to catalog-only.
+  if (p.companion === undefined) p.companion = { ...DEFAULT_COMPANION };
+  if (p.companion.catalog_only === undefined) p.companion.catalog_only = DEFAULT_COMPANION.catalog_only;
 }
 
 // ---- Sealing (encryption at rest) ----
@@ -249,6 +261,10 @@ function updateProfile(id, patch) {
         sc.nuvio_profile_index = s.nuvio_profile_index === null ? null : (parseInt(s.nuvio_profile_index, 10) || null);
       }
       if (s.nuvio_profile_name !== undefined) sc.nuvio_profile_name = String(s.nuvio_profile_name);
+    }
+    if (patch.companion && typeof patch.companion === 'object') {
+      if (!profile.companion) profile.companion = { ...DEFAULT_COMPANION };
+      if (patch.companion.catalog_only !== undefined) profile.companion.catalog_only = !!patch.companion.catalog_only;
     }
     updated = profile;
   });
