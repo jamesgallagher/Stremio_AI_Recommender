@@ -578,7 +578,7 @@ ok('recommendationStore: recency-weighted affinity (the Pirates behaviour)', () 
   assert.strictEqual(out.get('movie:C').because_title, 'Predator'); // C only came from the old seed
 });
 
-ok('recommendationStore: selectStrong gates on votes only (NOT rating), caps at 5, keeps TMDB order', () => {
+ok('recommendationStore: selectStrong gates on the supplied vote floor (NOT rating), caps at 5, keeps TMDB order', () => {
   const rs = require('../src/recommendationStore');
   const mk = (id, va, vc, adult = false, type = 'movie') => ({ type, tmdb_id: id, vote_average: va, vote_count: vc, adult });
   const recs = [
@@ -586,33 +586,63 @@ ok('recommendationStore: selectStrong gates on votes only (NOT rating), caps at 
     mk('adult', 8, 1000, true), mk('C', 6, 200), mk('D', 8, 1000), mk('E', 7, 1000),
   ];
   // Rating floor is NOT applied here (moved to serve time) — low-rating stays; the
-  // vote NOISE floor (>=150) drops low-votes; porn is dropped. Then top-5 in ORDER.
-  assert.deepStrictEqual(rs.selectStrong(recs).map((r) => r.tmdb_id), ['A', 'low-rating', 'B', 'C', 'D']);
+  // caller-supplied vote floor (here 150) drops low-votes; porn is dropped. Top-5 in ORDER.
+  assert.deepStrictEqual(rs.selectStrong(recs, 150).map((r) => r.tmdb_id), ['A', 'low-rating', 'B', 'C', 'D']);
   // low-votes and adult are excluded regardless of position
-  assert.ok(!rs.selectStrong(recs).some((r) => r.tmdb_id === 'low-votes' || r.tmdb_id === 'adult'));
-  // TV vote floor (50) is lower than movie (150) — same 60-vote title differs by type
-  assert.strictEqual(rs.selectStrong([mk('T', 7, 60, false, 'series')]).length, 1);
-  assert.strictEqual(rs.selectStrong([mk('M', 7, 60, false, 'movie')]).length, 0);
+  assert.ok(!rs.selectStrong(recs, 150).some((r) => r.tmdb_id === 'low-votes' || r.tmdb_id === 'adult'));
+  // A higher floor rejects more — C (200 votes) now drops under a 500 floor
+  assert.deepStrictEqual(rs.selectStrong(recs, 500).map((r) => r.tmdb_id), ['A', 'low-rating', 'B', 'D', 'E']);
+  // Floor 0 = "No minimum": no vote gate (porn still dropped)
+  assert.ok(rs.selectStrong(recs, 0).some((r) => r.tmdb_id === 'low-votes'));
+  assert.ok(!rs.selectStrong(recs, 0).some((r) => r.tmdb_id === 'adult'));
+});
+
+ok('recommendationStore: purgeBelowVoteFloor drops stored rows under the profile vote floor (movies vs series ⅕)', () => {
+  const rs = require('../src/recommendationStore');
+  const pid = 'vc-purge';
+  const mk = (id, type, vc) => ({ type, tmdb_id: id, imdb_id: 'tt' + id, title: id, year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: vc, affinity: 1, rec_count: 1, popularity: 1, poster: null });
+  rs.upsertCandidates(pid, [mk('hi', 'movie', 5000), mk('lo', 'movie', 100), mk('shi', 'series', 300), mk('slo', 'series', 100)]);
+  // floor 1000 -> movies gate at 1000, series at 200 (⅕). 'lo' (100) and 'slo' (100) go; 'hi'/'shi' stay.
+  assert.strictEqual(rs.purgeBelowVoteFloor(pid, { vote_count_floor: 1000 }), 2);
+  assert.deepStrictEqual(rs.getRecommended(pid, { limit: 100 }).map((r) => r.tmdb_id).sort(), ['hi', 'shi']);
+  // "No minimum" (0) purges nothing
+  rs.upsertCandidates(pid, [mk('tiny', 'movie', 1)]);
+  assert.strictEqual(rs.purgeBelowVoteFloor(pid, { vote_count_floor: 0 }), 0);
 });
 
 ok('recommendationStore: selectServe applies rating/genre/recency at serve time', () => {
   const rs = require('../src/recommendationStore');
-  const mk = (o) => ({ imdb_id: 'tt' + o.id, tmdb_id: o.id, title: o.id, year: o.year || 2024, primary_genre: o.g, genres: o.genres || o.g, vote_average: o.va ?? 8, age_classification: o.age || null, affinity: o.aff ?? 1 });
+  const mk = (o) => ({ imdb_id: 'tt' + o.id, tmdb_id: o.id, type: o.type || 'movie', title: o.id, year: o.year || 2024, primary_genre: o.g, genres: o.genres || o.g, vote_average: o.va ?? 8, imdb_rating: o.imdb, age_classification: o.age || null, affinity: o.aff ?? 1 });
   const rows = [
     mk({ id: 'A', g: 'Drama' }),
     mk({ id: 'B', g: 'Horror' }),                          // excluded primary genre
-    mk({ id: 'C', g: 'Drama', va: 4 }),                    // below rating floor
+    mk({ id: 'C', g: 'Drama', va: 4 }),                    // below rating floor (TMDB fallback)
     mk({ id: 'D', g: 'Action', genres: 'Action,Horror' }), // excluded SECONDARY genre
-    mk({ id: 'E', g: 'Drama', year: 1990 }),               // too old
+    mk({ id: 'E', g: 'Drama', year: 1990 }),               // too old (movie)
   ];
   const out = rs.selectServe(rows, { min_rating: 6, excluded_genres: ['Horror'], max_age_years: 5 }, { nowYear: 2026 });
   assert.deepStrictEqual(out.map((r) => r.tmdb_id), ['A']);
   // no filters -> all pass
   assert.strictEqual(rs.selectServe(rows, {}, { nowYear: 2026 }).length, 5);
-  // unrated (vote_average 0) is KEPT despite a rating floor — "no rating" isn't "bad"
+  // unrated (no IMDb, vote_average 0) is KEPT despite a rating floor — "no rating" isn't "bad"
   assert.strictEqual(rs.selectServe([mk({ id: 'Z', g: 'Drama', va: 0 })], { min_rating: 9 }, { nowYear: 2026 }).length, 1);
   // rows without a tt id are never servable
   assert.strictEqual(rs.selectServe([{ tmdb_id: 'X', primary_genre: 'Drama', genres: 'Drama', vote_average: 8, year: 2024 }], {}, { nowYear: 2026 }).length, 0);
+
+  // Rating floor prefers the IMDb rating (the poster badge) over TMDB's vote_average.
+  const rate = (imdb, va) => rs.selectServe([mk({ id: 'R', g: 'Drama', imdb, va })], { min_rating: 6 }, { nowYear: 2026 }).length;
+  assert.strictEqual(rate(5.5, 8), 0);        // IMDb 5.5 < 6 -> dropped even though TMDB 8 passes
+  assert.strictEqual(rate(6.5, 4), 1);        // IMDb 6.5 >= 6 -> kept even though TMDB 4 would fail
+  assert.strictEqual(rate(undefined, 7), 1);  // no IMDb -> fall back to TMDB 7 -> kept
+  assert.strictEqual(rate(undefined, 4), 0);  // no IMDb -> fall back to TMDB 4 -> dropped
+
+  // Recency window is MOVIES ONLY — an old series is never cut off by it.
+  const oldMovie = mk({ id: 'OM', g: 'Drama', type: 'movie', year: 1990 });
+  const oldSeries = mk({ id: 'OS', g: 'Drama', type: 'series', year: 1990 });
+  assert.deepStrictEqual(
+    rs.selectServe([oldMovie, oldSeries], { max_age_years: 5 }, { nowYear: 2026 }).map((r) => r.tmdb_id),
+    ['OS'],
+  );
 });
 
 ok('recommendationStore: selectServe age re-check drops classified titles above the band', () => {
@@ -638,6 +668,35 @@ ok('recommendationStore: balanceByGenre round-robins and never force-fills', () 
   assert.deepStrictEqual(rs.balanceByGenre(rows, 10).map((r) => r.imdb_id), ['tta1', 'ttb1', 'ttc1', 'tta2', 'tta3']);
   assert.strictEqual(rs.balanceByGenre(rows, 3).length, 3);   // limit caps output
   assert.strictEqual(rs.balanceByGenre(rows, 99).length, 5);  // never force-fills past what's available
+});
+
+ok('recommendationStore: listSizeFor clamps to the portal [5,50] band, defaults to 20', () => {
+  const rs = require('../src/recommendationStore');
+  assert.strictEqual(rs.listSizeFor({ filters: { list_size: 10 } }), 10);
+  assert.strictEqual(rs.listSizeFor({ filters: { list_size: 999 } }), 50);  // clamped up-bound
+  assert.strictEqual(rs.listSizeFor({ filters: { list_size: 1 } }), 5);     // clamped low-bound
+  assert.strictEqual(rs.listSizeFor({ filters: {} }), 20);                  // unset -> shipped default
+  assert.strictEqual(rs.listSizeFor({}), 20);
+});
+
+ok('recommendationStore: serveRecommendations serves list_size, not the 100 cap', () => {
+  const rs = require('../src/recommendationStore');
+  const pid = 'ls-test';
+  const genres = ['Drama', 'Action', 'Comedy'];
+  const cands = [];
+  for (let i = 0; i < 60; i++) {
+    cands.push({
+      type: 'movie', tmdb_id: 'ls' + i, imdb_id: 'ttls' + i, title: 'T' + i, year: 2024,
+      primary_genre: genres[i % 3], genres: genres[i % 3], vote_average: 8, affinity: 60 - i,
+      rec_count: 1, popularity: 1, poster: null,
+    });
+  }
+  rs.upsertCandidates(pid, cands);
+  const serve = (list_size) => rs.serveRecommendations({ id: pid, filters: { list_size } }, 'movie').length;
+  assert.strictEqual(serve(10), 10);   // honours the configured size (was ignored -> 60/SERVE_LIMIT)
+  assert.strictEqual(serve(30), 30);
+  assert.strictEqual(serve(999), 50);  // clamped to the band, NOT the old 100 cap
+  assert.strictEqual(rs.serveRecommendations({ id: pid, filters: {} }, 'movie').length, 20); // default
 });
 
 ok('recommendationStore: upsert, dont_recommend suppresses + drops from pool', () => {

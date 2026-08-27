@@ -4,13 +4,15 @@
 // /recommendations, aggregate into candidates scored by RECENCY-WEIGHTED
 // AFFINITY (a recent watch steers harder than an old one — the "watched
 // Pirates 1 today → Pirates 2 tops the list" behaviour), keep the strongest
-// few per title, resolve tt ids + posters, age-gate, and upsert a FULL pool
-// (rating + full genre list stored, NOT pre-filtered by user preference).
+// few per title (only those clearing the vote-count floor — the one build-time
+// user preference: a sub-floor title must never be stored), resolve tt ids +
+// posters + IMDb ratings, age-gate, and upsert a FULL pool (rating + full genre
+// list stored, NOT pre-filtered by the serve-time preferences).
 //
 // SERVE (request path, cheap, no network): selectServe applies the user's
-// preferences (rating floor, excluded genres, recency) + a cheap age-band
-// re-check over the stored pool, then genre-balances the result — so changing
-// a filter takes effect immediately with no rebuild.
+// serve-time preferences (rating floor, excluded genres, movies-only recency,
+// list size) + a cheap age-band re-check over the stored pool, then
+// genre-balances the result — so changing one takes effect with no rebuild.
 //
 // Tables: `recommended` (the candidate pool, with a decay lifecycle),
 // `dont_recommend` (user rejections + decay-outs, excluded from build/serve),
@@ -46,24 +48,26 @@ const DECAY_MIN_DAYS = 8;              // must be shown on ≥ this many distinc
 
 // Per-source-title selection: TMDB returns ~20 recs already in RELEVANCE order
 // (strongest match first). Keeping all 20 makes the matching mushy, so we keep
-// only the strongest few PER title — the top N in TMDB's own order, gated only
-// by the vote-count NOISE floor (an internal confidence gate, not a user
-// preference) and the porn flag.
+// only the strongest few PER title — the top N in TMDB's own order, gated by the
+// porn flag and the VOTE-COUNT FLOOR.
 //
-// DELIBERATELY NOT gated by the rating floor / genres / recency here: those are
-// USER PREFERENCES that change, so we store a fuller pool of strong candidates
-// (with vote_average + genres + year) and apply those filters at SERVE time
-// (F6). Changing the floor or un-excluding a genre then takes effect with no
-// rebuild and no TMDB refetch. (Decided 2026-08 — see docs/v6-features F5.)
+// The vote-count floor is the user's `vote_count_floor` filter (via
+// tmdb.voteFloor — series use ⅕, the same asymmetry as elsewhere). It is enforced
+// HERE, at build, ON PURPOSE (decided 2026-08-27): a title below the floor must
+// never be STORED in the pool, not merely hidden at serve. It can return on a
+// later build if its vote count climbs past the floor. The build also purges any
+// already-stored row that has since fallen below the floor (purgeBelowVoteFloor).
+//
+// The rating floor / genres / recency are DIFFERENT — those are cheap serve-time
+// preferences over the stored pool (no rebuild to change). The vote-count floor
+// can't be: its whole point is to keep sub-floor titles OUT of storage.
 const PER_TITLE_CAP = 5;
-const VOTE_FLOOR_MOVIE = 150;
-const VOTE_FLOOR_TV = 50;   // TV vote counts run lower, same asymmetry as elsewhere
-const voteFloorFor = (type) => (type === 'series' ? VOTE_FLOOR_TV : VOTE_FLOOR_MOVIE);
 
-// The strongest ≤N recommendations for one source title (relevance order).
-function selectStrong(recs) {
+// The strongest ≤N recommendations for one source title (relevance order), gated
+// by the porn flag and a vote-count floor (0 = no gate; callers pass the profile's).
+function selectStrong(recs, voteFloor = 0) {
   return (recs || [])
-    .filter((r) => !r.adult && (r.vote_count || 0) >= voteFloorFor(r.type))
+    .filter((r) => !r.adult && (r.vote_count || 0) >= voteFloor)
     .slice(0, PER_TITLE_CAP); // TMDB relevance order preserved
 }
 
@@ -80,7 +84,9 @@ function init() {
       year        INTEGER,
       primary_genre       TEXT,           -- genres[0], for genre-balanced serve
       genres      TEXT,                   -- full CSV genre list, for serve-time exclusion
-      vote_average REAL,                  -- for the serve-time rating floor
+      vote_average REAL,                  -- TMDB rating; serve-time rating-floor fallback
+      imdb_rating  REAL,                  -- IMDb rating (MDBList) = the number on the poster badge; the rating floor prefers this
+      vote_count   INTEGER,               -- TMDB vote count; the build-time vote-count floor gates + purges on this
       age_classification  TEXT,           -- filled by the age-gate slice
       affinity    REAL,                   -- recency-weighted score (primary rank)
       rec_count   INTEGER,                -- raw # of watched titles that recommended it
@@ -114,7 +120,7 @@ function init() {
   `);
   // Migrate older beta DBs that predate the serve-time-filter columns. ADD COLUMN
   // throws "duplicate column" once present, so each is best-effort.
-  for (const [col, decl] of [['genres', 'TEXT'], ['vote_average', 'REAL'], ['because_title', 'TEXT'],
+  for (const [col, decl] of [['genres', 'TEXT'], ['vote_average', 'REAL'], ['imdb_rating', 'REAL'], ['vote_count', 'INTEGER'], ['because_title', 'TEXT'],
     ['streak_started_at', 'INTEGER'], ['times_shown_in_streak', 'INTEGER DEFAULT 0'], ['last_shown_at', 'INTEGER']]) {
     try { db.get().exec(`ALTER TABLE recommended ADD COLUMN ${col} ${decl}`); } catch { /* already present */ }
   }
@@ -211,18 +217,19 @@ function upsertCandidates(profileId, candidates) {
   init();
   const conn = db.get();
   const stmt = conn.prepare(`
-    INSERT INTO recommended (profile_id, type, tmdb_id, imdb_id, title, year, primary_genre, genres, vote_average, affinity, rec_count, because_title, popularity, poster, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO recommended (profile_id, type, tmdb_id, imdb_id, title, year, primary_genre, genres, vote_average, imdb_rating, vote_count, affinity, rec_count, because_title, popularity, poster, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(profile_id, type, tmdb_id) DO UPDATE SET
       affinity = excluded.affinity, rec_count = excluded.rec_count, popularity = excluded.popularity,
       primary_genre = excluded.primary_genre, genres = excluded.genres, vote_average = excluded.vote_average,
+      imdb_rating = excluded.imdb_rating, vote_count = excluded.vote_count,
       because_title = excluded.because_title, title = excluded.title, year = excluded.year, poster = excluded.poster
   `);
   conn.prepare('BEGIN').run();
   try {
     const now = Date.now();
     for (const c of candidates) {
-      stmt.run(profileId, c.type, c.tmdb_id, c.imdb_id || null, c.title, c.year, c.primary_genre || null, c.genres || null, c.vote_average ?? null, c.affinity, c.rec_count, c.because_title || null, c.popularity, c.poster || null, now);
+      stmt.run(profileId, c.type, c.tmdb_id, c.imdb_id || null, c.title, c.year, c.primary_genre || null, c.genres || null, c.vote_average ?? null, c.imdb_rating ?? null, c.vote_count ?? null, c.affinity, c.rec_count, c.because_title || null, c.popularity, c.poster || null, now);
     }
     conn.prepare('COMMIT').run();
   } catch (err) { conn.prepare('ROLLBACK').run(); throw err; }
@@ -234,6 +241,24 @@ function setAgeClassification(profileId, type, tmdbId, age) {
 
 function hardDrop(profileId, type, tmdbId) {
   db.get().prepare('DELETE FROM recommended WHERE profile_id = ? AND type = ? AND tmdb_id = ?').run(profileId, type, String(tmdbId));
+}
+
+// Enforce the vote-count floor as a STORAGE gate (decided 2026-08-27): drop any
+// pool row whose TMDB vote count is confirmed below the profile's floor (movies
+// vs series ⅕, via tmdb.voteFloor). selectStrong keeps new sub-floor titles from
+// being added; this clears ones already stored — e.g. under the old fixed noise
+// gate, or after the floor is raised. A dropped title is NOT a user rejection: it
+// returns naturally on a later build once its vote count climbs past the floor.
+// Rows with an unknown (NULL) vote count are left for a rebuild to re-evaluate.
+function purgeBelowVoteFloor(profileId, filters = {}) {
+  init();
+  const r = db.get().prepare(`
+    DELETE FROM recommended
+    WHERE profile_id = ? AND vote_count IS NOT NULL
+      AND ((type = 'movie'  AND vote_count < ?)
+        OR (type = 'series' AND vote_count < ?))
+  `).run(profileId, tmdb.voteFloor(filters, 'movie'), tmdb.voteFloor(filters, 'series'));
+  return Number(r.changes || 0);
 }
 
 // Age-gate the pool (docs/v6-features F5). Reuses the shipped v5.2 stack:
@@ -307,10 +332,11 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
   if (!seeds.length) return { skipped: true, reason: 'no watched titles to seed from' };
 
   // Fetch recommendations per seed, then keep only the STRONGEST few per title
-  // (vote-count noise gate, TMDB relevance order). This is the matching quality
-  // lever — ~5/title instead of ~20. User-preference filters (rating floor,
-  // excluded genres, recency) are NOT applied here — they run at serve time over
-  // this stored pool, so changing one takes effect with no rebuild.
+  // (top ~5/title in TMDB relevance order) that clear the vote-count floor. The
+  // vote-count floor is the ONE user preference enforced at build — a sub-floor
+  // title must never be stored (see selectStrong). The other preferences (rating
+  // floor, excluded genres, recency) are NOT applied here — they run at serve
+  // time over the stored pool, so changing one takes effect with no rebuild.
   // Progress model: phase A (fetch recs per watched seed) is the first half of
   // the bar; phase B (resolve tt id + poster per stored candidate) is the second
   // half — the slow part. seeds = "shows + movies to scan", as the user sees it.
@@ -324,7 +350,9 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
       try {
         const recs = await tmdb.getRecommendations(tmdbKey, w.type, w.tmdb_id);
         rawFetched += recs.length;
-        recsBySeed.set(key(w.type, w.tmdb_id), selectStrong(recs));
+        // Vote-count floor is a HARD build gate — sub-floor titles never enter the
+        // pool (the user's vote_count_floor; series use ⅕ via tmdb.voteFloor).
+        recsBySeed.set(key(w.type, w.tmdb_id), selectStrong(recs, tmdb.voteFloor(filters, w.type)));
       } catch (err) { log.warn(`[rec] recs for ${w.title} failed: ${err.message}`); }
       seedsDone++;
     }));
@@ -375,11 +403,39 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
     }));
     onProgress(50 + (resolvedDone / (top.length || 1)) * 50, `Resolved ${resolvedDone}/${top.length} recommendations`);
   }
+
+  // Enrich with the IMDb rating — the number shown on the poster badge (RPDB) —
+  // so the serve-time rating floor judges the SAME rating the user sees, not
+  // TMDB's (the two disagree). Batched via MDBList (~50/call, rate-limited).
+  // Requires the profile's MDBList key; absent key or an unrated title leaves
+  // imdb_rating null and the floor falls back to TMDB's vote_average at serve.
+  const mdblistKey = settings.keyFor(profile, 'mdblist_api_key');
+  if (mdblistKey && servable.length) {
+    const mdblist = require('./services/mdblist');
+    let rated = 0;
+    for (const t of ['movie', 'series']) {
+      const ids = servable.filter((c) => c.type === t).map((c) => c.imdb_id);
+      if (!ids.length) continue;
+      try {
+        const ratings = await mdblist.imdbRatings(mdblistKey, t, ids, log);
+        for (const c of servable) {
+          if (c.type !== t) continue;
+          const v = ratings.get(c.imdb_id);
+          if (v != null) { c.imdb_rating = v; rated++; }
+        }
+      } catch (err) { log.warn(`[rec] IMDb-rating enrichment (${t}) failed: ${err.message}`); }
+    }
+    log.log(`[rec] ${profile.name}: IMDb ratings resolved for ${rated}/${servable.length} recommendation(s)`);
+  }
+
   upsertCandidates(profile.id, servable);
+  // Clear any already-stored row now under the vote-count floor (old fixed gate,
+  // or a raised floor). New sub-floor titles were already gated out at selectStrong.
+  const purged = purgeBelowVoteFloor(profile.id, filters);
   setBuiltAt(profile.id);
 
-  log.log(`[rec] ${profile.name}: ${seeds.length} seed(s), ${rawFetched} raw recs → top-${PER_TITLE_CAP}/title → ${candidates.size} unique → ${kept.length} after de-dupe → ${servable.length} servable → stored (total ${countRecommended(profile.id)})`);
-  return { seeds: seeds.length, raw: rawFetched, strong: candidates.size, kept: kept.length, stored: servable.length, total: countRecommended(profile.id) };
+  log.log(`[rec] ${profile.name}: ${seeds.length} seed(s), ${rawFetched} raw recs → top-${PER_TITLE_CAP}/title → ${candidates.size} unique → ${kept.length} after de-dupe → ${servable.length} servable → stored${purged ? `, ${purged} purged below vote floor` : ''} (total ${countRecommended(profile.id)})`);
+  return { seeds: seeds.length, raw: rawFetched, strong: candidates.size, kept: kept.length, stored: servable.length, purged, total: countRecommended(profile.id) };
 }
 
 // ---- build state ----
@@ -451,23 +507,45 @@ function selectServe(rows, filters = {}, { nowYear = new Date().getFullYear(), l
 
   const passed = (rows || []).filter((r) => {
     if (!r.imdb_id) return false;                                             // not servable
-    if (minRating > 0 && r.vote_average > 0 && r.vote_average < minRating) return false; // rating floor (0 = unknown -> kept)
+    // Rating floor: judged against the IMDb rating shown on the poster (via
+    // MDBList) when we have it, falling back to TMDB's rating only for titles
+    // with no IMDb rating. Neither known -> kept ("no rating" isn't "bad").
+    const shownRating = r.imdb_rating > 0 ? r.imdb_rating : (r.vote_average || 0);
+    if (minRating > 0 && shownRating > 0 && shownRating < minRating) return false;
     const genres = (r.genres || '').split(',').filter(Boolean);
     if (genres.some((g) => excluded.has(g))) return false;                    // excluded genre (full list, incl. Anime)
-    if (maxAge > 0 && r.year && r.year < nowYear - maxAge) return false;      // recency
+    // Recency window — MOVIES ONLY. Series run for years from an old first-air
+    // date, so a recency cut-off would wrongly drop still-running shows.
+    if (maxAge > 0 && r.type === 'movie' && r.year && r.year < nowYear - maxAge) return false;
     if (kids) { const m = certMinAge(r.age_classification); if (m !== null && m > judge) return false; } // lowered-limit safety net
     return true;
   });
   return balanceByGenre(passed, limit);
 }
 
+// The user's configured "List size (per catalog)" filter — the number of titles
+// the AI catalogs actually serve. Clamped to the same [5,50] band the portal
+// enforces so a hand-edited profiles.json can't ask for an absurd catalog, and
+// falls back to the shipped default (20) only when unset. Applied at SERVE time
+// like the other user preferences (rating floor, genres, recency), so changing
+// it takes effect immediately with no rebuild.
+const LIST_SIZE_DEFAULT = 20;
+const LIST_SIZE_MIN = 5;
+const LIST_SIZE_MAX = 50;
+function listSizeFor(profile) {
+  const n = parseInt(profile?.filters?.list_size, 10);
+  if (!Number.isFinite(n)) return LIST_SIZE_DEFAULT;
+  return Math.min(LIST_SIZE_MAX, Math.max(LIST_SIZE_MIN, n));
+}
+
 // Build Stremio catalog metas for a profile's AI recommendations of one type.
 // Cache-only + cheap (local writes only, no external calls) — safe for the addon
-// request path. Records one impression per served title (fuels decay).
-function serveRecommendations(profile, type, { limit = SERVE_LIMIT } = {}) {
+// request path. Records one impression per served title (fuels decay). The served
+// count is the profile's list_size filter (an explicit `limit` still overrides).
+function serveRecommendations(profile, type, { limit } = {}) {
   init();
   const rows = getRecommended(profile.id, { type, limit: 100000 });
-  const picked = selectServe(rows, profile.filters || {}, { limit });
+  const picked = selectServe(rows, profile.filters || {}, { limit: limit ?? listSizeFor(profile) });
   recordImpressions(profile.id, picked);
   return picked.map((r) => ({
     id: r.imdb_id,
@@ -589,6 +667,7 @@ module.exports = {
   needsBuild,
   resetRecommendations,
   upsertCandidates,
+  purgeBelowVoteFloor,
   getRecommended,
   countRecommended,
   dontRecommendKeys,
@@ -598,6 +677,7 @@ module.exports = {
   selectServe,
   balanceByGenre,
   certMinAge,
+  listSizeFor,
   serveRecommendations,
   setBuiltAt,
   getBuiltAt,

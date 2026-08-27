@@ -264,22 +264,23 @@ function render(profiles) {
       </div>
 
       <div class="tab-panel" data-tab="filters">
-        <div class="muted" style="margin-bottom:8px;font-size:11px">Rating floor, excluded genres and recency apply at <b>serve time</b> over the stored pool — change one and it takes effect immediately, no rebuild.</div>
+        <div class="muted" style="margin-bottom:8px;font-size:11px">Rating floor, excluded genres, recency and list size apply at <b>serve time</b> over the stored pool — change one and it takes effect immediately, no rebuild. The <b>age limit</b> and <b>minimum vote count</b> are baked in at build, so they apply on the next rebuild.</div>
         <div class="cols">
           <div><label>Minimum rating</label>
             <select data-filter="min_rating">
               ${[0,5,5.5,6,6.5,7,7.5,8,8.5,9].map(v => `<option value="${v}" ${v === p.filters.min_rating ? 'selected' : ''}>${v === 0 ? 'No minimum' : '≥ ' + v.toFixed(1)}</option>`).join('')}
             </select>
-            <div class="muted" style="font-size:11px;margin-top:3px">Applied to the TMDB rating (0–10) at serve time. Unrated titles are kept.</div></div>
+            <div class="muted" style="font-size:11px;margin-top:3px">Applied to the <b>IMDb rating</b> (0–10) — the number shown on the poster — at serve time. Needs an MDBList key (falls back to TMDB's rating without one); unrated titles are kept.</div></div>
           <div><label>Minimum vote count</label>
             <select data-filter="vote_count_floor">
               ${[[0,'No minimum'],[250,'250+'],[500,'500+'],[1000,'1,000+'],[2500,'2,500+'],[5000,'5,000+']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.vote_count_floor ?? 1000) ? 'selected' : ''}>${l}</option>`).join('')}
             </select>
-            <div class="muted" style="font-size:11px;margin-top:3px">Noise gate on TMDB vote counts — a high rating on very few votes is meaningless. Series automatically use ⅕ of this (TV vote counts run far lower).</div></div>
+            <div class="muted" style="font-size:11px;margin-top:3px">Titles with fewer TMDB votes than this are <b>never stored</b> in your recommendations (a high rating on a handful of votes is meaningless) — they can return later if they gain votes. Series use ⅕ of this (TV vote counts run far lower). Enforced when the pool is built, so a change applies on the next rebuild.</div></div>
           <div><label>Released within</label>
             <select data-filter="max_age_years">
               ${[[1,'1 year'],[2,'2 years'],[5,'5 years'],[10,'10 years'],[20,'20 years'],[0,'No limit']].map(([v,l]) => `<option value="${v}" ${v === p.filters.max_age_years ? 'selected' : ''}>${l}</option>`).join('')}
-            </select></div>
+            </select>
+            <div class="muted" style="font-size:11px;margin-top:3px">*Applied to movies only — a recency cut-off would wrongly drop long-running series.</div></div>
           <div><label>List size (per catalog)</label>
             <select data-filter="list_size">
               ${[10,15,20,25,30,40].map(v => `<option value="${v}" ${v === p.filters.list_size ? 'selected' : ''}>${v} titles</option>`).join('')}
@@ -302,7 +303,7 @@ function render(profiles) {
           ${GENRES.map(g => `<label><input type="checkbox" value="${esc(g)}" ${p.filters.excluded_genres.includes(g) ? 'checked' : ''}>${esc(g)}</label>`).join('')}
         </div>
         <div style="margin-top:10px"><button onclick="saveFilters('${p.id}')">Save filters</button>
-        <span class="muted"> — applies on next rebuild (or hit Rebuild now)</span></div>
+        <span class="muted"> — rating, genres, recency &amp; list size apply immediately; the age limit &amp; minimum vote count apply on the next rebuild (or hit Rebuild now)</span></div>
       </div>
 
       <div class="tab-panel" data-tab="catalogs">
