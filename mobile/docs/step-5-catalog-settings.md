@@ -44,15 +44,21 @@ whole pool (18) and persists. `GET /mobile/api/settings` never returns
 | `items` | the visible `display_count` titles **plus** a hidden on-deck bench (catalog view) |
 | `display_count` | how many the phone shows = the profile's `list_size` |
 
-- **catalog:** `selectServe(pool, filters, { limit: list_size + CATALOG_BENCH })`,
-  watched-pruned like the addon. Because `balanceByGenre` makes `selectServe(N)` a
-  strict **prefix** of `selectServe(N+k)`, the first `list_size` rows **are** the
-  Stremio row; the rest are the promotion buffer. `selectServe` (not
-  `serveRecommendations`) is used deliberately — no impression recording, so
-  browsing the phone doesn't fuel decay.
-- **all:** the whole pool, passed through `passesAgeBand` so an age-limited
-  profile still sees only vetted titles (adult → always true). No genre-balance,
-  no size cap — the honest full set.
+Both views run the **same** `selectServe` pipeline (the identical filters +
+genre-balance Stremio serves), watched-pruned, differing only in the size cap —
+so the catalog is **always the exact first `display_count` of the entire list**
+(one order, one filter set; they can't disagree). `selectServe` (not
+`serveRecommendations`) is used deliberately — no impression recording, so
+browsing the phone doesn't fuel decay.
+
+- **catalog:** `selectServe(pool, filters, { limit: list_size + CATALOG_BENCH })`.
+  Because `balanceByGenre` makes `selectServe(N)` a strict **prefix** of
+  `selectServe(N+k)`, the first `list_size` rows **are** the Stremio row; the rest
+  are the promotion buffer.
+- **all:** `selectServe(pool, filters, { limit: pool.length })` — the whole ranked
+  list in the same served order, the catalog's superset. (Entire-list order:
+  confirmed with James 2026-08-28 — keep genre-balancing, so the full list is the
+  balanced served order, not raw affinity; the catalog is its first N.)
 
 ### One in, one out (client, `app.js`)
 
@@ -63,26 +69,41 @@ bench); when the bench is spent, `refillBench` refetches. Undo unshifts the titl
 back and re-renders (a promoted bench title slides back down). Stremio back-fills
 on its own next fetch — the client-cache lag is inherent and unchanged.
 
-### Settings cog (`⚙`, between the profile name and Log out)
+### Settings cog (`⚙`, between the profile name and Log out) — two tabs
 
-- `GET /mobile/api/settings` → `{ filters, catalog_only, genres }` — the five
-  editable filters (`min_rating`, `vote_count_floor`, `max_age_years`,
-  `excluded_genres`, `list_size`), never `age_limit`.
-- `POST /mobile/api/settings` → strict whitelist of those five + `catalog_only`,
-  routed through `config.updateProfile` (which validates/clamps). `age_limit` is
-  dropped even if a crafted body includes it. Serve-time filters apply on the next
-  fetch; `vote_count_floor` applies on the next rebuild (as in the portal). Saving
-  marks the recs tab dirty so it refetches with the new filters/view.
-- The `companion` prefs object is **separate from `filters`** (config.js) so a
-  view toggle can never leak into recommendation logic.
+The settings screen has two sub-tabs: **Filters** (default) and **Catalogs**.
 
-## Tests (`mobile/test/mobile.smoke.js`, `+9 unit / +2 http`)
+- `GET /mobile/api/settings` → `{ filters, catalog_only, genres, catalogs }`.
+  `filters` is the five editable filters (`min_rating`, `vote_count_floor`,
+  `max_age_years`, `excluded_genres`, `list_size`) — **never** `age_limit`.
+  `catalogs` is the profile's **age-appropriate** extra catalogs (each `{ id,
+  name, type, enabled, source, min_imdb, target, dedupe_watched,
+  requirement_met }`), filtered by `catalogs.ageAppropriate` exactly like the
+  Stremio manifest — so the age limit shapes the list without ever being exposed.
+- `POST /mobile/api/settings` → strict whitelist: the five filters + `catalog_only`
+  + `catalogs` (only **age-appropriate** ids are accepted — a crafted body can
+  neither reach `age_limit` nor enable a catalog the profile may not see). Routed
+  through `config.updateProfile`. Serve-time filters + catalog toggles apply on
+  the next fetch/manifest; `vote_count_floor` applies on the next rebuild. Saving
+  filters marks the recs tab dirty so it refetches.
+- **Filters tab:** the five filter controls + the "Only my catalog items" toggle
+  (the `companion` view pref, kept **separate from `filters`** in config.js).
+- **Catalogs tab:** the two AI lists shown locked/always-on, then the extra
+  catalogs as toggles (Watch Later, Popular, the curated genre lists, Kids, Anime
+  TV-14…), mirroring the portal's Catalogs section. A live warning flags an
+  enabled catalog whose data source (Simkl / MDBList) isn't ready. Age-band notes
+  are omitted from the meta line — the Companion never surfaces age.
+
+## Tests (`mobile/test/mobile.smoke.js`)
 
 `passesAgeBand` bands; catalog view == Stremio prefix with `display_count =
 list_size` + a bench; entire-list view = whole pool (adult) / age-band-filtered
 (kids); default view follows `catalog_only` with `?view` override; one-in-one-out
 promotion at the data layer; `toCompanionFilters`/GET/POST never expose or write
-`age_limit`; POST of only forbidden keys → 400.
+`age_limit`; POST of only forbidden keys → 400. **Catalogs:** GET lists the
+age-appropriate extras with `enabled`/`requirement_met`; the list is age-filtered
+(a 13+ catalog is hidden from an 8+ profile, shown to adults); POST persists
+toggles and refuses an over-band toggle.
 
 ## Acceptance criteria
 
@@ -90,6 +111,8 @@ promotion at the data layer; `toCompanionFilters`/GET/POST never expose or write
   (`list_size` titles), or the whole pool when "Only my catalog items" is off.
 - Removing a title promotes the next bench title with no rebuild; the list holds
   its size; a mis-remove is undoable.
-- The settings cog edits the backend filters and the view pref; the age gate is
-  never shown, returned, or writable through the phone.
+- The settings cog opens two tabs — Filters (default) and Catalogs. Filters edits
+  the backend filters + view pref; Catalogs toggles the extra catalogs. The age
+  gate is never shown, returned, or writable through the phone, and the Catalogs
+  list is age-appropriate to the profile.
 - An age-limited profile's "entire list" stays vetted-only.

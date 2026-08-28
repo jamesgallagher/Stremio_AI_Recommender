@@ -3,6 +3,7 @@
 // client-supplied profile id — that's the isolation guarantee.
 const settings = require('../../src/settings');
 const config = require('../../src/config');
+const catalogs = require('../../src/catalogs');
 const tmdb = require('../../src/services/tmdb');
 const simkl = require('../../src/services/simkl');
 const recommendationStore = require('../../src/recommendationStore');
@@ -106,8 +107,12 @@ function toRecDTO(row) {
 // hidden on-deck bench for instant one-in-one-out promotion. `display_count` is
 // how many the phone actually shows (the profile's list_size); rows beyond that
 // are the bench.
-// view=all: the whole recommendation pool ("entire recommendations list"),
-// age-band-filtered for an age-limited profile so it stays vetted-only.
+// view=all: the whole ranked recommendation list ("entire recommendations list").
+//
+// BOTH views run the SAME pipeline — selectServe (the identical filters + genre
+// balance Stremio serves), watched-pruned — differing only in the size cap. That
+// guarantees the catalog is ALWAYS the exact first `display_count` of the entire
+// list (they share one order and one filter set), so the two never disagree.
 function recommendationsHandler(req, res) {
   const type = TYPES.includes(req.query && req.query.type) ? req.query.type : 'movie';
   const profile = req.profile;
@@ -119,26 +124,19 @@ function recommendationsHandler(req, res) {
   const view = (requested === 'catalog' || requested === 'all') ? requested : (catalogOnly ? 'catalog' : 'all');
 
   const rows = recommendationStore.getRecommended(profile.id, { type, limit: POOL_LIMIT });
-
-  if (view === 'all') {
-    // Entire pool, vetted-only for an age-limited profile (adult: passesAgeBand
-    // is always true). No genre-balance, no size cap — the honest full set.
-    const items = rows
-      .filter((r) => recommendationStore.passesAgeBand(r, filters))
-      .map(toRecDTO).filter((r) => r && r.id);
-    return res.json({ type, view, items, display_count: items.length });
-  }
-
-  // Catalog view: the served selection (+ bench), watched-pruned like the addon
-  // does (the pool excludes watched at build; this catches titles watched since)
-  // so the phone mirrors the Stremio row exactly.
   const displayCount = recommendationStore.listSizeFor(profile);
-  const picked = recommendationStore.selectServe(rows, filters, { limit: displayCount + CATALOG_BENCH });
+  // Catalog fetches list_size + a promotion bench; the entire-list view fetches
+  // the whole ranked pool. selectServe(N) is a strict prefix of selectServe(∞),
+  // so the catalog is exactly the first `display_count` of the entire list.
+  const limit = view === 'all' ? rows.length : displayCount + CATALOG_BENCH;
+  const picked = recommendationStore.selectServe(rows, filters, { limit });
+  // Watched-prune like the addon does (the pool excludes watched at build; this
+  // catches titles watched since) so the phone mirrors the Stremio row exactly.
   const watchedImdb = watchedStore.watchedIdSets(profile.id).imdb;
   const items = picked
     .filter((r) => !watchedImdb.has(r.imdb_id))
     .map(toRecDTO).filter((r) => r && r.id);
-  res.json({ type, view, items, display_count: displayCount });
+  res.json({ type, view, items, display_count: view === 'all' ? items.length : displayCount });
 }
 
 // POST /api/recommend/suppress  { type, tmdb_id?, imdb_id?, title? }  (swipe-right)
@@ -177,22 +175,52 @@ function toCompanionFilters(f = {}) {
 }
 const catalogOnlyOf = (profile) => (profile.companion ? profile.companion.catalog_only !== false : true);
 
-// GET /api/settings — the editable filter set + genre options + view pref.
-// Deliberately omits filters.age_limit (see COMPANION_FILTERS): the age gate is
-// never shown or accessible through the Companion.
-function settingsGetHandler(req, res) {
-  res.json({
-    filters: toCompanionFilters(req.profile.filters || {}),
-    catalog_only: catalogOnlyOf(req.profile),
-    genres: Object.keys(tmdb.GENRE_ALIASES).sort(),
-  });
+// The extra catalogs this profile may see (Catalogs tab). Age-appropriateness
+// uses the profile's age limit WITHOUT exposing it — the same filtering the
+// Stremio manifest applies (catalogs.ageAppropriate), so a kids profile never
+// sees an over-band catalog. `requirement_met` flags whether the list's data
+// source (Simkl / MDBList) is ready. Exported for tests.
+function companionCatalogs(profile) {
+  return catalogs.EXTRA_CATALOGS
+    .filter((def) => catalogs.ageAppropriate(profile, def))
+    .map((def) => ({
+      id: def.id,
+      name: def.name,
+      type: def.type,
+      enabled: catalogs.isEnabled(profile, def),
+      source: def.source,
+      min_imdb: def.min_imdb || 0,
+      target: def.target || 20,
+      dedupe_watched: def.dedupe_watched !== false,
+      requirement_met: catalogs.requirementMet(profile, def),
+    }));
 }
 
-// POST /api/settings — write the editable filters + view pref. STRICT whitelist:
-// only COMPANION_FILTERS + catalog_only are ever forwarded to updateProfile, so
-// a crafted body can never reach the age gate (age_limit is dropped even if
-// present). Serve-time filters take effect on the next fetch; vote_count_floor
-// applies on the next rebuild (same as the portal).
+// The full Companion settings payload — Filters tab (editable filters + view
+// pref + genre options) and Catalogs tab (age-appropriate extra catalogs). Never
+// includes the age gate. Exported for tests.
+function companionSettings(profile) {
+  return {
+    filters: toCompanionFilters(profile.filters || {}),
+    catalog_only: catalogOnlyOf(profile),
+    genres: Object.keys(tmdb.GENRE_ALIASES).sort(),
+    catalogs: companionCatalogs(profile),
+  };
+}
+
+// GET /api/settings — Filters + Catalogs for the two settings tabs. Deliberately
+// omits filters.age_limit (see COMPANION_FILTERS): the age gate is never shown or
+// accessible through the Companion.
+function settingsGetHandler(req, res) {
+  res.json(companionSettings(req.profile));
+}
+
+// POST /api/settings — write the editable filters + view pref + catalog toggles.
+// STRICT whitelist: only COMPANION_FILTERS + catalog_only + age-appropriate
+// catalog ids are ever forwarded to updateProfile, so a crafted body can never
+// reach the age gate (age_limit dropped even if present) nor enable a catalog the
+// profile isn't allowed to see. Serve-time filters + catalog toggles take effect
+// on the next fetch/manifest; vote_count_floor applies on the next rebuild.
 function settingsPostHandler(req, res) {
   const b = req.body || {};
   const patch = {};
@@ -200,7 +228,14 @@ function settingsPostHandler(req, res) {
   for (const k of COMPANION_FILTERS) if (b[k] !== undefined) filterPatch[k] = b[k];
   if (Object.keys(filterPatch).length) patch.filters = filterPatch; // age_limit can never be a key here
   if (b.catalog_only !== undefined) patch.companion = { catalog_only: !!b.catalog_only };
-  if (!patch.filters && !patch.companion) return res.status(400).json({ error: 'Nothing to update' });
+  if (b.catalogs && typeof b.catalogs === 'object') {
+    // Accept toggles ONLY for catalogs this profile may see (age-appropriate).
+    const allowed = new Set(catalogs.EXTRA_CATALOGS.filter((d) => catalogs.ageAppropriate(req.profile, d)).map((d) => d.id));
+    const cat = {};
+    for (const [id, on] of Object.entries(b.catalogs)) if (allowed.has(id)) cat[id] = !!on;
+    if (Object.keys(cat).length) patch.catalogs = cat;
+  }
+  if (!patch.filters && !patch.companion && !patch.catalogs) return res.status(400).json({ error: 'Nothing to update' });
 
   let updated;
   try {
@@ -209,12 +244,12 @@ function settingsPostHandler(req, res) {
     return res.status(423).json({ error: `Could not save — ${err.message}` });
   }
   if (!updated) return res.status(404).json({ error: 'Profile not found' });
-  res.json({ ok: true, filters: toCompanionFilters(updated.filters || {}), catalog_only: catalogOnlyOf(updated) });
+  res.json({ ok: true, ...companionSettings(updated) });
 }
 
 module.exports = {
   toTitleDTO, searchHandler, watchlistHandler,
   toRecDTO, recommendationsHandler, suppressHandler, unsuppressHandler,
-  toCompanionFilters, settingsGetHandler, settingsPostHandler,
+  toCompanionFilters, companionCatalogs, companionSettings, settingsGetHandler, settingsPostHandler,
   TYPES, COMPANION_FILTERS, SEARCH_LIMIT, SEARCH_LIMIT_MAX,
 };

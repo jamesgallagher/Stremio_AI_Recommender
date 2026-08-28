@@ -93,8 +93,13 @@
           <h1>Settings</h1>
           <button id="settings-done" class="ghost" type="button">Done</button>
         </div>
+        <div class="segmented settings-tabs" id="settings-tabs" role="tablist" aria-label="Settings section">
+          <button class="seg active" data-settab="filters" role="tab">Filters</button>
+          <button class="seg" data-settab="catalogs" role="tab">Catalogs</button>
+        </div>
         <p id="settings-msg" class="msg" role="status" aria-live="polite"></p>
 
+        <div class="settab" data-settab="filters">
         <div class="card stack">
           <div class="field">
             <label for="set-min-rating">Minimum rating</label>
@@ -163,6 +168,16 @@
         </div>
 
         <button id="settings-save" class="block" type="button" style="margin-top:14px">Save changes</button>
+        </div>
+
+        <div class="settab" data-settab="catalogs" hidden>
+          <div class="card">
+            <p class="sub" style="margin-bottom:10px">Your two AI lists are always on. Toggle the extra catalogs that show up in Stremio.</p>
+            <div id="set-catalogs" class="cats"></div>
+            <p id="set-catalogs-warn" class="msg"></p>
+          </div>
+          <button id="catalogs-save" class="block" type="button" style="margin-top:14px">Save catalogs</button>
+        </div>
       </section>
     </main>
   </div>

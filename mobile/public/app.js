@@ -393,14 +393,23 @@
     renderActive();
   }));
 
-  // ---- settings (Step 5) ----
+  // ---- settings (Step 5/6): Filters + Catalogs tabs ----
+  const settingsState = { catalogs: [] };
   const setEls = {
+    tabs: document.querySelectorAll('#settings-tabs .seg'),
     msg: $('settings-msg'),
     minRating: $('set-min-rating'), recency: $('set-recency'), listSize: $('set-list-size'),
     voteFloor: $('set-vote-floor'), genres: $('set-genres'), catalogOnly: $('set-catalog-only'),
     save: $('settings-save'), done: $('settings-done'),
+    catalogs: $('set-catalogs'), catalogsWarn: $('set-catalogs-warn'), catalogsSave: $('catalogs-save'),
   };
   const setSettingsMsg = (t, kind) => { setEls.msg.textContent = t || ''; setEls.msg.className = 'msg' + (kind ? ' ' + kind : ''); };
+
+  function switchSettingsTab(tab) {
+    setEls.tabs.forEach((s) => s.classList.toggle('active', s.dataset.settab === tab));
+    document.querySelectorAll('#view-settings .settab').forEach((p) => { p.hidden = p.dataset.settab !== tab; });
+    setSettingsMsg('');
+  }
 
   // Set a <select> to a value, falling back to its first option if the value
   // isn't one of the presets (e.g. a hand-edited profile).
@@ -423,7 +432,59 @@
     setEls.genres.appendChild(frag);
   }
 
+  // Compact meta line under a catalog name (type · source · IMDb floor · size).
+  // Age-band notes are intentionally omitted — the Companion never surfaces age.
+  function catMeta(c) {
+    const bits = [c.type === 'series' ? 'series' : 'movies'];
+    if (c.source === 'simkl_plantowatch') bits.push('Simkl plan-to-watch');
+    if (c.min_imdb) bits.push('IMDb ≥ ' + c.min_imdb);
+    if (c.target && c.target !== 20) bits.push(c.target + ' titles');
+    if (c.dedupe_watched === false) bits.push('keeps watched');
+    return bits.join(' · ');
+  }
+
+  function catRow(name, meta, { id, checked, locked } = {}) {
+    const label = document.createElement('label'); label.className = 'cat-row' + (locked ? ' locked' : '');
+    const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = !!checked;
+    if (locked) cb.disabled = true; else cb.dataset.catalog = id;
+    if (!locked) cb.addEventListener('change', updateCatalogWarning);
+    const nm = document.createElement('span'); nm.className = 'cat-name'; nm.textContent = name;
+    const mt = document.createElement('span'); mt.className = 'cat-meta'; mt.textContent = meta;
+    label.appendChild(cb); label.appendChild(nm); label.appendChild(mt);
+    return label;
+  }
+
+  function renderCatalogs(cats) {
+    settingsState.catalogs = cats || [];
+    setEls.catalogs.innerHTML = '';
+    const frag = document.createDocumentFragment();
+    // The two AI lists are always on (locked).
+    frag.appendChild(catRow('Movies recommended for you', 'always on', { checked: true, locked: true }));
+    frag.appendChild(catRow('Series recommended for you', 'always on', { checked: true, locked: true }));
+    settingsState.catalogs.forEach((c) => frag.appendChild(catRow(c.name, catMeta(c), { id: c.id, checked: c.enabled })));
+    setEls.catalogs.appendChild(frag);
+    updateCatalogWarning();
+  }
+
+  // Warn (like the portal) when an ENABLED catalog can't build for lack of its
+  // data source. Recomputed live as toggles change.
+  function updateCatalogWarning() {
+    const byId = new Map(settingsState.catalogs.map((c) => [c.id, c]));
+    let needsSimkl = false; let needsMdblist = false;
+    setEls.catalogs.querySelectorAll('input[data-catalog]:checked').forEach((cb) => {
+      const c = byId.get(cb.dataset.catalog);
+      if (!c || c.requirement_met) return;
+      if (c.source === 'simkl_plantowatch') needsSimkl = true; else needsMdblist = true;
+    });
+    const msgs = [];
+    if (needsSimkl) msgs.push('Watch Later needs Simkl connected');
+    if (needsMdblist) msgs.push('Curated lists need an MDBList key');
+    setEls.catalogsWarn.textContent = msgs.length ? '⚠ ' + msgs.join(' · ') + ' (set in the portal)' : '';
+    setEls.catalogsWarn.className = 'msg' + (msgs.length ? ' err' : '');
+  }
+
   async function loadSettings() {
+    switchSettingsTab('filters'); // Filters is the default tab on every entry
     setSettingsMsg('Loading…');
     try {
       const res = await apiFetch('/settings');
@@ -436,6 +497,7 @@
       setSelect(setEls.voteFloor, f.vote_count_floor != null ? f.vote_count_floor : 1000);
       setEls.catalogOnly.checked = data.catalog_only !== false;
       renderGenres(data.genres, f.excluded_genres);
+      renderCatalogs(data.catalogs);
       setSettingsMsg('');
     } catch { setSettingsMsg('Could not load settings — try again.', 'err'); }
   }
@@ -460,7 +522,23 @@
     finally { setEls.save.disabled = false; }
   }
 
+  async function saveCatalogs() {
+    setEls.catalogsSave.disabled = true; setSettingsMsg('Saving…');
+    const catalogs = {};
+    setEls.catalogs.querySelectorAll('input[data-catalog]').forEach((cb) => { catalogs[cb.dataset.catalog] = cb.checked; });
+    try {
+      const res = await apiFetch('/settings', { method: 'POST', body: JSON.stringify({ catalogs }) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { setSettingsMsg(data.error || 'Could not save — try again.', 'err'); return; }
+      setSettingsMsg('Catalogs saved — newly enabled lists build in the background.', 'ok');
+      if (Array.isArray(data.catalogs)) renderCatalogs(data.catalogs);
+    } catch { setSettingsMsg('Could not save — try again.', 'err'); }
+    finally { setEls.catalogsSave.disabled = false; }
+  }
+
+  setEls.tabs.forEach((seg) => seg.addEventListener('click', () => switchSettingsTab(seg.dataset.settab)));
   setEls.save.addEventListener('click', saveSettings);
+  setEls.catalogsSave.addEventListener('click', saveCatalogs);
   setEls.done.addEventListener('click', () => { location.hash = '#/recs'; });
   els.openSettings.addEventListener('click', () => { location.hash = '#/settings'; });
 

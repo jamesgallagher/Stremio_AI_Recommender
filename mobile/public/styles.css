@@ -198,6 +198,17 @@ select {
 select:focus { border-color: var(--accent); }
 .settings-head { display: flex; align-items: center; justify-content: space-between; margin: 12px 0 4px; }
 .settings-head h1 { margin: 0; }
+/* Settings sub-tabs (Filters / Catalogs) — full-width segmented control. */
+.settings-tabs { display: flex; width: 100%; margin: 4px 0 8px; }
+.settings-tabs .seg { flex: 1; }
+/* Extra-catalog toggle list (Catalogs tab). */
+.cats { display: flex; flex-direction: column; gap: 8px; }
+.cat-row { display: flex; align-items: center; gap: 10px; margin: 0; font-size: 14px; color: var(--text);
+  min-height: 44px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 10px; cursor: pointer; }
+.cat-row input { width: 20px; height: 20px; min-width: 20px; accent-color: var(--accent); }
+.cat-row.locked { opacity: .6; cursor: default; }
+.cat-name { font-weight: 600; }
+.cat-meta { color: var(--muted); font-size: 11px; margin-left: auto; text-align: right; }
 .field { margin-top: 4px; }
 .field + .field { margin-top: 12px; }
 .field > label { margin-top: 0; }

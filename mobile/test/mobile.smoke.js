@@ -550,6 +550,27 @@ async function unitTests() {
     recommendationStore.deleteForProfile(pid);
   });
 
+  await ok('recs: catalog is the exact first display_count of the entire list (genre-balanced, not raw affinity)', () => {
+    const pid = 'rec6-consistent-' + Date.now();
+    // A GENRE CLUSTER: the three strongest titles are all Action. Pure affinity
+    // would list A1,A2,A3 first; genre-balancing interleaves other genres, so the
+    // two orders genuinely differ — the case the sort-order bug was about.
+    const mk = (t, title, aff, genre) => mkCand({ tmdb_id: t, imdb_id: 'tt7' + t, title, affinity: aff, primary_genre: genre, genres: genre });
+    recommendationStore.upsertCandidates(pid, [
+      mk('700', 'A1', 12, 'Action'), mk('701', 'A2', 11, 'Action'), mk('702', 'A3', 10, 'Action'),
+      mk('703', 'D1', 9, 'Drama'), mk('704', 'D2', 8, 'Drama'), mk('705', 'C1', 7, 'Comedy'),
+    ]);
+    const profile = { id: pid, filters: { list_size: 5 }, companion: { catalog_only: true } };
+    const catRes = fakeRes(); handlers.recommendationsHandler({ query: { type: 'movie', view: 'catalog' }, profile }, catRes);
+    const allRes = fakeRes(); handlers.recommendationsHandler({ query: { type: 'movie', view: 'all' }, profile }, allRes);
+    const catalog = catRes.body.items.slice(0, catRes.body.display_count).map((r) => r.title);
+    const allTitles = allRes.body.items.map((r) => r.title);
+    assert.deepStrictEqual(catalog, allTitles.slice(0, catRes.body.display_count)); // catalog == first N of the entire list
+    assert.ok(allRes.body.items.length > catalog.length, 'entire list is a superset of the catalog');
+    assert.strictEqual(catalog[1], 'D1', 'genre-balanced (a Drama at #2, not the affinity-#2 Action)'); // proves balancing is active
+    recommendationStore.deleteForProfile(pid);
+  });
+
   await ok('recs: default view follows companion.catalog_only; explicit ?view overrides it', () => {
     const pid = 'rec5-pref-' + Date.now();
     recommendationStore.upsertCandidates(pid, [mkCand({ tmdb_id: '301', imdb_id: 'tt301', title: 'P' })]);
@@ -623,6 +644,39 @@ async function unitTests() {
     const res = fakeRes();
     handlers.settingsPostHandler({ profile: config.getProfile(p.id), body: { age_limit: 0, foo: 'bar' } }, res);
     assert.strictEqual(res.statusCode, 400);
+  });
+
+  await ok('catalogs: GET lists age-appropriate extra catalogs with enabled + requirement flags', () => {
+    const p = config.addProfile('CatGet');
+    const res = fakeRes();
+    handlers.settingsGetHandler({ profile: config.getProfile(p.id) }, res);
+    assert.ok(Array.isArray(res.body.catalogs) && res.body.catalogs.length > 0);
+    const wl = res.body.catalogs.find((c) => c.id === 'trakt-watchlist-movies');
+    assert.ok(wl && wl.name === 'Watch Later' && wl.enabled === true); // default_on
+    const pop = res.body.catalogs.find((c) => c.id === 'mdb-popular-movies');
+    assert.ok(pop && pop.enabled === false && typeof pop.requirement_met === 'boolean');
+  });
+
+  await ok('catalogs: list is age-filtered — 13+ catalog hidden for a kids profile, shown for adults', () => {
+    const kid = config.addProfile('CatKid'); config.updateProfile(kid.id, { filters: { age_limit: 8 } });
+    const adult = config.addProfile('CatAdult');
+    const hasAnime = (prof) => { const r = fakeRes(); handlers.settingsGetHandler({ profile: config.getProfile(prof.id) }, r); return r.body.catalogs.some((c) => c.id === 'trakt-anime-teen-series'); };
+    assert.strictEqual(hasAnime(kid), false);  // Anime TV-14 (13+) hidden from an 8+ profile
+    assert.strictEqual(hasAnime(adult), true);  // shown to an adult
+  });
+
+  await ok('catalogs: POST persists toggles; an over-band toggle is refused (age-appropriate only)', () => {
+    const kid = config.addProfile('CatSave'); config.updateProfile(kid.id, { filters: { age_limit: 8 } });
+    const res = fakeRes();
+    handlers.settingsPostHandler({
+      profile: config.getProfile(kid.id),
+      body: { catalogs: { 'mdb-popular-movies': true, 'trakt-anime-teen-series': true } }, // anime = 13+, must be refused
+    }, res);
+    assert.strictEqual(res.body.ok, true);
+    const after = config.getProfile(kid.id);
+    assert.strictEqual(after.catalogs['mdb-popular-movies'], true);            // allowed toggle written
+    assert.strictEqual(after.catalogs['trakt-anime-teen-series'], undefined);  // over-band toggle dropped
+    assert.strictEqual(after.filters.age_limit, 8, 'age gate untouched by catalog save');
   });
 }
 
@@ -872,6 +926,19 @@ async function httpTests() {
     const recBody = await (await fetch(`${BASE}/mobile/api/recommendations?type=movie`, { headers: { Cookie: cookie } })).json();
     assert.strictEqual(recBody.view, 'all');
     console.log('  ✓ recs: default view follows the saved catalog_only pref over HTTP');
+
+    // Catalogs tab: GET is age-filtered (this is the age_limit-8 profile from
+    // above), POST persists a toggle.
+    const getBody2 = await (await fetch(`${BASE}/mobile/api/settings`, { headers: { Cookie: cookie } })).json();
+    assert.ok(Array.isArray(getBody2.catalogs) && getBody2.catalogs.length > 0);
+    assert.ok(!getBody2.catalogs.some((c) => c.id === 'trakt-anime-teen-series'), 'kids profile hides the 13+ catalog');
+    const catPost = await fetch(`${BASE}/mobile/api/settings`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ catalogs: { 'mdb-popular-movies': true } }),
+    });
+    assert.strictEqual(catPost.status, 200);
+    assert.strictEqual(config.getProfile(p.id).catalogs['mdb-popular-movies'], true);
+    console.log('  ✓ catalogs: GET age-filtered; POST persists a toggle over HTTP');
   }
 
   console.log(`\nAll mobile checks passed (${passed} unit + http).`);
