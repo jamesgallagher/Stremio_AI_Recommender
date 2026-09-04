@@ -245,8 +245,11 @@ async function testRpdb(profile) {
 }
 
 async function testMdblist(profile) {
-  const key = profile.keys.mdblist_api_key;
-  if (!key) return { ok: false, error: 'MDBList key not set — required (extra catalogs + Common Sense age checks)' };
+  // Test the EFFECTIVE key (global Server-Config key first, per-profile only as a
+  // legacy fallback) — the same resolution enrichment/serve use via keyFor — so a
+  // passing test reflects what actually runs, not a stray per-profile field.
+  const key = settings.keyFor(profile, 'mdblist_api_key');
+  if (!key) return { ok: false, error: 'MDBList key not set — required (rating floor, extra catalogs + Common Sense age checks)' };
   try {
     const r = await mdblistService.testKey(key);
     return { ok: true, detail: `MDBList key valid (sample Common Sense lookup: ${r.sampleAge ? r.sampleAge + '+' : 'not rated'})` };

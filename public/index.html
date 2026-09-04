@@ -270,7 +270,8 @@ function render(profiles) {
             <select data-filter="min_rating">
               ${[0,5,5.5,6,6.5,7,7.5,8,8.5,9].map(v => `<option value="${v}" ${v === p.filters.min_rating ? 'selected' : ''}>${v === 0 ? 'No minimum' : '≥ ' + v.toFixed(1)}</option>`).join('')}
             </select>
-            <div class="muted" style="font-size:11px;margin-top:3px">Applied to the <b>IMDb rating</b> (0–10) — the number shown on the poster — at serve time. Needs an MDBList key (falls back to TMDB's rating without one); unrated titles are kept.</div></div>
+            <div class="muted" style="font-size:11px;margin-top:3px">Applied to the <b>IMDb rating</b> (0–10) — the number shown on the poster — at serve time. Needs an MDBList key (falls back to TMDB's rating without one); unrated titles are kept.</div>
+            ${p.filters.min_rating > 0 && !p.keys_set.mdblist_api_key ? '<div style="color:var(--err);font-size:12px;margin-top:4px">⚠ A rating floor is set but no MDBList key — the floor uses the <b>TMDB</b> rating as a fallback, not the IMDb number on the poster, so lower-rated titles can slip through. Add an MDBList key in Server Config.</div>' : ''}</div>
           <div><label>Minimum vote count</label>
             <select data-filter="vote_count_floor">
               ${[[0,'No minimum'],[250,'250+'],[500,'500+'],[1000,'1,000+'],[2500,'2,500+'],[5000,'5,000+']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.vote_count_floor ?? 1000) ? 'selected' : ''}>${l}</option>`).join('')}

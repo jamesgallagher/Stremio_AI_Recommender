@@ -1026,6 +1026,46 @@ async function httpTests() {
   // key set it explicitly).
   require('../src/settings').updateSettings({ keys: { tmdb_api_key: '', mdblist_api_key: '', rpdb_api_key: '' } });
 
+  // refreshStaleRatings (v6.38): the fix for titles that slip past the rating
+  // floor. Orphan pool rows the candidate build never re-enriches (stored while
+  // unrated on MDBList) keep a NULL rating and leak via the TMDB fallback; this
+  // heals them — chasing NULL ratings, refreshing known ones, and leaving rows
+  // just checked alone. Uses an injected fetcher, so no MDBList network.
+  {
+    const rs = require('../src/recommendationStore');
+    const q = { log() {}, warn() {} };
+    const pid = 'rating-refresh';
+    const day = 24 * 3600e3;
+    const now = 1_000_000 * day; // fixed clock
+    const mk = (id, over) => ({ type: 'movie', tmdb_id: id, imdb_id: 'tt' + id, title: id, year: 2025, primary_genre: 'Drama', genres: 'Drama', vote_average: 7, vote_count: 5000, affinity: 1, rec_count: 1, popularity: 1, poster: null, ...over });
+    // Three rows land unenriched (imdb_rating_at NULL) as a no-key build would;
+    // a fourth was just checked and must be left untouched.
+    rs.upsertCandidates(pid, [mk('afterburn'), mk('stowaway'), mk('series1', { type: 'series' })], { ratingCheckedAt: null });
+    rs.upsertCandidates(pid, [mk('fresh', { imdb_rating: 8.1 })], { ratingCheckedAt: now });
+    const answers = {
+      movie: new Map([['ttafterburn', 4.6], ['ttstowaway', 5.7], ['ttfresh', 8.1]]),
+      series: new Map([['ttseries1', 8.4]]),
+    };
+    const seen = { movie: null, series: null };
+    const r1 = await rs.refreshStaleRatings(pid, 'fake-key', q, {
+      now, fetchRatings: async (type, ids) => { seen[type] = ids.slice(); return answers[type]; },
+    });
+    assert.strictEqual(r1.updated, 3);                     // afterburn + stowaway + series1
+    assert.ok(!seen.movie.includes('ttfresh'));            // freshly-checked row not re-queried
+    const byId = Object.fromEntries(rs.getRecommended(pid, { limit: 100 }).map((x) => [x.imdb_id, x]));
+    assert.strictEqual(byId.ttafterburn.imdb_rating, 4.6); // now carries the real below-floor number
+    assert.strictEqual(byId.ttseries1.imdb_rating, 8.4);
+    // With the real ratings in place, a ≥6 floor now drops the two low movies.
+    const served = rs.selectServe(rs.getRecommended(pid, { limit: 100 }), { min_rating: 6 }, { nowYear: 2026 }).map((x) => x.imdb_id).sort();
+    assert.deepStrictEqual(served, ['ttfresh', 'ttseries1']);
+    // Re-running immediately checks nothing (all stamped within the window)…
+    const r2 = await rs.refreshStaleRatings(pid, 'fake-key', q, { now: now + 1, fetchRatings: async () => { throw new Error('should not fetch'); } });
+    assert.strictEqual(r2.checked, 0);
+    // …and with no key it's a no-op even when rows are due.
+    assert.deepStrictEqual(await rs.refreshStaleRatings(pid, '', q), { checked: 0, updated: 0 });
+    console.log('  ✓ refreshStaleRatings heals NULL/stale ratings, skips fresh rows, no-ops without a key');
+  }
+
   // Job queue: runs ONE AT A TIME (FIFO), reports progress, dedups same (profile,kind).
   {
     const jobs = require('../src/jobs');
@@ -1648,7 +1688,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 46 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 47 async/http).`);
   process.exit(0);
 }
 

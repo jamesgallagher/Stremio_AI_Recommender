@@ -34,6 +34,18 @@ const STORE_CAP = 300;      // keep the top-N candidates by affinity
 const SERVE_LIMIT = 100;    // max titles in a served, genre-balanced catalog
 const DAY_MS = 24 * 3600e3;
 
+// IMDb-rating re-enrichment (v6.38). The stored imdb_rating is a point-in-time
+// MDBList snapshot from the build that stored the title; the candidate build only
+// re-enriches this build's `servable`, so an ORPHAN row (no longer a live TMDB
+// candidate) would keep its NULL/stale rating forever and leak past the serve
+// rating floor via the TMDB vote_average fallback. refreshStaleRatings re-resolves
+// due rows each build: NULL ratings chased daily (a freshly released title is
+// unrated on MDBList at first, then isn't), known ratings refreshed monthly.
+// Capped per build so a large pool can't hammer MDBList in one pass.
+const RATING_NULL_RECHECK_MS = 1 * DAY_MS;
+const RATING_STALE_RECHECK_MS = 30 * DAY_MS;
+const RATING_RECHECK_CAP = 150;
+
 // ---- Recommendation decay (v6, params confirmed 2026-08-19) ----
 // A recommendation the user is repeatedly SHOWN but never engages with is an
 // implicit rejection — it decays out. Decay tracks a VISIBLE STREAK (consecutive
@@ -86,6 +98,7 @@ function init() {
       genres      TEXT,                   -- full CSV genre list, for serve-time exclusion
       vote_average REAL,                  -- TMDB rating; serve-time rating-floor fallback
       imdb_rating  REAL,                  -- IMDb rating (MDBList) = the number on the poster badge; the rating floor prefers this
+      imdb_rating_at INTEGER,             -- when imdb_rating was last resolved from MDBList (null = never); drives the stale/null re-enrichment pass
       vote_count   INTEGER,               -- TMDB vote count; the build-time vote-count floor gates + purges on this
       age_classification  TEXT,           -- filled by the age-gate slice
       affinity    REAL,                   -- recency-weighted score (primary rank)
@@ -120,7 +133,7 @@ function init() {
   `);
   // Migrate older beta DBs that predate the serve-time-filter columns. ADD COLUMN
   // throws "duplicate column" once present, so each is best-effort.
-  for (const [col, decl] of [['genres', 'TEXT'], ['vote_average', 'REAL'], ['imdb_rating', 'REAL'], ['vote_count', 'INTEGER'], ['because_title', 'TEXT'],
+  for (const [col, decl] of [['genres', 'TEXT'], ['vote_average', 'REAL'], ['imdb_rating', 'REAL'], ['imdb_rating_at', 'INTEGER'], ['vote_count', 'INTEGER'], ['because_title', 'TEXT'],
     ['streak_started_at', 'INTEGER'], ['times_shown_in_streak', 'INTEGER DEFAULT 0'], ['last_shown_at', 'INTEGER']]) {
     try { db.get().exec(`ALTER TABLE recommended ADD COLUMN ${col} ${decl}`); } catch { /* already present */ }
   }
@@ -213,23 +226,30 @@ function deleteForProfile(profileId) {
 // Upsert candidates, preserving the lifecycle columns (created_at, first_shown_at,
 // times_shown, engaged_at, age_classification) on conflict so decay/serve state
 // survives a rebuild.
-function upsertCandidates(profileId, candidates) {
+// `ratingCheckedAt` stamps imdb_rating_at for the rows written here — pass the
+// build time when this build resolved IMDb ratings (MDBList key present), or null
+// when it couldn't (no key), so refreshStaleRatings picks them up later. On
+// conflict both imdb_rating and imdb_rating_at COALESCE to the stored value when
+// this build's value is null, so a transient MDBList miss never wipes a known
+// rating (which would let the title leak past the floor until the next refresh).
+function upsertCandidates(profileId, candidates, { ratingCheckedAt = null } = {}) {
   init();
   const conn = db.get();
   const stmt = conn.prepare(`
-    INSERT INTO recommended (profile_id, type, tmdb_id, imdb_id, title, year, primary_genre, genres, vote_average, imdb_rating, vote_count, affinity, rec_count, because_title, popularity, poster, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO recommended (profile_id, type, tmdb_id, imdb_id, title, year, primary_genre, genres, vote_average, imdb_rating, imdb_rating_at, vote_count, affinity, rec_count, because_title, popularity, poster, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(profile_id, type, tmdb_id) DO UPDATE SET
       affinity = excluded.affinity, rec_count = excluded.rec_count, popularity = excluded.popularity,
       primary_genre = excluded.primary_genre, genres = excluded.genres, vote_average = excluded.vote_average,
-      imdb_rating = excluded.imdb_rating, vote_count = excluded.vote_count,
+      imdb_rating = COALESCE(excluded.imdb_rating, recommended.imdb_rating),
+      imdb_rating_at = COALESCE(excluded.imdb_rating_at, recommended.imdb_rating_at), vote_count = excluded.vote_count,
       because_title = excluded.because_title, title = excluded.title, year = excluded.year, poster = excluded.poster
   `);
   conn.prepare('BEGIN').run();
   try {
     const now = Date.now();
     for (const c of candidates) {
-      stmt.run(profileId, c.type, c.tmdb_id, c.imdb_id || null, c.title, c.year, c.primary_genre || null, c.genres || null, c.vote_average ?? null, c.imdb_rating ?? null, c.vote_count ?? null, c.affinity, c.rec_count, c.because_title || null, c.popularity, c.poster || null, now);
+      stmt.run(profileId, c.type, c.tmdb_id, c.imdb_id || null, c.title, c.year, c.primary_genre || null, c.genres || null, c.vote_average ?? null, c.imdb_rating ?? null, ratingCheckedAt, c.vote_count ?? null, c.affinity, c.rec_count, c.because_title || null, c.popularity, c.poster || null, now);
     }
     conn.prepare('COMMIT').run();
   } catch (err) { conn.prepare('ROLLBACK').run(); throw err; }
@@ -259,6 +279,63 @@ function purgeBelowVoteFloor(profileId, filters = {}) {
         OR (type = 'series' AND vote_count < ?))
   `).run(profileId, tmdb.voteFloor(filters, 'movie'), tmdb.voteFloor(filters, 'series'));
   return Number(r.changes || 0);
+}
+
+// Re-resolve IMDb ratings for stored pool rows that are DUE (see the RATING_*
+// constants): NULL ratings (unrated when first built) chased frequently, known
+// ratings refreshed occasionally. This is the ONLY thing that heals an orphan
+// row — a title that has dropped out of the live TMDB candidate set is never
+// re-enriched by the candidate build, so without this its NULL/stale rating
+// would let it slip past the serve-time floor via the TMDB fallback forever.
+// Network-bound (MDBList), so it runs in the background build, NEVER on the serve
+// path. Rows we check but that are still unrated get their timestamp stamped so
+// we don't re-hit them until due again. A failed batch leaves the timestamp
+// untouched so those rows retry next build. `fetchRatings(type, ids) ->
+// Promise<Map<imdbId, number|null>>` is injectable for tests (defaults to
+// MDBList). Returns { checked, updated }.
+async function refreshStaleRatings(profileId, mdblistKey, log = console, { now = Date.now(), fetchRatings, cap = RATING_RECHECK_CAP } = {}) {
+  init();
+  if (!mdblistKey) return { checked: 0, updated: 0 };
+  const nullCut = now - RATING_NULL_RECHECK_MS;
+  const staleCut = now - RATING_STALE_RECHECK_MS;
+  const due = db.get().prepare(`
+    SELECT type, imdb_id FROM recommended
+    WHERE profile_id = ? AND imdb_id IS NOT NULL
+      AND (imdb_rating_at IS NULL
+        OR (imdb_rating IS NULL     AND imdb_rating_at < ?)
+        OR (imdb_rating IS NOT NULL AND imdb_rating_at < ?))
+    ORDER BY imdb_rating_at IS NOT NULL, imdb_rating_at ASC
+    LIMIT ?
+  `).all(profileId, nullCut, staleCut, cap);
+  if (!due.length) return { checked: 0, updated: 0 };
+
+  const getRatings = fetchRatings
+    || ((type, ids) => require('./services/mdblist').imdbRatings(mdblistKey, type, ids, log));
+  const conn = db.get();
+  const setRating = conn.prepare('UPDATE recommended SET imdb_rating = ?, imdb_rating_at = ? WHERE profile_id = ? AND type = ? AND imdb_id = ?');
+  const stampOnly = conn.prepare('UPDATE recommended SET imdb_rating_at = ? WHERE profile_id = ? AND type = ? AND imdb_id = ?');
+  let updated = 0;
+  for (const t of ['movie', 'series']) {
+    const ids = due.filter((r) => r.type === t).map((r) => r.imdb_id);
+    if (!ids.length) continue;
+    let ratings;
+    try {
+      ratings = await getRatings(t, ids);
+    } catch (err) {
+      log.warn(`[rec] rating refresh (${t}) failed: ${err.message} — retrying next build`);
+      continue; // leave imdb_rating_at untouched so these rows stay due
+    }
+    conn.prepare('BEGIN').run();
+    try {
+      for (const id of ids) {
+        const v = ratings.get(id);
+        if (v != null) { setRating.run(v, now, profileId, t, id); updated++; }
+        else stampOnly.run(now, profileId, t, id); // checked, still unrated
+      }
+      conn.prepare('COMMIT').run();
+    } catch (err) { conn.prepare('ROLLBACK').run(); throw err; }
+  }
+  return { checked: due.length, updated };
 }
 
 // Age-gate the pool (docs/v6-features F5). Reuses the shipped v5.2 stack:
@@ -428,14 +505,31 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
     log.log(`[rec] ${profile.name}: IMDb ratings resolved for ${rated}/${servable.length} recommendation(s)`);
   }
 
-  upsertCandidates(profile.id, servable);
+  // Stamp imdb_rating_at only when this build could actually resolve ratings (a
+  // key was present); without one, leave it null so the refresh pass re-checks
+  // these rows once a key is configured.
+  upsertCandidates(profile.id, servable, { ratingCheckedAt: mdblistKey ? Date.now() : null });
   // Clear any already-stored row now under the vote-count floor (old fixed gate,
   // or a raised floor). New sub-floor titles were already gated out at selectStrong.
   const purged = purgeBelowVoteFloor(profile.id, filters);
   setBuiltAt(profile.id);
 
-  log.log(`[rec] ${profile.name}: ${seeds.length} seed(s), ${rawFetched} raw recs → top-${PER_TITLE_CAP}/title → ${candidates.size} unique → ${kept.length} after de-dupe → ${servable.length} servable → stored${purged ? `, ${purged} purged below vote floor` : ''} (total ${countRecommended(profile.id)})`);
-  return { seeds: seeds.length, raw: rawFetched, strong: candidates.size, kept: kept.length, stored: servable.length, purged, total: countRecommended(profile.id) };
+  // Heal orphan/stale pool rows: re-resolve IMDb ratings for stored titles the
+  // candidate enrichment above didn't touch (it only sees this build's servable).
+  // Without this a title first stored while unrated on MDBList keeps a NULL rating
+  // and leaks past the floor via the TMDB fallback. Best-effort — never fail the
+  // build over it. With no key, the floor silently degrades to TMDB's rating, so
+  // warn the operator instead (mirrors the portal warning on the rating filter).
+  let refreshed = { checked: 0, updated: 0 };
+  if (mdblistKey) {
+    try { refreshed = await refreshStaleRatings(profile.id, mdblistKey, log); }
+    catch (err) { log.warn(`[rec] ${profile.name}: rating refresh failed — ${err.message}`); }
+  } else if ((filters.min_rating || 0) > 0) {
+    log.warn(`[rec] ${profile.name}: rating floor ≥ ${filters.min_rating} is set but no MDBList key — the floor falls back to TMDB's rating, not the IMDb number on the poster (lower-rated titles can slip through)`);
+  }
+
+  log.log(`[rec] ${profile.name}: ${seeds.length} seed(s), ${rawFetched} raw recs → top-${PER_TITLE_CAP}/title → ${candidates.size} unique → ${kept.length} after de-dupe → ${servable.length} servable → stored${purged ? `, ${purged} purged below vote floor` : ''}${refreshed.updated ? `, ${refreshed.updated} rating(s) refreshed` : ''} (total ${countRecommended(profile.id)})`);
+  return { seeds: seeds.length, raw: rawFetched, strong: candidates.size, kept: kept.length, stored: servable.length, purged, ratingsRefreshed: refreshed.updated, total: countRecommended(profile.id) };
 }
 
 // ---- build state ----
@@ -697,6 +791,7 @@ module.exports = {
   upsertCandidates,
   setAgeClassification,
   purgeBelowVoteFloor,
+  refreshStaleRatings,
   getRecommended,
   countRecommended,
   dontRecommendKeys,
