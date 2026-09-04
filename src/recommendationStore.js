@@ -592,12 +592,25 @@ function impressionStep(row, nowMs = Date.now()) {
 
 // PURE: does this row qualify to decay out? Persistently shown (streak past the
 // window, on ≥ the day floor) AND never engaged. Watched titles never reach here
-// — they're excluded from the pool at build. Exported for testing.
-function shouldDecay(row, nowMs = Date.now()) {
+// — they're excluded from the pool at build. `windowMs` is the sustained-
+// visibility window: DECAY_WINDOW_MS by default, or the profile's configured
+// title_decay_days (see decayWindowMsFor). Exported for testing.
+function shouldDecay(row, nowMs = Date.now(), windowMs = DECAY_WINDOW_MS) {
   if (row.engaged_at) return false;
   if (!row.streak_started_at) return false;
-  if ((nowMs - row.streak_started_at) <= DECAY_WINDOW_MS) return false;
+  if ((nowMs - row.streak_started_at) <= windowMs) return false;
   return (row.times_shown_in_streak || 0) >= DECAY_MIN_DAYS;
+}
+
+// The sustained-visibility window (ms) for a profile, or null when decay is OFF.
+// Title decay is opt-in (v6.37): filters.title_decay_enabled gates it, and
+// filters.title_decay_days sets the window (config clamps it to 14–365). Callers
+// use null to skip decay entirely for that profile.
+function decayWindowMsFor(profile) {
+  const f = (profile && profile.filters) || {};
+  if (!f.title_decay_enabled) return null;
+  const days = Number(f.title_decay_days) || (DECAY_WINDOW_MS / DAY_MS);
+  return days * DAY_MS;
 }
 
 // Record one impression per served title (batched, day-de-duped so pagination /
@@ -620,17 +633,18 @@ function recordImpressions(profileId, rows, nowMs = Date.now()) {
 }
 
 // Move every decay-qualifying title to dont_recommend(reason='decayed'). Runs on
-// the hourly tick. Returns { decayed }.
-function applyDecay(profileId, { nowMs = Date.now(), log = console } = {}) {
+// the hourly tick — but only for profiles that opted in; the caller gates on
+// decayWindowMsFor and passes that window here. Returns { decayed }.
+function applyDecay(profileId, { nowMs = Date.now(), log = console, windowMs = DECAY_WINDOW_MS } = {}) {
   init();
   const rows = db.get().prepare(
     'SELECT type, tmdb_id, streak_started_at, times_shown_in_streak, engaged_at FROM recommended WHERE profile_id = ?',
   ).all(profileId);
   let decayed = 0;
   for (const r of rows) {
-    if (shouldDecay(r, nowMs)) { addDontRecommend(profileId, r.type, r.tmdb_id, 'decayed', nowMs); decayed++; }
+    if (shouldDecay(r, nowMs, windowMs)) { addDontRecommend(profileId, r.type, r.tmdb_id, 'decayed', nowMs); decayed++; }
   }
-  if (decayed) log.log(`[decay] ${profileId}: ${decayed} title(s) decayed out (shown ${DECAY_MIN_DAYS}+ days over ${DECAY_WINDOW_MS / DAY_MS}d, never engaged)`);
+  if (decayed) log.log(`[decay] ${profileId}: ${decayed} title(s) decayed out (shown ${DECAY_MIN_DAYS}+ days over ${Math.round(windowMs / DAY_MS)}d, never engaged)`);
   return { decayed };
 }
 
@@ -699,6 +713,7 @@ module.exports = {
   getBuiltAt,
   impressionStep,
   shouldDecay,
+  decayWindowMsFor,
   recordImpressions,
   applyDecay,
   noteMetaOpen,

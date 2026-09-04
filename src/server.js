@@ -176,8 +176,12 @@ function tick() {
           .catch((err) => console.warn(`[simkl] ${profile.name}: watched sync/enrich/build failed — ${err.message}`));
       }
       // v6 decay: retire persistently-shown-but-ignored recommendations. Cheap
-      // local SQL scan; runs for any profile that has a pool, Simkl or not.
-      try { recommendationStore.applyDecay(profile.id); } catch (err) { console.warn(`[decay] ${profile.name}: ${err.message}`); }
+      // local SQL scan. Opt-in per profile (v6.37) — decayWindowMsFor returns
+      // null when the profile has title decay off, so we skip it entirely.
+      try {
+        const decayWindowMs = recommendationStore.decayWindowMsFor(profile);
+        if (decayWindowMs) recommendationStore.applyDecay(profile.id, { windowMs: decayWindowMs });
+      } catch (err) { console.warn(`[decay] ${profile.name}: ${err.message}`); }
     } catch (err) {
       console.error(`[scheduler] ${profile.name}: ${err.message}`);
     }

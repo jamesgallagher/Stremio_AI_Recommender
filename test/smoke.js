@@ -174,6 +174,8 @@ ok('config: profile CRUD + filter clamping', () => {
   assert.strictEqual(p.filters.age_limit, 0); // age gate off by default
   assert.strictEqual(p.filters.list_size, 20); // fill-to-quota default
   assert.strictEqual(p.filters.engine, 'trakt'); // v5: existing behaviour is the default
+  assert.strictEqual(p.filters.title_decay_enabled, false); // v6.37: title decay is opt-in, off by default
+  assert.strictEqual(p.filters.title_decay_days, 60); // default sustained-visibility window when enabled
   config.updateProfile(p.id, { filters: { min_rating: -3, excluded_genres: ['Horror'] } });
   const p2 = config.getProfile(p.id);
   assert.strictEqual(p2.filters.min_rating, 0); // clamped
@@ -184,6 +186,18 @@ ok('config: profile CRUD + filter clamping', () => {
   assert.strictEqual(config.getProfile(p.id).filters.engine, 'ai');
   config.updateProfile(p.id, { filters: { engine: 'skynet' } });
   assert.strictEqual(config.getProfile(p.id).filters.engine, 'trakt');
+
+  // Title decay (v6.37): enabled coerces to a bool; the window clamps to 14–365
+  // (a sub-8-day window could never fire against the 8-distinct-day floor).
+  config.updateProfile(p.id, { filters: { title_decay_enabled: 1, title_decay_days: 5 } });
+  const pd1 = config.getProfile(p.id).filters;
+  assert.strictEqual(pd1.title_decay_enabled, true); // truthy -> true
+  assert.strictEqual(pd1.title_decay_days, 14);      // clamped up to the floor
+  config.updateProfile(p.id, { filters: { title_decay_enabled: 0, title_decay_days: 9999 } });
+  const pd2 = config.getProfile(p.id).filters;
+  assert.strictEqual(pd2.title_decay_enabled, false); // falsy -> false
+  assert.strictEqual(pd2.title_decay_days, 365);      // clamped down to the ceiling
+
   assert.deepStrictEqual(p2.filters.excluded_genres, ['Horror']);
   assert.deepStrictEqual(p2.catalogs, {}); // extra catalogs default off
   config.updateProfile(p.id, { catalogs: { 'mdb-action-movies': true, 'bogus-id': true, 'mdb-popular-movies': false, 'trakt-watchlist-movies': false } });
@@ -750,6 +764,33 @@ ok('recommendationStore: decay — impressionStep counts once/day + resets on fa
   assert.strictEqual(rs.shouldDecay({ streak_started_at: t0, times_shown_in_streak: 7 }, t0 + 61 * DAY), false); // below floor
   assert.strictEqual(rs.shouldDecay({ ...base, engaged_at: t0 }, t0 + 61 * DAY), false); // engaged
   assert.strictEqual(rs.shouldDecay({ times_shown_in_streak: 8 }, t0 + 61 * DAY), false); // no streak
+});
+
+ok('recommendationStore: decayWindowMsFor gates opt-in + maps days→window; applyDecay honours the window', () => {
+  const rs = require('../src/recommendationStore');
+  const DAY = 24 * 3600e3;
+  // OFF (default, or flag false) -> null, so the scheduler skips the profile entirely.
+  assert.strictEqual(rs.decayWindowMsFor({ filters: {} }), null);
+  assert.strictEqual(rs.decayWindowMsFor({ filters: { title_decay_enabled: false, title_decay_days: 30 } }), null);
+  // ON -> the configured window in ms; a missing days value falls back to the 60d default.
+  assert.strictEqual(rs.decayWindowMsFor({ filters: { title_decay_enabled: true, title_decay_days: 30 } }), 30 * DAY);
+  assert.strictEqual(rs.decayWindowMsFor({ filters: { title_decay_enabled: true } }), 60 * DAY);
+  // shouldDecay respects the passed window: a 30d streak decays at a 20d window, survives at 60d.
+  const t0 = Date.parse('2026-01-01T00:00:00Z');
+  const row = { streak_started_at: t0, times_shown_in_streak: 8 };
+  assert.strictEqual(rs.shouldDecay(row, t0 + 30 * DAY, 20 * DAY), true);
+  assert.strictEqual(rs.shouldDecay(row, t0 + 30 * DAY, 60 * DAY), false);
+  // End-to-end: a title safe under the default 60d window decays under a short 20d one.
+  const pid = 'decay-window-test';
+  const quiet = { log() {} };
+  const now = Date.parse('2026-06-01T00:00:00Z');
+  rs.upsertCandidates(pid, [
+    { type: 'movie', tmdb_id: '1', imdb_id: 'tt1', title: 'Ignored', year: 2020, primary_genre: 'Drama', genres: 'Drama', vote_average: 7, affinity: 1, rec_count: 1, popularity: 1, poster: null },
+  ]);
+  for (let d = 0; d < 8; d++) rs.recordImpressions(pid, rs.getRecommended(pid, { type: 'movie', limit: 100 }), now + d * DAY);
+  assert.strictEqual(rs.applyDecay(pid, { nowMs: now + 30 * DAY, log: quiet, windowMs: 60 * DAY }).decayed, 0); // default window: safe
+  assert.strictEqual(rs.applyDecay(pid, { nowMs: now + 30 * DAY, log: quiet, windowMs: 20 * DAY }).decayed, 1); // short window: decays out
+  rs.deleteForProfile(pid);
 });
 
 ok('recommendationStore: decay — record → decay-out → cooldown expiry; meta open spares a title', () => {

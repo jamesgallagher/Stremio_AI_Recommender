@@ -603,10 +603,12 @@ async function unitTests() {
     recommendationStore.deleteForProfile(pid);
   });
 
-  await ok('settings: toCompanionFilters exposes the 5 editable filters, never the age gate', () => {
-    const out = handlers.toCompanionFilters({ min_rating: 6, vote_count_floor: 1000, max_age_years: 5, excluded_genres: ['Horror'], list_size: 20, age_limit: 8, engine: 'trakt' });
-    assert.deepStrictEqual(Object.keys(out).sort(), ['excluded_genres', 'list_size', 'max_age_years', 'min_rating', 'vote_count_floor']);
+  await ok('settings: toCompanionFilters exposes the editable filters (incl. title decay), never the age gate', () => {
+    const out = handlers.toCompanionFilters({ min_rating: 6, vote_count_floor: 1000, max_age_years: 5, excluded_genres: ['Horror'], list_size: 20, title_decay_enabled: true, title_decay_days: 30, age_limit: 8, engine: 'trakt' });
+    assert.deepStrictEqual(Object.keys(out).sort(), ['excluded_genres', 'list_size', 'max_age_years', 'min_rating', 'title_decay_days', 'title_decay_enabled', 'vote_count_floor']);
     assert.ok(!('age_limit' in out), 'age gate never exposed');
+    assert.strictEqual(out.title_decay_enabled, true);
+    assert.strictEqual(out.title_decay_days, 30);
     assert.deepStrictEqual(out.excluded_genres, ['Horror']);
     assert.deepStrictEqual(handlers.toCompanionFilters({}).excluded_genres, []); // always an array
   });
@@ -637,6 +639,21 @@ async function unitTests() {
     assert.strictEqual(after.companion.catalog_only, false);  // written
     assert.strictEqual(after.filters.age_limit, 8, 'age gate untouched by the Companion');
     assert.ok(!('age_limit' in res.body.filters), 'response never echoes the age gate');
+  });
+
+  await ok('settings: POST persists title decay (opt-in + window), clamped to the band', () => {
+    const p = config.addProfile('SetDecay');
+    const res = fakeRes();
+    handlers.settingsPostHandler({
+      profile: config.getProfile(p.id),
+      body: { title_decay_enabled: true, title_decay_days: 5 }, // 5 is below the 14-day floor
+    }, res);
+    assert.strictEqual(res.body.ok, true);
+    const after = config.getProfile(p.id);
+    assert.strictEqual(after.filters.title_decay_enabled, true); // opt-in written
+    assert.strictEqual(after.filters.title_decay_days, 14);      // clamped up to the floor
+    assert.strictEqual(res.body.filters.title_decay_enabled, true); // echoed back to the phone
+    assert.strictEqual(res.body.filters.title_decay_days, 14);
   });
 
   await ok('settings: POST with only forbidden/unknown keys -> 400 (age gate alone cannot write)', () => {

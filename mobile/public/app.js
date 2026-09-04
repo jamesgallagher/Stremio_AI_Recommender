@@ -400,6 +400,7 @@
     msg: $('settings-msg'),
     minRating: $('set-min-rating'), recency: $('set-recency'), listSize: $('set-list-size'),
     voteFloor: $('set-vote-floor'), genres: $('set-genres'), catalogOnly: $('set-catalog-only'),
+    titleDecay: $('set-title-decay'), titleDecayDays: $('set-title-decay-days'), titleDecayDaysField: $('set-title-decay-days-field'),
     save: $('settings-save'), done: $('settings-done'),
     catalogs: $('set-catalogs'), catalogsWarn: $('set-catalogs-warn'), catalogsSave: $('catalogs-save'),
   };
@@ -495,6 +496,9 @@
       setSelect(setEls.recency, f.max_age_years != null ? f.max_age_years : 0);
       setSelect(setEls.listSize, f.list_size != null ? f.list_size : 20);
       setSelect(setEls.voteFloor, f.vote_count_floor != null ? f.vote_count_floor : 1000);
+      setEls.titleDecay.checked = !!f.title_decay_enabled;
+      setSelect(setEls.titleDecayDays, f.title_decay_days != null ? f.title_decay_days : 60);
+      setEls.titleDecayDaysField.hidden = !setEls.titleDecay.checked;
       setEls.catalogOnly.checked = data.catalog_only !== false;
       renderGenres(data.genres, f.excluded_genres);
       renderCatalogs(data.catalogs);
@@ -510,6 +514,8 @@
       list_size: parseInt(setEls.listSize.value, 10),
       vote_count_floor: parseInt(setEls.voteFloor.value, 10),
       excluded_genres: [...setEls.genres.querySelectorAll('input:checked')].map((i) => i.value),
+      title_decay_enabled: setEls.titleDecay.checked,
+      title_decay_days: parseInt(setEls.titleDecayDays.value, 10),
       catalog_only: setEls.catalogOnly.checked,
     };
     try {
@@ -537,6 +543,7 @@
   }
 
   setEls.tabs.forEach((seg) => seg.addEventListener('click', () => switchSettingsTab(seg.dataset.settab)));
+  setEls.titleDecay.addEventListener('change', () => { setEls.titleDecayDaysField.hidden = !setEls.titleDecay.checked; });
   setEls.save.addEventListener('click', saveSettings);
   setEls.catalogsSave.addEventListener('click', saveCatalogs);
   setEls.done.addEventListener('click', () => { location.hash = '#/recs'; });

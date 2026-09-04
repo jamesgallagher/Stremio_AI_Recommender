@@ -466,7 +466,8 @@ Writes `dont_recommend(reason=user)` directly. Two entry points:
 
 ### Decisions needed
 1. **`DECAY_WINDOW` (X)** — proposed **30 days** of sustained visibility.
-   Configurable on the filters tab?
+   Configurable on the filters tab? **DECIDED (v6.37): yes — decay is now
+   opt-in per profile with a configurable window; see the v6.37 note below.**
 2. **Fall-off gap** that resets a streak — proposed **14 days** without an
    impression.
 3. **Decay-out cooldown** length before a title may re-qualify — proposed
@@ -669,6 +670,25 @@ decayed entries after cooldown. Streak state shown in the View-recommendations
 debug panel. **Engagement via Simkl `watching`/`plantowatch` → `engaged_at` is
 reserved** (column + gate in place) but not yet wired — the /meta soft-reset is
 the interest signal for now.
+
+**DONE — Title decay is opt-in + configurable (v6.37.0-beta).** Decay was
+always-on for every profile; James made it a per-profile choice, **off by
+default**. Two new `filters` fields: `title_decay_enabled` (bool) and
+`title_decay_days` (the sustained-visibility window, replacing the hardcoded
+60-day `DECAY_WINDOW_MS`; clamped **14–365**, floored at 14 because the 8-distinct-
+day requirement can't be met inside a sub-8-day window). The engine change is
+minimal: `shouldDecay`/`applyDecay` take the window as a parameter, and a new
+`recommendationStore.decayWindowMsFor(profile)` returns the window in ms or
+**null when off** — the hourly tick (`server.js`) skips `applyDecay` entirely for
+null, so an off profile never decays. The fall-off gap (14d), cooldown (90d),
+and 8-day floor are unchanged; already-`decayed` entries keep their cooldown, so
+flipping the toggle off stops *new* decays without resurrecting old ones.
+Surfaced in **both** UIs: the portal **Filters** tab (a box between the genre
+grid and Save) and the Mobile Companion **Filters** tab (its own card between the
+filters and "Only show my catalog items"), each with an enable toggle, a
+"retire after N days" select (14/30/60/90/180/365), and a short explainer.
+Companion writes go through the same `COMPANION_FILTERS` whitelist (never the age
+gate).
 
 **DONE — Tabbed profile UI + non-destructive refresh (v6.20.0-beta).** Each
 profile card is now a tab bar (Simkl · Recommendations · Keys · Filters ·

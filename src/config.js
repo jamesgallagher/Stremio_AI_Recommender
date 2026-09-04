@@ -27,6 +27,13 @@ const DEFAULT_FILTERS = {
   excluded_genres: [], // portal genre names, e.g. ["Horror", "Anime"]
   age_limit: 0, // Common Sense age gate; 0 = off. >0 requires MDBList + Groq
   list_size: 20, // displayed titles per catalog (+ an equal-sized hidden bench)
+  // Title decay (v6.37): OPT-IN retirement of persistently-shown-but-ignored
+  // recommendations. Off by default. When on, the sustained-visibility window
+  // (recommendationStore's decay engine) is title_decay_days instead of the
+  // built-in 60. The engagement/cooldown mechanics are unchanged — see
+  // recommendationStore.decayWindowMsFor.
+  title_decay_enabled: false,
+  title_decay_days: 60, // sustained-visibility window in days when enabled (clamped 14–365)
   // Which engine generates candidates (v5). RESERVED — not wired in v6 (the
   // recommendationStore/TMDB path is used unconditionally); kept because engine
   // selection is planned to return in a future version.
@@ -109,6 +116,11 @@ function applyMigrations(p) {
   if (p.filters.age_limit === undefined) p.filters.age_limit = 0;
   if (p.filters.list_size === undefined) p.filters.list_size = 20;
   if (p.filters.vote_count_floor === undefined) p.filters.vote_count_floor = 1000;
+  // v6.37: title decay became opt-in + configurable. Older profiles ran the
+  // always-on 60-day decay; default them to OFF (the new default) — turning a
+  // silent background retirement into an explicit choice, per James.
+  if (p.filters.title_decay_enabled === undefined) p.filters.title_decay_enabled = false;
+  if (p.filters.title_decay_days === undefined) p.filters.title_decay_days = 60;
   // rating_source (Trakt vs IMDb rating floor) retired in v6.34 — the rating
   // floor now always prefers the poster's IMDb rating (TMDB fallback), so the
   // toggle is moot. Strip it from existing profiles, like other retired fields.
@@ -235,6 +247,10 @@ function updateProfile(id, patch) {
       if (f.list_size !== undefined) profile.filters.list_size = Math.min(50, Math.max(5, parseInt(f.list_size, 10) || 20));
       if (f.vote_count_floor !== undefined) profile.filters.vote_count_floor = Math.max(0, parseInt(f.vote_count_floor, 10) || 0);
       if (f.engine !== undefined) profile.filters.engine = ENGINES.includes(f.engine) ? f.engine : 'trakt';
+      if (f.title_decay_enabled !== undefined) profile.filters.title_decay_enabled = !!f.title_decay_enabled;
+      // Window floored at 14: decay needs ≥8 distinct shown days (DECAY_MIN_DAYS),
+      // so a sub-8-day window could never fire — 14 keeps the setting meaningful.
+      if (f.title_decay_days !== undefined) profile.filters.title_decay_days = Math.min(365, Math.max(14, parseInt(f.title_decay_days, 10) || 60));
     }
     if (patch.catalogs && typeof patch.catalogs === 'object') {
       // Only known catalog ids, coerced to booleans. False is stored
