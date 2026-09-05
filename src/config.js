@@ -34,19 +34,16 @@ const DEFAULT_FILTERS = {
   // recommendationStore.decayWindowMsFor.
   title_decay_enabled: false,
   title_decay_days: 60, // sustained-visibility window in days when enabled (clamped 14–365)
-  // Which engine generates candidates (v5). RESERVED — not wired in v6 (the
-  // recommendationStore/TMDB path is used unconditionally); kept because engine
-  // selection is planned to return in a future version.
-  //   'trakt' — Trakt /recommendations. Collaborative filtering: strong for an
-  //             adult with deep history, but structurally blind to age. A 13yo
-  //             anime watcher's nearest neighbours are ADULT anime watchers,
-  //             which is how Ciara's list filled with Elfen Lied.
-  //   'ai'    — LLM generates age-aware candidates, a second LLM pass vets
-  //             them. Slower and thinner, but age is considered at generation
-  //             time instead of being filtered afterwards.
-  engine: 'trakt',
+  // Which engine builds each catalog's candidates (v7 — see
+  // docs/engine-abstraction). Per-type so Movies and Series can run different
+  // engines. Defaults to Genesis, the original TMDB-affinity engine (now the
+  // first plug-in). The valid-id source of truth is the engine registry
+  // (src/engines), not a hardcoded list — so there's no drift; any unknown or
+  // type-unsupported id falls back to Genesis at read (migrate) and write
+  // (updateProfile). Requirement #5: default everything to the current engine.
+  engine_movie: 'genesis',
+  engine_series: 'genesis',
 };
-const ENGINES = ['trakt', 'ai'];
 
 // Auto-scrobble: mirror this profile's Nuvio/Stremio watched history into
 // Trakt. Per profile (no cross-account leakage). password_enc is AES-GCM (see
@@ -132,10 +129,22 @@ function applyMigrations(p) {
     p.filters.max_age_years = 0;
     p.filters.v4_recency_relaxed = true;
   }
-  // v5: engine selection. Existing profiles keep Trakt — it works well for the
-  // adults, and silently switching everyone to a slower LLM path would be a
-  // change nobody asked for. Kids profiles get moved deliberately, in the UI.
-  if (!ENGINES.includes(p.filters.engine)) p.filters.engine = 'trakt';
+  // v7: per-type engine selection (see docs/engine-abstraction). Retire the dead
+  // single-engine field (the v5 Trakt/AI concept, never actually wired) and add
+  // engine_movie/engine_series, each defaulting to Genesis. Any unknown or
+  // type-unsupported id (incl. the old 'trakt'/'ai', or a hand-edited value)
+  // coerces to Genesis so a stale value can never disable a type. Idempotent —
+  // safe to run on every load, like the other migrations.
+  if (p.filters.engine !== undefined) delete p.filters.engine;
+  {
+    const engines = require('./engines'); // lazy: keep config's load graph light
+    for (const t of ['movie', 'series']) {
+      const f = `engine_${t}`;
+      const cur = p.filters[f];
+      const e = engines.get(cur);
+      p.filters[f] = (e && e.supportedTypes.includes(t)) ? cur : 'genesis';
+    }
+  }
   // v6: Simkl fields alongside the (still-present) Trakt ones.
   if (p.keys.simkl_client_id === undefined) p.keys.simkl_client_id = '';
   if (p.keys.simkl_client_secret === undefined) p.keys.simkl_client_secret = '';
@@ -246,7 +255,35 @@ function updateProfile(id, patch) {
       if (f.age_limit !== undefined) profile.filters.age_limit = Math.max(0, parseInt(f.age_limit, 10) || 0);
       if (f.list_size !== undefined) profile.filters.list_size = Math.min(50, Math.max(5, parseInt(f.list_size, 10) || 20));
       if (f.vote_count_floor !== undefined) profile.filters.vote_count_floor = Math.max(0, parseInt(f.vote_count_floor, 10) || 0);
-      if (f.engine !== undefined) profile.filters.engine = ENGINES.includes(f.engine) ? f.engine : 'trakt';
+      // v7: per-type engine choice, validated against the registry AND the
+      // profile's age limit (I7 / docs/engine-abstraction §5.5). An unknown,
+      // type-unsupported, or age-inappropriate id silently lands on Genesis —
+      // never an error, never a disabled type, never open content on a kids
+      // profile (safety over strictness). Judged on the EFFECTIVE age limit: the
+      // value AFTER this patch (age_limit is applied just above), so a body that
+      // raises age_limit and picks an unrestricted engine together is rejected on
+      // the new limit. (The slice-clear + rebuild that must follow a revocation
+      // is SC-03; this card only makes the stored value safe.)
+      const engines = require('./engines'); // lazy: no config↔engines load cycle
+      const effLimit = profile.filters.age_limit || 0;
+      for (const t of ['movie', 'series']) {
+        const field = `engine_${t}`;
+        if (f[field] !== undefined) {
+          const e = engines.get(String(f[field]));
+          const okType = e && e.supportedTypes.includes(t);
+          const okAge = e && !(e.capabilities.unrestricted && effLimit > 0);
+          profile.filters[field] = (okType && okAge) ? e.id : 'genesis';
+        }
+      }
+      // Safety re-validation: raising the age limit must REVOKE an already-stored
+      // unrestricted engine even when engine_<type> isn't in this patch (§5.5
+      // point 3). Runs after age_limit + the per-type clamps above.
+      if (effLimit > 0) {
+        for (const t of ['movie', 'series']) {
+          const cur = engines.get(profile.filters[`engine_${t}`]);
+          if (cur && cur.capabilities.unrestricted) profile.filters[`engine_${t}`] = 'genesis';
+        }
+      }
       if (f.title_decay_enabled !== undefined) profile.filters.title_decay_enabled = !!f.title_decay_enabled;
       // Window floored at 14: decay needs ≥8 distinct shown days (DECAY_MIN_DAYS),
       // so a sub-8-day window could never fire — 14 keeps the setting meaningful.

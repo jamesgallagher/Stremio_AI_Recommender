@@ -603,12 +603,14 @@ async function unitTests() {
     recommendationStore.deleteForProfile(pid);
   });
 
-  await ok('settings: toCompanionFilters exposes the editable filters (incl. title decay), never the age gate', () => {
-    const out = handlers.toCompanionFilters({ min_rating: 6, vote_count_floor: 1000, max_age_years: 5, excluded_genres: ['Horror'], list_size: 20, title_decay_enabled: true, title_decay_days: 30, age_limit: 8, engine: 'trakt' });
-    assert.deepStrictEqual(Object.keys(out).sort(), ['excluded_genres', 'list_size', 'max_age_years', 'min_rating', 'title_decay_days', 'title_decay_enabled', 'vote_count_floor']);
+  await ok('settings: toCompanionFilters exposes the editable filters (incl. title decay + per-type engine), never the age gate', () => {
+    const out = handlers.toCompanionFilters({ min_rating: 6, vote_count_floor: 1000, max_age_years: 5, excluded_genres: ['Horror'], list_size: 20, title_decay_enabled: true, title_decay_days: 30, age_limit: 8, engine_movie: 'genesis', engine_series: 'genesis' });
+    assert.deepStrictEqual(Object.keys(out).sort(), ['engine_movie', 'engine_series', 'excluded_genres', 'list_size', 'max_age_years', 'min_rating', 'title_decay_days', 'title_decay_enabled', 'vote_count_floor']);
     assert.ok(!('age_limit' in out), 'age gate never exposed');
     assert.strictEqual(out.title_decay_enabled, true);
     assert.strictEqual(out.title_decay_days, 30);
+    assert.strictEqual(out.engine_movie, 'genesis'); // v7: per-type engine round-trips to the phone
+    assert.strictEqual(out.engine_series, 'genesis');
     assert.deepStrictEqual(out.excluded_genres, ['Horror']);
     assert.deepStrictEqual(handlers.toCompanionFilters({}).excluded_genres, []); // always an array
   });
@@ -639,6 +641,26 @@ async function unitTests() {
     assert.strictEqual(after.companion.catalog_only, false);  // written
     assert.strictEqual(after.filters.age_limit, 8, 'age gate untouched by the Companion');
     assert.ok(!('age_limit' in res.body.filters), 'response never echoes the age gate');
+  });
+
+  await ok('settings: POST forwards the per-type engine choice through the whitelist, still never the age gate (SC-02)', () => {
+    // The whitelist itself carries the two engine fields (SC-03's rebuild-on-change
+    // for companion saves depends on them being writable here).
+    assert.ok(handlers.COMPANION_FILTERS.includes('engine_movie'));
+    assert.ok(handlers.COMPANION_FILTERS.includes('engine_series'));
+    const p = config.addProfile('SetEngine');
+    config.updateProfile(p.id, { filters: { age_limit: 8 } }); // an age-limited profile
+    const res = fakeRes();
+    handlers.settingsPostHandler({
+      profile: config.getProfile(p.id),
+      body: { engine_movie: 'genesis', engine_series: 'genesis', age_limit: 0 }, // age_limit MUST be dropped
+    }, res);
+    assert.strictEqual(res.body.ok, true);
+    const after = config.getProfile(p.id);
+    assert.strictEqual(after.filters.engine_movie, 'genesis');  // forwarded + written
+    assert.strictEqual(after.filters.engine_series, 'genesis');
+    assert.strictEqual(after.filters.age_limit, 8, 'age gate untouched by the Companion');
+    assert.strictEqual(res.body.filters.engine_movie, 'genesis'); // echoed back to the phone
   });
 
   await ok('settings: POST persists title decay (opt-in + window), clamped to the band', () => {

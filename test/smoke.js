@@ -173,19 +173,25 @@ ok('config: profile CRUD + filter clamping', () => {
   assert.strictEqual(p.keys.rpdb_api_key, 't0-free-rpdb'); // free RPDB key pre-set
   assert.strictEqual(p.filters.age_limit, 0); // age gate off by default
   assert.strictEqual(p.filters.list_size, 20); // fill-to-quota default
-  assert.strictEqual(p.filters.engine, 'trakt'); // v5: existing behaviour is the default
+  assert.strictEqual(p.filters.engine_movie, 'genesis');  // v7: per-type engine, defaults to the original engine
+  assert.strictEqual(p.filters.engine_series, 'genesis'); // Movies + Series each default to Genesis
+  assert.ok(!('engine' in p.filters));                    // v5 single-engine field retired
   assert.strictEqual(p.filters.title_decay_enabled, false); // v6.37: title decay is opt-in, off by default
   assert.strictEqual(p.filters.title_decay_days, 60); // default sustained-visibility window when enabled
   config.updateProfile(p.id, { filters: { min_rating: -3, excluded_genres: ['Horror'] } });
   const p2 = config.getProfile(p.id);
   assert.strictEqual(p2.filters.min_rating, 0); // clamped
 
-  // Engine is a whitelist — an unknown value must never disable the age gating
-  // that a kids profile depends on, so it falls back to trakt.
-  config.updateProfile(p.id, { filters: { engine: 'ai' } });
-  assert.strictEqual(config.getProfile(p.id).filters.engine, 'ai');
-  config.updateProfile(p.id, { filters: { engine: 'skynet' } });
-  assert.strictEqual(config.getProfile(p.id).filters.engine, 'trakt');
+  // v7: per-type engine choice validated against the registry. A known id
+  // persists per type; an unknown id (or the retired 'trakt'/'ai') falls back to
+  // Genesis — never a disabled type. (Age-gating of unrestricted engines has its
+  // own test below.)
+  config.updateProfile(p.id, { filters: { engine_movie: 'genesis', engine_series: 'genesis' } });
+  assert.strictEqual(config.getProfile(p.id).filters.engine_movie, 'genesis');
+  assert.strictEqual(config.getProfile(p.id).filters.engine_series, 'genesis');
+  config.updateProfile(p.id, { filters: { engine_movie: 'skynet', engine_series: 'trakt' } });
+  assert.strictEqual(config.getProfile(p.id).filters.engine_movie, 'genesis');  // unknown id → Genesis
+  assert.strictEqual(config.getProfile(p.id).filters.engine_series, 'genesis'); // retired id → Genesis
 
   // Title decay (v6.37): enabled coerces to a bool; the window clamps to 14–365
   // (a sub-8-day window could never fire against the 8-distinct-day floor).
@@ -207,6 +213,52 @@ ok('config: profile CRUD + filter clamping', () => {
   assert.ok(config.getProfileByToken(p.token));
   config.removeProfile(p.id);
   assert.strictEqual(config.getProfile(p.id), null);
+});
+
+ok('config: legacy `engine` → per-type engine_movie/engine_series migration + I7 age-gating of unrestricted engines (SC-02)', () => {
+  const engines = require('../src/engines');
+  const store = require('../src/store');
+
+  // ---- Migration. A pre-v7 profile carries the retired single `engine` field
+  //      and NO per-type fields. On load it upgrades: `engine` dropped, both
+  //      types default to Genesis. Seed the raw file (filters aren't sealed).
+  const legacy = config.addProfile('Legacy');
+  {
+    const data = store.loadProfiles();
+    const raw = data.profiles.find((x) => x.id === legacy.id);
+    raw.filters.engine = 'trakt';     // resurrect the dead field
+    delete raw.filters.engine_movie;  // simulate a pre-v7 shape
+    delete raw.filters.engine_series;
+    store.saveProfiles(data);
+  }
+  const migrated = config.getProfile(legacy.id).filters;
+  assert.strictEqual(migrated.engine_movie, 'genesis');
+  assert.strictEqual(migrated.engine_series, 'genesis');
+  assert.ok(!('engine' in migrated)); // legacy field gone on read…
+  config.updateProfile(legacy.id, { name: 'Legacy' }); // …and not re-persisted after the next write
+  assert.ok(!('engine' in store.loadProfiles().profiles.find((x) => x.id === legacy.id).filters));
+
+  // ---- Age-gating (I7) at the WRITE boundary, using a registered unrestricted stub.
+  const dispose = engines._register({
+    id: 'open-stub', name: 'Open', description: 't', supportedTypes: ['movie', 'series'],
+    capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: true },
+    requirements: () => ({ ok: true, missing: [] }), generate: async () => [],
+  });
+  try {
+    // Adult profile (age_limit 0): the open stub is a legal selection and persists.
+    config.updateProfile(legacy.id, { filters: { engine_movie: 'open-stub' } });
+    assert.strictEqual(config.getProfile(legacy.id).filters.engine_movie, 'open-stub');
+    // Selecting it on an age-limited profile coerces to Genesis (never open content on a kid).
+    const kid = config.addProfile('Kid');
+    config.updateProfile(kid.id, { filters: { age_limit: 12, engine_series: 'open-stub' } });
+    assert.strictEqual(config.getProfile(kid.id).filters.engine_series, 'genesis');
+    // RAISING age_limit on a profile already holding the stub REVOKES it → Genesis,
+    // even though engine_movie isn't in this patch (§5.5 point 3).
+    config.updateProfile(legacy.id, { filters: { age_limit: 5 } });
+    assert.strictEqual(config.getProfile(legacy.id).filters.engine_movie, 'genesis');
+    config.removeProfile(kid.id);
+  } finally { dispose(); }
+  config.removeProfile(legacy.id);
 });
 
 ok('filters: cleanMetas strips every internal (_-prefixed) field', () => {
@@ -1334,6 +1386,15 @@ async function httpTests() {
   assert.ok(genres.genres.includes('Horror') && genres.genres.includes('Kids'));
   console.log('  ✓ /api/genres');
 
+  // /api/engines — the static registry for the portal's per-type dropdowns (SC-02).
+  // With one engine registered it advertises exactly Genesis, both types, default id.
+  const eng = await (await fetch(`${BASE}/api/engines`)).json();
+  assert.strictEqual(eng.default, 'genesis');
+  assert.deepStrictEqual(eng.engines.map((e) => e.id), ['genesis']);
+  assert.deepStrictEqual(eng.engines[0].supported_types, ['movie', 'series']);
+  assert.ok(eng.engines[0].description && eng.engines[0].capabilities.unrestricted === false);
+  console.log('  ✓ /api/engines advertises the registry (Genesis only, both types)');
+
   // Create a profile through the API
   let res = await fetch(`${BASE}/api/profiles`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1376,6 +1437,16 @@ async function httpTests() {
   assert.strictEqual(listed.keys.rpdb_api_key, 't0-free-rpdb'); // default pre-fill
   assert.ok('tmdb_api_key' in listed.keys && 'mdblist_api_key' in listed.keys);
   console.log('  ✓ profile API exposes full keys for portal pre-fill');
+
+  // publicProfile carries the per-type engine block (SC-02): selection (default
+  // Genesis), the age-filtered availability list, and the effective engine's
+  // requirement check. engine_movie/engine_series also arrive inside `filters`.
+  assert.strictEqual(listed.engines.movie, 'genesis');
+  assert.strictEqual(listed.engines.series, 'genesis');
+  assert.strictEqual(listed.filters.engine_movie, 'genesis');
+  assert.deepStrictEqual(listed.engines.available.movie, ['genesis']); // Genesis offered to every profile
+  assert.strictEqual(typeof listed.engines.requirements.movie.ok, 'boolean'); // needs TMDB+Simkl → false here (no keys)
+  console.log('  ✓ profile API carries the per-type engine selection + availability + requirements');
 
   // Unknown token -> 404
   res = await fetch(`${BASE}/addon/deadbeef/manifest.json`);

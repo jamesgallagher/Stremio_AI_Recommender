@@ -17,7 +17,15 @@ const TYPES = ['movie', 'series'];
 // rendered, and never writable through the phone (it stays a backend-only
 // control). The server still USES the profile's age limit internally for the
 // vetted-only "entire list" view; it just never leaves the server.
-const COMPANION_FILTERS = ['min_rating', 'vote_count_floor', 'max_age_years', 'excluded_genres', 'list_size', 'title_decay_enabled', 'title_decay_days'];
+// v7: engine_movie/engine_series are companion-editable (see docs/engine-abstraction
+// SC-02 §5) so a companion save round-trips the engine choice through the same
+// strict whitelist as every other filter — and SC-03's rebuild-on-change fires
+// for companion saves too. Still no age_limit exposure (the age gate is never a
+// companion field). config.updateProfile validates the ids against the registry
+// AND the profile's age limit, so a crafted unrestricted id lands on Genesis.
+// The engine LIST/dropdown the companion offers is age-filtered server-side in
+// SC-05; this card only makes read + write of the choice possible.
+const COMPANION_FILTERS = ['min_rating', 'vote_count_floor', 'max_age_years', 'excluded_genres', 'list_size', 'title_decay_enabled', 'title_decay_days', 'engine_movie', 'engine_series'];
 const SEARCH_LIMIT = 10;
 const SEARCH_LIMIT_MAX = 12; // search does 1 + N detail calls — keep it light
 

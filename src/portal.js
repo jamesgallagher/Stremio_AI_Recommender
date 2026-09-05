@@ -17,6 +17,7 @@ const traktImport = require('./services/traktImport');
 const watchedStore = require('./watchedStore');
 const recommendationStore = require('./recommendationStore');
 const dontRecommend = require('./dontRecommend');
+const engines = require('./engines');
 
 const { version } = require('../package.json');
 const USER_AGENT = `AI-Recommender/1.0 (+https://github.com/jamesgallagher/Stremio_AI_Recommender)`;
@@ -62,6 +63,25 @@ function publicProfile(p, req) {
     external_url_set: !!normalizeExternal(process.env.EXTERNAL_URL),
     filters: p.filters,
     catalogs: p.catalogs || {},
+    // Per-type engine selection (v7 — see docs/engine-abstraction). The chosen id
+    // per type, the ids this profile may OFFER per type (age-filtered, I7 — an
+    // unrestricted "all ages" engine is absent here when the profile has an age
+    // limit, so the dropdown never shows it), and the effective engine's
+    // requirement check per type (so the UI can warn "needs Simkl"/"needs a key").
+    // engine_movie/engine_series also arrive verbatim inside `filters`; this block
+    // is the convenience shape + the availability/requirement data cards 04/05 need.
+    engines: {
+      movie: p.filters.engine_movie || 'genesis',
+      series: p.filters.engine_series || 'genesis',
+      available: {
+        movie: engines.availableFor(p, 'movie').map((e) => e.id),
+        series: engines.availableFor(p, 'series').map((e) => e.id),
+      },
+      requirements: {
+        movie: engines.resolveFor(p, 'movie').requirements(p),
+        series: engines.resolveFor(p, 'series').requirements(p),
+      },
+    },
     // Full key values — returned only to the admin-authed portal so each key
     // input can be pre-filled (with a show/hide toggle). This endpoint is
     // behind adminAuth; the public /addon surface never sees these.
@@ -116,6 +136,21 @@ function publicProfile(p, req) {
 
 router.get('/genres', (req, res) => {
   res.json({ genres: Object.keys(tmdb.GENRE_ALIASES).sort() });
+});
+
+// The engine registry (static) for the portal's per-type engine dropdowns +
+// descriptions (card 04). Mirrors GET /genres. Per-profile availability + the
+// requirement check are profile-specific, so they live in publicProfile's
+// `engines` block, not here. With one engine this returns just Genesis → a
+// single, locked option per type.
+router.get('/engines', (req, res) => {
+  res.json({
+    engines: engines.list().map((e) => ({
+      id: e.id, name: e.name, description: e.description,
+      supported_types: e.supportedTypes, capabilities: e.capabilities,
+    })),
+    default: engines.DEFAULT_ID,
+  });
 });
 
 // Available extra-catalog definitions (static) for the portal's Catalogs section.
