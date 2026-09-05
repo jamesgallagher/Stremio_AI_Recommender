@@ -282,23 +282,25 @@ available to every profile, so a dropdown is never empty.
 | `04` | Portal UI — engine selectors (main config) | frontend (portal) | `02` |
 | `05` | Companion UI — engine selectors (mobile) | frontend (mobile) | `02` |
 | `06` | Conformance spec + second-engine template | doc/validation | `01`–`03` |
+| `07` | Global engine enablement (admin Server Config toggle) | backend/config + frontend (portal) | `01`, `02`, `03` |
 
 ```
-        01 ──► 02 ──► 03
-                │  ╲
-                ▼   ╲──► 06 (validates 01–03)
+        01 ──► 02 ──► 03 ──► 07 (admin enable/disable; disable→revert reuses 03)
+                │  ╲              │
+                ▼   ╲──► 06 (validates 01–03; its stub is switched on by 07)
           04 (portal)
           05 (mobile)   (04 and 05 both need 02; independent of each other)
 ```
 
 **Suggested delivery order:** `01` → `02` → `03` (the latent multi-engine
-capability, still Genesis-only) → `04` + `05` in parallel (surface the selectors)
-→ `06` when/if a real second engine is on the table.
+capability, still Genesis-only) → `07` (the admin on/off gate) → `04` + `05` in
+parallel (surface the selectors) → `06` when/if a real second engine is on the
+table.
 
-**Behaviorally, `01`–`05` are a no-op for users** until a second engine is
-registered: both dropdowns show only "Genesis Engine" and everyone keeps today's
-results byte-for-byte. That is the safety property that makes this shippable in
-stages.
+**Behaviorally, `01`–`05`/`07` are a no-op for users** until a second engine is
+both **registered** (in code) and **enabled** (the `07` admin toggle): both
+dropdowns show only "Genesis Engine" and everyone keeps today's results
+byte-for-byte. That is the safety property that makes this shippable in stages.
 
 ---
 
@@ -325,6 +327,19 @@ cards; one child-safety sub-question (Q1) is deliberately left open.
   `main` line** (it *is* Genesis Engine); the **`-beta` tag now tracks the engine
   work as a new `v7.0.0-beta` line** on a fresh v7 branch (see §9). Docs live in
   `docs/engine-abstraction/`.
+- **D4 — Global admin engine enablement. RESOLVED (2026-09-05).** Engines carry a
+  **global enabled/disabled toggle** stored in Server Config (`settings.engines`),
+  controlled **only by the admin** in the main app's config — never per-profile,
+  never the companion. **Genesis is permanently enabled** (the default and safe
+  floor; its toggle is locked-on and a request to disable it is coerced back on).
+  A newly code-registered engine ships **disabled** by default — it becomes
+  selectable only once the admin turns it on, which is what makes a second engine
+  appear in dropdowns only when **registered AND enabled**. Enablement gates
+  `availableFor` (dropdowns) and `resolveFor` (build/serve → Genesis fallback if
+  disabled). **Disabling** an engine reverts every profile using it to Genesis for
+  that type — a *persisted* revert plus a slice clear + rebuild, reusing card
+  `03`'s mechanism, so a switched-off engine's rows never keep serving. Specified
+  in **card `07`**. Right now only Genesis is enabled.
 
 ### Open sub-question (needs an explicit call before any `unrestricted` engine ships)
 - **Q1 — Does "fully open" include NSFW/porn?** Default in this design: **no.**

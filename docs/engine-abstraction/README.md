@@ -17,13 +17,15 @@ config model, migration, naming, and the dependency graph. Then the cards:
 | 04 | [Portal UI selectors](04-portal-ui.md) | frontend (portal) | 02 |
 | 05 | [Companion UI selectors](05-companion-ui.md) | frontend (mobile) | 02 |
 | 06 | [Conformance spec + second-engine template](06-conformance-and-second-engine-template.md) | doc/validation | 01–03 |
+| 07 | [Global engine enablement (admin toggle)](07-global-engine-enablement.md) | backend/config + frontend (portal) | 01, 02, 03 |
 
-**Delivery order:** 01 → 02 → 03 → (04 ∥ 05) → 06.
+**Delivery order:** 01 → 02 → 03 → 07 → (04 ∥ 05) → 06.
 
-**Key property:** cards 01–05 are a **user-visible no-op** until a second engine
-is registered — both dropdowns show only "Genesis Engine" and everyone keeps
-today's results. That makes the whole thing shippable in stages with near-zero
-risk to existing profiles.
+**Key property:** cards 01–05/07 are a **user-visible no-op** until a second
+engine is both **registered** (in code) and **enabled** (admin toggle, `07`) —
+both dropdowns show only "Genesis Engine" and everyone keeps today's results.
+That makes the whole thing shippable in stages with near-zero risk to existing
+profiles.
 
 **Decisions (resolved 2026-09-05 — see `00-overview.md` §8):**
 - **D1** — engines declare `supportedTypes` (Movies+Shows / Only Movies / Only
@@ -34,6 +36,12 @@ risk to existing profiles.
   engines are deferred, source-gated, James's call.
 - **D3** — current v6 build → **stable `main`**; engine work → **new
   `v7.0.0-beta`** line (design note only; git actions are James's, §9).
+- **D4** (added 2026-09-05) — engines carry a **global admin enable/disable**
+  toggle in Server Config (card `07`). **Genesis is permanently enabled** (the
+  default + safe floor, non-disableable); a new engine ships **disabled** and the
+  admin turns it on. A disabled engine reverts affected profiles to Genesis
+  (persisted revert + slice rebuild, reusing `03`). Right now only Genesis is
+  enabled.
 
 Each card is self-contained: current-state file/line references, design,
 tasks, acceptance criteria, and test notes — ready to hand to an independent
