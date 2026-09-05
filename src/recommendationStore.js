@@ -22,15 +22,13 @@ const settings = require('./settings');
 const tmdb = require('./services/tmdb');
 const animeMap = require('./services/animeMap');
 const watchedStore = require('./watchedStore');
+// The candidate-generation half of the build now lives in the Genesis Engine
+// (SC-01). recommendationStore keeps the pool table, serve path, decay, age gate
+// and the IMDb-rating heal — all engine-agnostic — and re-exports Genesis's pure
+// candidate logic (computeAffinity / selectStrong) + parameters (HALF_LIFE_DAYS /
+// PER_TITLE_CAP) so existing imports and tests resolve them from their old home.
+const genesis = require('./engines/genesis');
 
-const HALF_LIFE_DAYS = 90;  // recency weight = 0.5 ^ (days_since_watched / this)
-// PER-TYPE seed caps: the N most-recent watched titles of each type seed recs.
-// Movies get a higher cap (deeper back-catalogue); series (shows + anime, which
-// share the `series` type) get their own so a run of freshly-watched shows can't
-// crowd movies out and vice versa.
-const SEED_CAP = { movie: 150, series: 100 };
-const seedCapFor = (type) => SEED_CAP[type] ?? 100;
-const STORE_CAP = 300;      // keep the top-N candidates by affinity
 const SERVE_LIMIT = 100;    // max titles in a served, genre-balanced catalog
 const DAY_MS = 24 * 3600e3;
 
@@ -58,30 +56,12 @@ const FALLOFF_GAP_MS = 14 * DAY_MS;    // no impression this long → streak res
 const DECAY_COOLDOWN_MS = 90 * DAY_MS; // a decayed title may return to the pool after this
 const DECAY_MIN_DAYS = 8;              // must be shown on ≥ this many distinct days to decay
 
-// Per-source-title selection: TMDB returns ~20 recs already in RELEVANCE order
-// (strongest match first). Keeping all 20 makes the matching mushy, so we keep
-// only the strongest few PER title — the top N in TMDB's own order, gated by the
-// porn flag and the VOTE-COUNT FLOOR.
-//
-// The vote-count floor is the user's `vote_count_floor` filter (via
-// tmdb.voteFloor — series use ⅕, the same asymmetry as elsewhere). It is enforced
-// HERE, at build, ON PURPOSE (decided 2026-08-27): a title below the floor must
-// never be STORED in the pool, not merely hidden at serve. It can return on a
-// later build if its vote count climbs past the floor. The build also purges any
-// already-stored row that has since fallen below the floor (purgeBelowVoteFloor).
-//
-// The rating floor / genres / recency are DIFFERENT — those are cheap serve-time
-// preferences over the stored pool (no rebuild to change). The vote-count floor
-// can't be: its whole point is to keep sub-floor titles OUT of storage.
-const PER_TITLE_CAP = 5;
-
-// The strongest ≤N recommendations for one source title (relevance order), gated
-// by the porn flag and a vote-count floor (0 = no gate; callers pass the profile's).
-function selectStrong(recs, voteFloor = 0) {
-  return (recs || [])
-    .filter((r) => !r.adult && (r.vote_count || 0) >= voteFloor)
-    .slice(0, PER_TITLE_CAP); // TMDB relevance order preserved
-}
+// The vote-count floor is a build-time STORAGE gate (decided 2026-08-27): a
+// sub-floor title must never be stored, not merely hidden at serve. Genesis
+// applies it at candidate selection (selectStrong, now in engines/genesis.js);
+// purgeBelowVoteFloor below clears any already-stored row that has since fallen
+// under the floor, for EVERY engine. The rating floor / genres / recency are
+// DIFFERENT — cheap serve-time preferences over the stored pool (no rebuild).
 
 let ready = false;
 function init() {
@@ -141,33 +121,6 @@ function init() {
 }
 
 const key = (type, tmdbId) => `${type}:${tmdbId}`;
-
-// PURE: aggregate recommendations into scored candidates. Exported for testing.
-//   seeds:          [{ tmdb_id, type, watched_at, title }]
-//   recsBySeed:     Map<`type:tmdb_id`, recs[]>  (recs from tmdb.getRecommendations)
-// Returns Map<`type:tmdb_id`, candidate> with affinity + rec_count + because_title
-// (the strongest-contributing watched title — the "because you watched X" reason;
-// _because_weight is a transient field used only to pick it, not stored).
-function computeAffinity(seeds, recsBySeed, { halfLifeDays = HALF_LIFE_DAYS, nowMs = Date.now() } = {}) {
-  const out = new Map();
-  for (const seed of seeds) {
-    const ts = seed.watched_at ? Date.parse(seed.watched_at) : NaN;
-    const days = Number.isNaN(ts) ? 0 : Math.max(0, (nowMs - ts) / DAY_MS);
-    const weight = 0.5 ** (days / halfLifeDays);
-    const recs = recsBySeed.get(key(seed.type, seed.tmdb_id)) || [];
-    for (const r of recs) {
-      const k = key(r.type, r.tmdb_id);
-      let c = out.get(k);
-      if (!c) { c = { ...r, affinity: 0, rec_count: 0, because_title: null, _because_weight: -1 }; out.set(k, c); }
-      c.affinity += weight;
-      c.rec_count += 1;
-      // Strongest contributor wins the reason. Strict `>` + most-recent-first
-      // seed order means ties go to the most recently watched title.
-      if (weight > c._because_weight) { c._because_weight = weight; c.because_title = seed.title || null; }
-    }
-  }
-  return out;
-}
 
 // Titles to suppress from build + serve. Explicit user rejections are permanent;
 // DECAYED entries expire after the cooldown so a decayed title gets another
@@ -387,149 +340,74 @@ function resetRecommendations(profileId) {
   return { cleared: true };
 }
 
-// Build the recommendation pool for a profile. Fetches TMDB recs per watched
-// seed, scores by affinity, applies deterministic filters, upserts the top N.
-// The caller runs ageGatePool() after this to make the pool age-safe.
+// Build the recommendation pool for a profile — now a thin TWO-TYPE GENESIS
+// WRAPPER (SC-01). Genesis produces candidates per type; the shared pipeline
+// (engines/pipeline.js) resolves/enriches/upserts/purges each type's slice. The
+// caller runs ageGatePool() after this to make the pool age-safe. Callers/tests
+// are unchanged — the return still carries { skipped?, seeds, stored, … } and
+// per-type dispatch-by-config arrives in SC-03.
+//
+// NOTE: the STORE_CAP (300) is now applied PER TYPE (in Genesis), not across the
+// combined candidate set as the pre-abstraction monolith did. This is the
+// architecturally correct seam for SC-03 (independent per-type engines) and
+// matches the existing per-type SEED_CAP. Served catalogs are IDENTICAL — serve
+// only ever reads the strongest list_size titles per type, and the per-type pool
+// is a superset of the old combined pool that adds only weaker, never-served
+// rows. The one observable difference is a larger stored `total` for very active
+// profiles (deeper storage per type).
 async function buildRecommendations(profile, log = console, onProgress = () => {}) {
   init();
   const s = settings.getSettings();
   const tmdbKey = s?.keys?.tmdb_api_key;
   if (!tmdbKey) return { skipped: true, reason: 'no TMDB key in Server Config' };
 
+  const pipeline = require('./engines/pipeline');
   const filters = profile.filters || {};
-  // Seed PER TYPE so neither can starve the other: the SEED_CAP most-recent
-  // MOVIES and the SEED_CAP most-recent SERIES, gathered independently. A single
-  // shared cap let a run of freshly-watched shows crowd movies out of the seed
-  // set (and vice versa) — acute now that in-progress shows carry fresh
-  // watched_at. Re-merged newest-first so computeAffinity's recency tie-break holds.
-  const seedTs = (w) => { const t = w.watched_at ? Date.parse(w.watched_at) : NaN; return Number.isNaN(t) ? 0 : t; };
-  const seeds = ['movie', 'series']
-    .flatMap((t) => watchedStore.getWatched(profile.id, { type: t }).filter((w) => w.tmdb_id).slice(0, seedCapFor(t)))
-    .sort((a, b) => seedTs(b) - seedTs(a));
-  if (!seeds.length) return { skipped: true, reason: 'no watched titles to seed from' };
+  const ctx = {
+    tmdbKey,
+    mdblistKey: settings.keyFor(profile, 'mdblist_api_key'),
+    settings: s,
+    filters,
+    log,
+  };
+  const band = (lo, hi) => (pct, label) => onProgress(lo + (pct / 100) * (hi - lo), label);
 
-  // Fetch recommendations per seed, then keep only the STRONGEST few per title
-  // (top ~5/title in TMDB relevance order) that clear the vote-count floor. The
-  // vote-count floor is the ONE user preference enforced at build — a sub-floor
-  // title must never be stored (see selectStrong). The other preferences (rating
-  // floor, excluded genres, recency) are NOT applied here — they run at serve
-  // time over the stored pool, so changing one takes effect with no rebuild.
-  // Progress model: phase A (fetch recs per watched seed) is the first half of
-  // the bar; phase B (resolve tt id + poster per stored candidate) is the second
-  // half — the slow part. seeds = "shows + movies to scan", as the user sees it.
-  const recsBySeed = new Map();
-  let rawFetched = 0;
-  let seedsDone = 0;
-  onProgress(0, `Scanning ${seeds.length} watched title(s) for recommendations…`);
-  for (let i = 0; i < seeds.length; i += 5) {
-    const chunk = seeds.slice(i, i + 5);
-    await Promise.all(chunk.map(async (w) => {
-      try {
-        const recs = await tmdb.getRecommendations(tmdbKey, w.type, w.tmdb_id);
-        rawFetched += recs.length;
-        // Vote-count floor is a HARD build gate — sub-floor titles never enter the
-        // pool (the user's vote_count_floor; series use ⅕ via tmdb.voteFloor).
-        recsBySeed.set(key(w.type, w.tmdb_id), selectStrong(recs, tmdb.voteFloor(filters, w.type)));
-      } catch (err) { log.warn(`[rec] recs for ${w.title} failed: ${err.message}`); }
-      seedsDone++;
-    }));
-    onProgress((seedsDone / seeds.length) * 50, `Scanned ${seedsDone}/${seeds.length} watched titles`);
-  }
+  // Both types via Genesis, each built independently through the shared pipeline.
+  const m = await pipeline.runEngineBuild(profile, 'movie', genesis, ctx, band(0, 50));
+  const sr = await pipeline.runEngineBuild(profile, 'series', genesis, ctx, band(50, 100));
 
-  const candidates = computeAffinity(seeds, recsBySeed);
-  const watchedIds = watchedStore.watchedIdSets(profile.id);
-  const dont = dontRecommendKeys(profile.id);
-  const genreMap = await tmdb.getGenreMap(tmdbKey);
+  // No seeds of either type → nothing to build. Unchanged: DON'T stamp built_at,
+  // so needsBuild stays true until watch history appears.
+  if ((m.seeds + sr.seeds) === 0) return { skipped: true, reason: 'no watched titles to seed from' };
 
-  const kept = [];
-  for (const c of candidates.values()) {
-    if (watchedIds.tmdb.has(c.tmdb_id)) continue;             // already watched
-    if (dont.has(key(c.type, c.tmdb_id))) continue;           // user-rejected / decayed
-    // Resolve genre names once and store the FULL list — serve-time exclusion
-    // needs every genre, not just the primary, or a title whose secondary genre
-    // is excluded would slip through.
-    const names = (c.genre_ids || []).map((g) => genreMap[g]).filter(Boolean);
-    c.primary_genre = names[0] || null;
-    c.genres = names.join(',');
-    kept.push(c);
-  }
-  kept.sort((a, b) => b.affinity - a.affinity || b.popularity - a.popularity);
-  const top = kept.slice(0, STORE_CAP);
-
-  // Dress the survivors for Stremio: resolve the tt id (catalogs need it) and a
-  // full poster URL, and tag the Anime pseudo-genre so serve-time exclusion is a
-  // pure string check. No tt id -> not servable -> dropped. This is the only
-  // heavy step (one light TMDB call each); it runs in the background build.
-  await animeMap.ensureLoaded(log);
-  const servable = [];
-  let resolvedDone = 0;
-  onProgress(50, `Resolving ${top.length} recommendation(s)…`);
-  for (let i = 0; i < top.length; i += 8) {
-    const chunk = top.slice(i, i + 8);
-    await Promise.all(chunk.map(async (c) => {
-      const imdb = await tmdb.imdbFor(tmdbKey, c.type, c.tmdb_id);
-      if (imdb) {
-        c.imdb_id = imdb;
-        c.poster = tmdb.posterUrl(c.poster);     // bare path -> full URL
-        if (animeMap.isAnime(imdb, c.tmdb_id) && !c.genres.split(',').includes('Anime')) {
-          c.genres = c.genres ? `Anime,${c.genres}` : 'Anime';
-        }
-        servable.push(c);
-      }
-      resolvedDone++;
-    }));
-    onProgress(50 + (resolvedDone / (top.length || 1)) * 50, `Resolved ${resolvedDone}/${top.length} recommendations`);
-  }
-
-  // Enrich with the IMDb rating — the number shown on the poster badge (RPDB) —
-  // so the serve-time rating floor judges the SAME rating the user sees, not
-  // TMDB's (the two disagree). Batched via MDBList (~50/call, rate-limited).
-  // Requires the profile's MDBList key; absent key or an unrated title leaves
-  // imdb_rating null and the floor falls back to TMDB's vote_average at serve.
-  const mdblistKey = settings.keyFor(profile, 'mdblist_api_key');
-  if (mdblistKey && servable.length) {
-    const mdblist = require('./services/mdblist');
-    let rated = 0;
-    for (const t of ['movie', 'series']) {
-      const ids = servable.filter((c) => c.type === t).map((c) => c.imdb_id);
-      if (!ids.length) continue;
-      try {
-        const ratings = await mdblist.imdbRatings(mdblistKey, t, ids, log);
-        for (const c of servable) {
-          if (c.type !== t) continue;
-          const v = ratings.get(c.imdb_id);
-          if (v != null) { c.imdb_rating = v; rated++; }
-        }
-      } catch (err) { log.warn(`[rec] IMDb-rating enrichment (${t}) failed: ${err.message}`); }
-    }
-    log.log(`[rec] ${profile.name}: IMDb ratings resolved for ${rated}/${servable.length} recommendation(s)`);
-  }
-
-  // Stamp imdb_rating_at only when this build could actually resolve ratings (a
-  // key was present); without one, leave it null so the refresh pass re-checks
-  // these rows once a key is configured.
-  upsertCandidates(profile.id, servable, { ratingCheckedAt: mdblistKey ? Date.now() : null });
-  // Clear any already-stored row now under the vote-count floor (old fixed gate,
-  // or a raised floor). New sub-floor titles were already gated out at selectStrong.
-  const purged = purgeBelowVoteFloor(profile.id, filters);
-  setBuiltAt(profile.id);
-
-  // Heal orphan/stale pool rows: re-resolve IMDb ratings for stored titles the
-  // candidate enrichment above didn't touch (it only sees this build's servable).
-  // Without this a title first stored while unrated on MDBList keeps a NULL rating
-  // and leaks past the floor via the TMDB fallback. Best-effort — never fail the
-  // build over it. With no key, the floor silently degrades to TMDB's rating, so
-  // warn the operator instead (mirrors the portal warning on the rating filter).
+  // Whole-pool IMDb-rating heal — runs ONCE after BOTH types (like the age gate),
+  // so an orphan/stale row of either type is re-enriched and can't leak past the
+  // serve rating floor via the TMDB fallback. Best-effort. With no key the floor
+  // degrades to TMDB's rating; warn the operator (mirrors the portal warning).
   let refreshed = { checked: 0, updated: 0 };
-  if (mdblistKey) {
-    try { refreshed = await refreshStaleRatings(profile.id, mdblistKey, log); }
+  if (ctx.mdblistKey) {
+    try { refreshed = await refreshStaleRatings(profile.id, ctx.mdblistKey, log); }
     catch (err) { log.warn(`[rec] ${profile.name}: rating refresh failed — ${err.message}`); }
   } else if ((filters.min_rating || 0) > 0) {
     log.warn(`[rec] ${profile.name}: rating floor ≥ ${filters.min_rating} is set but no MDBList key — the floor falls back to TMDB's rating, not the IMDb number on the poster (lower-rated titles can slip through)`);
   }
 
-  log.log(`[rec] ${profile.name}: ${seeds.length} seed(s), ${rawFetched} raw recs → top-${PER_TITLE_CAP}/title → ${candidates.size} unique → ${kept.length} after de-dupe → ${servable.length} servable → stored${purged ? `, ${purged} purged below vote floor` : ''}${refreshed.updated ? `, ${refreshed.updated} rating(s) refreshed` : ''} (total ${countRecommended(profile.id)})`);
-  return { seeds: seeds.length, raw: rawFetched, strong: candidates.size, kept: kept.length, stored: servable.length, purged, ratingsRefreshed: refreshed.updated, total: countRecommended(profile.id) };
+  setBuiltAt(profile.id);
+
+  const seeds = m.seeds + sr.seeds;
+  const stored = m.stored + sr.stored;
+  const purged = m.purged + sr.purged;
+  log.log(`[rec] ${profile.name}: ${seeds} seed(s) → ${m.strong + sr.strong} unique → ${stored} servable (movies ${m.stored}, series ${sr.stored})${purged ? `, ${purged} purged below vote floor` : ''}${refreshed.updated ? `, ${refreshed.updated} rating(s) refreshed` : ''} (total ${countRecommended(profile.id)})`);
+  return {
+    seeds,
+    raw: m.raw + sr.raw,
+    strong: m.strong + sr.strong,
+    kept: m.kept + sr.kept,
+    stored,
+    purged,
+    ratingsRefreshed: refreshed.updated,
+    total: countRecommended(profile.id),
+  };
 }
 
 // ---- build state ----
@@ -780,8 +658,10 @@ async function ensureBuilt(profile, log = console) {
 
 module.exports = {
   init,
-  computeAffinity,
-  selectStrong,
+  // Re-exported from the Genesis Engine (their new home) so existing imports and
+  // the smoke tests keep resolving them from recommendationStore.
+  computeAffinity: genesis.computeAffinity,
+  selectStrong: genesis.selectStrong,
   buildRecommendations,
   ageGatePool,
   buildPool,
@@ -812,8 +692,8 @@ module.exports = {
   recordImpressions,
   applyDecay,
   noteMetaOpen,
-  HALF_LIFE_DAYS,
-  PER_TITLE_CAP,
+  HALF_LIFE_DAYS: genesis.HALF_LIFE_DAYS,
+  PER_TITLE_CAP: genesis.PER_TITLE_CAP,
   SERVE_LIMIT,
   DECAY_WINDOW_MS,
   FALLOFF_GAP_MS,

@@ -611,6 +611,40 @@ ok('recommendationStore: selectStrong gates on the supplied vote floor (NOT rati
   assert.ok(!rs.selectStrong(recs, 0).some((r) => r.tmdb_id === 'adult'));
 });
 
+ok('engines: registry lists Genesis, resolveFor/availableFor honour age gating (I7)', () => {
+  const engines = require('../src/engines');
+  // Single engine → a single, locked option per type (requirement #3).
+  assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['genesis']);
+  assert.deepStrictEqual(engines.listForType('series').map((e) => e.id), ['genesis']);
+  // resolveFor falls back to Genesis for any profile, incl. a vestigial old id.
+  assert.strictEqual(engines.resolveFor({ filters: { engine_movie: 'trakt' } }, 'movie').id, 'genesis');
+  assert.strictEqual(engines.resolveFor({ filters: {} }, 'series').id, 'genesis');
+  assert.strictEqual(engines.resolveFor({}, 'movie').id, 'genesis');
+  // Genesis (unrestricted:false) is available to adult AND age-limited profiles.
+  assert.deepStrictEqual(engines.availableFor({ filters: {} }, 'movie').map((e) => e.id), ['genesis']);
+  assert.deepStrictEqual(engines.availableFor({ filters: { age_limit: 12 } }, 'movie').map((e) => e.id), ['genesis']);
+
+  // Register an unrestricted ("all ages") stub and prove the age-selection gate.
+  const dispose = engines._register({
+    id: 'open-stub', name: 'Open', description: 't', supportedTypes: ['movie', 'series'],
+    capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: true },
+    requirements: () => ({ ok: true, missing: [] }), generate: async () => [],
+  });
+  try {
+    const adult = { filters: {} };
+    const kid = { filters: { age_limit: 12, engine_movie: 'open-stub' } };
+    // Adult profile: the open stub is offered and resolvable.
+    assert.ok(engines.availableFor(adult, 'movie').some((e) => e.id === 'open-stub'));
+    assert.strictEqual(engines.resolveFor({ filters: { engine_movie: 'open-stub' } }, 'movie').id, 'open-stub');
+    // Age-limited profile: the open stub is hidden from the dropdown…
+    assert.ok(!engines.availableFor(kid, 'movie').some((e) => e.id === 'open-stub'));
+    // …and never resolved even if hand-stored — Genesis is the safe floor (I7).
+    assert.strictEqual(engines.resolveFor(kid, 'movie').id, 'genesis');
+  } finally { dispose(); }
+  // Registry restored to a single engine after the stub is disposed.
+  assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['genesis']);
+});
+
 ok('recommendationStore: purgeBelowVoteFloor drops stored rows under the profile vote floor (movies vs series ⅕)', () => {
   const rs = require('../src/recommendationStore');
   const pid = 'vc-purge';
@@ -1064,6 +1098,46 @@ async function httpTests() {
     // …and with no key it's a no-op even when rows are due.
     assert.deepStrictEqual(await rs.refreshStaleRatings(pid, '', q), { checked: 0, updated: 0 });
     console.log('  ✓ refreshStaleRatings heals NULL/stale ratings, skips fresh rows, no-ops without a key');
+  }
+
+  // Engine abstraction (SC-01): a FAKE engine returning hand-built
+  // NormalizedCandidates flows through the shared pipeline and lands as pool rows
+  // with the right column mapping (rankScore→affinity, reason→because_title,
+  // recCount→rec_count). First proof the abstraction works; doubles as the SC-06
+  // conformance fixture. preResolved:true keeps it no-network (pipeline skips the
+  // TMDB tt-id resolve); the no-keys baseline above keeps it off the enrich path.
+  {
+    const pipeline = require('../src/engines/pipeline');
+    const rs = require('../src/recommendationStore');
+    const q = { log() {}, warn() {} };
+    const pid = 'engine-fake';
+    rs.deleteForProfile(pid);
+    const cand = (id, rank, reason, recCount) => ({
+      type: 'movie', tmdb_id: id, rankScore: rank, reason, recCount,
+      imdb_id: 'tt' + id, title: 'Fake ' + id, year: 2024,
+      primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000,
+      popularity: 10, poster: 'https://example/' + id + '.jpg',
+    });
+    const fakeEngine = {
+      id: 'fake', name: 'Fake', description: 't', supportedTypes: ['movie', 'series'],
+      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+      requirements: () => ({ ok: true, missing: [] }),
+      generate: async () => [cand('f1', 3.5, 'because A', 2), cand('f2', 2.0, 'because B', 1), cand('f3', 1.0, null, 3)],
+    };
+    const ctx = { tmdbKey: 'unused', mdblistKey: '', settings: {}, filters: {}, log: q };
+    const res = await pipeline.runEngineBuild({ id: pid, name: 'Fake', filters: {} }, 'movie', fakeEngine, ctx, () => {});
+    assert.strictEqual(res.stored, 3);
+    const rows = Object.fromEntries(rs.getRecommended(pid, { type: 'movie', limit: 100 }).map((r) => [r.tmdb_id, r]));
+    assert.strictEqual(Object.keys(rows).length, 3);
+    assert.strictEqual(rows.f1.affinity, 3.5);              // rankScore → affinity (I6)
+    assert.strictEqual(rows.f1.because_title, 'because A'); // reason → because_title
+    assert.strictEqual(rows.f1.rec_count, 2);               // recCount → rec_count
+    assert.strictEqual(rows.f1.imdb_id, 'ttf1');
+    assert.strictEqual(rows.f3.because_title, null);        // null reason tolerated
+    // affinity ordering preserved (I6): serve reads strongest-first.
+    assert.deepStrictEqual(rs.getRecommended(pid, { type: 'movie', limit: 100 }).map((r) => r.tmdb_id), ['f1', 'f2', 'f3']);
+    rs.deleteForProfile(pid);
+    console.log('  ✓ engines: fake engine → shared pipeline → pool rows (rankScore/reason/recCount mapped)');
   }
 
   // Job queue: runs ONE AT A TIME (FIFO), reports progress, dedups same (profile,kind).
