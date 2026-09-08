@@ -19,6 +19,11 @@ config model, migration, naming, and the dependency graph. Then the cards:
 | 06 | [Conformance spec + second-engine template](06-conformance-and-second-engine-template.md) | doc/validation | 01–03 |
 | 07 | [Global engine enablement (admin toggle)](07-global-engine-enablement.md) | backend/config + frontend (portal) | 01, 02, 03 |
 
+The card `06` deliverables are live: the pass/fail gate for any engine is
+[`CONFORMANCE.md`](CONFORMANCE.md), the copy-me skeleton is
+[`src/engines/_template.js`](../../src/engines/_template.js) (unregistered), and
+the tested example is [`test/fixtures/fake-engine.js`](../../test/fixtures/fake-engine.js).
+
 **Delivery order:** 01 → 02 → 03 → 07 → (04 ∥ 05) → 06.
 
 **Key property:** cards 01–05/07 are a **user-visible no-op** until a second

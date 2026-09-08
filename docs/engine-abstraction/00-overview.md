@@ -4,6 +4,10 @@
 multi-engine recommendation architecture. Every scope card (`01`–`06`) references
 the contract and invariants defined here.
 
+> The engine **contract** below (§4) and the **invariants** (§3) are distilled
+> into a single pass/fail gate in [`CONFORMANCE.md`](CONFORMANCE.md) — the
+> definition of done for any engine before it may enter the registry (card `06`).
+
 **Target line:** a **new `v7.0.0-beta` line** (D3, confirmed). The current v6
 build **graduates to the stable `main` line** — it *is* Genesis Engine — and the
 `-beta` tag now tracks this engine-abstraction work on a fresh v7 branch. The

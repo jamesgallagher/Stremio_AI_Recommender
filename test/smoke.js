@@ -1312,6 +1312,132 @@ async function httpTests() {
     }
   }
 
+  // Engine abstraction (SC-06): the canonical FAKE fixture (test/fixtures/
+  // fake-engine.js) is the conformance vehicle — an engine that shares NONE of
+  // Genesis's internals (no Simkl seeding, no TMDB affinity math). Three checks
+  // exercise CONFORMANCE.md end-to-end. All offline: the fixture is preResolved
+  // (pipeline skips the resolve network) and the age-gate's LLM pass is served
+  // from the seeded verdict cache.
+
+  // 1. Per-type isolation: `fake` builds Movies, Genesis owns Series. Genesis RUNS
+  //    for series (a Simkl token clears its requirements) and returns [] offline
+  //    (no watched series to seed) — proving the fake did not leak across the type
+  //    boundary and Genesis, not the fake, produced the (empty) series slice.
+  {
+    const rs = require('../src/recommendationStore');
+    const engines = require('../src/engines');
+    const settings = require('../src/settings');
+    const { fake } = require('./fixtures/fake-engine');
+    const q = { log() {}, warn() {} };
+    const dispose = engines._register(fake);
+    const prevTmdb = settings.getSettings()?.keys?.tmdb_api_key || '';
+    settings.updateSettings({ keys: { tmdb_api_key: 'sc06-tmdb' }, engines: { fake: true } });
+    const prof = config.addProfile('SC06-ISO');
+    try {
+      config.updateProfile(prof.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'fake', engine_series: 'genesis' } });
+      const res = await rs.buildRecommendations(config.getProfile(prof.id), q);
+      assert.deepStrictEqual(res.engines, { movie: 'fake', series: 'genesis' });   // dispatch routed each type
+      // Movie slice = the fixture's three candidates, strongest-first (rankScore→affinity, I6).
+      assert.deepStrictEqual(
+        rs.getRecommended(prof.id, { type: 'movie', limit: 100 }).map((r) => r.tmdb_id),
+        ['fake-movie-1', 'fake-movie-2', 'fake-movie-3']);
+      assert.ok(!res.series.skipped && res.series.engine === 'genesis');            // Genesis RAN for series…
+      assert.strictEqual(rs.getRecommended(prof.id, { type: 'series', limit: 100 }).length, 0); // …and produced nothing (no leak)
+      console.log('  ✓ engines: SC-06 fake fixture → per-type isolation (fake Movies + Genesis Series), no Genesis internals');
+    } finally {
+      config.removeProfile(prof.id);
+      rs.deleteForProfile(prof.id);
+      settings.updateSettings({ keys: { tmdb_api_key: prevTmdb }, engines: { fake: false } });
+      dispose();
+    }
+  }
+
+  // 2. Safety is engine-independent (I1): a FAKE-sourced kids pool containing an
+  //    over-band title has it removed by the SHARED age gate — the age gate, not
+  //    the engine, is the authority. The over-band drop comes through the LLM ACB
+  //    pass, served entirely from the seeded verdict cache (no LLM call).
+  {
+    const rs = require('../src/recommendationStore');
+    const engines = require('../src/engines');
+    const settings = require('../src/settings');
+    const store = require('../src/store');
+    const animeMap = require('../src/services/animeMap');
+    const pipeline = require('../src/engines/pipeline');
+    const { fake } = require('./fixtures/fake-engine');
+    const q = { log() {}, warn() {} };
+    const dispose = engines._register(fake);
+    settings.updateSettings({ engines: { fake: true } });
+    // Fresh EMPTY anime index so applyAnimeGate (step 1) stays offline and treats
+    // every fake title as non-anime (they pass step 1 untouched).
+    animeMap._setIndex({ at: Date.now(), etag: 'sc06', byImdb: {}, byTmdb: {} });
+    const prof = config.addProfile('SC06-AGE');
+    config.updateProfile(prof.id, { filters: { age_limit: 8 } }); // kids profile → judged at 9
+    const ctx = { tmdbKey: 'unused', mdblistKey: '', settings: settings.getSettings(), filters: config.getProfile(prof.id).filters, log: q };
+    await pipeline.runEngineBuild(config.getProfile(prof.id), 'movie', fake, ctx, () => {});
+    assert.strictEqual(rs.getRecommended(prof.id, { type: 'movie', limit: 100 }).length, 3);
+    const prevVerdicts = store.loadAgeVerdicts();
+    // fake-movie-1 is judged UNSUITABLE at the judgement age (9); the others pass.
+    store.saveAgeVerdicts({ 'movie:9:fake-movie-1': false, 'movie:9:fake-movie-2': true, 'movie:9:fake-movie-3': true });
+    try {
+      const r = await rs.ageGatePool(config.getProfile(prof.id), q);
+      assert.strictEqual(r.vetoed, 1);   // the shared age gate removed the over-band title
+      assert.strictEqual(r.dropped, 0);  // none were NSFW/anime-band
+      assert.deepStrictEqual(
+        rs.getRecommended(prof.id, { type: 'movie', limit: 100 }).map((x) => x.tmdb_id),
+        ['fake-movie-2', 'fake-movie-3']); // over-band gone; safe titles remain
+      console.log('  ✓ engines: SC-06 shared age gate makes a fake-sourced kids pool safe (I1)');
+    } finally {
+      store.saveAgeVerdicts(prevVerdicts);
+      animeMap._setIndex({ at: Date.now(), etag: 'test', byImdb: {}, byTmdb: {} }); // leave empty-fresh for later tests
+      config.removeProfile(prof.id);
+      rs.deleteForProfile(prof.id);
+      settings.updateSettings({ engines: { fake: false } });
+      dispose();
+    }
+  }
+
+  // 3. Unrestricted gating (I7) via `fake-open` on the registry surface: offered to
+  //    adults, gated away from any age-limited profile at every enforcement point
+  //    (§5.5). (The companion surface's omission of an unrestricted engine reuses
+  //    this same fixture in the mobile suite.)
+  {
+    const engines = require('../src/engines');
+    const settings = require('../src/settings');
+    const { fake, fakeOpen } = require('./fixtures/fake-engine');
+    const disposeF = engines._register(fake);
+    const disposeO = engines._register(fakeOpen);
+    settings.updateSettings({ engines: { fake: true, 'fake-open': true } });
+    const adultP = config.addProfile('SC06-adult');
+    const kidP = config.addProfile('SC06-kid');
+    try {
+      const adult = { filters: {} };
+      const kid = { filters: { age_limit: 10, engine_movie: 'fake-open' } };
+      // availableFor: open offered to adults, hidden from kids; the GATED fake is
+      // offered to both (unrestricted:false is safe via the shared age gate).
+      assert.ok(engines.availableFor(adult, 'movie').some((e) => e.id === 'fake-open'));
+      assert.ok(!engines.availableFor(kid, 'movie').some((e) => e.id === 'fake-open'));
+      assert.ok(engines.availableFor(kid, 'movie').some((e) => e.id === 'fake'));
+      // resolveFor: never the open engine for a kid even if hand-stored (Genesis
+      // is the safe floor); an adult resolves to it normally.
+      assert.strictEqual(engines.resolveFor(kid, 'movie').id, 'genesis');
+      assert.strictEqual(engines.resolveFor({ filters: { engine_movie: 'fake-open' } }, 'movie').id, 'fake-open');
+      // updateProfile: open persists on an adult; coerces to Genesis on an
+      // age-limited profile; and RAISING the limit later revokes it (§5.5 pt3).
+      config.updateProfile(adultP.id, { filters: { engine_movie: 'fake-open' } });
+      assert.strictEqual(config.getProfile(adultP.id).filters.engine_movie, 'fake-open');
+      config.updateProfile(kidP.id, { filters: { age_limit: 12, engine_series: 'fake-open' } });
+      assert.strictEqual(config.getProfile(kidP.id).filters.engine_series, 'genesis'); // coerced
+      config.updateProfile(adultP.id, { filters: { age_limit: 7 } });
+      assert.strictEqual(config.getProfile(adultP.id).filters.engine_movie, 'genesis'); // revoked
+      console.log('  ✓ engines: SC-06 fake-open (unrestricted) gated off age-limited profiles (I7: availableFor/resolveFor/updateProfile)');
+    } finally {
+      config.removeProfile(adultP.id);
+      config.removeProfile(kidP.id);
+      settings.updateSettings({ engines: { fake: false, 'fake-open': false } });
+      disposeO(); disposeF();
+    }
+  }
+
   // Job queue: runs ONE AT A TIME (FIFO), reports progress, dedups same (profile,kind).
   {
     const jobs = require('../src/jobs');
@@ -2017,7 +2143,7 @@ async function httpTests() {
     console.log('  ✓ /api/settings SC-07: enable/disable toggle, Genesis-lock + unknown-drop, disable→revert fan-out');
   }
 
-  console.log(`\nAll checks passed (${passed} unit + 49 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 52 async/http).`);
   process.exit(0);
 }
 

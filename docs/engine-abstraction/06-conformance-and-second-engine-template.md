@@ -180,14 +180,27 @@ then implement against Part A's checklist using Part C's template.
 
 ## Tasks
 
-- [ ] Write Part A as a standalone `CONFORMANCE.md` (or keep it in this file and
-      link it from `00-overview.md`).
-- [ ] Add the `fake` + `fake-open` engine fixtures + the test-only registration hook.
-- [ ] Add `01`/`03` tests that exercise the fake engine end-to-end (pipeline →
-      pool → serve; per-type isolation; age gate over a fake-sourced kids pool).
-- [ ] Add I7 tests via `fake-open` (`availableFor`/`resolveFor`/`updateProfile`
-      coercion/age-limit-raise revocation/companion omission).
-- [ ] Commit `src/engines/_template.js` (unregistered).
+- [x] Write Part A as a standalone `CONFORMANCE.md` and link it from
+      `00-overview.md` (also from this dir's `README.md`).
+- [x] Add the `fake` + `fake-open` engine fixtures (`test/fixtures/fake-engine.js`)
+      using the existing test-only registration hook (`engines._register`, which
+      returns a disposer — production's registry stays Genesis-only).
+- [x] Add tests that exercise the fake engine end-to-end (fake → pipeline → pool →
+      serve in rankScore order; per-type isolation `fake` Movies + Genesis Series;
+      age gate over a fake-sourced kids pool). In `test/smoke.js`.
+- [x] Add I7 tests via `fake-open` (`availableFor`/`resolveFor`/`updateProfile`
+      coercion/age-limit-raise revocation in `test/smoke.js`; **companion omission**
+      in `mobile/test/mobile.smoke.js`, which reuses the same `fake-open` fixture).
+- [x] Commit `src/engines/_template.js` (unregistered).
+
+> **Implementation note.** The shipped fixtures are `preResolved: true` — a
+> deliberate test-hermeticity choice so they reach pool rows with **no network**
+> (the pipeline skips the TMDB tt-id/poster/genre resolve). The Part B sketch below
+> shows a `preResolved:false` shape with `tmdb.imdbFor`/MDBList stubbed; that
+> resolve path is already covered by Genesis's own tests, so the fixtures take the
+> no-stub route. The over-band drop in the "kids pool" test comes through the LLM
+> ACB pass served from the seeded verdict cache (offline), rather than the anime
+> band — same guarantee (I1), no MAL/anilist network.
 
 ## Acceptance criteria
 

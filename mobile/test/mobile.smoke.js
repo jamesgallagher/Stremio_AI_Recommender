@@ -29,6 +29,7 @@ const governor = require('../../src/services/governor');
 const recommendationStore = require('../../src/recommendationStore');
 const dontRecommend = require('../../src/dontRecommend');
 const handlers = require('../server/handlers'); // Step 3/4 data handlers
+const { fakeOpen } = require('../../test/fixtures/fake-engine'); // SC-06 canonical unrestricted fixture
 
 let passed = 0;
 async function ok(name, fn) { await fn(); passed++; console.log(`  ✓ ${name}`); }
@@ -680,30 +681,26 @@ async function unitTests() {
     const reqWording = JSON.stringify([s0.engines.requirements.movie, s0.engines.requirements.series]).toLowerCase();
     assert.ok(!reqWording.includes('age'), 'requirement wording never mentions age');
 
-    // I7 + SC-07 compose: register an unrestricted stub and ENABLE it (SC-07 —
-    // otherwise availableFor excludes it as disabled). It is then offered to an
-    // adult profile and OMITTED from an age-limited one, with no age value sent
-    // either way.
-    const dispose = engines._register({
-      id: 'mob-open', name: 'Open', description: 'stub', supportedTypes: ['movie', 'series'],
-      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: true },
-      requirements: () => ({ ok: true, missing: [] }), generate: async () => [],
-    });
-    settingsMod.updateSettings({ engines: { 'mob-open': true } });
+    // I7 + SC-07 compose: register the canonical unrestricted fixture `fake-open`
+    // (test/fixtures/fake-engine.js, SC-06) and ENABLE it (SC-07 — otherwise
+    // availableFor excludes it as disabled). It is then offered to an adult profile
+    // and OMITTED from an age-limited one, with no age value sent either way.
+    const dispose = engines._register(fakeOpen);
+    settingsMod.updateSettings({ engines: { 'fake-open': true } });
     try {
       const adult = config.addProfile('EngAdult');
       const sA = handlers.companionSettings(config.getProfile(adult.id));
-      assert.ok(sA.engines.available.movie.some((e) => e.id === 'mob-open')); // offered to an adult
+      assert.ok(sA.engines.available.movie.some((e) => e.id === 'fake-open')); // offered to an adult
 
       const kid = config.addProfile('EngKid');
       config.updateProfile(kid.id, { filters: { age_limit: 12 } });
       const sK = handlers.companionSettings(config.getProfile(kid.id));
-      assert.ok(!sK.engines.available.movie.some((e) => e.id === 'mob-open')); // hidden from a kid
-      assert.ok(!sK.engines.available.series.some((e) => e.id === 'mob-open'));
+      assert.ok(!sK.engines.available.movie.some((e) => e.id === 'fake-open')); // hidden from a kid
+      assert.ok(!sK.engines.available.series.some((e) => e.id === 'fake-open'));
       assert.ok(!('age_limit' in sK.filters), 'no age gate in the filters payload');
       assert.ok(!JSON.stringify(sK).includes('age_limit'), 'no age_limit anywhere in the settings response');
       config.removeProfile(adult.id); config.removeProfile(kid.id);
-    } finally { dispose(); settingsMod.updateSettings({ engines: { 'mob-open': false } }); }
+    } finally { dispose(); settingsMod.updateSettings({ engines: { 'fake-open': false } }); }
     config.removeProfile(p.id);
   });
 
