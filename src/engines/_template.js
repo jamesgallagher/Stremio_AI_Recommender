@@ -45,8 +45,9 @@ module.exports = {
   capabilities: {
     providesRankScore: true,   // must be true in v1 — rankScore drives order + genre-balance (I6)
     preResolved: false,        // false → the shared pipeline resolves tt-id/poster/genres.
-                               //   true → YOU guarantee a valid `tt` id + poster + genres on every
-                               //   candidate (no-tt candidates are dropped by the pipeline).
+                               //   true → YOU guarantee a valid `tt` id + poster on every candidate
+                               //   (no-tt candidates are dropped) AND set primary_genre + genres
+                               //   yourself (the pipeline only derives those on the resolve path).
     serveOrder: 'affinity',    // leave 'affinity' unless the serve path has been taught 'preserve'
     unrestricted: false,       // false = age-GATED (safe for any profile via the shared age gate).
                                //   Set true ONLY for a genuinely "all ages"/fully-open engine that

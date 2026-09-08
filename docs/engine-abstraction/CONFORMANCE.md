@@ -61,7 +61,11 @@ contradicts them is non-conformant.
 ## Capabilities
 - [ ] `capabilities.preResolved` accurately reflects whether candidates already
       carry `imdb_id` + poster + genres. If `false`, the pipeline resolves them; if
-      `true`, the engine guarantees a valid `tt` id (no-tt candidates are dropped).
+      `true`, the engine guarantees a valid `tt` id (no-tt candidates are dropped)
+      **and supplies `primary_genre` + `genres` itself** — the pipeline only derives
+      those from `genre_ids` on the resolve path, so a `preResolved` row with no
+      `primary_genre` lands in serve's "Other" genre bucket (no crash, but genre
+      balance degrades).
 - [ ] `capabilities.serveOrder` is `'affinity'` unless the serve path has been
       taught to honor `'preserve'` (out of scope until an engine needs it).
 - [ ] `capabilities.unrestricted` is set **honestly** (I7):

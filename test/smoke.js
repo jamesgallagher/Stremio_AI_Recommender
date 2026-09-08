@@ -2116,6 +2116,10 @@ async function httpTests() {
       assert.strictEqual(put.settings.engines.genesis, true); // Genesis-lock coercion
       assert.ok(!('ghost-id' in put.settings.engines));       // unknown id dropped
       assert.strictEqual(engines.isEnabled('sc07-fake'), true);
+      // PATCH semantics: a PUT that does NOT name sc07-fake must leave it enabled —
+      // a partial toggle never silently disables engines it omitted.
+      await fetch(`${BASE}/api/settings`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ engines: { genesis: true } }) });
+      assert.strictEqual(engines.isEnabled('sc07-fake'), true);
       const enabledP = await listP();
       assert.ok(enabledP.engines.available.movie.includes('sc07-fake')); // now selectable
 

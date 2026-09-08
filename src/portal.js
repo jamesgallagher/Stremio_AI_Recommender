@@ -657,12 +657,19 @@ router.put('/settings', (req, res) => {
     // transition BEFORE the write (isEnabled still reports the old state here).
     let disabledIds = [];
     if (req.body.engines && typeof req.body.engines === 'object') {
-      const validated = {};
+      const body = req.body.engines;
+      // PATCH semantics: only engines NAMED in the body change; every other engine
+      // keeps its stored state. (A partial toggle must never silently disable — and
+      // revert to Genesis — an engine it didn't mention; the portal always sends the
+      // full map, but an API caller might send one key.) Genesis is always forced
+      // on. Unknown ids are ignored by iterating the registry, not the body.
+      const validated = { ...(settings.getSettings()?.engines || {}) };
       for (const e of engines.list()) {
-        validated[e.id] = e.id === engines.DEFAULT_ID ? true : req.body.engines[e.id] === true;
+        if (e.id === engines.DEFAULT_ID) { validated[e.id] = true; continue; }
+        if (e.id in body) validated[e.id] = body[e.id] === true;
       }
       disabledIds = engines.list()
-        .filter((e) => e.id !== engines.DEFAULT_ID && engines.isEnabled(e.id) && validated[e.id] !== true)
+        .filter((e) => e.id !== engines.DEFAULT_ID && e.id in body && engines.isEnabled(e.id) && body[e.id] !== true)
         .map((e) => e.id);
       patch.engines = validated;
     }

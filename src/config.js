@@ -275,6 +275,15 @@ function updateProfile(id, patch) {
       // raises age_limit and picks an unrestricted engine together is rejected on
       // the new limit. (The slice-clear + rebuild that must follow a revocation
       // is SC-03; this card only makes the stored value safe.)
+      // NOTE: global enablement (SC-07) is deliberately NOT checked here. It is a
+      // resolve-time floor, not a write constraint: engines.resolveFor() returns
+      // Genesis for a disabled engine on build/serve, and an admin disable fans out
+      // a persisted revert (portal.revertDisabledEngines). Gating the WRITE too
+      // would forbid the legitimate "pre-select an engine on a profile, then enable
+      // it globally" workflow — and only Genesis (permanently enabled) could ever be
+      // stored. So a stored id may name a currently-disabled engine; it simply
+      // never SERVES that engine (resolveFor floors it). Storing an unknown/
+      // type-unsupported/age-inappropriate id still coerces to Genesis below.
       const engines = require('./engines'); // lazy: no config↔engines load cycle
       const effLimit = profile.filters.age_limit || 0;
       for (const t of ['movie', 'series']) {

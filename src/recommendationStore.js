@@ -423,12 +423,21 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
   const sr = results.series;
 
   // Nothing to build — either no type's engine was ready (all requirement-skipped)
-  // or the engines ran but found no seeds. DON'T stamp built_at, so needsBuild
+  // or the engines ran but produced nothing. DON'T stamp built_at, so needsBuild
   // keeps retrying until the inputs (a connection, watch history) appear. A
   // requirements miss reports what's missing; the ready-but-empty case keeps its
   // long-standing reason so existing status text is unchanged.
+  //
+  // "Produced nothing" is measured by what was STORED, not by seeds: a non-history
+  // engine (LLM/trending) legitimately has 0 watch-history seeds yet stores
+  // candidates. Keying off seeds alone left such a build perpetually "skipped" — it
+  // never stamped built_at, so needsBuild re-fired every tick (churn) and, worse,
+  // buildPool skipped the age gate over rows that WERE stored. A build that stored
+  // anything is a real build. (Genesis with 0 seeds stores nothing → still skipped.)
   const ranAny = !m.skipped || !sr.skipped;
-  if (!ranAny || (m.seeds + sr.seeds) === 0) {
+  const builtSeeds = m.seeds + sr.seeds;
+  const builtStored = (m.stored || 0) + (sr.stored || 0);
+  if (!ranAny || (builtSeeds === 0 && builtStored === 0)) {
     const reason = !ranAny
       ? `engine not ready — missing ${[...new Set(missing)].join(', ') || 'requirements'}`
       : 'no watched titles to seed from';
@@ -702,14 +711,14 @@ function needsBuild(profileId) {
 async function buildPool(profile, log = console, onProgress = () => {}) {
   init();
   const r = await buildRecommendations(profile, log, (pct, label) => onProgress(pct * 0.85, label)); // 0–85%
-  // Age-gate (I1) whenever this build STORED candidates — even if buildRecommendations
-  // reported `skipped`. It flags skipped on zero watch-history SEEDS, but that is a
-  // Genesis-shaped assumption: a non-history engine (LLM/trending) legitimately has
-  // 0 seeds yet stores candidates. Keying the gate off `skipped` alone would let
-  // those rows reach the pool un-vetted, and the serve-time band re-check is only a
-  // lowered-limit safety net (unrated → kept, no LLM), so an over-band title could
-  // be SERVED to a kids profile. Base it on what was stored instead. (Genesis with
-  // 0 seeds stores nothing, so this is a no-op for it.)
+  // Age-gate (I1) whenever this build STORED candidates. buildRecommendations no
+  // longer reports `skipped` once rows were stored (so `!r.skipped` already covers
+  // the normal case), but the `stored > 0` clause is a deliberate belt-and-braces
+  // floor: the age gate is the child-safety authority, so it must run over anything
+  // that reached the pool regardless of how the skip decision above is computed — a
+  // future regression in that logic can never let un-vetted rows serve. The
+  // serve-time band re-check is only a lowered-limit net (unrated → kept, no LLM),
+  // so this is the real gate. (Genesis with 0 seeds stores nothing → no-op.)
   const stored = (r.movie?.stored || 0) + (r.series?.stored || 0);
   if (!r.skipped || stored > 0) await ageGatePool(profile, log, (pct, label) => onProgress(85 + pct * 0.15, label)); // 85–100%
   return r;

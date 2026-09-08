@@ -202,13 +202,13 @@ async function main() {
     }
   });
 
-  // ── F. Regression (I1): a NON-HISTORY engine — one that stores candidates but
-  //      reports 0 watch-history seeds, exactly as a trending/LLM engine would —
-  //      must STILL have its rows age-gated. buildRecommendations flags the build
-  //      `skipped` on 0 seeds, but buildPool age-gates on what was STORED, so the
-  //      over-band title never reaches the kid. (Before the buildPool fix this
-  //      served an un-vetted title — see the review notes.)
-  await it('F. a 0-seed engine\'s stored rows are still age-gated before serve (I1 regression)', async () => {
+  // ── F. Regression: a NON-HISTORY engine — one that stores candidates but reports
+  //      0 watch-history seeds, exactly as a trending/LLM engine would — is treated
+  //      as a real build. It is NOT reported `skipped`, it stamps built_at (no
+  //      needsBuild churn, finding 2), and its rows are age-gated before serve so an
+  //      over-band title never reaches the kid (I1, finding 1). Both regressed
+  //      before the review fixes — see the review notes.
+  await it('F. a 0-seed engine\'s stored rows build cleanly + are age-gated before serve (I1/churn regression)', async () => {
     const nohist = { // deliberately does NOT set ctx.stats.seeds
       id: 'nohist', name: 'No-History', description: 't', supportedTypes: ['movie', 'series'],
       capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
@@ -226,8 +226,12 @@ async function main() {
     store.saveAgeVerdicts({ [verdictKey('movie', 9, 'nh-movie-1')]: false, [verdictKey('series', 9, 'nh-series-1')]: false });
     try {
       const r = await rs.buildPool(config.getProfile(p.id), quiet);
-      assert.strictEqual(r.skipped, true); // 0 seeds → buildRecommendations still reports skipped…
-      // …but the age gate ran over the stored rows, so the over-band title is gone.
+      // Finding 2: a 0-seed engine that STORED rows is a real build — not skipped,
+      // and built_at is stamped so needsBuild won't re-fire every tick.
+      assert.ok(!r.skipped, '0-seed-but-stored build must not be reported as skipped');
+      assert.ok(rs.getBuiltAt(p.id) > 0, 'built_at is stamped (no perpetual-rebuild churn)');
+      // Finding 1: the shared age gate ran over the stored rows, so the over-band
+      // title (verdict=false) never reaches the kid — on serve OR in the pool.
       assert.deepStrictEqual(rs.serveRecommendations(config.getProfile(p.id), 'movie').map((m) => m.id), []);
       assert.strictEqual(rs.getRecommended(p.id, { type: 'movie', limit: 100 }).length, 0);
       assert.strictEqual(rs.getRecommended(p.id, { type: 'series', limit: 100 }).length, 0);
