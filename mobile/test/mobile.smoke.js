@@ -663,6 +663,50 @@ async function unitTests() {
     assert.strictEqual(res.body.filters.engine_movie, 'genesis'); // echoed back to the phone
   });
 
+  await ok('settings: companionSettings ships per-type engine lists + requirements (SC-05), age + enablement gated server-side, no age leak', () => {
+    const settingsMod = require('../../src/settings');
+    const engines = require('../../src/engines');
+
+    // Genesis-only: both lists carry exactly Genesis; requirements present; the
+    // DTO is phone-safe (no capabilities / supported_types); no age in the
+    // requirement wording.
+    const p = config.addProfile('EngList');
+    const s0 = handlers.companionSettings(config.getProfile(p.id));
+    assert.deepStrictEqual(s0.engines.available.movie.map((e) => e.id), ['genesis']);
+    assert.deepStrictEqual(s0.engines.available.series.map((e) => e.id), ['genesis']);
+    assert.strictEqual(typeof s0.engines.requirements.movie.ok, 'boolean');
+    assert.strictEqual(typeof s0.engines.requirements.series.ok, 'boolean');
+    assert.deepStrictEqual(Object.keys(s0.engines.available.movie[0]).sort(), ['description', 'id', 'name']); // no internal-flag leak
+    const reqWording = JSON.stringify([s0.engines.requirements.movie, s0.engines.requirements.series]).toLowerCase();
+    assert.ok(!reqWording.includes('age'), 'requirement wording never mentions age');
+
+    // I7 + SC-07 compose: register an unrestricted stub and ENABLE it (SC-07 —
+    // otherwise availableFor excludes it as disabled). It is then offered to an
+    // adult profile and OMITTED from an age-limited one, with no age value sent
+    // either way.
+    const dispose = engines._register({
+      id: 'mob-open', name: 'Open', description: 'stub', supportedTypes: ['movie', 'series'],
+      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: true },
+      requirements: () => ({ ok: true, missing: [] }), generate: async () => [],
+    });
+    settingsMod.updateSettings({ engines: { 'mob-open': true } });
+    try {
+      const adult = config.addProfile('EngAdult');
+      const sA = handlers.companionSettings(config.getProfile(adult.id));
+      assert.ok(sA.engines.available.movie.some((e) => e.id === 'mob-open')); // offered to an adult
+
+      const kid = config.addProfile('EngKid');
+      config.updateProfile(kid.id, { filters: { age_limit: 12 } });
+      const sK = handlers.companionSettings(config.getProfile(kid.id));
+      assert.ok(!sK.engines.available.movie.some((e) => e.id === 'mob-open')); // hidden from a kid
+      assert.ok(!sK.engines.available.series.some((e) => e.id === 'mob-open'));
+      assert.ok(!('age_limit' in sK.filters), 'no age gate in the filters payload');
+      assert.ok(!JSON.stringify(sK).includes('age_limit'), 'no age_limit anywhere in the settings response');
+      config.removeProfile(adult.id); config.removeProfile(kid.id);
+    } finally { dispose(); settingsMod.updateSettings({ engines: { 'mob-open': false } }); }
+    config.removeProfile(p.id);
+  });
+
   await ok('settings: POST persists title decay (opt-in + window), clamped to the band', () => {
     const p = config.addProfile('SetDecay');
     const res = fakeRes();

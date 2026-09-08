@@ -4,6 +4,7 @@
 const settings = require('../../src/settings');
 const config = require('../../src/config');
 const catalogs = require('../../src/catalogs');
+const engines = require('../../src/engines');
 const tmdb = require('../../src/services/tmdb');
 const simkl = require('../../src/services/simkl');
 const recommendationStore = require('../../src/recommendationStore');
@@ -204,15 +205,36 @@ function companionCatalogs(profile) {
     }));
 }
 
+// PURE: a phone-safe engine descriptor. Only id/name/description — capabilities
+// and supported_types (internal flags) never leave the server (SC-05).
+const engDTO = (e) => ({ id: e.id, name: e.name, description: e.description });
+
 // The full Companion settings payload — Filters tab (editable filters + view
-// pref + genre options) and Catalogs tab (age-appropriate extra catalogs). Never
-// includes the age gate. Exported for tests.
+// pref + genre options + per-type engine choices) and Catalogs tab
+// (age-appropriate extra catalogs). Never includes the age gate. Exported for tests.
 function companionSettings(profile) {
   return {
-    filters: toCompanionFilters(profile.filters || {}),
+    filters: toCompanionFilters(profile.filters || {}), // includes engine_movie/series via COMPANION_FILTERS
     catalog_only: catalogOnlyOf(profile),
     genres: Object.keys(tmdb.GENRE_ALIASES).sort(),
     catalogs: companionCatalogs(profile),
+    // Per-type engine choices (SC-05). `available` is AGE-FILTERED and
+    // ENABLEMENT-filtered SERVER-SIDE (engines.availableFor → I7 + SC-07): an
+    // unrestricted or globally-disabled engine is simply never sent to the phone,
+    // and the age limit that does the filtering is NEVER exposed (same discipline
+    // companionCatalogs uses for age-band catalogs). `requirements` is the
+    // effective engine's per-profile readiness so the UI can warn "needs Simkl" /
+    // "needs a key" — its wording carries no age reference.
+    engines: {
+      available: {
+        movie: engines.availableFor(profile, 'movie').map(engDTO),
+        series: engines.availableFor(profile, 'series').map(engDTO),
+      },
+      requirements: {
+        movie: engines.resolveFor(profile, 'movie').requirements(profile),
+        series: engines.resolveFor(profile, 'series').requirements(profile),
+      },
+    },
   };
 }
 
