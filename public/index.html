@@ -118,6 +118,8 @@
 <script>
 const $ = (s, el = document) => el.querySelector(s);
 let GENRES = [];
+let ENGINES = [];   // [{id,name,description,supported_types,capabilities}] — the engine registry (card 04)
+const enginesForType = (t) => ENGINES.filter(e => e.supported_types.includes(t));
 let CATALOG_DEFS = [];
 // A catalog pitched at a rating band (min_profile_age) is hidden from profiles
 // limited below it — the option should not exist, not merely be unchecked.
@@ -264,7 +266,11 @@ function render(profiles) {
       </div>
 
       <div class="tab-panel" data-tab="filters">
-        <div class="muted" style="margin-bottom:8px;font-size:11px">Rating floor, excluded genres, recency and list size apply at <b>serve time</b> over the stored pool — change one and it takes effect immediately, no rebuild. The <b>age limit</b> and <b>minimum vote count</b> are baked in at build, so they apply on the next rebuild.</div>
+        <div class="muted" style="margin-bottom:8px;font-size:11px">The <b>engine</b> decides how each list is generated; changing it rebuilds that catalog. Rating floor, excluded genres, recency and list size apply at <b>serve time</b> over the stored pool — change one and it takes effect immediately, no rebuild. The <b>age limit</b> and <b>minimum vote count</b> are baked in at build, so they apply on the next rebuild.</div>
+        <div class="cols">
+          ${engineField(p, 'movie')}
+          ${engineField(p, 'series')}
+        </div>
         <div class="cols">
           <div><label>Minimum rating</label>
             <select data-filter="min_rating">
@@ -438,6 +444,38 @@ function switchTab(btn, name) {
 
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
+// Per-type engine selector (card 04). Genesis-only today → one locked option; a
+// second engine (once registered AND enabled) lights the dropdown up on its own.
+function engineField(p, type) {
+  // Only engines this profile may CHOOSE for this type — the age-filtered list the
+  // API computed (p.engines.available[type], from availableFor / I7). An
+  // unrestricted engine is simply absent for an age-limited profile, so it is
+  // never offered. Intersect the global catalog (for name/description) with it.
+  const allow = new Set((p.engines && p.engines.available && p.engines.available[type]) || ['genesis']);
+  const opts  = enginesForType(type).filter(e => allow.has(e.id));
+  const sel   = (p.filters[`engine_${type}`]) || 'genesis';
+  const cur   = opts.find(e => e.id === sel) || opts[0];
+  const only  = opts.length <= 1;
+  const req   = p.engines && p.engines.requirements && p.engines.requirements[type];
+  const warn  = req && !req.ok
+    ? `<div style="color:var(--err);font-size:12px;margin-top:4px">⚠ ${esc(cur ? cur.name : 'This engine')} needs ${esc((req.missing || []).join(', '))}.</div>`
+    : '';
+  return `<div><label>${type === 'movie' ? 'Movies' : 'Series'} engine</label>
+    <select data-filter="engine_${type}" ${only ? 'disabled' : ''} onchange="updateEngineDesc(this,'${type}')">
+      ${opts.map(e => `<option value="${esc(e.id)}" ${e.id === (cur ? cur.id : sel) ? 'selected' : ''}>${esc(e.name)}${only ? ' (only engine)' : ''}</option>`).join('')}
+    </select>
+    <div class="muted" data-engine-desc="${type}" style="font-size:11px;margin-top:3px">${esc(cur ? cur.description : '')}</div>
+    ${warn}</div>`;
+}
+
+// Swap the description under an engine select to the newly chosen engine's.
+// Pure client-side (the catalog is already cached in ENGINES); scoped to this card.
+function updateEngineDesc(sel, type) {
+  const e = ENGINES.find(x => x.id === sel.value);
+  const desc = sel.parentElement.querySelector(`[data-engine-desc="${type}"]`);
+  if (desc) desc.textContent = e ? e.description : '';
+}
+
 // Effective catalog toggle: explicit profile setting wins, else the
 // definition's default (Watch Later ships ON, curated lists ship OFF).
 function catOn(p, c) {
@@ -600,6 +638,7 @@ function toggleServerConfig() { cfgForced = !cfgForced; applyServerConfigVisibil
 
 async function load() {
   if (!GENRES.length) GENRES = (await api('/genres')).genres;
+  if (!ENGINES.length) ENGINES = (await api('/engines')).engines || [];
   if (!CATALOG_DEFS.length) CATALOG_DEFS = (await api('/catalogs')).catalogs;
   if (!$('#ver').textContent) $('#ver').textContent = `· v${(await api('/version')).version}`;
   const settings = await api('/settings');
@@ -685,10 +724,18 @@ async function saveFilters(id) {
     excluded_genres: [...card.querySelectorAll('.genres input:checked')].map(i => i.value),
     title_decay_enabled: decayOn,
     title_decay_days: parseInt(card.querySelector('[data-filter=title_decay_days]').value, 10),
+    engine_movie: card.querySelector('[data-filter=engine_movie]').value,
+    engine_series: card.querySelector('[data-filter=engine_series]').value,
   };
+  // An engine change replaces that catalog's producer, so it rebuilds the slice
+  // (backend card 03) — hint at that rather than claiming it applies immediately.
+  const prev = (PROFILES.find(p => p.id === id) || {}).filters || {};
+  const engineChanged = filters.engine_movie !== (prev.engine_movie || 'genesis')
+    || filters.engine_series !== (prev.engine_series || 'genesis');
   await api('/profiles/' + id, { method: 'PUT', body: { filters } });
   dirty = false;
-  toast('Filters saved — applies at serve time (rating/genre/recency) or next rebuild');
+  toast('Filters saved — applies at serve time (rating/genre/recency) or next rebuild'
+    + (engineChanged ? ' — engine change rebuilds that catalog' : ''));
   pollStatus();
 }
 
