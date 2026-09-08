@@ -22,8 +22,10 @@
 // default (SC-07): the admin turns it on in Server Config before it appears in any
 // dropdown. So a new engine is user-visible only when it is BOTH registered AND
 // enabled.
-
-const settings = require('../settings'); // typical dependency; delete if unused
+//
+// Typical dependencies (require what you use):
+//   const settings = require('../settings');  // keys/LLM availability for requirements()
+//   const tmdb = require('../services/tmdb');  // resolve a non-TMDB source to a tmdb_id
 
 /** @type {import('./types').Engine} */
 module.exports = {

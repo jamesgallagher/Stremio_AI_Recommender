@@ -702,7 +702,16 @@ function needsBuild(profileId) {
 async function buildPool(profile, log = console, onProgress = () => {}) {
   init();
   const r = await buildRecommendations(profile, log, (pct, label) => onProgress(pct * 0.85, label)); // 0–85%
-  if (!r.skipped) await ageGatePool(profile, log, (pct, label) => onProgress(85 + pct * 0.15, label)); // 85–100%
+  // Age-gate (I1) whenever this build STORED candidates — even if buildRecommendations
+  // reported `skipped`. It flags skipped on zero watch-history SEEDS, but that is a
+  // Genesis-shaped assumption: a non-history engine (LLM/trending) legitimately has
+  // 0 seeds yet stores candidates. Keying the gate off `skipped` alone would let
+  // those rows reach the pool un-vetted, and the serve-time band re-check is only a
+  // lowered-limit safety net (unrated → kept, no LLM), so an over-band title could
+  // be SERVED to a kids profile. Base it on what was stored instead. (Genesis with
+  // 0 seeds stores nothing, so this is a no-op for it.)
+  const stored = (r.movie?.stored || 0) + (r.series?.stored || 0);
+  if (!r.skipped || stored > 0) await ageGatePool(profile, log, (pct, label) => onProgress(85 + pct * 0.15, label)); // 85–100%
   return r;
 }
 
