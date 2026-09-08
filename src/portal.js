@@ -221,8 +221,17 @@ router.put('/profiles/:id', (req, res) => {
       return res.status(400).json({ error: 'Set and test the account password before enabling auto-scrobble' });
     }
   }
-  const profile = config.updateProfile(req.params.id, patch);
+  const { profile, engineChanged } = config.updateProfile(req.params.id, patch);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  // SC-03: an engine change (a new per-type selection, or an age-limit raise that
+  // revoked an unrestricted engine) replaces that type's candidate producer —
+  // clear its stale rows and kick a rebuild (fire-and-forget; the portal already
+  // polls status/job). dont_recommend is engine-independent and survives.
+  if (engineChanged.length) {
+    for (const t of engineChanged) recommendationStore.clearType(profile.id, t);
+    recommendationStore.ensureBuilt(profile)
+      .catch((err) => console.warn(`[rec] ${profile.name}: engine-change rebuild failed — ${err.message}`));
+  }
   // Rule: extra-catalog caches can be built "from the configure" — when the
   // toggle set changes and any enabled, buildable catalog has no cache yet,
   // build those in the background (extras only: never burns LLM quota).
@@ -474,6 +483,8 @@ router.get('/profiles/:id/recommend', (req, res) => {
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
   res.json({
     total: recommendationStore.countRecommended(profile.id),
+    // Which engine currently produces each catalog (SC-03) — for the Advanced tab.
+    engines: { movie: engines.resolveFor(profile, 'movie').id, series: engines.resolveFor(profile, 'series').id },
     movies: recommendationStore.getRecommended(profile.id, { type: 'movie', limit: 40 }),
     series: recommendationStore.getRecommended(profile.id, { type: 'series', limit: 40 }),
   });
@@ -518,7 +529,7 @@ router.post('/profiles/:id/recommend/suppress', async (req, res) => {
 });
 
 router.post('/profiles/:id/simkl/disconnect', (req, res) => {
-  const profile = config.updateProfile(req.params.id, { simkl_auth: null });
+  const { profile } = config.updateProfile(req.params.id, { simkl_auth: null });
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
   simklFlows.delete(req.params.id);
   res.json({ ok: true });

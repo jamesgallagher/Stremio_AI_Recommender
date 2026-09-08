@@ -340,6 +340,23 @@ function resetRecommendations(profileId) {
   return { cleared: true };
 }
 
+// Clear ONE type's pool slice — SC-03. Used when a profile's engine_<type> changes
+// (a new selection, or an age-limit raise that revokes an unrestricted engine): the
+// candidate PRODUCER changed, so stale rows from the previous engine must not linger
+// (overview §5.4). Deliberately leaves dont_recommend ALONE — a user's rejections /
+// decays are engine-independent and persist across an engine swap. Also resets the
+// profile's build state so needsBuild → true and the next ensureBuilt rebuilds the
+// pool. (We mark build-needed here rather than teaching needsBuild to treat an empty
+// slice as build-needed: an empty slice is ambiguous — a single-type watcher legitimately
+// has an empty other slice — and would re-trigger every tick. buildRecommendations
+// rebuilds both types anyway, so the cost is identical.) Returns rows removed.
+function clearType(profileId, type) {
+  init();
+  const r = db.get().prepare('DELETE FROM recommended WHERE profile_id = ? AND type = ?').run(profileId, String(type));
+  db.get().prepare('DELETE FROM rec_state WHERE profile_id = ?').run(profileId); // mark build-needed
+  return Number(r.changes || 0);
+}
+
 // Build the recommendation pool for a profile — now a thin TWO-TYPE GENESIS
 // WRAPPER (SC-01). Genesis produces candidates per type; the shared pipeline
 // (engines/pipeline.js) resolves/enriches/upserts/purges each type's slice. The
@@ -361,6 +378,7 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
   const tmdbKey = s?.keys?.tmdb_api_key;
   if (!tmdbKey) return { skipped: true, reason: 'no TMDB key in Server Config' };
 
+  const engines = require('./engines');
   const pipeline = require('./engines/pipeline');
   const filters = profile.filters || {};
   const ctx = {
@@ -370,15 +388,52 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
     filters,
     log,
   };
+  const spans = { movie: [0, 50], series: [50, 100] };
   const band = (lo, hi) => (pct, label) => onProgress(lo + (pct / 100) * (hi - lo), label);
 
-  // Both types via Genesis, each built independently through the shared pipeline.
-  const m = await pipeline.runEngineBuild(profile, 'movie', genesis, ctx, band(0, 50));
-  const sr = await pipeline.runEngineBuild(profile, 'series', genesis, ctx, band(50, 100));
+  // SC-03: dispatch each type to the engine the profile selected for it (Genesis
+  // is the guaranteed safe floor — resolveFor never returns an unknown engine, one
+  // that doesn't support the type, or an age-inappropriate one, so this can never
+  // disable or unsafely fill a type). A type whose resolved engine's requirements
+  // are unmet is SKIPPED with a logged reason and its existing pool rows are LEFT
+  // SERVING — a skip must NEVER wipe a slice (only an engine CHANGE does, via
+  // config.updateProfile → clearType). The engine id per type is threaded into the
+  // result + logs so the Advanced tab / API can show who produced each catalog.
+  const results = {};
+  const engineIds = {};
+  const missing = [];
+  const skipResult = (engine) => ({ skipped: true, engine: engine.id, seeds: 0, raw: 0, strong: 0, kept: 0, stored: 0, purged: 0 });
+  for (const type of ['movie', 'series']) {
+    const engine = engines.resolveFor(profile, type);
+    engineIds[type] = engine.id;
+    const req = engine.requirements(profile);
+    if (!req.ok) {
+      const miss = req.missing || [];
+      missing.push(...miss);
+      log.warn(`[rec] ${profile.name}/${type}: ${engine.name} unavailable — missing ${miss.join(', ') || 'requirements'} (keeping existing ${type} rows)`);
+      results[type] = { ...skipResult(engine), missing: miss };
+      continue;
+    }
+    log.log(`[rec] ${profile.name}/${type}: building with ${engine.name}`);
+    const r = await pipeline.runEngineBuild(profile, type, engine, ctx, band(...spans[type]));
+    r.engine = engine.id;
+    results[type] = r;
+  }
+  const m = results.movie;
+  const sr = results.series;
 
-  // No seeds of either type → nothing to build. Unchanged: DON'T stamp built_at,
-  // so needsBuild stays true until watch history appears.
-  if ((m.seeds + sr.seeds) === 0) return { skipped: true, reason: 'no watched titles to seed from' };
+  // Nothing to build — either no type's engine was ready (all requirement-skipped)
+  // or the engines ran but found no seeds. DON'T stamp built_at, so needsBuild
+  // keeps retrying until the inputs (a connection, watch history) appear. A
+  // requirements miss reports what's missing; the ready-but-empty case keeps its
+  // long-standing reason so existing status text is unchanged.
+  const ranAny = !m.skipped || !sr.skipped;
+  if (!ranAny || (m.seeds + sr.seeds) === 0) {
+    const reason = !ranAny
+      ? `engine not ready — missing ${[...new Set(missing)].join(', ') || 'requirements'}`
+      : 'no watched titles to seed from';
+    return { skipped: true, reason, engines: engineIds, movie: m, series: sr };
+  }
 
   // Whole-pool IMDb-rating heal — runs ONCE after BOTH types (like the age gate),
   // so an orphan/stale row of either type is re-enriched and can't leak past the
@@ -397,7 +452,7 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
   const seeds = m.seeds + sr.seeds;
   const stored = m.stored + sr.stored;
   const purged = m.purged + sr.purged;
-  log.log(`[rec] ${profile.name}: ${seeds} seed(s) → ${m.strong + sr.strong} unique → ${stored} servable (movies ${m.stored}, series ${sr.stored})${purged ? `, ${purged} purged below vote floor` : ''}${refreshed.updated ? `, ${refreshed.updated} rating(s) refreshed` : ''} (total ${countRecommended(profile.id)})`);
+  log.log(`[rec] ${profile.name}: ${seeds} seed(s) → ${m.strong + sr.strong} unique → ${stored} servable (movies ${m.stored} via ${engineIds.movie}, series ${sr.stored} via ${engineIds.series})${purged ? `, ${purged} purged below vote floor` : ''}${refreshed.updated ? `, ${refreshed.updated} rating(s) refreshed` : ''} (total ${countRecommended(profile.id)})`);
   return {
     seeds,
     raw: m.raw + sr.raw,
@@ -407,6 +462,9 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
     purged,
     ratingsRefreshed: refreshed.updated,
     total: countRecommended(profile.id),
+    engines: engineIds, // which engine produced each type (SC-03)
+    movie: m,           // per-type detail (engine id, stored, or {skipped,missing})
+    series: sr,
   };
 }
 
@@ -668,6 +726,7 @@ module.exports = {
   ensureBuilt,
   needsBuild,
   resetRecommendations,
+  clearType,
   upsertCandidates,
   setAgeClassification,
   purgeBelowVoteFloor,

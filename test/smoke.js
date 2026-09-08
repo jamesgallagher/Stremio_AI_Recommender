@@ -1192,6 +1192,108 @@ async function httpTests() {
     console.log('  ✓ engines: fake engine → shared pipeline → pool rows (rankScore/reason/recCount mapped)');
   }
 
+  // Engine abstraction (SC-03): buildRecommendations DISPATCHES each type to the
+  // engine the profile selected, requirement-SKIPS an unready type WITHOUT wiping
+  // its rows, annotates the result with the engine id per type, and clearType
+  // clears one slice + marks the profile build-needed while dont_recommend survives.
+  {
+    const rs = require('../src/recommendationStore');
+    const engines = require('../src/engines');
+    const settings = require('../src/settings');
+    const q = { log() {}, warn() {} };
+
+    // preResolved fakes → no network. Each stamps ctx.stats.seeds (so the build
+    // isn't treated as seed-less) and tags its rows so we can watch dispatch route
+    // each type independently. `ready:false` exercises the requirement-skip path.
+    const mkEngine = (id, tag, { ready = true } = {}) => ({
+      id, name: id, description: 't', supportedTypes: ['movie', 'series'],
+      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+      requirements: () => (ready ? { ok: true, missing: [] } : { ok: false, missing: ['a widget'] }),
+      generate: async (profile, type, ctx) => {
+        if (ctx.stats) ctx.stats.seeds = 1;
+        return [{
+          type, tmdb_id: `${tag}-${type}`, rankScore: 5, imdb_id: `tt-${tag}-${type}`,
+          title: `${tag} ${type}`, year: 2024, primary_genre: 'Drama', genres: 'Drama',
+          vote_average: 8, vote_count: 5000, popularity: 1, poster: null,
+        }];
+      },
+    });
+    const disposers = [
+      engines._register(mkEngine('sc03-a', 'A')),
+      engines._register(mkEngine('sc03-b', 'B')),
+      engines._register(mkEngine('sc03-need', 'N', { ready: false })),
+    ];
+    // buildRecommendations early-returns without a global TMDB key; set one (the
+    // preResolved fakes ignore it) and restore the prior value afterwards.
+    const prevTmdb = settings.getSettings()?.keys?.tmdb_api_key || '';
+    settings.updateSettings({ keys: { tmdb_api_key: 'sc03-tmdb' } });
+    const prof = config.addProfile('SC03');
+    const load = () => config.getProfile(prof.id);
+    try {
+      // 1. Per-type dispatch: movie built by sc03-a, series by sc03-b.
+      config.updateProfile(prof.id, { filters: { engine_movie: 'sc03-a', engine_series: 'sc03-b' } });
+      const r1 = await rs.buildRecommendations(load(), q);
+      assert.deepStrictEqual(r1.engines, { movie: 'sc03-a', series: 'sc03-b' }); // engine id per type
+      assert.strictEqual(rs.getRecommended(prof.id, { type: 'movie', limit: 10 })[0].tmdb_id, 'A-movie'); // sc03-a produced movies
+      assert.strictEqual(rs.getRecommended(prof.id, { type: 'series', limit: 10 })[0].tmdb_id, 'B-series'); // sc03-b produced series
+
+      // 2. Requirement-skip must NOT wipe the slice. Point series at the not-ready
+      //    engine (bypass updateProfile's rebuild path — set the field directly so
+      //    the existing B-series row is still present) and rebuild.
+      config.updateProfile(prof.id, { filters: { engine_series: 'sc03-need' } });
+      // the change cleared the series slice (via the caller hook is not run here) —
+      // clearType is not called by updateProfile itself, so re-seed the slice to
+      // prove a REQUIREMENT skip (not an engine change) leaves rows intact.
+      rs.upsertCandidates(prof.id, [{ type: 'series', tmdb_id: 'keep1', imdb_id: 'ttkeep1', title: 'Keep', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, affinity: 9, rec_count: 1, popularity: 1, poster: null }], { ratingCheckedAt: null });
+      const r2 = await rs.buildRecommendations(load(), q);
+      assert.strictEqual(r2.engines.series, 'sc03-need');
+      assert.strictEqual(r2.movie.engine, 'sc03-a');         // movie still built
+      assert.strictEqual(r2.series.skipped, true);           // series requirement-skipped
+      assert.deepStrictEqual(r2.series.missing, ['a widget']);
+      assert.ok(rs.getRecommended(prof.id, { type: 'series', limit: 10 }).some((x) => x.tmdb_id === 'keep1')); // rows survived the skip
+
+      // 3. clearType clears ONLY that slice, keeps dont_recommend, marks build-needed.
+      rs.addDontRecommend(prof.id, 'movie', 'A-movie'); // a rejection (also drops the pool row)
+      rs.addDontRecommend(prof.id, 'series', 'nope99');
+      rs.setBuiltAt(prof.id); // pretend fresh
+      const removed = rs.clearType(prof.id, 'series');
+      assert.ok(removed >= 1);                                            // series rows deleted
+      assert.strictEqual(rs.getRecommended(prof.id, { type: 'series', limit: 10 }).length, 0); // series slice empty
+      assert.strictEqual(rs.getBuiltAt(prof.id), 0);                     // build state reset → needsBuild fires
+      assert.ok(rs.dontRecommendKeys(prof.id).has('series:nope99'));      // dont_recommend untouched
+      assert.ok(rs.dontRecommendKeys(prof.id).has('movie:A-movie'));
+
+      // 4. config.updateProfile REPORTS the changed engine field(s) so the portal /
+      //    companion hooks know which slice to clear + rebuild.
+      const c1 = config.updateProfile(prof.id, { filters: { engine_movie: 'sc03-b' } });
+      assert.deepStrictEqual(c1.engineChanged, ['movie']);              // only movie changed
+      const c2 = config.updateProfile(prof.id, { filters: { engine_movie: 'sc03-b' } });
+      assert.deepStrictEqual(c2.engineChanged, []);                     // no-op change reports nothing
+
+      // 5. Age-limit REVOCATION (I7) surfaces through the SAME diff — no special
+      //    casing: select an unrestricted engine on an adult profile, then raise
+      //    age_limit; updateProfile rewrites that type to genesis, and the change
+      //    shows up in engineChanged so the caller clears + rebuilds it.
+      const disposeOpen = engines._register({
+        id: 'sc03-open', name: 'Open', description: 't', supportedTypes: ['movie', 'series'],
+        capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: true },
+        requirements: () => ({ ok: true, missing: [] }), generate: async () => [],
+      });
+      try {
+        config.updateProfile(prof.id, { filters: { engine_movie: 'sc03-open' } }); // legal on an adult profile
+        assert.strictEqual(load().filters.engine_movie, 'sc03-open');
+        const c3 = config.updateProfile(prof.id, { filters: { age_limit: 12 } });   // raise the limit
+        assert.strictEqual(load().filters.engine_movie, 'genesis');                 // unrestricted engine revoked
+        assert.deepStrictEqual(c3.engineChanged, ['movie']);                        // revocation reported → clear+rebuild
+      } finally { disposeOpen(); }
+      console.log('  ✓ engines: SC-03 per-type dispatch, requirement-skip keeps rows, clearType + engineChanged (incl. age revocation)');
+    } finally {
+      config.removeProfile(prof.id);
+      settings.updateSettings({ keys: { tmdb_api_key: prevTmdb } });
+      for (const d of disposers) d();
+    }
+  }
+
   // Job queue: runs ONE AT A TIME (FIFO), reports progress, dedups same (profile,kind).
   {
     const jobs = require('../src/jobs');
@@ -1498,9 +1600,14 @@ async function httpTests() {
   }
   assert.strictEqual(job.state, 'done');
   assert.strictEqual(job.result.skipped, true);
-  assert.strictEqual(job.result.reason, 'no watched titles to seed from');
+  // SC-03: Genesis' requirements gate now fires first — this profile has a TMDB key
+  // (global) but no Simkl connection, so both types requirement-skip with a clear
+  // "missing Simkl connection" reason (was the generic seed-less skip pre-SC-03).
+  assert.match(job.result.reason, /Simkl/);
+  assert.deepStrictEqual(job.result.engines, { movie: 'genesis', series: 'genesis' });
   const recView = await (await fetch(`${BASE}/api/profiles/${profile.id}/recommend`)).json();
   assert.strictEqual(recView.total, 0);
+  assert.deepStrictEqual(recView.engines, { movie: 'genesis', series: 'genesis' }); // /recommend surfaces per-type engine
   // Suppress endpoint validates its input and records a rejection
   const badSuppress = await fetch(`${BASE}/api/profiles/${profile.id}/recommend/suppress`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
   assert.strictEqual(badSuppress.status, 400);
@@ -1833,7 +1940,7 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 47 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 48 async/http).`);
   process.exit(0);
 }
 

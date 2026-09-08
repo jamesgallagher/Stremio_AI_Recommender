@@ -245,13 +245,21 @@ function settingsPostHandler(req, res) {
   }
   if (!patch.filters && !patch.companion && !patch.catalogs) return res.status(400).json({ error: 'Nothing to update' });
 
-  let updated;
+  let updated; let engineChanged = [];
   try {
-    updated = config.updateProfile(req.profile.id, patch); // validates + clamps each field
+    ({ profile: updated, engineChanged } = config.updateProfile(req.profile.id, patch)); // validates + clamps each field
   } catch (err) {
     return res.status(423).json({ error: `Could not save — ${err.message}` });
   }
   if (!updated) return res.status(404).json({ error: 'Profile not found' });
+  // SC-03: a companion engine change clears + rebuilds that slice too (fire-and-
+  // forget). age_limit is never a companion field, so a revocation can't originate
+  // here — only an explicit engine_movie/engine_series swap.
+  if (engineChanged.length) {
+    for (const t of engineChanged) recommendationStore.clearType(updated.id, t);
+    recommendationStore.ensureBuilt(updated)
+      .catch((err) => console.warn(`[rec] ${updated.name}: engine-change rebuild failed — ${err.message}`));
+  }
   res.json({ ok: true, ...companionSettings(updated) });
 }
 

@@ -239,11 +239,22 @@ function addProfile(name) {
   return profile; // plaintext (a new profile has no secrets yet)
 }
 
+// Returns { profile, engineChanged }: the updated plaintext profile (or null if
+// not found) plus the list of types whose engine_<type> actually changed value.
+// SC-03 callers use engineChanged to clear + rebuild the affected pool slice —
+// config.js itself never touches recommendationStore (no dependency/cycle across
+// the layer). engineChanged is captured around the WHOLE update so it also picks
+// up an age-limit-driven revocation (§5.5 pt3), where raising age_limit rewrites
+// engine_<type> to 'genesis' without the field appearing in the patch.
 function updateProfile(id, patch) {
   let updated = null;
+  const engineChanged = [];
   mutateProfiles((data) => {
     const profile = data.profiles.find((p) => p.id === id);
     if (!profile) return;
+    // Snapshot the per-type engine ids BEFORE any mutation (applyMigrations has
+    // already run inside mutateProfiles, so both fields exist here).
+    const beforeEngines = { movie: profile.filters.engine_movie, series: profile.filters.engine_series };
     if (patch.name !== undefined) profile.name = String(patch.name);
     if (patch.email !== undefined) profile.email = String(patch.email || '').trim();
     if (patch.keys) Object.assign(profile.keys, patch.keys);
@@ -319,9 +330,13 @@ function updateProfile(id, patch) {
       if (!profile.companion) profile.companion = { ...DEFAULT_COMPANION };
       if (patch.companion.catalog_only !== undefined) profile.companion.catalog_only = !!patch.companion.catalog_only;
     }
+    // Report which type(s) swapped producer — a selection change OR a revocation.
+    for (const t of ['movie', 'series']) {
+      if (beforeEngines[t] !== profile.filters[`engine_${t}`]) engineChanged.push(t);
+    }
     updated = profile;
   });
-  return updated; // plaintext object, or null if not found
+  return { profile: updated, engineChanged }; // profile is null if not found
 }
 
 function removeProfile(id) {
