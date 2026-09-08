@@ -148,6 +148,10 @@ router.get('/engines', (req, res) => {
     engines: engines.list().map((e) => ({
       id: e.id, name: e.name, description: e.description,
       supported_types: e.supportedTypes, capabilities: e.capabilities,
+      // SC-07: global admin enablement. `enabled` drives the Server Config
+      // toggles; `locked` marks Genesis as non-disableable (permanent default).
+      enabled: engines.isEnabled(e.id),
+      locked: e.id === engines.DEFAULT_ID,
     })),
     default: engines.DEFAULT_ID,
   });
@@ -619,12 +623,54 @@ router.get('/settings', (req, res) => {
   });
 });
 
+// SC-07: when an engine is disabled globally, every profile that had it selected
+// for a type reverts to Genesis (a PERSISTED revert) and that slice is cleared +
+// rebuilt — the SC-03 per-profile engine-change path, fanned out across all
+// profiles by a single admin toggle. Kept here in the portal layer, which owns
+// the config↔recommendationStore wiring (config/settings never depend on the
+// store). dont_recommend is engine-independent and is left intact by clearType.
+function revertDisabledEngines(disabledIds) {
+  const disabled = new Set(disabledIds);
+  for (const p of config.listProfiles()) {
+    const filtersPatch = {};
+    for (const t of ['movie', 'series']) {
+      if (disabled.has(p.filters?.[`engine_${t}`])) filtersPatch[`engine_${t}`] = 'genesis';
+    }
+    if (!Object.keys(filtersPatch).length) continue;
+    const { profile, engineChanged } = config.updateProfile(p.id, { filters: filtersPatch });
+    if (!profile || !engineChanged.length) continue;
+    for (const t of engineChanged) recommendationStore.clearType(profile.id, t);
+    recommendationStore.ensureBuilt(profile)
+      .catch((err) => console.warn(`[engines] ${profile.name}: disable-revert rebuild failed — ${err.message}`));
+  }
+}
+
 router.put('/settings', (req, res) => {
   try {
     const patch = {};
     if (req.body.llm && typeof req.body.llm === 'object') patch.llm = req.body.llm;
     if (req.body.keys && typeof req.body.keys === 'object') patch.keys = req.body.keys;
+    // SC-07: admin engine enable/disable map. Validate against the registry —
+    // keep only known ids, coerce to bool, and FORCE Genesis on (it can never be
+    // disabled; a body asking to is silently corrected). Unknown ids are dropped
+    // by iterating the registry rather than the request body. Compute the disable
+    // transition BEFORE the write (isEnabled still reports the old state here).
+    let disabledIds = [];
+    if (req.body.engines && typeof req.body.engines === 'object') {
+      const validated = {};
+      for (const e of engines.list()) {
+        validated[e.id] = e.id === engines.DEFAULT_ID ? true : req.body.engines[e.id] === true;
+      }
+      disabledIds = engines.list()
+        .filter((e) => e.id !== engines.DEFAULT_ID && engines.isEnabled(e.id) && validated[e.id] !== true)
+        .map((e) => e.id);
+      patch.engines = validated;
+    }
     const updated = settings.updateSettings(patch);
+    // Fan out AFTER the write is persisted, so isEnabled already reports the new
+    // (disabled) state while the revert runs. resolveFor's disabled→Genesis
+    // fallback is the belt-and-suspenders for the window before this finishes.
+    if (disabledIds.length) revertDisabledEngines(disabledIds);
     res.json({ settings: updated, complete: settings.isComplete(updated) });
   } catch (err) {
     res.status(423).json({ error: err.message });

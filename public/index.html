@@ -528,7 +528,41 @@ function renderServerConfig(data) {
         <div><label>RPDB</label>${keyRowS('rpdb', 'rpdb_api_key', keys.rpdb_api_key)}</div>
       </div>
     </details>
+
+    <details open><summary>Engines — which recommendation engines are available install-wide</summary>
+      <div class="muted" style="font-size:11px;margin:6px 0 8px">Turn an engine on to make it selectable per profile (Movies / Series). A disabled engine disappears from every dropdown and any profile using it reverts to Genesis, which rebuilds that catalog. Genesis is the default and can't be turned off.</div>
+      ${enginesSection()}
+    </details>
   </div>`;
+}
+
+// SC-07: the admin engine enable/disable list. Reads the module-global ENGINES
+// (from GET /api/engines, which now carries enabled + locked). Genesis renders
+// locked-on; every other engine is a live checkbox. With only Genesis registered
+// this is a single locked row — it lights up on its own once a second engine is
+// registered in code.
+const SUPPORTED_LABEL = (types) => {
+  const s = new Set(types || []);
+  if (s.has('movie') && s.has('series')) return 'Movies + Shows';
+  if (s.has('movie')) return 'Only Movies';
+  if (s.has('series')) return 'Only Shows';
+  return '—';
+};
+function enginesSection() {
+  if (!ENGINES.length) return '<div class="muted" style="font-size:12px">No engines registered.</div>';
+  return `<div class="stack" style="gap:8px">${ENGINES.map((e) => {
+    const locked = !!e.locked;
+    const on = locked || !!e.enabled;
+    return `<label class="engine-row" style="display:flex;align-items:flex-start;gap:8px;padding:8px;border:1px solid var(--border);border-radius:6px">
+      <input type="checkbox" data-engine="${esc(e.id)}" ${on ? 'checked' : ''} ${locked ? 'disabled' : ''} style="margin-top:2px">
+      <span style="flex:1">
+        <span style="font-weight:600">${esc(e.name)}</span>
+        <span class="badge" style="margin-left:6px">${esc(SUPPORTED_LABEL(e.supported_types))}</span>
+        ${locked ? '<span class="muted" style="font-size:11px;margin-left:6px">Default engine — always on</span>' : ''}
+        <span class="muted" style="display:block;font-size:11px;margin-top:3px">${esc(e.description || '')}</span>
+      </span>
+    </label>`;
+  }).join('')}</div>`;
 }
 
 // key row with a Test button that hits /settings/test/:service with the field's
@@ -540,12 +574,15 @@ function keyRowS(service, dataKey, value) {
 function collectSettings() {
   const el = $('#serverConfig');
   const val = (k) => (el.querySelector(`[data-key="${k}"]`)?.value ?? '').trim();
+  const engines = {};
+  el.querySelectorAll('[data-engine]').forEach((cb) => { engines[cb.dataset.engine] = cb.checked; }); // genesis stays checked+locked; the server forces it on
   return {
     llm: {
       custom_name: val('custom_name'), custom_uri: val('custom_uri'), custom_api_key: val('custom_api_key'),
       groq_api_key: val('groq_api_key'), groq_api_key_backup: val('groq_api_key_backup'),
     },
     keys: { tmdb_api_key: val('tmdb_api_key'), mdblist_api_key: val('mdblist_api_key'), rpdb_api_key: val('rpdb_api_key') },
+    engines,
   };
 }
 
@@ -555,10 +592,17 @@ async function saveSettings(btn) {
     await api('/settings', { method: 'PUT', body: collectSettings() });
     dirty = false;
     toast('Server config saved');
+    ENGINES = (await api('/engines')).engines || []; // enabled/locked may have changed
     const s = await api('/settings');
     cfgComplete = !!s.complete;
-    renderServerConfig(s); // re-render only the server-config block
+    renderServerConfig(s); // re-render only the server-config block (reads the fresh ENGINES)
     applyServerConfigVisibility();
+    // A disable reverts affected profiles to Genesis and changes per-type
+    // availability, so refresh the profile list + engine dropdowns too.
+    const { profiles } = await api('/profiles');
+    PROFILES = profiles;
+    renderTopBar();
+    renderSelected();
     pollStatus(); // profile badges/warnings may flip (keys/LLM now configured)
   } catch (e) { toast('Save failed: ' + e.message); } finally { btn.disabled = false; }
 }

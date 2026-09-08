@@ -32,6 +32,13 @@ function blankSettings() {
       mdblist_api_key: '',
       rpdb_api_key: DEFAULT_RPDB_KEY,
     },
+    // v7 (SC-07): admin-only global engine enablement map { engineId: bool }.
+    // Genesis is permanently enabled in code (engines.isEnabled), so its stored
+    // value is irrelevant — a non-Genesis engine is OFF until it appears here as
+    // `true`. Not a secret: plaintext, like the rest of the config metadata (the
+    // seal path below skips it). settings.js stays registry-agnostic — validation
+    // (drop unknown ids, force genesis:true) lives in the portal write path.
+    engines: {},
     created_at: null, // null until Server Config is first saved
   };
 }
@@ -41,7 +48,7 @@ function settingsLocked() { return locked; }
 
 // ---- sealing ----
 function sealSettings(s) {
-  const q = { llm: { ...s.llm }, keys: { ...s.keys }, created_at: s.created_at };
+  const q = { llm: { ...s.llm }, keys: { ...s.keys }, engines: { ...(s.engines || {}) }, created_at: s.created_at };
   for (const f of LLM_SECRET_FIELDS) if (q.llm[f]) q.llm[f] = secret.seal(q.llm[f]);
   for (const f of KEY_SECRET_FIELDS) if (q.keys[f]) q.keys[f] = secret.seal(q.keys[f]);
   return q;
@@ -63,6 +70,7 @@ function applyDefaults(s) {
   const merged = {
     llm: { ...base.llm, ...(s.llm || {}) },
     keys: { ...base.keys, ...(s.keys || {}) },
+    engines: { ...base.engines, ...(s.engines || {}) }, // seeds {} on older files (SC-07)
     created_at: s.created_at ?? null,
   };
   return merged;
@@ -96,6 +104,9 @@ function updateSettings(patch) {
   }
   if (patch.llm) Object.assign(current.llm, patch.llm);
   if (patch.keys) Object.assign(current.keys, patch.keys);
+  // SC-07: merge the engine-enablement map (already validated by the caller —
+  // settings.js stores it as-is; enablement is resolved by engines.isEnabled).
+  if (patch.engines) Object.assign(current.engines, patch.engines);
   if (!current.created_at) current.created_at = Date.now();
   store.saveSettings(sealSettings(current));
   return current;

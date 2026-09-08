@@ -538,6 +538,7 @@ ok('settings: roundtrip, migration seeds from "James", isComplete, llmChain', ()
   let s = settings.getSettings();
   assert.strictEqual(s.keys.tmdb_api_key, 'JAMES-TMDB'); // unsealed back to plaintext
   assert.strictEqual(s.llm.groq_api_key, 'JAMES-GROQ');
+  assert.deepStrictEqual(s.engines, {}); // SC-07: engine-enablement map seeds empty (Genesis is on in code)
   assert.strictEqual(settings.isComplete(s), true); // TMDB + a groq key
 
   // Migration is one-time — a second call is a no-op
@@ -663,11 +664,14 @@ ok('recommendationStore: selectStrong gates on the supplied vote floor (NOT rati
   assert.ok(!rs.selectStrong(recs, 0).some((r) => r.tmdb_id === 'adult'));
 });
 
-ok('engines: registry lists Genesis, resolveFor/availableFor honour age gating (I7)', () => {
+ok('engines: registry lists Genesis, resolveFor/availableFor honour age gating (I7) + global enablement (SC-07)', () => {
   const engines = require('../src/engines');
+  const settings = require('../src/settings');
   // Single engine → a single, locked option per type (requirement #3).
   assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['genesis']);
   assert.deepStrictEqual(engines.listForType('series').map((e) => e.id), ['genesis']);
+  // Genesis is the permanent default + safe floor — always enabled (SC-07).
+  assert.strictEqual(engines.isEnabled('genesis'), true);
   // resolveFor falls back to Genesis for any profile, incl. a vestigial old id.
   assert.strictEqual(engines.resolveFor({ filters: { engine_movie: 'trakt' } }, 'movie').id, 'genesis');
   assert.strictEqual(engines.resolveFor({ filters: {} }, 'series').id, 'genesis');
@@ -676,7 +680,8 @@ ok('engines: registry lists Genesis, resolveFor/availableFor honour age gating (
   assert.deepStrictEqual(engines.availableFor({ filters: {} }, 'movie').map((e) => e.id), ['genesis']);
   assert.deepStrictEqual(engines.availableFor({ filters: { age_limit: 12 } }, 'movie').map((e) => e.id), ['genesis']);
 
-  // Register an unrestricted ("all ages") stub and prove the age-selection gate.
+  // Register an unrestricted ("all ages") stub and prove BOTH gates: global
+  // enablement (SC-07) and the age-selection gate (I7) compose.
   const dispose = engines._register({
     id: 'open-stub', name: 'Open', description: 't', supportedTypes: ['movie', 'series'],
     capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: true },
@@ -685,6 +690,14 @@ ok('engines: registry lists Genesis, resolveFor/availableFor honour age gating (
   try {
     const adult = { filters: {} };
     const kid = { filters: { age_limit: 12, engine_movie: 'open-stub' } };
+    // SC-07: a freshly registered engine ships DISABLED — absent from dropdowns and
+    // never resolved, even on an adult profile, until an admin enables it.
+    assert.strictEqual(engines.isEnabled('open-stub'), false);
+    assert.ok(!engines.availableFor(adult, 'movie').some((e) => e.id === 'open-stub'));
+    assert.strictEqual(engines.resolveFor({ filters: { engine_movie: 'open-stub' } }, 'movie').id, 'genesis');
+    // Enable it (admin Server Config toggle). Now the age gate is the only filter.
+    settings.updateSettings({ engines: { 'open-stub': true } });
+    assert.strictEqual(engines.isEnabled('open-stub'), true);
     // Adult profile: the open stub is offered and resolvable.
     assert.ok(engines.availableFor(adult, 'movie').some((e) => e.id === 'open-stub'));
     assert.strictEqual(engines.resolveFor({ filters: { engine_movie: 'open-stub' } }, 'movie').id, 'open-stub');
@@ -692,7 +705,7 @@ ok('engines: registry lists Genesis, resolveFor/availableFor honour age gating (
     assert.ok(!engines.availableFor(kid, 'movie').some((e) => e.id === 'open-stub'));
     // …and never resolved even if hand-stored — Genesis is the safe floor (I7).
     assert.strictEqual(engines.resolveFor(kid, 'movie').id, 'genesis');
-  } finally { dispose(); }
+  } finally { dispose(); settings.updateSettings({ engines: { 'open-stub': false } }); }
   // Registry restored to a single engine after the stub is disposed.
   assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['genesis']);
 });
@@ -1227,6 +1240,10 @@ async function httpTests() {
     // preResolved fakes ignore it) and restore the prior value afterwards.
     const prevTmdb = settings.getSettings()?.keys?.tmdb_api_key || '';
     settings.updateSettings({ keys: { tmdb_api_key: 'sc03-tmdb' } });
+    // SC-07: dispatch runs through resolveFor, which now gates on global
+    // enablement — a registered engine is OFF until Server Config enables it, so
+    // turn the dispatch fakes on (Genesis is otherwise the safe-floor fallback).
+    settings.updateSettings({ engines: { 'sc03-a': true, 'sc03-b': true, 'sc03-need': true } });
     const prof = config.addProfile('SC03');
     const load = () => config.getProfile(prof.id);
     try {
@@ -1290,6 +1307,7 @@ async function httpTests() {
     } finally {
       config.removeProfile(prof.id);
       settings.updateSettings({ keys: { tmdb_api_key: prevTmdb } });
+      settings.updateSettings({ engines: { 'sc03-a': false, 'sc03-b': false, 'sc03-need': false } });
       for (const d of disposers) d();
     }
   }
@@ -1940,7 +1958,66 @@ async function httpTests() {
   assert.ok(html.includes('AI Recommender'));
   console.log('  ✓ /configure/ portal served');
 
-  console.log(`\nAll checks passed (${passed} unit + 48 async/http).`);
+  // SC-07: global engine enablement over HTTP — GET /api/engines enabled/locked,
+  // PUT /api/settings toggle (Genesis-lock coercion + unknown-id drop), and the
+  // disable→revert fan-out (a disabled engine's profiles fall back to Genesis, its
+  // slice is cleared, dont_recommend preserved, the other type untouched).
+  {
+    const engines = require('../src/engines');
+    const rs = require('../src/recommendationStore');
+    // Genesis: enabled + locked in the API payload.
+    const eng0 = await (await fetch(`${BASE}/api/engines`)).json();
+    const gen = eng0.engines.find((e) => e.id === 'genesis');
+    assert.deepStrictEqual([gen.enabled, gen.locked], [true, true]);
+
+    // A second (preResolved) engine ships DISABLED — registered ≠ available.
+    const dispose = engines._register({
+      id: 'sc07-fake', name: 'SC07 Fake', description: 'stub', supportedTypes: ['movie', 'series'],
+      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+      requirements: () => ({ ok: true, missing: [] }),
+      generate: async (p, type) => [{ type, tmdb_id: `sc07-${type}`, rankScore: 5, imdb_id: `ttsc07${type}`, title: 'x', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, popularity: 1, poster: null }],
+    });
+    try {
+      const eng1 = await (await fetch(`${BASE}/api/engines`)).json();
+      assert.strictEqual(eng1.engines.find((e) => e.id === 'sc07-fake').enabled, false);
+
+      const prof = (await (await fetch(`${BASE}/api/profiles`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'SC07' }) })).json()).profile;
+      const listP = async () => (await (await fetch(`${BASE}/api/profiles`)).json()).profiles.find((x) => x.id === prof.id);
+      assert.ok(!(await listP()).engines.available.movie.includes('sc07-fake')); // disabled → absent from dropdowns
+
+      // Enable it. Genesis:false is coerced back on; an unknown id is dropped.
+      const put = await (await fetch(`${BASE}/api/settings`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ engines: { 'sc07-fake': true, genesis: false, 'ghost-id': true } }) })).json();
+      assert.strictEqual(put.settings.engines.genesis, true); // Genesis-lock coercion
+      assert.ok(!('ghost-id' in put.settings.engines));       // unknown id dropped
+      assert.strictEqual(engines.isEnabled('sc07-fake'), true);
+      const enabledP = await listP();
+      assert.ok(enabledP.engines.available.movie.includes('sc07-fake')); // now selectable
+
+      // Select it on Series; seed a pool row per type + a Series rejection.
+      await fetch(`${BASE}/api/profiles/${prof.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filters: { ...enabledP.filters, engine_series: 'sc07-fake' } }) });
+      assert.strictEqual((await listP()).engines.series, 'sc07-fake');
+      rs.upsertCandidates(prof.id, [
+        { type: 'movie', tmdb_id: 'm-keep', imdb_id: 'ttmkeep', title: 'M', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, affinity: 9, rec_count: 1, popularity: 1, poster: null },
+        { type: 'series', tmdb_id: 's-gone', imdb_id: 'ttsgone', title: 'S', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, affinity: 9, rec_count: 1, popularity: 1, poster: null },
+      ]);
+      rs.addDontRecommend(prof.id, 'series', 'rejected-1', 'user');
+
+      // Disable it → the Series slice reverts to Genesis + clears; Movies untouched;
+      // the rejection survives; the engine leaves the dropdowns.
+      await fetch(`${BASE}/api/settings`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ engines: { 'sc07-fake': false } }) });
+      const afterP = await listP();
+      assert.strictEqual(afterP.engines.series, 'genesis');                 // persisted revert
+      assert.strictEqual(rs.getRecommended(prof.id, { type: 'series', limit: 10 }).length, 0); // stale slice cleared
+      assert.ok(rs.getRecommended(prof.id, { type: 'movie', limit: 10 }).some((r) => r.tmdb_id === 'm-keep')); // Movies untouched
+      assert.ok(rs.dontRecommendKeys(prof.id).has('series:rejected-1')); // rejection preserved (engine-independent)
+      assert.ok(!afterP.engines.available.series.includes('sc07-fake'));  // gone from dropdowns
+
+      await fetch(`${BASE}/api/profiles/${prof.id}`, { method: 'DELETE' });
+    } finally { dispose(); require('../src/settings').updateSettings({ engines: { 'sc07-fake': false } }); }
+    console.log('  ✓ /api/settings SC-07: enable/disable toggle, Genesis-lock + unknown-drop, disable→revert fan-out');
+  }
+
+  console.log(`\nAll checks passed (${passed} unit + 49 async/http).`);
   process.exit(0);
 }
 

@@ -20,26 +20,45 @@ function _register(engine) {
   return () => REGISTRY.delete(engine.id);
 }
 
+// isEnabled (SC-07): the global admin on/off gate, read from Server Config
+// (`settings.engines`). Genesis is the permanent default + safe floor and is
+// ALWAYS enabled (its stored value, if any, is ignored); every other engine is
+// OFF until an admin turns it on — so a code-registered engine ships dark and
+// only appears once it is BOTH registered AND enabled. The settings read is lazy
+// (settings.js has no dependency on this module, so no require cycle) and
+// tolerant of settings being absent/uninitialised → non-Genesis engines read off.
+function isEnabled(id) {
+  if (id === DEFAULT_ID) return true;                 // Genesis: permanently on
+  if (!has(id)) return false;
+  const cfg = require('../settings').getSettings()?.engines || {};
+  return cfg[id] === true;                            // non-Genesis default OFF
+}
+function listEnabled() { return list().filter((e) => isEnabled(e.id)); }
+function listEnabledFor(type) { return listForType(type).filter((e) => isEnabled(e.id)); }
+
 // availableFor: the engines this profile may CHOOSE for `type` — listForType
-// minus any `unrestricted` ("all ages"/fully open) engine when the profile has
-// an age limit (I7 / overview §5.5). Powers the dropdowns (portal + companion)
-// so an open engine is never offered to an age-gated profile. Genesis
-// (unrestricted:false) is always in the result, so a dropdown is never empty.
+// minus any engine that is globally DISABLED (SC-07) or is `unrestricted` ("all
+// ages"/fully open) while the profile has an age limit (I7 / overview §5.5).
+// Powers the dropdowns (portal + companion) so a disabled or open engine is never
+// offered. Genesis (always enabled, unrestricted:false) always survives, so a
+// dropdown is never empty.
 function availableFor(profile, type) {
   const limited = (profile?.filters?.age_limit || 0) > 0;
-  return listForType(type).filter((e) => !(limited && e.capabilities.unrestricted));
+  return listForType(type).filter((e) => isEnabled(e.id) && !(limited && e.capabilities.unrestricted));
 }
 
 // resolveFor: the effective engine for (profile, type). Falls back to Genesis
 // (the guaranteed safe floor) when the stored id is unknown, doesn't support the
-// type, OR is an unrestricted engine on an age-limited profile — so even a
-// hand-edited profiles.json can never serve open content to a kids profile (I7).
+// type, is globally DISABLED (SC-07), OR is an unrestricted engine on an
+// age-limited profile — so even a hand-edited profiles.json can never build/serve
+// from a switched-off engine or serve open content to a kids profile (I7).
 function resolveFor(profile, type) {
   const id = profile?.filters?.[`engine_${type}`];
   const e = get(id);
   if (!e || !e.supportedTypes.includes(type)) return genesis;
+  if (!isEnabled(e.id)) return genesis;               // SC-07: disabled → safe floor
   if (e.capabilities.unrestricted && (profile?.filters?.age_limit || 0) > 0) return genesis;
   return e;
 }
 
-module.exports = { get, list, listForType, has, availableFor, resolveFor, DEFAULT_ID, _register };
+module.exports = { get, list, listForType, has, isEnabled, listEnabled, listEnabledFor, availableFor, resolveFor, DEFAULT_ID, _register };
