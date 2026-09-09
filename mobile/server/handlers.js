@@ -281,6 +281,11 @@ function catalogPreviewHandler(req, res) {
     id: served.id,
     name: served.name,
     type: served.type,
+    // MW-02: `source` drives the per-cell action wiring (a Watch Later cell's ✕
+    // removes from the list; every other ✕ suppresses). It leaks nothing about age
+    // — it's already in the companionCatalogs DTO — and the portal preview already
+    // forwards it, so both surfaces read the same flag.
+    source: served.source,
     requirement_met: served.requirement_met,
     state: served.state,
     count: served.metas.length,

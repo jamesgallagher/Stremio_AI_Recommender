@@ -88,6 +88,18 @@
   .cpv-cell .cap { margin-top: 5px; display: block; line-height: 1.3;
     overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
   .cpv-cell .yr { color: var(--muted); }
+  /* MW-02: always-visible corner actions — eye (mark watched) top-left, ✕ top-right.
+     ≥32px hit area, keyboard-focusable, dark scrim over the poster, clear of the
+     rating badge (bottom-left). Overrides the global purple button background. */
+  .cpv-cell .poster .cpv-act { position: absolute; top: 6px; width: 32px; height: 32px; padding: 0;
+    display: flex; align-items: center; justify-content: center; border: 0; border-radius: 999px;
+    background: rgba(0,0,0,.6); color: #fff; font-size: 14px; font-weight: 700; line-height: 1; cursor: pointer; }
+  .cpv-cell .poster .cpv-act:hover { background: rgba(0,0,0,.82); }
+  .cpv-cell .poster .cpv-act:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .cpv-cell .poster .cpv-act svg { width: 15px; height: 15px; display: block; }
+  .cpv-cell .poster .cpv-watch { left: 6px; }
+  .cpv-cell .poster .cpv-nope { right: 6px; }
+  .cpv-cell .poster .cpv-nope:hover { background: var(--err); }
   .cpv-msg { padding: 30px 10px; text-align: center; color: var(--muted); font-size: 13px; }
   /* One key per line, with a show/hide eye pinned inside the input */
   .keys-list { display: flex; flex-direction: column; gap: 12px; margin-top: 4px; }
@@ -563,6 +575,7 @@ const CPV_STATE_MSG = {
 };
 
 let _cpvLastFocus = null;
+let _cpvPid = null; // MW-02: the profile whose preview is open, for the cell actions
 function _cpvClose() {
   const b = document.getElementById('cpvBackdrop');
   if (b) b.remove();
@@ -588,6 +601,7 @@ function _cpvKey(e) {
 async function openCatalogPreview(ev, pid, catalogId, title) {
   ev.preventDefault(); ev.stopPropagation();
   _cpvLastFocus = ev.currentTarget;
+  _cpvPid = pid; // the cell actions (mark-watched / not-interested / WL-remove) post to this profile
   const backdrop = document.createElement('div');
   backdrop.className = 'cpv-backdrop'; backdrop.id = 'cpvBackdrop';
   backdrop.addEventListener('mousedown', (e) => { if (e.target === backdrop) _cpvClose(); });
@@ -626,9 +640,69 @@ function _cpvRender(data) {
       : '<div class="no-poster">' + esc(m.name || 'No poster') + '</div>';
     const rating = m.imdbRating ? '<span class="rating" title="IMDb rating">★ ' + esc(String(m.imdbRating)) + '</span>' : '';
     const yr = m.releaseInfo ? ' <span class="yr">' + esc(String(m.releaseInfo)) + '</span>' : '';
-    return '<div class="cpv-cell"><div class="poster">' + poster + rating + '</div>'
+    return '<div class="cpv-cell"><div class="poster">' + poster + rating + _cpvActions(data, m) + '</div>'
       + '<span class="cap">' + esc(m.name || '') + yr + '</span></div>';
   }).join('') + '</div>';
+}
+
+// MW-02: the two always-visible corner buttons for a preview cell — eye (mark
+// watched) top-left, ✕ top-right. On a Watch Later list (source:'simkl_plantowatch')
+// the ✕ removes from the list (MW-04) and the eye keeps the cell; elsewhere the ✕ is
+// "not interested" (suppress) and the eye drops the cell. Only the SAFE values
+// (type, tt-id, isWatchLater) ride the inline onclick; the title goes through a
+// data-name attribute (HTML-attribute-escaped) and is read back from the button, so
+// a title with an apostrophe/quote can never break out of the handler call.
+function _cpvActions(data, m) {
+  const isWL = data.source === 'simkl_plantowatch';
+  const xLabel = isWL ? 'Remove from Watch Later' : 'Not interested';
+  const xFn    = isWL ? 'cpvRemoveFromWatchlist'  : 'cpvNotInterested';
+  const eyeLbl = isWL ? 'Mark as watched (kept in Watch Later)' : 'Mark as watched';
+  const t = esc(data.type), id = esc(m.id), nm = esc(m.name || '');
+  return '<button type="button" class="cpv-act cpv-watch" data-name="' + nm + '" title="' + esc(eyeLbl) + '" aria-label="' + esc(eyeLbl) + ': ' + nm + '" '
+    + 'onclick="cpvMarkWatched(event, this, \'' + t + '\', \'' + id + '\', ' + isWL + ')">' + EYE + '</button>'
+    + '<button type="button" class="cpv-act cpv-nope" data-name="' + nm + '" title="' + esc(xLabel) + '" aria-label="' + esc(xLabel) + ': ' + nm + '" '
+    + 'onclick="' + xFn + '(event, this, \'' + t + '\', \'' + id + '\')">✕</button>';
+}
+
+// Drop a preview cell and re-derive the header count from what's left.
+function _cpvDropCell(btn) {
+  const cell = btn.closest('.cpv-cell'); if (cell) cell.remove();
+  const body = document.getElementById('cpvBody');
+  const n = body ? body.querySelectorAll('.cpv-cell').length : 0;
+  const count = document.getElementById('cpvCount');
+  if (count) count.textContent = n + ' ' + (n === 1 ? 'title' : 'titles');
+}
+
+// MW-02 portal cell actions. Each reuses the SAME endpoint its companion twin does
+// so behaviour can't drift: watched → POST /profiles/:id/watched (shared markWatched),
+// not-interested → the existing /recommend/suppress, Watch Later ✕ → MW-04's
+// /watchlist/remove. api() throws on a non-2xx; we toast the reason and KEEP the cell.
+async function cpvMarkWatched(ev, btn, type, id, isWatchLater) {
+  ev.preventDefault(); ev.stopPropagation();
+  const title = btn.dataset.name || '';
+  try {
+    await api('/profiles/' + _cpvPid + '/watched', { method: 'POST', body: { type, imdb_id: id, title } });
+    toast(isWatchLater ? 'Marked “' + (title || 'title') + '” watched — kept in Watch Later' : 'Marked “' + (title || 'title') + '” watched');
+    if (!isWatchLater) _cpvDropCell(btn); // Watch Later keeps watched — leave the cell (WL-KW)
+  } catch (err) { toast(/simkl/i.test(err.message) ? 'Connect Simkl for this profile first' : ('Couldn’t mark watched — ' + err.message)); }
+}
+async function cpvNotInterested(ev, btn, type, id) {
+  ev.preventDefault(); ev.stopPropagation();
+  const title = btn.dataset.name || '';
+  try {
+    await api('/profiles/' + _cpvPid + '/recommend/suppress', { method: 'POST', body: { type, imdb_id: id, title } });
+    toast('Not interested in “' + (title || 'title') + '”');
+    _cpvDropCell(btn);
+  } catch (err) { toast('Couldn’t update — ' + err.message); }
+}
+async function cpvRemoveFromWatchlist(ev, btn, type, id) {
+  ev.preventDefault(); ev.stopPropagation();
+  const title = btn.dataset.name || '';
+  try {
+    await api('/profiles/' + _cpvPid + '/watchlist/remove', { method: 'POST', body: { type, imdb_id: id, title } });
+    toast('Removed “' + (title || 'title') + '” from Watch Later');
+    _cpvDropCell(btn);
+  } catch (err) { toast(/simkl/i.test(err.message) ? 'Connect Simkl for this profile first' : ('Couldn’t remove — ' + err.message)); }
 }
 
 // Persistent show/hide — click to reveal, click again to mask (not press-hold).

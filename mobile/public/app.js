@@ -291,10 +291,15 @@
     if (r.because) { const b = document.createElement('div'); b.className = 'rec-because'; b.textContent = 'Because you watched ' + r.because; meta.appendChild(b); }
     const actions = document.createElement('div'); actions.className = 'rec-actions';
     const saveBtn = document.createElement('button'); saveBtn.type = 'button'; saveBtn.className = 'rec-save'; saveBtn.title = 'Add to Watch Later'; saveBtn.setAttribute('aria-label', 'Add to Watch Later'); saveBtn.textContent = '＋';
-    const remBtn = document.createElement('button'); remBtn.type = 'button'; remBtn.className = 'rec-remove'; remBtn.title = 'Remove'; remBtn.setAttribute('aria-label', 'Remove'); remBtn.textContent = '✕';
+    // MW-01: eye = "mark as watched" (a real Simkl scrobble, not a hide). Sits
+    // between save and reject. The X keeps its suppress behaviour but is relabelled
+    // "Not interested" so the training intent reads honestly (class name unchanged).
+    const watchedBtn = document.createElement('button'); watchedBtn.type = 'button'; watchedBtn.className = 'rec-watched'; watchedBtn.title = 'Mark as watched'; watchedBtn.setAttribute('aria-label', 'Mark as watched'); watchedBtn.innerHTML = EYE_ICON;
+    const remBtn = document.createElement('button'); remBtn.type = 'button'; remBtn.className = 'rec-remove'; remBtn.title = 'Not interested'; remBtn.setAttribute('aria-label', 'Not interested'); remBtn.textContent = '✕';
     saveBtn.addEventListener('click', (e) => { e.stopPropagation(); saveRec(r, saveBtn); });
+    watchedBtn.addEventListener('click', (e) => { e.stopPropagation(); watchRec(r, row); });
     remBtn.addEventListener('click', (e) => { e.stopPropagation(); removeRec(r, row); });
-    actions.appendChild(saveBtn); actions.appendChild(remBtn);
+    actions.appendChild(saveBtn); actions.appendChild(watchedBtn); actions.appendChild(remBtn);
     body.appendChild(img); body.appendChild(meta); body.appendChild(actions);
 
     row.appendChild(under); row.appendChild(body);
@@ -342,27 +347,53 @@
     finally { if (btn) btn.disabled = false; }
   }
 
-  async function removeRec(r, row) {
-    row.classList.add('removing');
-    setTimeout(() => row.remove(), 200);
+  // Shared one-in-one-out bench bookkeeping for a title LEAVING the recs list —
+  // used by both removeRec ("not interested") and watchRec ("mark as watched") so
+  // the two stay in lockstep. Splices the title out of the type's dataset and, in
+  // catalog view, promotes the top bench title into the freed slot; returns whether
+  // the bench is now spent and needs a server refill.
+  function dropRecFromList(r) {
     const d = recs.data[r.type];
     let needRefill = false;
     if (d) {
       const idx = d.items.findIndex((x) => x.id === r.id);
       if (idx !== -1) d.items.splice(idx, 1);
-      // One in, one out: in catalog view, promote the top of the bench into the
-      // freed slot; when the bench is spent, top it up after the server settles.
       if (d.view === 'catalog') {
         if (d.items.length >= d.display) appendRecRow(r.type, d.items[d.display - 1]);
         else needRefill = !d.benchExhausted;
       }
     }
     updateBadges();
+    return needRefill;
+  }
+
+  async function removeRec(r, row) {
+    row.classList.add('removing');
+    setTimeout(() => row.remove(), 200);
+    const needRefill = dropRecFromList(r);
     try {
       await apiFetch('/recommend/suppress', { method: 'POST', body: JSON.stringify({ type: r.type, imdb_id: r.id, tmdb_id: r.tmdb_id, title: r.title }) });
       showSnack('Removed “' + (r.title || 'title') + '”', () => undoRemove(r));
       if (needRefill) await refillBench(r.type);
     } catch { showSnack('Could not remove — try again.', null); }
+  }
+
+  // MW-01: "mark as watched" — a real Simkl history write (POST /api/watched, the
+  // shared MW-00 action), not a rejection. Same one-in-one-out row bookkeeping as
+  // removeRec, but NO Undo: a watched mark is authoritative and "undo" would mean an
+  // un-watch (out of scope, MW-00). Don't read the POST body — act on the status,
+  // like saveRec (the proxy may stall a POST body).
+  async function watchRec(r, row) {
+    row.classList.add('removing');
+    setTimeout(() => row.remove(), 200);
+    const needRefill = dropRecFromList(r);
+    try {
+      const res = await apiFetch('/watched', { method: 'POST', body: JSON.stringify({ type: r.type, imdb_id: r.id, tmdb_id: r.tmdb_id, title: r.title }) });
+      if (res.ok) showSnack('Marked “' + (r.title || 'title') + '” watched', null);
+      else if (res.status === 400) showSnack('Couldn’t mark watched — connect Simkl in the portal first', null);
+      else showSnack('Couldn’t mark watched — try again', null);
+      if (needRefill) await refillBench(r.type);
+    } catch { showSnack('Couldn’t mark watched — try again.', null); }
   }
 
   async function undoRemove(r) {
@@ -478,6 +509,11 @@
   // eye): a document with a small eye badge. Copied here because the portal and
   // the companion ship separate bundles with no shared module.
   const PREVIEW_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h4.5"/><path d="M13 3l5 5v2"/><line x1="8" y1="8" x2="11" y2="8"/><line x1="8" y1="12" x2="13" y2="12"/><path d="M12.5 17.5s1.6-2.5 4.25-2.5 4.25 2.5 4.25 2.5-1.6 2.5-4.25 2.5-4.25-2.5-4.25-2.5z"/><circle cx="16.75" cy="17.5" r="1"/></svg>';
+  // MW-01/02: "mark as watched" glyph — a PLAIN outline eye ("I've seen it"),
+  // deliberately distinct from PREVIEW_ICON (the document-with-eye that OPENS a
+  // preview). Shared by the recs eye button and both catalog-preview cells so the
+  // mark reads the same everywhere. Matches the portal's EYE (public/index.html).
+  const EYE_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/></svg>';
 
   // One catalog row: a label (checkbox + "<Name> — <Type>") plus a preview button
   // OUTSIDE the label, so tapping it opens the sheet without toggling enable
@@ -558,6 +594,10 @@
     pvEls.title.textContent = data.name + ' — ' + catTypeLabel(data.type);
     pvEls.count.textContent = data.count + ' ' + (data.count === 1 ? 'title' : 'titles');
     if (!data.count) { pvMsg(PV_STATE_MSG[data.state] || 'Nothing to show.'); return; }
+    // MW-02: on the two Watch Later rows the ✕ REMOVES from the list (MW-04) and
+    // the eye keeps the cell (Watch Later keeps watched — WL-KW); on every other
+    // catalog the ✕ is "not interested" (suppress) and the eye drops the cell.
+    const isWatchLater = data.source === 'simkl_plantowatch';
     const grid = document.createElement('div'); grid.className = 'preview-grid';
     data.metas.forEach((m) => {
       const cell = document.createElement('div'); cell.className = 'pv-cell';
@@ -567,12 +607,63 @@
       // RPDB posters already carry the rating; this numeric badge is the fallback
       // when the served meta has an imdbRating but no RPDB key (CP-03 populates it).
       if (m.imdbRating) { const r = document.createElement('span'); r.className = 'pv-rating'; r.title = 'IMDb rating'; r.textContent = '★ ' + m.imdbRating; wrap.appendChild(r); }
+      // Always-visible corner actions (no hover gate, no age surface): eye top-left,
+      // ✕ top-right. Buttons opt out of any parent gesture via stopPropagation.
+      const eye = document.createElement('button'); eye.type = 'button'; eye.className = 'pv-act pv-watch';
+      const eyeLbl = isWatchLater ? 'Mark as watched (kept in Watch Later)' : 'Mark as watched';
+      eye.title = eyeLbl; eye.setAttribute('aria-label', eyeLbl + ': ' + (m.name || '')); eye.innerHTML = EYE_ICON;
+      eye.addEventListener('click', (e) => { e.stopPropagation(); pvMarkWatched(m, data.type, cell, isWatchLater); });
+      const nope = document.createElement('button'); nope.type = 'button'; nope.className = 'pv-act pv-nope';
+      const xLbl = isWatchLater ? 'Remove from Watch Later' : 'Not interested';
+      nope.title = xLbl; nope.setAttribute('aria-label', xLbl + ': ' + (m.name || '')); nope.textContent = '✕';
+      nope.addEventListener('click', (e) => { e.stopPropagation(); if (isWatchLater) pvRemoveFromWatchlist(m, data.type, cell); else pvNotInterested(m, data.type, cell); });
+      wrap.appendChild(eye); wrap.appendChild(nope);
       const cap = document.createElement('span'); cap.className = 'pv-cap';
       cap.textContent = (m.name || '') + (m.releaseInfo ? ' (' + m.releaseInfo + ')' : '');
       cell.appendChild(wrap); cell.appendChild(cap);
       grid.appendChild(cell);
     });
     pvEls.body.innerHTML = ''; pvEls.body.appendChild(grid);
+  }
+
+  // Drop a preview cell and re-derive the header count from what's left, so the
+  // "N titles" label stays honest as cells are actioned away.
+  function pvDropCell(cell) {
+    cell.remove();
+    const n = pvEls.body.querySelectorAll('.pv-cell').length;
+    pvEls.count.textContent = n + ' ' + (n === 1 ? 'title' : 'titles');
+  }
+
+  // MW-02 companion cell actions. All reuse the SAME endpoints as the recs list so
+  // behaviour can't drift: watched → MW-00 /api/watched, not-interested →
+  // /api/recommend/suppress, Watch Later ✕ → MW-04 /api/watchlist/remove. Feedback
+  // rides the recs snackbar (z-index above the sheet); the sheet never shows age.
+  async function pvMarkWatched(m, type, cell, isWatchLater) {
+    try {
+      const res = await apiFetch('/watched', { method: 'POST', body: JSON.stringify({ type, imdb_id: m.id, title: m.name }) });
+      if (res.ok) {
+        showSnack(isWatchLater ? 'Marked “' + (m.name || 'title') + '” watched — kept in Watch Later' : 'Marked “' + (m.name || 'title') + '” watched', null);
+        if (!isWatchLater) pvDropCell(cell); // Watch Later keeps watched — leave the cell (WL-KW)
+      } else if (res.status === 400) showSnack('Couldn’t mark watched — connect Simkl in the portal first', null);
+      else showSnack('Couldn’t mark watched — try again', null);
+    } catch { showSnack('Couldn’t mark watched — try again.', null); }
+  }
+
+  async function pvNotInterested(m, type, cell) {
+    try {
+      const res = await apiFetch('/recommend/suppress', { method: 'POST', body: JSON.stringify({ type, imdb_id: m.id, title: m.name }) });
+      if (res.ok) { showSnack('Not interested in “' + (m.name || 'title') + '”', null); pvDropCell(cell); }
+      else showSnack('Couldn’t update — try again', null);
+    } catch { showSnack('Couldn’t update — try again.', null); }
+  }
+
+  async function pvRemoveFromWatchlist(m, type, cell) {
+    try {
+      const res = await apiFetch('/watchlist/remove', { method: 'POST', body: JSON.stringify({ type, imdb_id: m.id, title: m.name }) });
+      if (res.ok) { showSnack('Removed “' + (m.name || 'title') + '” from Watch Later', null); pvDropCell(cell); }
+      else if (res.status === 400) showSnack('Couldn’t remove — connect Simkl in the portal first', null);
+      else showSnack('Couldn’t remove — try again', null);
+    } catch { showSnack('Couldn’t remove — try again.', null); }
   }
 
   async function openCatalogPreview(catalogId, title) {

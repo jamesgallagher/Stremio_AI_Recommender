@@ -17,6 +17,7 @@ const traktImport = require('./services/traktImport');
 const watchedStore = require('./watchedStore');
 const recommendationStore = require('./recommendationStore');
 const dontRecommend = require('./dontRecommend');
+const markWatched = require('./markWatched');
 const engines = require('./engines');
 const catalogServe = require('./catalogServe');
 
@@ -587,6 +588,30 @@ router.post('/profiles/:id/watchlist/remove', async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     res.status(502).json({ error: `Could not remove from Watch Later — ${err.message}` });
+  }
+});
+
+// MW-02 — mark a title watched from a catalog-preview cell (the eye). The one
+// backend addition this card needs; the companion already has /api/watched from
+// MW-00. Resolves the profile from :id (admin-guarded, like the other portal
+// profile routes) and delegates to the SHARED markWatched action, so the Simkl
+// history write + pending-watched serve-prune behave identically to the companion.
+// Mirrors the companion watchedHandler's status codes (400 no-Simkl, 502 on error).
+router.post('/profiles/:id/watched', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  const { type, tmdb_id, imdb_id, title } = req.body || {};
+  if (type !== 'movie' && type !== 'series') return res.status(400).json({ error: 'type must be movie or series' });
+  if (tmdb_id == null && !imdb_id) return res.status(400).json({ error: 'tmdb_id or imdb_id is required' });
+  if (!profile.keys.simkl_client_id || !profile.simkl_auth?.access_token) {
+    return res.status(400).json({ error: 'Simkl is not connected for this profile' });
+  }
+  try {
+    const out = await markWatched.markWatched(profile, { type, imdbId: imdb_id, tmdbId: tmdb_id, title }, console);
+    if (!out.ok) return res.status(400).json({ error: `Could not mark watched (${out.reason})` });
+    res.json({ ok: true, title: out.title || null });
+  } catch (err) {
+    res.status(502).json({ error: `Could not mark watched — ${err.message}` });
   }
 });
 

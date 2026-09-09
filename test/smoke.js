@@ -1874,6 +1874,19 @@ async function httpTests() {
   assert.strictEqual(reset.total, 0);
   console.log('  ✓ recommendation build/view/suppress/reset endpoints');
 
+  // MW-02: portal mark-as-watched route (the catalog-preview eye). Validates its
+  // input like the companion twin, then guards Simkl-not-connected with a 400 (this
+  // profile has a TMDB key but no Simkl). The happy/502 paths ride markWatched's own
+  // tests + the companion watchedHandler; here we pin the route wiring + guards.
+  const badWatched = await fetch(`${BASE}/api/profiles/${profile.id}/watched`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  assert.strictEqual(badWatched.status, 400); // no type
+  const noIdWatched = await fetch(`${BASE}/api/profiles/${profile.id}/watched`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'movie' }) });
+  assert.strictEqual(noIdWatched.status, 400); // type but no id
+  const noSimklWatched = await fetch(`${BASE}/api/profiles/${profile.id}/watched`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'movie', imdb_id: 'tt0133093', title: 'The Matrix' }) });
+  assert.strictEqual(noSimklWatched.status, 400);
+  assert.match((await noSimklWatched.json()).error, /Simkl/); // clean "connect Simkl", never a silent pass
+  console.log('  ✓ portal /watched: validates + guards Simkl-not-connected (MW-02)');
+
   // Empty pool -> warming-up card, short client cache
   const recStore = require('../src/recommendationStore');
   const wStore = require('../src/watchedStore');

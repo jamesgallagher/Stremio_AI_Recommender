@@ -138,15 +138,15 @@ with the same box and a neutral hover (not the destructive red of remove).
 
 ## Tasks
 
-- [ ] `app.js` `buildRecRow`: insert `rec-watched` eye button between save and
+- [x] `app.js` `buildRecRow`: insert `rec-watched` eye button between save and
       remove; wire to `watchRec`; keep `stopPropagation`.
-- [ ] `app.js`: `watchRec(r, row)` → `POST /api/watched`, optimistic removal + bench
+- [x] `app.js`: `watchRec(r, row)` → `POST /api/watched`, optimistic removal + bench
       promotion (shared helper extracted from `removeRec`), snackbar (no Undo).
-- [ ] `app.js`: rename the X `title`/`aria-label` to "Not interested" (handler
+- [x] `app.js`: rename the X `title`/`aria-label` to "Not interested" (handler
       unchanged).
-- [ ] `swipe.js`: `REMOVE_LABEL = 'Not interested'`.
-- [ ] `app.js` / stylesheet: `EYE_ICON` constant + `.rec-watched` button style.
-- [ ] Tests / live check — see Test notes.
+- [x] `swipe.js`: `REMOVE_LABEL = 'Not interested'`.
+- [x] `app.js` / stylesheet: `EYE_ICON` constant + `.rec-watched` button style.
+- [x] Tests / live check — see Test notes.
 
 ## Acceptance criteria
 

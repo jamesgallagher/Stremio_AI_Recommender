@@ -188,6 +188,11 @@ input[type=search]:focus { border-color: var(--accent); }
 .rec-save:hover { background: #2bbd86; }
 .rec-remove { background: transparent; border: 1px solid var(--border); color: var(--muted); }
 .rec-remove:hover { color: var(--err); border-color: var(--err); background: transparent; }
+/* MW-01: "mark as watched" eye — neutral (accent) hover, NOT the destructive red
+   of the reject, so the eye never reads as a delete. Same box as save/remove. */
+.rec-watched { background: transparent; border: 1px solid var(--border); color: var(--muted); display: flex; align-items: center; justify-content: center; }
+.rec-watched:hover { color: var(--accent); border-color: var(--accent); background: transparent; }
+.rec-watched svg { display: block; }
 
 /* ---- Settings (Step 5) ---- */
 select {
@@ -232,6 +237,18 @@ select:focus { border-color: var(--accent); }
   text-align: center; padding: 6px; color: var(--muted); font-size: 11px; }
 .pv-rating { position: absolute; left: 5px; bottom: 5px; background: rgba(0,0,0,.78);
   color: #ffd34d; font-weight: 700; font-size: 11px; padding: 2px 6px; border-radius: 6px; }
+/* MW-02: always-visible corner actions on a preview cell — eye (mark watched)
+   top-left, ✕ top-right. ≥32px hit area, keyboard-focusable, clear of the rating
+   badge (bottom-left). Dark scrim keeps them legible over any poster. */
+.pv-act { position: absolute; top: 5px; width: 34px; height: 34px; min-width: 0; min-height: 0;
+  padding: 0; display: flex; align-items: center; justify-content: center; border: 0; border-radius: 999px;
+  background: rgba(0,0,0,.62); color: #fff; line-height: 1; font-size: 15px; cursor: pointer; }
+.pv-act:hover { background: rgba(0,0,0,.82); }
+.pv-act:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.pv-act svg { width: 16px; height: 16px; display: block; }
+.pv-watch { left: 5px; }
+.pv-nope { right: 5px; }
+.pv-nope:hover { background: var(--err); }
 .pv-cap { display: block; margin-top: 5px; line-height: 1.3;
   overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .field { margin-top: 4px; }

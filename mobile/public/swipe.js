@@ -10,7 +10,7 @@
 
   const REMOVE_COLOR = '#f8d7da'; // light red  — swipe RIGHT to remove
   const SAVE_COLOR = '#d4edda';   // light green — swipe LEFT to add to watch later
-  const REMOVE_LABEL = 'Remove';
+  const REMOVE_LABEL = 'Not interested'; // MW-01: the swipe-right reject is "not interested", matching the X button
   const SAVE_LABEL = 'Add to watch later';
 
   // Given the horizontal drag `dx` (px, + = right) and the row width, return the

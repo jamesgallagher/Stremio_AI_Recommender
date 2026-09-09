@@ -210,25 +210,25 @@ correctness doesn't depend on this.)
 
 ## Tasks
 
-- [ ] Add `source` to both preview payloads (companion
+- [x] Add `source` to both preview payloads (companion
       [`catalogPreviewHandler`](../mobile/server/handlers.js) and the portal mirror) —
       no age leak.
-- [ ] Compute `isWatchLater = data.source === 'simkl_plantowatch'` once per render in
+- [x] Compute `isWatchLater = data.source === 'simkl_plantowatch'` once per render in
       both `_cpvRender` and `renderPreview`; drive the ✕ handler/label and the eye's
       keep-vs-drop from it (§0 table).
-- [ ] Portal `_cpvRender`: two `.cpv-act` corner buttons in `.poster`, always visible;
+- [x] Portal `_cpvRender`: two `.cpv-act` corner buttons in `.poster`, always visible;
       eye → `cpvMarkWatched` (drops cell unless Watch Later); ✕ → `cpvNotInterested`
       **or** `cpvRemoveFromWatchlist` by `isWatchLater`; count decrement; inline
       Simkl-not-connected message.
-- [ ] Portal endpoint `POST /api/profiles/:id/watched` → shared `markWatched`. (The
+- [x] Portal endpoint `POST /api/profiles/:id/watched` → shared `markWatched`. (The
       Watch Later remove endpoint is [MW-04](remove-from-watchlist.md).)
-- [ ] Companion `renderPreview`: two `.pv-act` always-visible corner buttons; eye →
+- [x] Companion `renderPreview`: two `.pv-act` always-visible corner buttons; eye →
       `pvMarkWatched`; ✕ → `pvNotInterested` **or** `pvRemoveFromWatchlist` by
       `isWatchLater`; cell removal/keep + count decrement; no age surface.
-- [ ] CSS: `.cpv-act`/`.pv-act` corner positioning + scrim, **always visible on both
+- [x] CSS: `.cpv-act`/`.pv-act` corner positioning + scrim, **always visible on both
       surfaces**, ≥32px targets, keyboard-focusable, clear of the rating badge.
-- [ ] Reuse `EYE_ICON` (MW-01) for both eyes.
-- [ ] Live check + tests — see Test notes.
+- [x] Reuse `EYE_ICON` (MW-01) for both eyes.
+- [x] Live check + tests — see Test notes.
 
 ## Acceptance criteria
 

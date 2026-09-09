@@ -500,10 +500,11 @@ async function unitTests() {
     assert.strictEqual(handlers.toRecDTO(null), null);
   });
 
-  await ok('swipe: right past threshold -> remove/red "Remove"; left -> save/green "Add to watch later"', () => {
+  await ok('swipe: right past threshold -> remove/red "Not interested"; left -> save/green "Add to watch later"', () => {
     const W = 300;
     const right = clientSwipe.swipeOutcome(0.3 * W, W);
-    assert.deepStrictEqual([right.action, right.color, right.label, right.direction], ['remove', clientSwipe.REMOVE_COLOR, 'Remove', 'right']);
+    // MW-01: the swipe-right reject label matches the relabelled X button.
+    assert.deepStrictEqual([right.action, right.color, right.label, right.direction], ['remove', clientSwipe.REMOVE_COLOR, 'Not interested', 'right']);
     const left = clientSwipe.swipeOutcome(-0.3 * W, W);
     assert.deepStrictEqual([left.action, left.color, left.label, left.direction], ['save', clientSwipe.SAVE_COLOR, 'Add to watch later', 'left']);
   });
@@ -896,7 +897,9 @@ async function unitTests() {
     handlers.catalogPreviewHandler({ profile: config.getProfile(p.id), params: { catalogId: 'mdb-war-movies' } }, res);
     assert.strictEqual(res.statusCode, 200);
     // Exactly the phone-safe envelope — crucially NO age/band/limit key anywhere.
-    assert.deepStrictEqual(Object.keys(res.body).sort(), ['count', 'id', 'metas', 'name', 'requirement_met', 'state', 'type']);
+    // `source` (MW-02) is included: it drives the cell actions and leaks no age.
+    assert.deepStrictEqual(Object.keys(res.body).sort(), ['count', 'id', 'metas', 'name', 'requirement_met', 'source', 'state', 'type']);
+    assert.strictEqual(res.body.source, 'mdblist'); // a curated list → not-interested ✕ (not Watch Later remove)
     assert.deepStrictEqual(Object.keys(res.body.metas[0]).sort(), ['id', 'imdbRating', 'name', 'poster', 'releaseInfo']);
     assert.ok(!JSON.stringify(res.body).toLowerCase().includes('age_'), 'no age_limit/age_band anywhere in the payload');
     // Same list the shared serve produces (== what the addon feeds the client).
