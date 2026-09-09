@@ -10,6 +10,7 @@ const simkl = require('../../src/services/simkl');
 const recommendationStore = require('../../src/recommendationStore');
 const watchedStore = require('../../src/watchedStore');
 const dontRecommend = require('../../src/dontRecommend');
+const markWatched = require('../../src/markWatched');
 const catalogServe = require('../../src/catalogServe');
 
 const TYPES = ['movie', 'series'];
@@ -81,6 +82,29 @@ async function watchlistHandler(req, res) {
     res.json({ ok: true, added: out.added || {}, existing: out.existing || {}, skipped: !!out.skipped });
   } catch (err) {
     res.status(502).json({ error: `Could not add to watchlist — ${err.message}` });
+  }
+}
+
+// POST /api/watchlist/remove  { type, tmdb_id?, imdb_id?, title? }  (MW-04)
+// The ✕ on a WATCH LATER cell: remove the title from the Simkl plan-to-watch
+// list. Plain list management — explicitly NOT a "not interested" suppression
+// (it writes nothing to dont_recommend, so the title can still be recommended).
+// The other lists' ✕ is suppression (MW-03); the UI decides which by the cell's
+// source. Session-scoped (acts on req.profile), mirrors watchlistHandler's copy.
+async function watchlistRemoveHandler(req, res) {
+  const body = req.body || {};
+  const { type, tmdb_id, imdb_id, title } = body;
+  if (!TYPES.includes(type)) return res.status(400).json({ error: 'type must be movie or series' });
+  if (tmdb_id == null && !imdb_id) return res.status(400).json({ error: 'tmdb_id or imdb_id is required' });
+  if (!req.profile.simkl_auth?.access_token) {
+    return res.status(400).json({ error: 'Simkl is not connected — connect it in the portal first' });
+  }
+  try {
+    // Always targets req.profile — a profile id in the body is ignored.
+    await simkl.removeFromPlanToWatch(req.profile, { type, tmdb_id, imdb_id, title });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(502).json({ error: `Could not remove from Watch Later — ${err.message}` });
   }
 }
 
@@ -160,6 +184,28 @@ async function suppressHandler(req, res) {
   const result = await dontRecommend.suppress(req.profile, { type, imdbId: imdb_id, tmdbId: tmdb_id, title }, console);
   if (!result.ok) return res.status(result.reason === 'bad-type' ? 400 : 422).json({ error: `could not remove (${result.reason})` });
   res.json({ ok: true, title: result.title, tmdb_id: result.tmdbId, total: recommendationStore.countRecommended(req.profile.id) });
+}
+
+// POST /api/watched  { type, tmdb_id?, imdb_id?, title? }  (MW-00 — eye button)
+// Marks the title watched via the shared markWatched action (Simkl history write
+// + immediate pending-watched serve-prune). Session-scoped: acts on req.profile
+// only — there is no id in the path/body to abuse. Mirrors watchlistHandler's
+// Simkl-not-connected copy; a Simkl error is a 502 (never a silent failure).
+async function watchedHandler(req, res) {
+  const body = req.body || {};
+  const { type, tmdb_id, imdb_id, title } = body;
+  if (!TYPES.includes(type)) return res.status(400).json({ error: 'type must be movie or series' });
+  if (tmdb_id == null && !imdb_id) return res.status(400).json({ error: 'tmdb_id or imdb_id is required' });
+  if (!req.profile.simkl_auth?.access_token) {
+    return res.status(400).json({ error: 'Simkl is not connected — connect it in the portal first' });
+  }
+  try {
+    const out = await markWatched.markWatched(req.profile, { type, imdbId: imdb_id, tmdbId: tmdb_id, title }, console);
+    if (!out.ok) return res.status(400).json({ error: `Could not mark watched (${out.reason})` });
+    res.json({ ok: true, title: out.title || null });
+  } catch (err) {
+    res.status(502).json({ error: `Could not mark watched — ${err.message}` });
+  }
 }
 
 // POST /api/recommend/unsuppress  { type, tmdb_id }  (Undo a swipe-remove)
@@ -330,8 +376,8 @@ function settingsPostHandler(req, res) {
 }
 
 module.exports = {
-  toTitleDTO, searchHandler, watchlistHandler,
-  toRecDTO, recommendationsHandler, suppressHandler, unsuppressHandler,
+  toTitleDTO, searchHandler, watchlistHandler, watchlistRemoveHandler,
+  toRecDTO, recommendationsHandler, suppressHandler, unsuppressHandler, watchedHandler,
   toCompanionFilters, companionCatalogs, companionSettings, settingsGetHandler, settingsPostHandler,
   catalogPreviewHandler,
   TYPES, COMPANION_FILTERS, SEARCH_LIMIT, SEARCH_LIMIT_MAX,

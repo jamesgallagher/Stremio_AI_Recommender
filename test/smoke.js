@@ -944,6 +944,60 @@ ok('recommendationStore: decay — record → decay-out → cooldown expiry; met
   rs.deleteForProfile(pid);
 });
 
+// ---- MW-00: mark-as-watched core ----
+ok('markWatched: buildWatchedHistoryBody — movie vs whole-show shape, id preference, no watched_at / no seasons', () => {
+  const mw = require('../src/markWatched');
+  const mov = mw.buildWatchedHistoryBody({ type: 'movie', imdbId: 'tt0133093', tmdbId: '603' });
+  assert.deepStrictEqual(mov, { movies: [{ ids: { imdb: 'tt0133093', tmdb: '603' } }], shows: [] });
+  assert.ok(!('watched_at' in mov.movies[0]), 'no explicit date — Simkl stamps "now"');
+  const ser = mw.buildWatchedHistoryBody({ type: 'series', imdbId: 'tt0944947' });
+  assert.deepStrictEqual(ser, { movies: [], shows: [{ ids: { imdb: 'tt0944947' } }] });
+  assert.ok(!('seasons' in ser.shows[0]), 'whole-show mark, never per-episode');
+  // tmdb-only stringifies; neither id -> empty body (nothing to match on).
+  assert.deepStrictEqual(mw.buildWatchedHistoryBody({ type: 'movie', tmdbId: 27205 }).movies[0].ids, { tmdb: '27205' });
+  assert.deepStrictEqual(mw.buildWatchedHistoryBody({ type: 'movie' }), { movies: [], shows: [] });
+});
+
+ok('watchedStore: pending-watched unions into id sets, retired by supersession, never a timer (MW-00 I4)', () => {
+  const wStore = require('../src/watchedStore');
+  const pid = 'pending-' + Date.now();
+  // A movie mark (imdb+tmdb) and a series mark (tmdb-only) both union in.
+  assert.strictEqual(wStore.addPendingWatched(pid, { type: 'movie', imdbId: 'tt0133093', tmdbId: '603' }), true);
+  wStore.addPendingWatched(pid, { type: 'series', tmdbId: '1399' });
+  let sets = wStore.watchedIdSets(pid);
+  assert.ok(sets.imdb.has('tt0133093') && sets.tmdb.has('603') && sets.tmdb.has('1399'));
+  // A no-id mark is a harmless no-op.
+  assert.strictEqual(wStore.addPendingWatched(pid, { type: 'movie' }), false);
+  // Re-tap upserts on the dedupe key (no duplicate row).
+  wStore.addPendingWatched(pid, { type: 'movie', imdbId: 'tt0133093', tmdbId: '603' });
+  // The real synced row lands -> upsertMany supersedes the MATCHING shim only.
+  wStore.upsertMany(pid, [{ type: 'movie', title: 'M', year: 1999, tmdb_id: '603', imdb_id: 'tt0133093', simkl_id: 603, watched_at: '2026-09-09T00:00:00Z' }]);
+  sets = wStore.watchedIdSets(pid);
+  assert.ok(sets.imdb.has('tt0133093'), 'now backed by the real watched row');
+  assert.ok(sets.tmdb.has('1399'), 'the series shim (no real row) is still pending');
+  // The movie shim was cleared by upsertMany (I4): a second sweep finds nothing
+  // to clear — had it not been cleared, it would still match the real row (→ 1).
+  assert.strictEqual(wStore.clearSupersededPending(pid), 0);
+  wStore.deleteForProfile(pid);
+});
+
+// ---- MW-03: "not interested" reaches every catalog ----
+ok('recommendationStore: dontRecommendImdbSet — user kept, decayed expires, null-imdb skipped; addDontRecommend persists imdb', () => {
+  const rs = require('../src/recommendationStore');
+  const DAY = 24 * 3600e3;
+  const pid = 'dnr-imdb-' + Date.now();
+  const now = Date.parse('2026-06-01T00:00:00Z');
+  rs.addDontRecommend(pid, 'movie', '10', 'user', now, 'tt0000010');      // user + imdb
+  rs.addDontRecommend(pid, 'series', '20', 'decayed', now, 'tt0000020');  // decayed + imdb
+  rs.addDontRecommend(pid, 'movie', '30', 'user', now);                   // user, NO imdb -> skipped
+  let set = rs.dontRecommendImdbSet(pid, now);
+  assert.deepStrictEqual([...set].sort(), ['tt0000010', 'tt0000020']);    // both present, null-imdb absent
+  // After the 90-day decay cooldown the decayed imdb drops out; the user one stays.
+  set = rs.dontRecommendImdbSet(pid, now + 91 * DAY);
+  assert.deepStrictEqual([...set], ['tt0000010']);
+  rs.deleteForProfile(pid);
+});
+
 ok('llm: chatUrl joins, extractArray tolerates wrappers, groq model list', () => {
   const llm = require('../src/services/llm');
   assert.strictEqual(llm.chatUrl('http://h:1/v1/'), 'http://h:1/v1/chat/completions');
@@ -2177,6 +2231,72 @@ async function httpTests() {
   res = await fetch(`${BASE}/addon/${p2.token}/catalog/series/mdb-action-movies.json`);
   assert.strictEqual(res.status, 404);
   console.log('  ✓ extra catalog type mismatch rejected');
+
+  // ---- MW-00: mark watched prunes AI + curated NOW, keeps Watch Later ----
+  // Inline profile (synthetic id) so this doesn't couple to p2's later assertions.
+  {
+    const markWatched = require('../src/markWatched');
+    const wStore = require('../src/watchedStore');
+    const simklSvc = require('../src/services/simkl');
+    const rsvc = require('../src/recommendationStore');
+    const catServe = require('../src/catalogServe');
+    const mwId = 'mw00-serve-' + Date.now();
+    const prof = { id: mwId, name: 'MW', filters: {}, keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    rsvc.upsertCandidates(mwId, [
+      { type: 'movie', tmdb_id: '603', imdb_id: 'tt0133093', title: 'The Matrix', year: 1999, primary_genre: 'Action', genres: 'Action', vote_average: 8.7, affinity: 3, rec_count: 1, popularity: 9, poster: null },
+    ]);
+    store.swapExtra(mwId, 'mdb-action-movies', [
+      { id: 'tt0133093', type: 'movie', name: 'The Matrix' },
+      { id: 'tt0111161', type: 'movie', name: 'Other' },
+    ]);
+    store.swapExtra(mwId, 'trakt-watchlist-movies', [{ id: 'tt0133093', type: 'movie', name: 'The Matrix' }]);
+    // Present everywhere before the mark.
+    assert.ok(catServe.servedCatalog(prof, 'ai-recs-movies').metas.some((m) => m.id === 'tt0133093'));
+    assert.ok(catServe.servedCatalog(prof, 'mdb-action-movies').metas.some((m) => m.id === 'tt0133093'));
+    // Mark watched — stub the Simkl write, capture the body.
+    const origHist = simklSvc.addToHistory;
+    let sentBody = null;
+    simklSvc.addToHistory = async (_p, body) => { sentBody = body; return {}; };
+    let out;
+    try {
+      out = await markWatched.markWatched(prof, { type: 'movie', imdbId: 'tt0133093', tmdbId: '603', title: 'The Matrix' }, { log() {} });
+    } finally { simklSvc.addToHistory = origHist; }
+    assert.strictEqual(out.ok, true);
+    assert.deepStrictEqual(sentBody, { movies: [{ ids: { imdb: 'tt0133093', tmdb: '603' } }], shows: [] });
+    assert.ok(!('watched_at' in sentBody.movies[0]), 'MW: no explicit watched date');
+    assert.ok(wStore.watchedIdSets(mwId).imdb.has('tt0133093'), 'pending shim unions into the watched set now');
+    // Gone from AI + the curated extra immediately (before any sync)...
+    assert.ok(!catServe.servedCatalog(prof, 'ai-recs-movies').metas.some((m) => m.id === 'tt0133093'));
+    assert.deepStrictEqual(catServe.servedCatalog(prof, 'mdb-action-movies').metas.map((m) => m.id), ['tt0111161']);
+    // ...but KEPT in Watch Later (dedupe_watched:false).
+    assert.deepStrictEqual(catServe.servedCatalog(prof, 'trakt-watchlist-movies').metas.map((m) => m.id), ['tt0133093']);
+    wStore.deleteForProfile(mwId); rsvc.deleteForProfile(mwId); store.deleteCache(mwId);
+    console.log('  ✓ mark watched (no date) prunes AI + curated now, keeps Watch Later (MW-00)');
+  }
+
+  // ---- MW-03: "not interested" filters curated (Christmas) but exempts Watch Later ----
+  {
+    const rsvc = require('../src/recommendationStore');
+    const catServe = require('../src/catalogServe');
+    const s3Id = 'mw03-suppress-' + Date.now();
+    const prof = { id: s3Id, name: 'S3', filters: {}, keys: {}, simkl_auth: { access_token: 't' } };
+    // Same title in Christmas (mdblist, dedupe_watched:false) AND Watch Later (plantowatch).
+    store.swapExtra(s3Id, 'mdb-christmas-movies', [
+      { id: 'tt_sup', type: 'movie', name: 'Suppressed Xmas' },
+      { id: 'tt_keep', type: 'movie', name: 'Kept Xmas' },
+    ]);
+    store.swapExtra(s3Id, 'trakt-watchlist-movies', [{ id: 'tt_sup', type: 'movie', name: 'Suppressed but planned' }]);
+    // Suppress by imdb (with a resolvable tmdb, as the real path requires).
+    rsvc.addDontRecommend(s3Id, 'movie', '9001', 'user', Date.now(), 'tt_sup');
+    assert.ok(rsvc.dontRecommendImdbSet(s3Id).has('tt_sup'));
+    // Christmas (source:mdblist) is filtered even though it's dedupe_watched:false;
+    // the exemption is keyed on SOURCE, not dedupe_watched.
+    assert.deepStrictEqual(catServe.servedCatalog(prof, 'mdb-christmas-movies').metas.map((m) => m.id), ['tt_keep']);
+    // Watch Later (source:simkl_plantowatch) is EXEMPT — the planned title stays.
+    assert.deepStrictEqual(catServe.servedCatalog(prof, 'trakt-watchlist-movies').metas.map((m) => m.id), ['tt_sup']);
+    rsvc.deleteForProfile(s3Id); store.deleteCache(s3Id);
+    console.log('  ✓ not-interested filters Christmas but exempts Watch Later, source-keyed (MW-03)');
+  }
 
   // Async rebuild: endpoint answers 202 immediately (no held-open response —
   // proxies kill those), then status.rebuilding flips false and last_results

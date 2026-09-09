@@ -244,6 +244,57 @@ async function addToPlanToWatch(profile, items) {
   return res.json().catch(() => ({}));
 }
 
+// ---- plan-to-watch REMOVE (v7 MW-04, Mobile Companion / portal "remove from
+// Watch Later") ----
+// The inverse of addToPlanToWatch. Plain list management — NOT a "not
+// interested" suppression: it writes nothing to dont_recommend, so a removed
+// title can still appear in AI recs and other catalogs (that's the point).
+//
+// ENDPOINT — verified against the Simkl API spec (github.com/SIMKL/API,
+// apiary.apib § "Remove Items from History and from Lists"): POST
+// /sync/history/remove removes the item from history AND from the user's lists —
+// "If [no] seasons [are] skipped too then the show will be removed completely."
+// Passing a whole movie/show with NO seasons therefore removes it from
+// plan-to-watch. Body shape matches /sync/history: { movies:[{ids}], shows:[{ids}] }.
+// BUILD-TIME GATE (MW-05 I3): still confirm live against a real plan-to-watch
+// item (removing a title that is ONLY on plan-to-watch, never in history) before
+// relying on it in production — the offline suite stubs the write.
+//
+// PURE: build the /sync/history/remove body for watchlist item(s). A movie →
+// movies:[{ids}]; a series → shows:[{ids}] with NO seasons (remove the whole
+// show). An item with no usable id is skipped. Exported for tests.
+function buildRemoveFromListBody(items) {
+  const movies = [];
+  const shows = [];
+  for (const it of Array.isArray(items) ? items : [items]) {
+    if (!it) continue;
+    const ids = {};
+    if (it.imdb_id) ids.imdb = String(it.imdb_id);
+    if (it.tmdb_id != null && it.tmdb_id !== '') ids.tmdb = String(it.tmdb_id);
+    if (!ids.imdb && !ids.tmdb) continue; // need at least one id for Simkl to match
+    (it.type === 'series' ? shows : movies).push({ ids });
+  }
+  return { movies, shows };
+}
+
+// Remove title(s) from the profile's Simkl plan-to-watch list. Rate-governed at
+// the hard 1-POST/s write cap (same simkl_post lane as the add/history writes).
+// De-dupe-safe: removing something already gone is a harmless no-op. Requires the
+// profile's Simkl connection; a rejected token maps to the reconnect message.
+async function removeFromPlanToWatch(profile, items) {
+  const clientId = profile.keys.simkl_client_id;
+  const token = profile.simkl_auth?.access_token;
+  if (!clientId || !token) throw new Error('Simkl is not connected for this profile');
+  const body = buildRemoveFromListBody(items);
+  if (!body.movies.length && !body.shows.length) return { skipped: true };
+  const res = await governor.schedule('simkl_post', () => fetch(withParams(clientId, '/sync/history/remove'), {
+    method: 'POST', headers: headers(token), body: JSON.stringify(body),
+  }));
+  if (res.status === 401 || res.status === 403) throw new Error('Simkl token rejected — reconnect the account');
+  if (!res.ok) throw new Error(`Simkl POST /sync/history/remove failed (${res.status})`);
+  return res.json().catch(() => ({}));
+}
+
 module.exports = {
   startPinFlow,
   pollPin,
@@ -257,6 +308,8 @@ module.exports = {
   addToHistory,
   buildAddToListBody,
   addToPlanToWatch,
+  buildRemoveFromListBody,
+  removeFromPlanToWatch,
   parseWatchedItem,
   parseWatchedItems,
   withParams,

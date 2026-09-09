@@ -122,14 +122,22 @@ not-interested state for the Watch Later row).
 
 ## Tasks
 
-- [ ] **Verify** the Simkl plan-to-watch removal endpoint against the live API / docs
+- [x] **Verify** the Simkl plan-to-watch removal endpoint against the live API / docs
       (do not guess). Record it in a `simkl.js` comment like the other verified calls.
-- [ ] `simkl.js`: `buildRemoveFromListBody` (pure, exported) + `removeFromPlanToWatch`
+      → Verified against the Simkl API spec (github.com/SIMKL/API `apiary.apib`
+      § *"Remove Items from History and from Lists"*): **`POST /sync/history/remove`**
+      with no `seasons` removes the whole title from history AND lists (plan-to-watch
+      included). Recorded in the `simkl.js` comment. **I3 live-API gate still open:**
+      confirm against a real plan-to-watch-only item before promotion.
+- [x] `simkl.js`: `buildRemoveFromListBody` (pure, exported) + `removeFromPlanToWatch`
       (rate-lane, token handling, de-dupe-safe).
-- [ ] `mobile/server`: `POST /api/watchlist/remove` handler + route (session-scoped).
-- [ ] `POST /api/profiles/:id/watchlist/remove` (portal — in scope).
-- [ ] (Optional) immediate cached-metas prune for the Watch Later extra.
-- [ ] Tests — see Test notes.
+- [x] `mobile/server`: `POST /api/watchlist/remove` handler + route (session-scoped).
+- [x] `POST /api/profiles/:id/watchlist/remove` (portal — in scope).
+- [ ] (Optional) immediate cached-metas prune for the Watch Later extra. — deferred
+      (optional; the daily rebuild + optimistic UI cover it, per §3).
+- [x] Tests — see Test notes.
+
+> **Build note (v7, 2026-09-09):** built on `v7`, local commit only.
 
 ## Acceptance criteria
 

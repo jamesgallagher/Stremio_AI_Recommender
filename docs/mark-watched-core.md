@@ -216,17 +216,22 @@ either way: it flows from the Simkl write via the existing sync into seeds + de-
 
 ## Tasks
 
-- [ ] `src/markWatched.js`: `buildWatchedHistoryBody` (pure, exported) + `markWatched`
+- [x] `src/markWatched.js`: `buildWatchedHistoryBody` (pure, exported) + `markWatched`
       (Simkl-only, no `watched_at`, series→whole-show, transport-agnostic result).
-- [ ] `mobile/server/handlers.js`: `watchedHandler` (targets `req.profile`, 400
+- [x] `mobile/server/handlers.js`: `watchedHandler` (targets `req.profile`, 400
       Simkl-not-connected copy matching `watchlistHandler`, 502 on Simkl error);
       export it.
-- [ ] `mobile/server/router.js`: `POST /api/watched` behind `requireSession`.
-- [ ] `watchedStore`: a per-profile **pending-watched set** (imdb + tmdb + type)
+- [x] `mobile/server/router.js`: `POST /api/watched` behind `requireSession`.
+- [x] `watchedStore`: a per-profile **pending-watched set** (imdb + tmdb + type)
       recorded by `markWatched`, **unioned into `watchedIdSets`** so every existing
       watched-prune site drops the title immediately (no change at those call sites);
       cleared/superseded when the real Simkl-synced row lands.
-- [ ] Tests — see Test notes.
+- [x] Tests — see Test notes.
+
+> **Build note (v7, 2026-09-09):** built on `v7`, local commit only. I2
+> (whole-show `/sync/history` write) remains a **live-API build-time gate** — the
+> offline suite pins the body shape (`shows:[{ids}]`, no `seasons`/`watched_at`)
+> but a real Simkl account run still needs confirming before promotion.
 
 ## Acceptance criteria
 

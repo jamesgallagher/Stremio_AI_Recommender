@@ -568,6 +568,28 @@ router.post('/profiles/:id/recommend/suppress', async (req, res) => {
   res.json({ ok: true, title: result.title, total: recommendationStore.countRecommended(profile.id) });
 });
 
+// MW-04 — remove a title from the profile's Simkl plan-to-watch list (the ✕ on a
+// Watch Later preview cell). Plain list management, NOT a suppression: it writes
+// nothing to dont_recommend, so the title stays eligible for AI recs and other
+// catalogs. Mirrors the companion /api/watchlist/remove; the portal has an :id in
+// the path (admin-guarded), the companion is session-scoped.
+router.post('/profiles/:id/watchlist/remove', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  const { type, tmdb_id, imdb_id, title } = req.body || {};
+  if (type !== 'movie' && type !== 'series') return res.status(400).json({ error: 'type must be movie or series' });
+  if (tmdb_id == null && !imdb_id) return res.status(400).json({ error: 'tmdb_id or imdb_id is required' });
+  if (!profile.keys.simkl_client_id || !profile.simkl_auth?.access_token) {
+    return res.status(400).json({ error: 'Simkl is not connected for this profile' });
+  }
+  try {
+    await simkl.removeFromPlanToWatch(profile, { type, tmdb_id, imdb_id, title });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(502).json({ error: `Could not remove from Watch Later — ${err.message}` });
+  }
+});
+
 router.post('/profiles/:id/simkl/disconnect', (req, res) => {
   const { profile } = config.updateProfile(req.params.id, { simkl_auth: null });
   if (!profile) return res.status(404).json({ error: 'Profile not found' });

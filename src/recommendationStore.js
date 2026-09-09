@@ -117,6 +117,15 @@ function init() {
     ['streak_started_at', 'INTEGER'], ['times_shown_in_streak', 'INTEGER DEFAULT 0'], ['last_shown_at', 'INTEGER']]) {
     try { db.get().exec(`ALTER TABLE recommended ADD COLUMN ${col} ${decl}`); } catch { /* already present */ }
   }
+  // MW-03: persist the imdb id alongside the tmdb-keyed suppression row so a
+  // curated (imdb-keyed) catalog meta can be matched at serve time WITHOUT a
+  // per-title TMDB lookup. Best-effort ADD COLUMN (idempotent). Backfill is
+  // unnecessary — a NULL imdb_id on an old row just means that title isn't
+  // imdb-filterable from curated lists until it's re-suppressed (it stays
+  // tmdb-suppressed from the AI pool, as before). The index backs
+  // dontRecommendImdbSet's one read per curated serve.
+  try { db.get().exec('ALTER TABLE dont_recommend ADD COLUMN imdb_id TEXT'); } catch { /* already present */ }
+  db.get().exec('CREATE INDEX IF NOT EXISTS ix_dnr_profile ON dont_recommend (profile_id)');
   ready = true;
 }
 
@@ -136,14 +145,35 @@ function dontRecommendKeys(profileId, nowMs = Date.now()) {
   return out;
 }
 
-function addDontRecommend(profileId, type, tmdbId, reason = 'user', at = Date.now()) {
+// `imdbId` (MW-03, trailing/optional so existing positional callers are
+// unaffected) is stored as the serve-time MATCH KEY for curated imdb-keyed
+// catalogs — NOT an alternate identity: the row is still tmdb-keyed and requires
+// a resolvable tmdb. On conflict imdb_id COALESCEs so a later re-suppression that
+// happens to know the imdb can fill a previously-null one, but a null never wipes
+// a known imdb.
+function addDontRecommend(profileId, type, tmdbId, reason = 'user', at = Date.now(), imdbId = null) {
   init();
   db.get().prepare(`
-    INSERT INTO dont_recommend (profile_id, type, tmdb_id, reason, at) VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(profile_id, type, tmdb_id) DO UPDATE SET reason = excluded.reason, at = excluded.at
-  `).run(profileId, type, String(tmdbId), reason, at);
+    INSERT INTO dont_recommend (profile_id, type, tmdb_id, reason, at, imdb_id) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(profile_id, type, tmdb_id) DO UPDATE SET reason = excluded.reason, at = excluded.at, imdb_id = COALESCE(excluded.imdb_id, dont_recommend.imdb_id)
+  `).run(profileId, type, String(tmdbId), reason, at, imdbId || null);
   // If it was in the pool, drop it now.
   db.get().prepare('DELETE FROM recommended WHERE profile_id = ? AND type = ? AND tmdb_id = ?').run(profileId, type, String(tmdbId));
+}
+
+// MW-03: the imdb-id siblings of dontRecommendKeys — a Set of `tt…` ids for
+// filtering imdb-keyed curated catalog metas at serve time. Honours the same
+// reason/decay rules (a 'decayed' row past its cooldown is allowed back), and
+// skips rows with a null imdb_id (nothing to match on). One indexed read.
+function dontRecommendImdbSet(profileId, nowMs = Date.now()) {
+  init();
+  const rows = db.get().prepare('SELECT imdb_id, reason, at FROM dont_recommend WHERE profile_id = ? AND imdb_id IS NOT NULL').all(profileId);
+  const out = new Set();
+  for (const r of rows) {
+    if (r.reason === 'decayed' && r.at && (nowMs - r.at) > DECAY_COOLDOWN_MS) continue; // cooldown expired → allow back
+    out.add(r.imdb_id);
+  }
+  return out;
 }
 
 // Undo a USER rejection (Mobile Companion "Undo" after a swipe-remove). Scoped to
@@ -686,11 +716,13 @@ function recordImpressions(profileId, rows, nowMs = Date.now()) {
 function applyDecay(profileId, { nowMs = Date.now(), log = console, windowMs = DECAY_WINDOW_MS } = {}) {
   init();
   const rows = db.get().prepare(
-    'SELECT type, tmdb_id, streak_started_at, times_shown_in_streak, engaged_at FROM recommended WHERE profile_id = ?',
+    'SELECT type, tmdb_id, imdb_id, streak_started_at, times_shown_in_streak, engaged_at FROM recommended WHERE profile_id = ?',
   ).all(profileId);
   let decayed = 0;
   for (const r of rows) {
-    if (shouldDecay(r, nowMs, windowMs)) { addDontRecommend(profileId, r.type, r.tmdb_id, 'decayed', nowMs); decayed++; }
+    // Carry the pool row's imdb_id (MW-03) so a decayed title is filtered from
+    // curated catalogs too, not just the AI pool.
+    if (shouldDecay(r, nowMs, windowMs)) { addDontRecommend(profileId, r.type, r.tmdb_id, 'decayed', nowMs, r.imdb_id); decayed++; }
   }
   if (decayed) log.log(`[decay] ${profileId}: ${decayed} title(s) decayed out (shown ${DECAY_MIN_DAYS}+ days over ${Math.round(windowMs / DAY_MS)}d, never engaged)`);
   return { decayed };
@@ -761,6 +793,7 @@ module.exports = {
   getRecommended,
   countRecommended,
   dontRecommendKeys,
+  dontRecommendImdbSet,
   addDontRecommend,
   removeDontRecommend,
   deleteForProfile,

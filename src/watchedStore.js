@@ -42,6 +42,27 @@ function init() {
       simkl_activities_all TEXT,
       last_synced_at INTEGER
     );
+
+    -- MW-00 pending-watched shim. When a user marks a title watched from the
+    -- phone we write it to Simkl (authoritative), but the local watched row is
+    -- keyed by simkl_id which we don't have at tap-time. This tiny per-profile
+    -- table holds the just-marked title's imdb/tmdb so watchedIdSets can UNION it
+    -- into the served id sets immediately — every serve path that already prunes
+    -- watched then drops the title NOW, before the next activities-gated sync
+    -- pulls the real row back. id is imdb_id (preferred) or tmdb_id, the dedupe
+    -- key — a re-tap upserts, never duplicates. Cleared only by SUPERSESSION (a
+    -- real watched row with the same id lands) or profile reset, NEVER on a timer
+    -- (MW-05 I4): a timed expiry would flash the title back between expiry and the
+    -- next sync.
+    CREATE TABLE IF NOT EXISTS pending_watched (
+      profile_id TEXT NOT NULL,
+      type       TEXT NOT NULL,   -- 'movie' | 'series'
+      id         TEXT NOT NULL,   -- imdb_id preferred, else tmdb_id (dedupe key)
+      imdb_id    TEXT,
+      tmdb_id    TEXT,
+      at         INTEGER,
+      PRIMARY KEY (profile_id, type, id)
+    );
   `);
   ready = true;
 }
@@ -76,6 +97,9 @@ function upsertMany(profileId, items) {
       n++;
     }
     commit.run();
+    // A real watched row (with its simkl_id) now exists for these titles, so any
+    // MW-00 pending-watched shim they had is superseded — retire it (I4).
+    if (n) clearSupersededPending(profileId);
     return n;
   } catch (err) { rollback.run(); throw err; }
 }
@@ -95,13 +119,47 @@ function countWatched(profileId) {
   return row.n;
 }
 
-// Id sets for excluding watched titles from recommendations.
+// Id sets for excluding watched titles from recommendations. UNIONS the MW-00
+// pending-watched shim (a just-marked title with no simkl_id yet) so every
+// serve path that prunes watched drops the title immediately — no change needed
+// at those call sites, they just see a bigger set.
 function watchedIdSets(profileId) {
   init();
   const rows = db.get().prepare('SELECT imdb_id, tmdb_id FROM watched WHERE profile_id = ?').all(profileId);
   const imdb = new Set(); const tmdb = new Set();
   for (const r of rows) { if (r.imdb_id) imdb.add(r.imdb_id); if (r.tmdb_id) tmdb.add(r.tmdb_id); }
+  const pend = db.get().prepare('SELECT imdb_id, tmdb_id FROM pending_watched WHERE profile_id = ?').all(profileId);
+  for (const r of pend) { if (r.imdb_id) imdb.add(r.imdb_id); if (r.tmdb_id) tmdb.add(r.tmdb_id); }
   return { imdb, tmdb };
+}
+
+// MW-00: record a just-marked-watched title as pending (see the table comment).
+// `id` is imdb (preferred) or tmdb; an item with neither is a no-op (nothing to
+// pin). A re-tap upserts on the dedupe key rather than duplicating.
+function addPendingWatched(profileId, { type, imdbId = null, tmdbId = null } = {}) {
+  init();
+  const imdb = imdbId || null;
+  const tmdb = (tmdbId != null && tmdbId !== '') ? String(tmdbId) : null;
+  const id = imdb || tmdb;
+  if (!id) return false;
+  db.get().prepare(`
+    INSERT INTO pending_watched (profile_id, type, id, imdb_id, tmdb_id, at) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(profile_id, type, id) DO UPDATE SET imdb_id = excluded.imdb_id, tmdb_id = excluded.tmdb_id, at = excluded.at
+  `).run(profileId, type, id, imdb, tmdb, Date.now());
+  return true;
+}
+
+// MW-00 I4: drop pending rows now backed by a REAL watched row (matched on imdb
+// OR tmdb). Called after a sync upsert so the shim retires exactly when the
+// authoritative row lands — supersede-only, never a timer. Returns rows cleared.
+function clearSupersededPending(profileId) {
+  init();
+  const r = db.get().prepare(`
+    DELETE FROM pending_watched WHERE profile_id = ?
+      AND ((imdb_id IS NOT NULL AND imdb_id IN (SELECT imdb_id FROM watched WHERE profile_id = ? AND imdb_id IS NOT NULL))
+        OR (tmdb_id IS NOT NULL AND tmdb_id IN (SELECT tmdb_id FROM watched WHERE profile_id = ? AND tmdb_id IS NOT NULL)))
+  `).run(profileId, profileId, profileId);
+  return Number(r.changes || 0);
 }
 
 // Most-recent watch time (ms) for a profile, or 0 if nothing watched. Drives
@@ -117,6 +175,7 @@ function deleteForProfile(profileId) {
   init();
   db.get().prepare('DELETE FROM watched WHERE profile_id = ?').run(profileId);
   db.get().prepare('DELETE FROM sync_state WHERE profile_id = ?').run(profileId);
+  db.get().prepare('DELETE FROM pending_watched WHERE profile_id = ?').run(profileId);
 }
 
 // ---- ingest enrichment: fill primary_genre + age_classification ----
@@ -240,6 +299,8 @@ module.exports = {
   getWatched,
   countWatched,
   watchedIdSets,
+  addPendingWatched,
+  clearSupersededPending,
   newestWatchedMs,
   deleteForProfile,
   getSyncState,

@@ -69,7 +69,9 @@ async function suppress(profile, { type, imdbId = null, tmdbId = null, title = n
   const id = await resolveTmdbId(profile, type, imdbId, tmdbId, log);
   if (!id) return { ok: false, reason: 'unresolved', title: resolvedTitle, imdbId };
 
-  recommendationStore.addDontRecommend(profile.id, type, id, 'user');
+  // Persist imdbId too (MW-03) so the rejection reaches imdb-keyed curated
+  // catalogs at serve time, not just the tmdb-keyed AI pool.
+  recommendationStore.addDontRecommend(profile.id, type, id, 'user', Date.now(), imdbId);
   const total = recommendationStore.countRecommended(profile.id);
   log.log(`[dnr] ${profile.name}: "${resolvedTitle || imdbId || id}" (${type} tmdb:${id}) → don't recommend (pool now ${total})`);
   return { ok: true, title: resolvedTitle, type, tmdbId: id, imdbId, total };

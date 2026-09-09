@@ -351,6 +351,65 @@ async function unitTests() {
     } finally { governor.schedule = origSchedule; global.fetch = origFetch; }
   });
 
+  // ---- MW-04: Simkl plan-to-watch REMOVE (inverse of add) ----
+  await ok('simkl: buildRemoveFromListBody routes by kind (whole show, no seasons / no `to`), id preference, skips id-less', () => {
+    const body = simkl.buildRemoveFromListBody([
+      { type: 'movie', tmdb_id: 603, imdb_id: 'tt0133093' },
+      { type: 'series', tmdb_id: '1399' },
+      { type: 'movie', title: 'no ids here' },   // dropped
+      null,                                       // dropped
+    ]);
+    assert.deepStrictEqual(body.movies, [{ ids: { imdb: 'tt0133093', tmdb: '603' } }]);
+    assert.deepStrictEqual(body.shows, [{ ids: { tmdb: '1399' } }]);
+    // /sync/history/remove shape — NOT the add-to-list { to, ids } shape, and no seasons (whole show).
+    assert.ok(!('seasons' in body.shows[0]) && !('to' in body.shows[0]));
+    assert.deepStrictEqual(simkl.buildRemoveFromListBody({ type: 'movie', tmdb_id: 27205 }).movies[0].ids, { tmdb: '27205' });
+  });
+
+  await ok('simkl: removeFromPlanToWatch throws when not connected (no fetch)', async () => {
+    await assert.rejects(
+      () => simkl.removeFromPlanToWatch({ keys: {}, simkl_auth: null }, { type: 'movie', tmdb_id: '1' }),
+      /not connected/i,
+    );
+  });
+
+  await ok('simkl: removeFromPlanToWatch short-circuits an id-less payload (no fetch)', async () => {
+    const r = await simkl.removeFromPlanToWatch(
+      { keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } },
+      [{ type: 'movie', title: 'no ids' }],
+    );
+    assert.strictEqual(r.skipped, true);
+  });
+
+  await ok('simkl: removeFromPlanToWatch paces on simkl_post + posts to the verified /sync/history/remove', async () => {
+    const origSchedule = governor.schedule; const origFetch = global.fetch;
+    let scheduledService = null; let sentUrl = null; let sentBody = null;
+    governor.schedule = (service, fn) => { scheduledService = service; return fn(); };
+    global.fetch = async (url, opts) => { sentUrl = String(url); sentBody = JSON.parse(opts.body); return { ok: true, status: 200, json: async () => ({ deleted: { movies: 1 } }) }; };
+    try {
+      const r = await simkl.removeFromPlanToWatch(
+        { keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } },
+        { type: 'movie', tmdb_id: '603' },
+      );
+      assert.strictEqual(scheduledService, 'simkl_post');                        // hard 1-POST/s write cap
+      assert.ok(sentUrl.includes('/sync/history/remove'), 'verified plan-to-watch removal endpoint');
+      assert.deepStrictEqual(sentBody.movies[0], { ids: { tmdb: '603' } });
+      assert.deepStrictEqual(r, { deleted: { movies: 1 } });
+    } finally { governor.schedule = origSchedule; global.fetch = origFetch; }
+  });
+
+  await ok('simkl: removeFromPlanToWatch maps a rejected token to the reconnect error', async () => {
+    const origSchedule = governor.schedule; const origFetch = global.fetch;
+    governor.schedule = (_s, fn) => fn();
+    global.fetch = async () => ({ ok: false, status: 401, json: async () => ({}) });
+    try {
+      await assert.rejects(
+        () => simkl.removeFromPlanToWatch({ keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } }, { type: 'movie', tmdb_id: '1' }),
+        /reconnect/i,
+      );
+    } finally { governor.schedule = origSchedule; global.fetch = origFetch; }
+  });
+
   // ---- Step 3: handlers ----
   await ok('handlers: toTitleDTO maps meta -> DTO, drops nulls, no mutation', () => {
     const meta = Object.freeze({
@@ -399,6 +458,32 @@ async function unitTests() {
       assert.strictEqual(res.statusCode, 200);
       assert.strictEqual(res.body.ok, true);
     } finally { simkl.addToPlanToWatch = orig; }
+  });
+
+  await ok('handlers: watchlistRemoveHandler validates, uses req.profile, and writes NO suppression (MW-04)', async () => {
+    const connected = { id: 'A', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    let res = fakeRes();
+    await handlers.watchlistRemoveHandler({ profile: connected, body: { tmdb_id: '1' } }, res); // no type
+    assert.strictEqual(res.statusCode, 400);
+    res = fakeRes();
+    await handlers.watchlistRemoveHandler({ profile: { id: 'B', keys: {}, simkl_auth: null }, body: { type: 'movie', tmdb_id: '1' } }, res);
+    assert.strictEqual(res.statusCode, 400);                 // Simkl not connected
+    assert.match(res.body.error, /not connected/i);
+    // Happy path: targets the session profile, and touches NOTHING in dont_recommend.
+    const orig = simkl.removeFromPlanToWatch;
+    let gotProfileId = null;
+    simkl.removeFromPlanToWatch = async (profile) => { gotProfileId = profile.id; return {}; };
+    const pid = 'wlrm-h-' + Date.now();
+    try {
+      res = fakeRes();
+      const req = { profile: { id: pid, keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } }, body: { type: 'movie', imdb_id: 'tt1', tmdb_id: '603', profile_id: 'Z' } };
+      await handlers.watchlistRemoveHandler(req, res);
+      assert.strictEqual(gotProfileId, pid);                 // session profile, NOT body.profile_id 'Z'
+      assert.strictEqual(res.statusCode, 200);
+      assert.strictEqual(res.body.ok, true);
+      assert.strictEqual(recommendationStore.dontRecommendKeys(pid).size, 0);        // remove != suppress
+      assert.ok(!recommendationStore.dontRecommendImdbSet(pid).has('tt1'));
+    } finally { simkl.removeFromPlanToWatch = orig; recommendationStore.deleteForProfile(pid); }
   });
 
   // ---- Step 4: recommendations tabs + swipe ----
@@ -498,6 +583,45 @@ async function unitTests() {
     assert.ok(keys.has('movie:11') && keys.has('movie:22'), 'both surfaces produce the same suppression');
     assert.strictEqual(recommendationStore.countRecommended(pid), 0);
     recommendationStore.deleteForProfile(pid);
+  });
+
+  // ---- MW-00: mark-as-watched handler ----
+  await ok('handlers: watchedHandler validation (type + ids + Simkl connection)', async () => {
+    const connected = { id: 'A', name: 'A', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    let res = fakeRes();
+    await handlers.watchedHandler({ profile: connected, body: { tmdb_id: '1' } }, res); // no type
+    assert.strictEqual(res.statusCode, 400);
+    res = fakeRes();
+    await handlers.watchedHandler({ profile: connected, body: { type: 'movie' } }, res); // no ids
+    assert.strictEqual(res.statusCode, 400);
+    res = fakeRes();
+    await handlers.watchedHandler({ profile: { id: 'B', keys: {}, simkl_auth: null }, body: { type: 'movie', tmdb_id: '1' } }, res);
+    assert.strictEqual(res.statusCode, 400); // Simkl not connected
+    assert.match(res.body.error, /not connected/i);
+  });
+
+  await ok('handlers: watchedHandler marks via req.profile + pins the pending shim; 502 on Simkl error (MW-00)', async () => {
+    const wStore = require('../../src/watchedStore');
+    const origHist = simkl.addToHistory;
+    let gotProfileId = null; let gotBody = null;
+    simkl.addToHistory = async (profile, body) => { gotProfileId = profile.id; gotBody = body; return {}; };
+    const pid = 'watched-h-' + Date.now();
+    const prof = { id: pid, name: 'A', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    try {
+      const res = fakeRes();
+      await handlers.watchedHandler({ profile: prof, body: { type: 'movie', imdb_id: 'tt1', tmdb_id: '603', title: 'M', profile_id: 'B' } }, res);
+      assert.strictEqual(gotProfileId, pid);                 // session profile, NOT body.profile_id 'B'
+      assert.deepStrictEqual(gotBody, { movies: [{ ids: { imdb: 'tt1', tmdb: '603' } }], shows: [] });
+      assert.ok(!('watched_at' in gotBody.movies[0]));       // Simkl stamps "now"
+      assert.strictEqual(res.statusCode, 200);
+      assert.strictEqual(res.body.ok, true);
+      assert.ok(wStore.watchedIdSets(pid).imdb.has('tt1'), 'pending shim recorded for immediate serve-prune');
+      // A thrown Simkl write surfaces as 502, never a silent success.
+      simkl.addToHistory = async () => { throw new Error('token rejected'); };
+      const res2 = fakeRes();
+      await handlers.watchedHandler({ profile: prof, body: { type: 'movie', imdb_id: 'tt2' } }, res2);
+      assert.strictEqual(res2.statusCode, 502);
+    } finally { simkl.addToHistory = origHist; wStore.deleteForProfile(pid); }
   });
 
   await ok('regression: recommendations are per-profile (isolation)', () => {
@@ -1003,6 +1127,15 @@ async function httpTests() {
     assert.strictEqual(notConnected.status, 400);
     assert.match((await notConnected.json()).error, /not connected/i);
     console.log('  ✓ watchlist: bad body -> 400, Simkl not connected -> 400');
+
+    // MW-04: watchlist/remove — session required, then Simkl-not-connected -> 400.
+    assert.strictEqual((await fetch(`${BASE}/mobile/api/watchlist/remove`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 401);
+    const wlrmBad = await fetch(`${BASE}/mobile/api/watchlist/remove`, { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({ tmdb_id: '1' }) });
+    assert.strictEqual(wlrmBad.status, 400); // no type
+    const wlrm = await fetch(`${BASE}/mobile/api/watchlist/remove`, { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({ type: 'movie', tmdb_id: '603' }) });
+    assert.strictEqual(wlrm.status, 400);
+    assert.match((await wlrm.json()).error, /not connected/i);
+    console.log('  ✓ watchlist/remove: session required, bad body -> 400, Simkl not connected -> 400 (MW-04)');
   }
 
   // ---- Step 4: recommendations + suppress boundaries ----
@@ -1023,6 +1156,15 @@ async function httpTests() {
     const sup = await fetch(`${BASE}/mobile/api/recommend/suppress`, { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({ type: 'movie', tmdb_id: '603' }) });
     assert.strictEqual(sup.status, 200);
     console.log('  ✓ recommendations returns items[] for the session profile; suppress works over HTTP');
+
+    // MW-00: /api/watched — session required, then Simkl-not-connected -> 400.
+    assert.strictEqual((await fetch(`${BASE}/mobile/api/watched`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 401);
+    const wmBad = await fetch(`${BASE}/mobile/api/watched`, { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({ tmdb_id: '1' }) });
+    assert.strictEqual(wmBad.status, 400); // no type
+    const wm = await fetch(`${BASE}/mobile/api/watched`, { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({ type: 'movie', tmdb_id: '603' }) });
+    assert.strictEqual(wm.status, 400);
+    assert.match((await wm.json()).error, /not connected/i);
+    console.log('  ✓ watched: session required, bad body -> 400, Simkl not connected -> 400 (MW-00)');
   }
 
   // ---- Step 5: settings (editable filters, age gate hidden + immutable) ----

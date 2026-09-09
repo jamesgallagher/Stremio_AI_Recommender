@@ -86,6 +86,17 @@ function servedCatalog(profile, catalogId, { record = false } = {}) {
     const watchedImdb = watchedStore.watchedIdSets(profile.id).imdb;
     served = served.filter((m) => !watchedImdb.has(m.id));
   }
+  // MW-03: "Not interested" now reaches every curated catalog, not just the AI
+  // pool — drop suppressed titles here (imdb-keyed match). EXEMPT the two Watch
+  // Later rows (source:'simkl_plantowatch'): the user's own plan-to-watch list
+  // supersedes watched/not-interested, and its ✕ is a list-removal (MW-04), not
+  // a suppression. The exemption is keyed on SOURCE, not dedupe_watched —
+  // Christmas is also dedupe_watched:false but source:'mdblist', so it IS
+  // filtered. AI catalogs never reach here (already suppression-clean).
+  if (extraDef.source !== 'simkl_plantowatch') {
+    const suppressed = recommendationStore.dontRecommendImdbSet(profile.id);
+    served = served.filter((m) => !suppressed.has(m.id));
+  }
   const metas = applyRpdb(served, rpdbKey);
   return { id: extraDef.id, name: extraDef.name, type: extraDef.type, source: extraDef.source, requirement_met: reqMet, state: 'ok', metas };
 }

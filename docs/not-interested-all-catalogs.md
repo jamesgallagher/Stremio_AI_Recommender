@@ -141,15 +141,20 @@ I do want this" — surfaced where they put it, nowhere else.
 
 ## Tasks
 
-- [ ] `recommendationStore`: add nullable `imdb_id` to `dont_recommend` (idempotent
+- [x] `recommendationStore`: add nullable `imdb_id` to `dont_recommend` (idempotent
       migration); persist it in `addDontRecommend`; thread `imdbId` through
-      `dontRecommend.suppress`.
-- [ ] `recommendationStore.dontRecommendImdbSet(profileId)` — imdb id set honouring
-      reason/decay, null-imdb rows skipped.
-- [ ] `catalogServe.servedCatalog` extras branch: filter out `dontRecommendImdbSet`
+      `dontRecommend.suppress`. (Also threaded through the decay path so a decayed
+      title is imdb-filterable from curated lists too.)
+- [x] `recommendationStore.dontRecommendImdbSet(profileId)` — imdb id set honouring
+      reason/decay, null-imdb rows skipped. (Backed by a new `ix_dnr_profile` index.)
+- [x] `catalogServe.servedCatalog` extras branch: filter out `dontRecommendImdbSet`
       titles for every extra **except `source === 'simkl_plantowatch'`** (Watch Later
       exempt; Christmas and all others filtered).
-- [ ] Tests — see Test notes.
+- [x] Tests — see Test notes.
+
+> **Build note (v7, 2026-09-09):** built on `v7`, local commit only. Suppression
+> still requires a resolvable tmdb (I1) — the `imdb_id` column is the serve-time
+> match key only, as scoped.
 
 ## Acceptance criteria
 
