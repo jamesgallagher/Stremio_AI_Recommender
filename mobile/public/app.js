@@ -469,36 +469,47 @@
     setEls.genres.appendChild(frag);
   }
 
-  // Compact meta line under a catalog name (type · source · IMDb floor · size).
-  // Age-band notes are intentionally omitted — the Companion never surfaces age.
-  function catMeta(c) {
-    const bits = [c.type === 'series' ? 'series' : 'movies'];
-    if (c.source === 'simkl_plantowatch') bits.push('Simkl plan-to-watch');
-    if (c.min_imdb) bits.push('IMDb ≥ ' + c.min_imdb);
-    if (c.target && c.target !== 20) bits.push(c.target + ' titles');
-    if (c.dedupe_watched === false) bits.push('keeps watched');
-    return bits.join(' · ');
-  }
+  // CP-02: the type word appended to a catalog name on the phone. The manifest
+  // names carry NO type (CP-01 §4) — this is what makes the two "Watch Later" and
+  // two "Recommended for you" rows read distinctly here, exactly as in the portal.
+  const catTypeLabel = (t) => (t === 'series' ? 'Series' : 'Movies');
 
-  function catRow(name, meta, { id, checked, locked } = {}) {
-    const label = document.createElement('label'); label.className = 'cat-row' + (locked ? ' locked' : '');
+  // The shared preview mark (CP-01's PREVIEW_ICON — same glyph, kept in sync by
+  // eye): a document with a small eye badge. Copied here because the portal and
+  // the companion ship separate bundles with no shared module.
+  const PREVIEW_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h4.5"/><path d="M13 3l5 5v2"/><line x1="8" y1="8" x2="11" y2="8"/><line x1="8" y1="12" x2="13" y2="12"/><path d="M12.5 17.5s1.6-2.5 4.25-2.5 4.25 2.5 4.25 2.5-1.6 2.5-4.25 2.5-4.25-2.5-4.25-2.5z"/><circle cx="16.75" cy="17.5" r="1"/></svg>';
+
+  // One catalog row: a label (checkbox + "<Name> — <Type>") plus a preview button
+  // OUTSIDE the label, so tapping it opens the sheet without toggling enable
+  // (mirrors CP-01). Title-only — NO meta/restriction line: the Companion never
+  // surfaces age. AI rows are locked (always on); extras carry data-catalog and
+  // drive the build-requirement warning.
+  function catRow(name, type, { id, checked, locked } = {}) {
+    const title = name + ' — ' + catTypeLabel(type);
+    const item = document.createElement('div'); item.className = 'cat-item' + (locked ? ' locked' : '');
+    const label = document.createElement('label'); label.className = 'cat-row';
     const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = !!checked;
     if (locked) cb.disabled = true; else cb.dataset.catalog = id;
     if (!locked) cb.addEventListener('change', updateCatalogWarning);
-    const nm = document.createElement('span'); nm.className = 'cat-name'; nm.textContent = name;
-    const mt = document.createElement('span'); mt.className = 'cat-meta'; mt.textContent = meta;
-    label.appendChild(cb); label.appendChild(nm); label.appendChild(mt);
-    return label;
+    const nm = document.createElement('span'); nm.className = 'cat-name'; nm.textContent = title;
+    label.appendChild(cb); label.appendChild(nm);
+    const btn = document.createElement('button'); btn.type = 'button'; btn.className = 'cat-preview';
+    btn.title = 'Preview catalog titles'; btn.setAttribute('aria-label', 'Preview ' + title + ' titles');
+    btn.innerHTML = PREVIEW_ICON;
+    btn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); openCatalogPreview(id, title); });
+    item.appendChild(label); item.appendChild(btn);
+    return item;
   }
 
   function renderCatalogs(cats) {
     settingsState.catalogs = cats || [];
     setEls.catalogs.innerHTML = '';
     const frag = document.createDocumentFragment();
-    // The two AI lists are always on (locked).
-    frag.appendChild(catRow('Movies recommended for you', 'always on', { checked: true, locked: true }));
-    frag.appendChild(catRow('Series recommended for you', 'always on', { checked: true, locked: true }));
-    settingsState.catalogs.forEach((c) => frag.appendChild(catRow(c.name, catMeta(c), { id: c.id, checked: c.enabled })));
+    // The two AI lists are always on (locked). CP-01 §4 name = "Recommended for
+    // you"; we append the type. Known ids so the preview endpoint can serve them.
+    frag.appendChild(catRow('Recommended for you', 'movie', { id: 'ai-recs-movies', checked: true, locked: true }));
+    frag.appendChild(catRow('Recommended for you', 'series', { id: 'ai-recs-series', checked: true, locked: true }));
+    settingsState.catalogs.forEach((c) => frag.appendChild(catRow(c.name, c.type, { id: c.id, checked: c.enabled })));
     setEls.catalogs.appendChild(frag);
     updateCatalogWarning();
   }
@@ -518,6 +529,61 @@
     if (needsMdblist) msgs.push('Curated lists need an MDBList key');
     setEls.catalogsWarn.textContent = msgs.length ? '⚠ ' + msgs.join(' · ') + ' (set in the portal)' : '';
     setEls.catalogsWarn.className = 'msg' + (msgs.length ? ' err' : '');
+  }
+
+  // ---- catalog preview (CP-02) ----
+  // Opens a bottom sheet of the SAME served titles Nuvio receives (GET
+  // /catalogs/:id/preview → shared servedCatalog), so the phone can compare on
+  // the device. Session-scoped server-side (no profile id in the path). Nothing
+  // about age is shown or requested — the sheet only ever renders posters,
+  // titles and IMDb ratings the cache has already age-filtered.
+  const pvEls = { sheet: $('preview-sheet'), title: $('preview-title'), count: $('preview-count'), body: $('preview-body') };
+  const PV_STATE_MSG = {
+    empty: 'This catalog is empty right now — nothing on the list to serve.',
+    not_built: 'This catalog hasn’t been built yet — it builds in the background once enabled.',
+    needs_simkl: 'Connect Simkl in the portal to build this catalog.',
+    needs_mdblist_key: 'This catalog needs an MDBList key (set in the portal) to build.',
+  };
+  const closePreview = () => { pvEls.sheet.hidden = true; };
+  pvEls.sheet.querySelectorAll('[data-close]').forEach((el) => el.addEventListener('click', closePreview));
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !pvEls.sheet.hidden) closePreview(); });
+
+  function pvMsg(text, kind) {
+    pvEls.body.innerHTML = '';
+    const p = document.createElement('p'); p.className = 'msg' + (kind ? ' ' + kind : ''); p.textContent = text;
+    pvEls.body.appendChild(p);
+  }
+
+  function renderPreview(data) {
+    pvEls.title.textContent = data.name + ' — ' + catTypeLabel(data.type);
+    pvEls.count.textContent = data.count + ' ' + (data.count === 1 ? 'title' : 'titles');
+    if (!data.count) { pvMsg(PV_STATE_MSG[data.state] || 'Nothing to show.'); return; }
+    const grid = document.createElement('div'); grid.className = 'preview-grid';
+    data.metas.forEach((m) => {
+      const cell = document.createElement('div'); cell.className = 'pv-cell';
+      const wrap = document.createElement('div'); wrap.className = 'pv-poster';
+      if (m.poster) { const img = document.createElement('img'); img.loading = 'lazy'; img.alt = ''; img.src = m.poster; wrap.appendChild(img); }
+      else { const ph = document.createElement('div'); ph.className = 'pv-noposter'; ph.textContent = m.name || 'No poster'; wrap.appendChild(ph); }
+      // RPDB posters already carry the rating; this numeric badge is the fallback
+      // when the served meta has an imdbRating but no RPDB key (CP-03 populates it).
+      if (m.imdbRating) { const r = document.createElement('span'); r.className = 'pv-rating'; r.title = 'IMDb rating'; r.textContent = '★ ' + m.imdbRating; wrap.appendChild(r); }
+      const cap = document.createElement('span'); cap.className = 'pv-cap';
+      cap.textContent = (m.name || '') + (m.releaseInfo ? ' (' + m.releaseInfo + ')' : '');
+      cell.appendChild(wrap); cell.appendChild(cap);
+      grid.appendChild(cell);
+    });
+    pvEls.body.innerHTML = ''; pvEls.body.appendChild(grid);
+  }
+
+  async function openCatalogPreview(catalogId, title) {
+    pvEls.title.textContent = title || 'Preview'; pvEls.count.textContent = '';
+    pvMsg('Loading…'); pvEls.sheet.hidden = false;
+    try {
+      const res = await apiFetch('/catalogs/' + encodeURIComponent(catalogId) + '/preview');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { pvMsg(data.error || 'Couldn’t load preview.', 'err'); return; }
+      renderPreview(data);
+    } catch { pvMsg('Couldn’t load preview — try again.', 'err'); }
   }
 
   async function loadSettings() {

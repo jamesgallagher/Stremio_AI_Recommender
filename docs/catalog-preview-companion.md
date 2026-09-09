@@ -125,14 +125,24 @@ GET  <companion>/api/catalogs/:catalogId/preview      (profile = authenticated s
 
 ## Tasks
 
-- [ ] Companion server: `GET /api/catalogs/:catalogId/preview` (session-scoped
-      profile, `servedCatalog`, `ageAppropriate` 404 gate, empty-state reasons, **no
-      age field**).
-- [ ] Companion UI: simplify `catRow` to title-only + shared `PREVIEW_ICON` button;
-      remove `cat-meta`/restriction text.
-- [ ] Companion UI: preview sheet/modal (poster grid + rating), reusing the app's
-      poster + sheet patterns; states + dismiss + safe-area.
-- [ ] Tests (below).
+- [x] Companion server: `GET /api/catalogs/:catalogId/preview`
+      ([`handlers.js` `catalogPreviewHandler`](../mobile/server/handlers.js),
+      routed in [`router.js`](../mobile/server/router.js)) — session-scoped to
+      `req.profile` (**no `:id` in the path**), delegates to CP-01 `servedCatalog`
+      (`record:false`), `ageAppropriate` 404 gate with **no age reason leaked**,
+      empty-state reasons, and **no age field** in the payload.
+- [x] Companion UI: `catRow` reduced to title-only (`"<name> — <Type>"`, type from
+      `def.type`) + the shared `PREVIEW_ICON` button OUTSIDE the label
+      (`stopPropagation`, never toggles enable); `cat-meta`/`catMeta` removed; **no
+      restriction line** (the age invariant holds). The two AI rows carry the
+      `ai-recs-movies`/`-series` ids + "Recommended for you" name so they preview too.
+- [x] Companion UI: preview bottom sheet reusing the app's `.sheet` shell — poster
+      grid (RPDB/`no-poster` fallback), IMDb rating badge, header + count, state
+      messages, backdrop + close + **Esc** dismiss, safe-area insets.
+- [x] Tests: preview shape + **no age field** (exact key set), `servedCatalog`
+      equivalence, over-band 404 (no age reason) + unknown-id 404, AI type-free name +
+      `needs_simkl` empty state, and the HTTP route (session guard 401, age-gate 404,
+      no age leak). Verified live in the browser (rows + sheet render).
 
 ## Acceptance criteria
 

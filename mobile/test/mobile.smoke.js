@@ -28,6 +28,8 @@ const simkl = require('../../src/services/simkl');
 const governor = require('../../src/services/governor');
 const recommendationStore = require('../../src/recommendationStore');
 const dontRecommend = require('../../src/dontRecommend');
+const store = require('../../src/store'); // extras cache seeding (CP-02 preview)
+const catalogServe = require('../../src/catalogServe'); // CP-01 shared serve (CP-02 equivalence)
 const handlers = require('../server/handlers'); // Step 3/4 data handlers
 const { fakeOpen } = require('../../test/fixtures/fake-engine'); // SC-06 canonical unrestricted fixture
 
@@ -758,6 +760,54 @@ async function unitTests() {
     assert.strictEqual(after.catalogs['trakt-anime-teen-series'], undefined);  // over-band toggle dropped
     assert.strictEqual(after.filters.age_limit, 8, 'age gate untouched by catalog save');
   });
+
+  // ---- CP-02: catalog preview (Mobile Companion) ----
+  await ok('preview: payload is the shared servedCatalog list, phone-safe fields only, NO age field', () => {
+    const p = config.addProfile('PvShape');
+    store.swapExtra(p.id, 'mdb-war-movies', [
+      { id: 'tt0110413', type: 'movie', name: 'Leon', poster: 'https://img/leon.jpg', imdbRating: '8.5', releaseInfo: '1994' },
+      { id: 'tt0102926', type: 'movie', name: 'JFK', poster: 'https://img/jfk.jpg', imdbRating: '8.0', releaseInfo: '1991' },
+    ]);
+    const res = fakeRes();
+    handlers.catalogPreviewHandler({ profile: config.getProfile(p.id), params: { catalogId: 'mdb-war-movies' } }, res);
+    assert.strictEqual(res.statusCode, 200);
+    // Exactly the phone-safe envelope — crucially NO age/band/limit key anywhere.
+    assert.deepStrictEqual(Object.keys(res.body).sort(), ['count', 'id', 'metas', 'name', 'requirement_met', 'state', 'type']);
+    assert.deepStrictEqual(Object.keys(res.body.metas[0]).sort(), ['id', 'imdbRating', 'name', 'poster', 'releaseInfo']);
+    assert.ok(!JSON.stringify(res.body).toLowerCase().includes('age_'), 'no age_limit/age_band anywhere in the payload');
+    // Same list the shared serve produces (== what the addon feeds the client).
+    const shared = catalogServe.servedCatalog(config.getProfile(p.id), 'mdb-war-movies', { record: false });
+    assert.strictEqual(res.body.state, 'ok');
+    assert.strictEqual(res.body.count, 2);
+    assert.deepStrictEqual(res.body.metas.map((m) => m.id), shared.metas.map((m) => m.id)); // preview == serve
+    assert.strictEqual(res.body.metas[0].imdbRating, '8.5'); // rating carried for the badge
+  });
+
+  await ok('preview: an AI list serves the type-free name + needs_simkl empty-state (no Simkl)', () => {
+    const p = config.addProfile('PvAi'); // fresh profile: no pool, no Simkl
+    const res = fakeRes();
+    handlers.catalogPreviewHandler({ profile: config.getProfile(p.id), params: { catalogId: 'ai-recs-movies' } }, res);
+    assert.strictEqual(res.statusCode, 200);
+    assert.strictEqual(res.body.name, 'Recommended for you'); // type-free (CP-01 §4)
+    assert.strictEqual(res.body.type, 'movie');
+    assert.strictEqual(res.body.count, 0);
+    assert.strictEqual(res.body.state, 'needs_simkl');
+  });
+
+  await ok('preview: an over-band extra on a kids profile -> 404 with NO age reason leaked', () => {
+    const kid = config.addProfile('PvKid'); config.updateProfile(kid.id, { filters: { age_limit: 8 } });
+    const res = fakeRes();
+    handlers.catalogPreviewHandler({ profile: config.getProfile(kid.id), params: { catalogId: 'trakt-anime-teen-series' } }, res); // 13+
+    assert.strictEqual(res.statusCode, 404);
+    assert.ok(!/age|band|limit|\d+\+/i.test(res.body.error), 'the 404 reason never mentions age');
+  });
+
+  await ok('preview: an unknown catalog id -> 404', () => {
+    const p = config.addProfile('PvUnknown');
+    const res = fakeRes();
+    handlers.catalogPreviewHandler({ profile: config.getProfile(p.id), params: { catalogId: 'nope-nope' } }, res);
+    assert.strictEqual(res.statusCode, 404);
+  });
 }
 
 // ---- HTTP surface (boots the real server, hits it with global fetch) ----
@@ -1019,6 +1069,20 @@ async function httpTests() {
     assert.strictEqual(catPost.status, 200);
     assert.strictEqual(config.getProfile(p.id).catalogs['mdb-popular-movies'], true);
     console.log('  ✓ catalogs: GET age-filtered; POST persists a toggle over HTTP');
+
+    // CP-02: catalog preview is session-scoped (no :id in the path) and age-gated.
+    // p is the age_limit-8 kids profile from above.
+    assert.strictEqual((await fetch(`${BASE}/mobile/api/catalogs/ai-recs-movies/preview`)).status, 401); // no cookie -> guard
+    const pvAi = await fetch(`${BASE}/mobile/api/catalogs/ai-recs-movies/preview`, { headers: { Cookie: cookie } });
+    assert.strictEqual(pvAi.status, 200);
+    const pvAiBody = await pvAi.json();
+    assert.strictEqual(pvAiBody.name, 'Recommended for you');
+    assert.ok(!JSON.stringify(pvAiBody).toLowerCase().includes('age_'), 'preview payload leaks no age field');
+    // The 13+ anime catalog is over-band for this kids profile -> 404, no age reason.
+    const pvBanned = await fetch(`${BASE}/mobile/api/catalogs/trakt-anime-teen-series/preview`, { headers: { Cookie: cookie } });
+    assert.strictEqual(pvBanned.status, 404);
+    assert.ok(!/age|band|\d+\+/i.test((await pvBanned.json()).error || ''), 'the 404 reason never mentions age');
+    console.log('  ✓ preview: session-scoped, age-gated 404, no age leak over HTTP (CP-02)');
   }
 
   console.log(`\nAll mobile checks passed (${passed} unit + http).`);

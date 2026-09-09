@@ -201,14 +201,39 @@ select:focus { border-color: var(--accent); }
 /* Settings sub-tabs (Filters / Catalogs) — full-width segmented control. */
 .settings-tabs { display: flex; width: 100%; margin: 4px 0 8px; }
 .settings-tabs .seg { flex: 1; }
-/* Extra-catalog toggle list (Catalogs tab). */
+/* Extra-catalog toggle list (Catalogs tab). CP-02: title-only rows + a preview
+   button that sits OUTSIDE the label, so tapping it never toggles the checkbox. */
 .cats { display: flex; flex-direction: column; gap: 8px; }
-.cat-row { display: flex; align-items: center; gap: 10px; margin: 0; font-size: 14px; color: var(--text);
-  min-height: 44px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 10px; cursor: pointer; }
+.cat-item { display: flex; align-items: center; gap: 6px; min-height: 44px;
+  padding: 4px 8px 4px 12px; border: 1px solid var(--border); border-radius: 10px; }
+.cat-item.locked { opacity: .6; }
+.cat-item > .cat-row { flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px;
+  margin: 0; padding: 8px 0; border: 0; min-height: 0; font-size: 14px; color: var(--text); cursor: pointer; }
+.cat-item.locked > .cat-row { cursor: default; }
 .cat-row input { width: 20px; height: 20px; min-width: 20px; accent-color: var(--accent); }
-.cat-row.locked { opacity: .6; cursor: default; }
-.cat-name { font-weight: 600; }
-.cat-meta { color: var(--muted); font-size: 11px; margin-left: auto; text-align: right; }
+.cat-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cat-preview { flex: 0 0 auto; background: transparent; border: 0; margin: 0;
+  min-height: 40px; min-width: 40px; padding: 6px; display: flex; align-items: center; justify-content: center;
+  color: var(--muted); border-radius: 8px; cursor: pointer; }
+.cat-preview:hover { background: transparent; color: var(--accent); }
+.cat-preview svg { display: block; }
+
+/* Catalog preview sheet (CP-02) — reuses the .sheet shell; body is a poster grid. */
+.preview-head { margin: 4px 34px 12px 0; }
+.preview-head h2 { font-size: 18px; margin: 0 0 2px; }
+.preview-head .sub { margin: 0; }
+.preview-body { min-height: 60px; }
+.preview-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 12px; }
+.pv-cell { font-size: 12px; color: var(--text); }
+.pv-poster { position: relative; aspect-ratio: 2/3; border-radius: 8px; overflow: hidden;
+  background: var(--card2); border: 1px solid var(--border); }
+.pv-poster img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.pv-noposter { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  text-align: center; padding: 6px; color: var(--muted); font-size: 11px; }
+.pv-rating { position: absolute; left: 5px; bottom: 5px; background: rgba(0,0,0,.78);
+  color: #ffd34d; font-weight: 700; font-size: 11px; padding: 2px 6px; border-radius: 6px; }
+.pv-cap { display: block; margin-top: 5px; line-height: 1.3;
+  overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .field { margin-top: 4px; }
 .field + .field { margin-top: 12px; }
 .field > label { margin-top: 0; }

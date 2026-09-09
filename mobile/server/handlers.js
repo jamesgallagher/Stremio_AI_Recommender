@@ -10,6 +10,7 @@ const simkl = require('../../src/services/simkl');
 const recommendationStore = require('../../src/recommendationStore');
 const watchedStore = require('../../src/watchedStore');
 const dontRecommend = require('../../src/dontRecommend');
+const catalogServe = require('../../src/catalogServe');
 
 const TYPES = ['movie', 'series'];
 
@@ -205,6 +206,49 @@ function companionCatalogs(profile) {
     }));
 }
 
+// GET /api/catalogs/:catalogId/preview (CP-02) — the served titles for ONE of
+// this profile's catalogs, so the phone can compare "what AI Recommender has"
+// against what Nuvio shows, on the device. Session-scoped: the profile is
+// req.profile (there is NO :id in the path to abuse — a profile can only ever
+// preview its own catalogs). Delegates to CP-01's shared servedCatalog, so the
+// list/order/prune/RPDB are identical to the portal preview AND to what the addon
+// feeds the client, by construction. record:false keeps it read-only (peeking
+// never advances the recommendation decay lifecycle).
+//
+// Companion age invariant (same discipline as companionCatalogs): an over-band
+// extra (Kids/Anime TV-14) on an age-limited profile is a 404 with NO age reason
+// leaked, and the payload carries NO age field — just titles/posters/ratings the
+// cache has already age-filtered. RPDB posters already carry the rating; the
+// numeric badge reads imdbRating (populated for AI/Watch Later by CP-03).
+function catalogPreviewHandler(req, res) {
+  const profile = req.profile;
+  const catalogId = req.params.catalogId;
+  // Refuse an over-band extra without hinting why — an age-limited profile must
+  // never learn a catalog exists above its band, not even via preview.
+  const extraDef = catalogs.getExtra(catalogId);
+  if (extraDef && !catalogs.ageAppropriate(profile, extraDef)) {
+    return res.status(404).json({ error: 'Catalog not available' });
+  }
+  const served = catalogServe.servedCatalog(profile, catalogId, { record: false });
+  if (!served) return res.status(404).json({ error: 'Unknown catalog' });
+  res.json({
+    id: served.id,
+    name: served.name,
+    type: served.type,
+    requirement_met: served.requirement_met,
+    state: served.state,
+    count: served.metas.length,
+    // No age field — deliberately. Only the phone-safe meta fields.
+    metas: served.metas.map((m) => ({
+      id: m.id,
+      name: m.name,
+      poster: m.poster || null,
+      imdbRating: m.imdbRating || null,
+      releaseInfo: m.releaseInfo || null,
+    })),
+  });
+}
+
 // PURE: a phone-safe engine descriptor. Only id/name/description — capabilities
 // and supported_types (internal flags) never leave the server (SC-05).
 const engDTO = (e) => ({ id: e.id, name: e.name, description: e.description });
@@ -289,5 +333,6 @@ module.exports = {
   toTitleDTO, searchHandler, watchlistHandler,
   toRecDTO, recommendationsHandler, suppressHandler, unsuppressHandler,
   toCompanionFilters, companionCatalogs, companionSettings, settingsGetHandler, settingsPostHandler,
+  catalogPreviewHandler,
   TYPES, COMPANION_FILTERS, SEARCH_LIMIT, SEARCH_LIMIT_MAX,
 };

@@ -231,6 +231,19 @@
     </div>
   </div>
 
+  <!-- ===== Catalog preview sheet (CP-02) ===== -->
+  <div id="preview-sheet" class="sheet" hidden>
+    <div class="sheet-backdrop" data-close></div>
+    <div class="sheet-panel card" role="dialog" aria-modal="true" aria-labelledby="preview-title">
+      <button class="ghost sheet-close" data-close aria-label="Close">✕</button>
+      <div class="preview-head">
+        <h2 id="preview-title"></h2>
+        <p id="preview-count" class="sub"></p>
+      </div>
+      <div id="preview-body" class="preview-body"></div>
+    </div>
+  </div>
+
   <!-- ===== Undo snackbar (swipe-remove) ===== -->
   <div id="snackbar" class="snackbar" hidden>
     <span id="snackbar-text"></span>

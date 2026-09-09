@@ -124,6 +124,7 @@ router.post('/api/recommend/suppress', requireSession, handlers.suppressHandler)
 router.post('/api/recommend/unsuppress', requireSession, handlers.unsuppressHandler);  // Step 4: undo a remove
 router.get('/api/settings', requireSession, handlers.settingsGetHandler);              // Step 5: editable filters + view pref
 router.post('/api/settings', requireSession, handlers.settingsPostHandler);            // Step 5: save filters + view pref
+router.get('/api/catalogs/:catalogId/preview', requireSession, handlers.catalogPreviewHandler); // CP-02: served-titles preview (session-scoped)
 
 // ---- app config (public) ----
 // A single source for the SPA's app name/version, no session needed.
