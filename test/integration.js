@@ -1,10 +1,14 @@
-// Engine-abstraction INTEGRATION tests (SC-01..07 together, end to end).
+// INTEGRATION tests — whole features as one flow through the REAL modules.
 //
 // Where test/smoke.js is mostly UNIT (pure functions in isolation) plus a few
-// per-card checks, this suite walks the WHOLE feature as one flow through the REAL
-// modules — config → engines registry → build dispatch → shared pipeline → pool →
-// the shared age gate → serve — driven by a non-Genesis engine so it exercises the
-// abstraction, not the engine it was reverse-engineered from.
+// per-card checks, this suite walks the WHOLE feature end to end.
+//   A–F: engine abstraction (SC-01..07) — config → engines registry → build
+//        dispatch → shared pipeline → pool → the shared age gate → serve, driven
+//        by a non-Genesis engine so it exercises the abstraction, not the engine
+//        it was reverse-engineered from.
+//   G–I: the catalog-preview cluster (WL-KW + CP-01/02/03) — the Watch Later
+//        build, the shared servedCatalog seam, the watched store, the IMDb rating
+//        cache, and the Mobile Companion preview handler, composed together.
 //
 // Same doctrine as the smoke tests: NO real network. The fixtures are preResolved
 // (the pipeline skips the TMDB resolve), a fresh EMPTY anime index keeps the age
@@ -25,11 +29,31 @@ const rs = require('../src/recommendationStore');
 const engines = require('../src/engines');
 const store = require('../src/store');
 const animeMap = require('../src/services/animeMap');
+// Catalog-preview cluster (WL-KW + CP-01/02/03) — the shared serve seam, the
+// Watch Later build, the catalog registry, the watched store, and the Mobile
+// Companion preview handler, all through their real modules.
+const catalogServe = require('../src/catalogServe');
+const rebuild = require('../src/rebuild');
+const catalogs = require('../src/catalogs');
+const watchedStore = require('../src/watchedStore');
+const companion = require('../mobile/server/handlers');
+const simkl = require('../src/services/simkl');
+const tmdb = require('../src/services/tmdb');
 const { fake, fakeOpen, makeEngine } = require('./fixtures/fake-engine');
 
 const quiet = { log() {}, warn() {}, error() {} };
 let passed = 0;
 async function it(name, fn) { await fn(); passed++; console.log(`  ✓ ${name}`); }
+
+// Minimal Express-like res for driving handlers without HTTP (mirrors the mobile
+// smoke harness) — the Companion preview handler writes status()/json().
+function fakeRes() {
+  return {
+    statusCode: 200, body: null,
+    status(c) { this.statusCode = c; return this; },
+    json(o) { this.body = o; return this; },
+  };
+}
 
 // A fresh EMPTY, non-stale anime index keeps rebuild.applyAnimeGate offline (no
 // Jikan/AniList reach-out) and treats every fixture title as non-anime, so the
@@ -239,6 +263,129 @@ async function main() {
       store.saveAgeVerdicts(prev);
       config.removeProfile(p.id); rs.deleteForProfile(p.id);
       settings.updateSettings({ engines: { nohist: false } }); dispose();
+    }
+  });
+
+  // ══ Catalog-preview cluster: WL-KW + CP-01 + CP-02 + CP-03, end to end ════════
+  // These walk the four catalog cards TOGETHER through the real modules — the
+  // Watch Later build, the shared servedCatalog seam (what the addon serialises
+  // and both previews delegate to), the watched store, the IMDb rating cache, and
+  // the Mobile Companion preview handler — proving the cards compose, not just
+  // that each works alone.
+
+  // ── G. Watch Later: a watched title is KEPT (WL-KW) and carries its true IMDb
+  //      rating (CP-03) all the way from build → cache → the served list the
+  //      preview shows (CP-01 seam), and the Companion preview is that same list.
+  await it('G. WL-KW keep-watched + CP-03 rating survive build → cache → served preview, and the Companion preview matches (CP-01/02 seam)', async () => {
+    const p = config.addProfile('INT-G');
+    const wlDef = catalogs.getExtra('trakt-watchlist-movies');
+    assert.strictEqual(wlDef.dedupe_watched, false, 'WL-KW: Watch Later is flagged keep-watched');
+    // A plan-to-watch list where ONE title is already in the watched store.
+    const origPTW = simkl.getPlanToWatch; const origMeta = tmdb.metaByTmdbId;
+    simkl.getPlanToWatch = async () => ([
+      { imdb_id: 'tt_seen', tmdb_id: '111', title: 'Seen', year: 2018 },
+      { imdb_id: 'tt_fresh', tmdb_id: '222', title: 'Fresh', year: 2020 },
+    ]);
+    // TMDB gives a fallback rating of 6.0 for both — CP-03 must overwrite it with
+    // the true IMDb number when MDBList has one.
+    tmdb.metaByTmdbId = async (_k, _t, id) => ({
+      id: id === '111' ? 'tt_seen' : 'tt_fresh', type: 'movie', name: id === '111' ? 'Seen' : 'Fresh',
+      poster: null, description: '', releaseInfo: id === '111' ? '2018' : '2020', imdbRating: '6.0',
+    });
+    watchedStore.upsertMany(p.id, [{ type: 'movie', title: 'Seen', year: 2018, tmdb_id: '111', imdb_id: 'tt_seen', simkl_id: 111, watched_at: '2026-08-01T00:00:00Z' }]);
+    // Warm the SHARED rating cache so the enrich resolves offline (no MDBList net).
+    store.saveImdbRatingCache({ tt_seen: { rating: 8.2, at: Date.now() }, tt_fresh: { rating: 7.4, at: Date.now() } });
+    try {
+      // BUILD (profile object carries an MDBList key so CP-03 enrich runs).
+      const built = await rebuild.buildWatchlistCatalog(
+        { id: p.id, name: 'INT-G', simkl_auth: { access_token: 't' }, keys: { tmdb_api_key: 'itest-tmdb', mdblist_api_key: 'int-mdb' }, filters: {} }, wlDef, quiet,
+      );
+      assert.deepStrictEqual(built.map((m) => m.id), ['tt_seen', 'tt_fresh'], 'WL-KW: watched title kept at BUILD');
+      assert.strictEqual(built.find((m) => m.id === 'tt_seen').imdbRating, '8.2', 'CP-03: true IMDb overwrote the TMDB fallback');
+      // Persist to the cache the way rebuildProfile does, then SERVE via the seam.
+      store.swapExtra(p.id, wlDef.id, built);
+      const served = catalogServe.servedCatalog(config.getProfile(p.id), wlDef.id, { record: false });
+      assert.strictEqual(served.state, 'ok');
+      assert.deepStrictEqual(served.metas.map((m) => m.id), ['tt_seen', 'tt_fresh'], 'WL-KW: watched title NOT pruned at SERVE');
+      assert.strictEqual(served.metas.find((m) => m.id === 'tt_seen').imdbRating, '8.2', 'CP-03 rating survived cleanMetas → cache → serve');
+      // CP-02: the Companion preview delegates to the SAME servedCatalog — identical list.
+      const res = fakeRes();
+      companion.catalogPreviewHandler({ profile: config.getProfile(p.id), params: { catalogId: wlDef.id } }, res);
+      assert.deepStrictEqual(res.body.metas.map((m) => m.id), served.metas.map((m) => m.id), 'preview == serve');
+      assert.strictEqual(res.body.metas.find((m) => m.id === 'tt_seen').imdbRating, '8.2');
+    } finally {
+      simkl.getPlanToWatch = origPTW; tmdb.metaByTmdbId = origMeta;
+      store.saveImdbRatingCache({}); watchedStore.deleteForProfile(p.id);
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); store.deleteCache(p.id);
+    }
+  });
+
+  // ── H. AI recommendations: the pool's imdb_rating flows serveRecommendations →
+  //      servedCatalog → the Companion preview (CP-03 passthrough). Because the
+  //      addon route serialises servedCatalog().metas verbatim, this is also the
+  //      rating the client receives — one projection, three surfaces.
+  await it('H. CP-03 AI passthrough: imdb_rating (→ vote_average fallback → null) reaches servedCatalog and the Companion preview, type-free name (CP-01 §4)', async () => {
+    const p = config.addProfile('INT-H');
+    rs.upsertCandidates(p.id, [
+      { type: 'movie', tmdb_id: 'h1', imdb_id: 'tth1', title: 'HasImdb', year: 2021, primary_genre: 'Drama', genres: 'Drama', vote_average: 7.0, imdb_rating: 8.9, affinity: 3, rec_count: 1, popularity: 1 },
+      { type: 'movie', tmdb_id: 'h2', imdb_id: 'tth2', title: 'TmdbOnly', year: 2021, primary_genre: 'Action', genres: 'Action', vote_average: 6.4, imdb_rating: null, affinity: 2, rec_count: 1, popularity: 1 },
+    ]);
+    try {
+      const served = catalogServe.servedCatalog(config.getProfile(p.id), 'ai-recs-movies', { record: false });
+      const byId = new Map(served.metas.map((m) => [m.id, m.imdbRating]));
+      assert.strictEqual(byId.get('tth1'), '8.9', 'imdb_rating projected onto the served AI meta');
+      assert.strictEqual(byId.get('tth2'), '6.4', 'vote_average fallback when imdb_rating is null');
+      // Companion preview delegates to servedCatalog: same ids, same ratings, type-free name.
+      const res = fakeRes();
+      companion.catalogPreviewHandler({ profile: config.getProfile(p.id), params: { catalogId: 'ai-recs-movies' } }, res);
+      assert.strictEqual(res.body.name, 'Recommended for you');
+      assert.deepStrictEqual(res.body.metas.map((m) => m.id), served.metas.map((m) => m.id));
+      assert.strictEqual(res.body.metas.find((m) => m.id === 'tth1').imdbRating, '8.9');
+    } finally {
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); store.deleteCache(p.id);
+    }
+  });
+
+  // ── I. The Companion preview holds the age invariant OVER REAL age-gated content:
+  //      a kids profile's fake-sourced AI pool has an over-band title dropped by the
+  //      shared age gate (build), so the preview shows only age-passed titles — and
+  //      an over-band EXTRA by id is 404 with no age reason, no age field anywhere
+  //      (CP-02 × age gate, composing with the engine build of sections A/B).
+  await it('I. Companion preview over a kids profile: age-gated AI list + over-band extra 404, no age reason, no age field (CP-02 × age gate)', async () => {
+    const dispose = engines._register(fake);
+    settings.updateSettings({ engines: { fake: true } });
+    offlineAnimeMap();
+    const p = config.addProfile('INT-I');
+    config.updateProfile(p.id, { filters: { age_limit: 8, engine_movie: 'fake', engine_series: 'fake' } }); // judged at 9
+    const prev = store.loadAgeVerdicts();
+    store.saveAgeVerdicts({
+      [verdictKey('movie', 9, 'fake-movie-1')]: false, // over-band -> gated out of the pool
+      [verdictKey('movie', 9, 'fake-movie-2')]: true,
+      [verdictKey('movie', 9, 'fake-movie-3')]: true,
+      // Series build also runs (engine_series: fake) — seed its verdicts too so the
+      // ACB pass stays offline; all pass (this test only asserts on the movie list).
+      [verdictKey('series', 9, 'fake-series-1')]: true,
+      [verdictKey('series', 9, 'fake-series-2')]: true,
+      [verdictKey('series', 9, 'fake-series-3')]: true,
+    });
+    try {
+      await rs.buildPool(config.getProfile(p.id), quiet);
+      // Over-band extra by id -> 404, and the reason never mentions age.
+      const banned = fakeRes();
+      companion.catalogPreviewHandler({ profile: config.getProfile(p.id), params: { catalogId: 'trakt-anime-teen-series' } }, banned);
+      assert.strictEqual(banned.statusCode, 404);
+      assert.ok(!/age|band|\d+\+/i.test(banned.body.error || ''), 'the 404 reason never mentions age');
+      // The AI preview shows only the age-passed titles; the gated one never appears.
+      const ai = fakeRes();
+      companion.catalogPreviewHandler({ profile: config.getProfile(p.id), params: { catalogId: 'ai-recs-movies' } }, ai);
+      assert.strictEqual(ai.statusCode, 200);
+      assert.ok(!ai.body.metas.some((m) => m.id === 'ttfakemovie1'), 'over-band title is never previewed to a kid');
+      assert.deepStrictEqual(ai.body.metas.map((m) => m.id), ['ttfakemovie2', 'ttfakemovie3']);
+      assert.ok(!JSON.stringify(ai.body).toLowerCase().includes('age_'), 'no age field leaks in the preview payload');
+    } finally {
+      store.saveAgeVerdicts(prev);
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); store.deleteCache(p.id);
+      settings.updateSettings({ engines: { fake: false } }); dispose();
     }
   });
 
