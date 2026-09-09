@@ -237,6 +237,62 @@ async function imdbRatings(apiKey, type, imdbIds, log = console) {
   return out;
 }
 
+// CP-03: IMDb ratings are near-static — refresh a title's cached rating every
+// two weeks. Env-tunable (IMDB_RATING_TTL_MS) for tests/ops. Shorter than the
+// CSM TTL because a rating can nudge as votes accumulate, but still far off the
+// request path (build-time only).
+const RATING_TTL_MS = parseInt(process.env.IMDB_RATING_TTL_MS, 10) || 14 * 24 * 3600e3;
+
+// IMDb ratings for many imdb ids, resolved through the SHARED rating cache
+// (CP-03) — a fact about a title, not a profile, so a title on several
+// watchlists is fetched once per fortnight rather than per profile per build.
+// Cache misses are batch-fetched (POST /imdb, ~50/call) and stored; a genuinely
+// unrated title caches `null` so it isn't re-fetched every build. A failed batch
+// leaves that chunk UNCACHED (retried next build) and simply absent from the
+// result, so the caller keeps its fallback. Returns Map<imdbId, number|null>.
+// Deliberately mirrors commonSenseAges (the CSM sibling) — same cache dance.
+// `fetchBatch` defaults to the real mediaInfoBatch; it's injectable for tests
+// (the same seam recommendationStore uses for imdbRatings).
+async function cachedImdbRatings(apiKey, type, imdbIds, log = console, { fetchBatch = mediaInfoBatch } = {}) {
+  const results = new Map();
+  const now = Date.now();
+  const cache = store.loadImdbRatingCache();
+  const misses = [];
+  for (const id of imdbIds) {
+    const entry = cache[id];
+    if (entry && now - entry.at < RATING_TTL_MS) results.set(id, entry.rating);
+    else misses.push(id);
+  }
+  if (!misses.length) return results;
+
+  const fetched = new Map();
+  for (let i = 0; i < misses.length; i += BATCH_SIZE) {
+    const chunk = misses.slice(i, i + BATCH_SIZE);
+    try {
+      const infoMap = await fetchBatch(apiKey, type, chunk);
+      // A returned title (rated or not) is cached; parseImdbRating -> number|null.
+      for (const id of chunk) fetched.set(id, parseImdbRating(infoMap.get(id)));
+    } catch (err) {
+      // Transient failure: cache NOTHING for the chunk (so it retries next build)
+      // and leave those ids out of the result — the caller keeps its fallback.
+      log.warn(`[mdblist] imdb rating batch failed (${err.message}) — chunk left uncached, retried next build`);
+    }
+  }
+
+  // Persist (reload first — another profile's build may have written since),
+  // dropping expired entries so the file stays bounded.
+  const merged = store.loadImdbRatingCache();
+  for (const [key, entry] of Object.entries(merged)) {
+    if (now - entry.at >= RATING_TTL_MS) delete merged[key];
+  }
+  for (const [id, rating] of fetched) {
+    merged[id] = { rating, at: now };
+    results.set(id, rating);
+  }
+  store.saveImdbRatingCache(merged);
+  return results;
+}
+
 async function testKey(apiKey) {
   // A title guaranteed to exist; validates the key end-to-end.
   const age = await commonSenseAge(apiKey, 'movie', 'tt0111161');
@@ -251,5 +307,6 @@ module.exports = {
   mediaInfoBatch,
   parseImdbRating,
   imdbRatings,
+  cachedImdbRatings,
   testKey,
 };

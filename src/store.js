@@ -151,6 +151,23 @@ function saveCsmCache(entries) {
   writeJsonAtomic(CSM_FILE, entries);
 }
 
+// ---- Global IMDb rating cache (CP-03) ----
+// An IMDb rating is a fact about a title, not per-profile data, and near-static
+// — shared across profiles so a title on five watchlists is resolved once per
+// fortnight (the TTL lives with the consumer, mdblist.js), not five times a day.
+// Entries: { "tt123": { rating, at } } where rating is a number OR null (unrated
+// — cached too, so a genuinely-unrated title isn't re-fetched every build). Same
+// shape and discipline as the CSM cache above; the TTL prune happens on save.
+const IMDB_RATING_FILE = path.join(CACHE_DIR, 'imdb-ratings.json');
+
+function loadImdbRatingCache() {
+  return readJson(IMDB_RATING_FILE, {});
+}
+
+function saveImdbRatingCache(entries) {
+  writeJsonAtomic(IMDB_RATING_FILE, entries);
+}
+
 // ---- Meta cache (v5 metadata service) ----
 // Meta is a fact about a title, not about a profile, so it's shared. One file
 // PER TITLE rather than one big map: a series meta carries every episode, and
@@ -245,6 +262,8 @@ module.exports = {
   touchWatchedSync,
   loadCsmCache,
   saveCsmCache,
+  loadImdbRatingCache,
+  saveImdbRatingCache,
   loadMeta,
   saveMeta,
   loadAnimeIndex,

@@ -817,6 +817,23 @@ ok('recommendationStore: serveRecommendations serves list_size, not the 100 cap'
   assert.strictEqual(rs.serveRecommendations({ id: pid, filters: {} }, 'movie').length, 20); // default
 });
 
+ok('recommendationStore: serveRecommendations projects imdbRating — imdb_rating, else vote_average, else null (CP-03)', () => {
+  const rs = require('../src/recommendationStore');
+  const pid = 'cp03-ai';
+  rs.upsertCandidates(pid, [
+    // imdb_rating present -> it wins (one decimal), even over a different TMDB score
+    { type: 'movie', tmdb_id: 'c1', imdb_id: 'ttc1', title: 'HasImdb', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 7.0, imdb_rating: 8.3, affinity: 3, rec_count: 1, popularity: 1, poster: null },
+    // no imdb_rating -> TMDB vote_average fallback
+    { type: 'movie', tmdb_id: 'c2', imdb_id: 'ttc2', title: 'TmdbOnly', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 6.2, imdb_rating: null, affinity: 2, rec_count: 1, popularity: 1, poster: null },
+    // neither -> null (no fabricated 0.0 badge)
+    { type: 'movie', tmdb_id: 'c3', imdb_id: 'ttc3', title: 'Unrated', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: null, imdb_rating: null, affinity: 1, rec_count: 1, popularity: 1, poster: null },
+  ]);
+  const byId = new Map(rs.serveRecommendations({ id: pid, filters: {} }, 'movie').map((m) => [m.id, m.imdbRating]));
+  assert.strictEqual(byId.get('ttc1'), '8.3'); // imdb_rating projected as a string
+  assert.strictEqual(byId.get('ttc2'), '6.2'); // vote_average fallback
+  assert.strictEqual(byId.get('ttc3'), null);  // neither present
+});
+
 ok('recommendationStore: upsert, dont_recommend suppresses + drops from pool', () => {
   const rs = require('../src/recommendationStore');
   const pid = 'rec-test';
@@ -1507,6 +1524,39 @@ async function httpTests() {
   store.saveCsmCache({});
   console.log('  ✓ CSM disk cache answers without network');
 
+  // CP-03: the IMDb rating cache is a shared fact-about-a-title cache — one fetch
+  // per title per fortnight across ALL profiles, nulls cached, TTL honoured. Stub
+  // the batch fetcher (injectable seam) and count calls.
+  store.saveImdbRatingCache({});
+  let ratingCalls = 0; let lastFetchedIds = null;
+  const fakeBatch = async (_key, _type, ids) => {
+    ratingCalls++; lastFetchedIds = ids;
+    const m = new Map();
+    for (const id of ids) m.set(id, id === 'tt_rated' ? { ratings: [{ source: 'imdb', value: 7.7 }] } : {}); // tt_* others carry no imdb rating -> null
+    return m;
+  };
+  // Profile A: both ids are cache misses -> ONE batch for the pair.
+  const rA = await mdblist.cachedImdbRatings('k', 'movie', ['tt_rated', 'tt_unrated'], console, { fetchBatch: fakeBatch });
+  assert.strictEqual(rA.get('tt_rated'), 7.7);
+  assert.strictEqual(rA.get('tt_unrated'), null); // resolved unrated -> cached as null
+  assert.strictEqual(ratingCalls, 1);
+  // Profile B: same two titles -> served from the SHARED cache, no second fetch.
+  const rB = await mdblist.cachedImdbRatings('k', 'movie', ['tt_rated', 'tt_unrated'], console, { fetchBatch: fakeBatch });
+  assert.deepStrictEqual([rB.get('tt_rated'), rB.get('tt_unrated')], [7.7, null]);
+  assert.strictEqual(ratingCalls, 1, 'warm cache is shared across profiles — no re-fetch');
+  // A cached null is NOT re-fetched: adding a fresh id fetches only that one.
+  await mdblist.cachedImdbRatings('k', 'movie', ['tt_rated', 'tt_unrated', 'tt_new'], console, { fetchBatch: fakeBatch });
+  assert.strictEqual(ratingCalls, 2);
+  assert.deepStrictEqual(lastFetchedIds, ['tt_new'], 'only the miss is fetched; cached rated + null ids are skipped');
+  // TTL: age every entry past 14 days -> a re-fetch on next lookup.
+  const aged = store.loadImdbRatingCache();
+  for (const key of Object.keys(aged)) aged[key].at -= 15 * 24 * 3600e3;
+  store.saveImdbRatingCache(aged);
+  await mdblist.cachedImdbRatings('k', 'movie', ['tt_rated'], console, { fetchBatch: fakeBatch });
+  assert.strictEqual(ratingCalls, 3, 'an entry past the 14-day TTL is re-fetched');
+  store.saveImdbRatingCache({});
+  console.log('  ✓ IMDb rating cache: shared one-fetch, null-caching, 14-day TTL (CP-03)');
+
   // v5: the CSM gate is retired. A kids profile with NO MDBList key must pass
   // straight through instead of throwing — its anime coverage was so thin that
   // "unrated" was the common case, which emptied whole catalogs. The AI gate
@@ -2006,6 +2056,36 @@ async function httpTests() {
   simklSvc.getPlanToWatch = origPTW;
   wStoreB.deleteForProfile(p2.id);
   console.log('  ✓ Watch Later keeps watched titles at BUILD (WL-KW)');
+
+  // CP-03: buildWatchlistCatalog enriches each title's IMDb rating via the shared
+  // cache. Stub Simkl (one title) + TMDB meta (so we own the TMDB fallback), seed
+  // the rating cache, and build. The badge should carry the true IMDb number with
+  // a key, and keep the TMDB-derived value (never blank) without one — no network
+  // either way (warm cache / skipped).
+  {
+    const tmdbSvc = require('../src/services/tmdb');
+    const origMeta = tmdbSvc.metaByTmdbId;
+    simklSvc.getPlanToWatch = async () => ([{ imdb_id: 'tt_cp03wl', tmdb_id: '4242', title: 'WL Title', year: 2019 }]);
+    tmdbSvc.metaByTmdbId = async () => ({ id: 'tt_cp03wl', type: 'movie', name: 'WL Title', poster: null, description: '', releaseInfo: '2019', imdbRating: '6.9' });
+    try {
+      // (a) MDBList key + a warm cache with the true IMDb 8.1 -> overwrite the TMDB value.
+      store.saveImdbRatingCache({ tt_cp03wl: { rating: 8.1, at: Date.now() } });
+      const withKey = await rebuild.buildWatchlistCatalog(
+        { id: 'cp03-wl-a', name: 'WLa', simkl_auth: { access_token: 't' }, keys: { mdblist_api_key: 'wl-mdb' } }, wlDef, silentLog,
+      );
+      assert.strictEqual(withKey[0].imdbRating, '8.1'); // true IMDb, resolved from the cache (no fetch)
+      // (b) No MDBList key -> enrichment skipped, the TMDB-derived rating is kept.
+      const noKey = await rebuild.buildWatchlistCatalog(
+        { id: 'cp03-wl-b', name: 'WLb', simkl_auth: { access_token: 't' }, keys: {} }, wlDef, silentLog,
+      );
+      assert.strictEqual(noKey[0].imdbRating, '6.9'); // TMDB fallback, never blanked
+    } finally {
+      simklSvc.getPlanToWatch = origPTW;
+      tmdbSvc.metaByTmdbId = origMeta;
+      store.saveImdbRatingCache({});
+    }
+    console.log('  ✓ Watch Later build enriches IMDb rating via the shared cache; TMDB fallback kept without a key (CP-03)');
+  }
 
   // Watch Later toggled off -> 404 (explicit false beats default-on)
   await fetch(`${BASE}/api/profiles/${p2.id}`, {

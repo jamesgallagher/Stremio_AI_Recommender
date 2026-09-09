@@ -610,6 +610,12 @@ function serveRecommendations(profile, type, { limit, record = true } = {}) {
     poster: r.poster || null,
     releaseInfo: r.year ? String(r.year) : null,
     genres: (r.genres || '').split(',').filter(Boolean),
+    // CP-03: surface the rating the pool already maintains (imdb_rating, kept
+    // fresh by refreshStaleRatings) so the CP-01/CP-02 preview badge and the
+    // addon-served meta carry it — TMDB vote_average as the fallback, null when
+    // neither exists. Projection only: no fetch, no cost on the serve path.
+    imdbRating: r.imdb_rating != null ? r.imdb_rating.toFixed(1)
+      : (r.vote_average ? r.vote_average.toFixed(1) : null),
   }));
 }
 

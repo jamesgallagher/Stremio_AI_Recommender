@@ -290,9 +290,30 @@ async function buildWatchlistCatalog(profile, def, log = console) {
         : null;
     })));
   }
-  return keepWatched
+  const built = keepWatched
     ? metas.filter(Boolean)
     : metas.filter((m) => m && !watched.imdb.has(m.id)); // cleaned after the age gate
+
+  // CP-03: give each Watch Later title its true IMDb rating (the badge CP-01/
+  // CP-02 render), resolved through the shared 2-week cache — one batch fetch of
+  // cache misses at BUILD (never the serve path), shared across profiles. The
+  // meta already carries a TMDB-derived rating from metaByTmdbId; we only
+  // OVERWRITE it when MDBList yields a real IMDb number, so a populated badge is
+  // never blanked. No MDBList key -> skip entirely (RPDB poster overlay is
+  // unaffected either way).
+  const mdblistKey = settings.keyFor(profile, 'mdblist_api_key');
+  if (mdblistKey && built.length) {
+    try {
+      const ratings = await mdblist.cachedImdbRatings(mdblistKey, def.type, built.map((m) => m.id), log);
+      for (const m of built) {
+        const r = ratings.get(m.id);
+        if (r != null) m.imdbRating = r.toFixed(1);
+      }
+    } catch (err) {
+      log.warn(`[watchlist] ${profile.name}/${def.type}: IMDb rating enrich failed (${err.message}) — keeping TMDB ratings`);
+    }
+  }
+  return built;
 }
 
 async function buildExtraCatalog(profile, def, log = console) {

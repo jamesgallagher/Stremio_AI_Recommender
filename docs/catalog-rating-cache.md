@@ -103,13 +103,26 @@ deliberately cleared its RPDB key); noted as a future option, not built here.
 
 ## Tasks
 
-- [ ] `recommendationStore.js`: add `imdbRating` (imdb_rating → vote_average fallback)
-      to the `serveRecommendations` map.
-- [ ] `store.js`: `loadImdbRatingCache`/`saveImdbRatingCache` + `RATING_TTL_MS` (14d).
-- [ ] `rebuild.js` `buildWatchlistCatalog`: resolve IMDb ratings through the shared
-      cache (batch-fetch misses via `mediaInfoBatch`/`parseImdbRating`, cache nulls),
-      set `meta.imdbRating` (TMDB value as fallback).
-- [ ] Tests (below).
+- [x] `recommendationStore.js`: `serveRecommendations` map now projects `imdbRating`
+      (`imdb_rating` → `vote_average` fallback → null). Because `servedCatalog`
+      reuses `serveRecommendations`, this lights up the addon-served meta AND the
+      CP-01/CP-02 preview badge at zero serve-path cost.
+- [x] `store.js`: `loadImdbRatingCache`/`saveImdbRatingCache` (shared
+      `data/cache/imdb-ratings.json`, nulls cached, same shape as the CSM cache).
+      The **14-day TTL** (`RATING_TTL_MS`, env `IMDB_RATING_TTL_MS`) lives with the
+      consumer in `mdblist.js`, matching the CSM precedent (`CSM_TTL_MS` there).
+- [x] `mdblist.js` `cachedImdbRatings` (new, mirrors `commonSenseAges`): resolve
+      ids against the shared cache, batch-fetch **misses** via
+      `mediaInfoBatch`/`parseImdbRating`, cache results incl. nulls, TTL-prune on
+      save; a failed batch leaves its chunk uncached (retried next build). Injectable
+      `fetchBatch` for tests. `rebuild.js` `buildWatchlistCatalog` calls it at BUILD
+      and sets `meta.imdbRating` to the true IMDb value, keeping the TMDB-derived
+      value as fallback (no key → skipped, never blanks a populated badge).
+- [x] Tests: `serveRecommendations` projection (imdb→vote→null); rating-cache
+      shared one-fetch across profiles + null-caching + 14-day TTL; build enrich
+      (true IMDb with a key, TMDB fallback kept without one). Full suite green
+      (smoke 51+52, integration 6, mobile 57). Verified live: the AI preview badge
+      now populates end-to-end.
 
 ## Acceptance criteria
 
