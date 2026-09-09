@@ -133,16 +133,27 @@ route coverage for the new endpoints — `POST /api/watched` and `POST /api/watc
 
 ## Tasks
 
-- [ ] Apply the must-fix findings in their owning cards: **I1** (MW-03 wording),
-      **I4** (MW-00 pending-watched lifecycle), **I5** (de-conditionalise MW-02/MW-04),
-      confirm **I6** task present in MW-02.
-- [ ] Record the build-time verifications **I2** (whole-show history) and **I3**
-      (Simkl remove endpoint) as explicit checklist items on MW-00 / MW-04.
-- [ ] `test/integration.js`: add sections **J–N** with Simkl-write capture spies,
+- [x] Apply the must-fix findings in their owning cards: **I1** (MW-03 wording),
+      **I4** (MW-00 pending-watched lifecycle — `clearSupersededPending`, supersede-only),
+      **I5** (de-conditionalise MW-02/MW-04), confirm **I6** task present in MW-02
+      (`catalogPreviewHandler` forwards `source`). Landed in the MW-00/03/04 and
+      MW-01/02 commits; verified here.
+- [x] Record the build-time verifications **I2** (whole-show history) and **I3**
+      (Simkl remove endpoint) as explicit checklist items on MW-00 / MW-04
+      (`mark-watched-core.md` build note; `remove-from-watchlist.md` I3 gate).
+- [x] `test/integration.js`: sections **J–N** added with a Simkl-write capture spy,
       continuing the lettered harness after I.
-- [ ] `mobile/test/mobile.smoke.js`: route tests for `/api/watched` and
-      `/api/watchlist/remove`.
-- [ ] `npm test` green (smoke + integration + mobile) on `v7`.
+- [x] `mobile/test/mobile.smoke.js`: route tests for `/api/watched` and
+      `/api/watchlist/remove` — now cover 401 / 400 / **200 (stubbed happy)** /
+      **502 (Simkl throws)** for both.
+- [x] `npm test` green (smoke + integration + mobile) on `v7`.
+
+> **Build note (v7, 2026-09-09):** built on `v7`, local commit only. The review's
+> must-fix items (I1/I4/I6) and I5 were already applied in the owning-card commits;
+> this card verifies them and adds the cross-card gate — integration **J–N** and the
+> two connected-route smoke cases — all green. The two live-API gates stay open until
+> a real Simkl account run: **I2** (whole-show `/sync/history` write — J/K pin the
+> body shape only) and **I3** (`/sync/history/remove` for a plan-to-watch-only title).
 
 ## Acceptance criteria
 

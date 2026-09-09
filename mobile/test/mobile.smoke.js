@@ -1139,6 +1139,26 @@ async function httpTests() {
     assert.strictEqual(wlrm.status, 400);
     assert.match((await wlrm.json()).error, /not connected/i);
     console.log('  ✓ watchlist/remove: session required, bad body -> 400, Simkl not connected -> 400 (MW-04)');
+
+    // MW-04: a Simkl-connected profile → 200 (stubbed happy) and 502 (Simkl
+    // throws), over the real route. Stub the singleton Simkl write the in-process
+    // server shares; restore it after.
+    {
+      const ce = uniqEmail(); const cp = seedProfile('WLRM Connected', ce);
+      config.updateProfile(cp.id, { keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } });
+      const ccookie = await sessionCookieFor(ce);
+      const origRemove = simkl.removeFromPlanToWatch;
+      simkl.removeFromPlanToWatch = async () => ({});
+      try {
+        const okRes = await fetch(`${BASE}/mobile/api/watchlist/remove`, { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: ccookie }, body: JSON.stringify({ type: 'movie', tmdb_id: '603' }) });
+        assert.strictEqual(okRes.status, 200);
+        assert.strictEqual((await okRes.json()).ok, true);
+        simkl.removeFromPlanToWatch = async () => { throw new Error('token rejected'); };
+        const errRes = await fetch(`${BASE}/mobile/api/watchlist/remove`, { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: ccookie }, body: JSON.stringify({ type: 'movie', tmdb_id: '603' }) });
+        assert.strictEqual(errRes.status, 502);
+      } finally { simkl.removeFromPlanToWatch = origRemove; }
+      console.log('  ✓ watchlist/remove: connected -> 200 stubbed happy, 502 on Simkl throw (MW-04)');
+    }
   }
 
   // ---- Step 4: recommendations + suppress boundaries ----
@@ -1168,6 +1188,26 @@ async function httpTests() {
     assert.strictEqual(wm.status, 400);
     assert.match((await wm.json()).error, /not connected/i);
     console.log('  ✓ watched: session required, bad body -> 400, Simkl not connected -> 400 (MW-00)');
+
+    // MW-00: a Simkl-connected profile → 200 (stubbed happy) and 502 (Simkl
+    // throws), over the real route. Stub the singleton Simkl history write the
+    // in-process server shares; restore it after.
+    {
+      const ce = uniqEmail(); const cp = seedProfile('Watched Connected', ce);
+      config.updateProfile(cp.id, { keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } });
+      const ccookie = await sessionCookieFor(ce);
+      const origHist = simkl.addToHistory;
+      simkl.addToHistory = async () => ({});
+      try {
+        const okRes = await fetch(`${BASE}/mobile/api/watched`, { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: ccookie }, body: JSON.stringify({ type: 'movie', imdb_id: 'tt1', tmdb_id: '603', title: 'M' }) });
+        assert.strictEqual(okRes.status, 200);
+        assert.strictEqual((await okRes.json()).ok, true);
+        simkl.addToHistory = async () => { throw new Error('token rejected'); };
+        const errRes = await fetch(`${BASE}/mobile/api/watched`, { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: ccookie }, body: JSON.stringify({ type: 'movie', imdb_id: 'tt2' }) });
+        assert.strictEqual(errRes.status, 502);
+      } finally { simkl.addToHistory = origHist; }
+      console.log('  ✓ watched: connected -> 200 stubbed happy, 502 on Simkl throw (MW-00)');
+    }
   }
 
   // ---- Step 5: settings (editable filters, age gate hidden + immutable) ----

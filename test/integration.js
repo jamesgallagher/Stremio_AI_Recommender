@@ -9,6 +9,10 @@
 //   G–I: the catalog-preview cluster (WL-KW + CP-01/02/03) — the Watch Later
 //        build, the shared servedCatalog seam, the watched store, the IMDb rating
 //        cache, and the Mobile Companion preview handler, composed together.
+//   J–N: the mark-watched / not-interested cluster (MW-00..04) — the shared
+//        markWatched action + Simkl history write, the pending-watched shim, the
+//        source-keyed not-interested exemption, the Watch Later removal, and the
+//        preview `source` field, all through the SAME serve seam (MW-05).
 //
 // Same doctrine as the smoke tests: NO real network. The fixtures are preResolved
 // (the pipeline skips the TMDB resolve), a fresh EMPTY anime index keeps the age
@@ -39,6 +43,11 @@ const watchedStore = require('../src/watchedStore');
 const companion = require('../mobile/server/handlers');
 const simkl = require('../src/services/simkl');
 const tmdb = require('../src/services/tmdb');
+// Mark-watched / not-interested cluster (MW-00..04) — the shared markWatched
+// action and the shared dontRecommend.suppress, driven through the same serve
+// seam the previews and the addon use.
+const markWatched = require('../src/markWatched');
+const dontRecommend = require('../src/dontRecommend');
 const { fake, fakeOpen, makeEngine } = require('./fixtures/fake-engine');
 
 const quiet = { log() {}, warn() {}, error() {} };
@@ -386,6 +395,176 @@ async function main() {
       store.saveAgeVerdicts(prev);
       config.removeProfile(p.id); rs.deleteForProfile(p.id); store.deleteCache(p.id);
       settings.updateSettings({ engines: { fake: false } }); dispose();
+    }
+  });
+
+  // ══ Mark-watched / not-interested cluster: MW-00..04, end to end ════════════
+  // Five cards touch one flow from three directions — a Simkl history write, a
+  // local suppression table, and the shared servedCatalog seam feeding both Nuvio
+  // and the two preview surfaces. J–N pin the CROSS-CARD invariants (watched-
+  // keeps-in-WL, source-keyed exemption, remove-≠-suppress, source-in-payload,
+  // age intact) that no single card's unit tests prove. Same doctrine as A–I:
+  // real modules, no network — the only new machinery is a capture spy over the
+  // two Simkl writes (addToHistory / removeFromPlanToWatch) that records the body
+  // and returns {} (Simkl's de-dupe-safe success), so the body shape stays
+  // assertable offline.
+
+  // ── J. A watched mark leaves the AI list AND a curated list (via the pending-
+  //      watched union) but is KEPT in Watch Later, and the real synced row later
+  //      SUPERSEDES the shim rather than duplicating it (MW-00 × WL-KW × MW-03, I4).
+  await it('J. markWatched: pruned from AI + curated, kept in Watch Later; real sync supersedes the shim, not duplicates it (I4)', async () => {
+    const p = config.addProfile('INT-J');
+    const mprof = { id: p.id, name: 'INT-J', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    const origHist = simkl.addToHistory;
+    let body = null;
+    simkl.addToHistory = async (_profile, b) => { body = b; return {}; }; // capture spy, no network
+    // ONE title, present in all three places at once.
+    const meta = { id: 'tt_watch', type: 'movie', name: 'Seen It', poster: null, imdbRating: '7.0', releaseInfo: '2019' };
+    rs.upsertCandidates(p.id, [
+      { type: 'movie', tmdb_id: 'w1', imdb_id: 'tt_watch', title: 'Seen It', year: 2019, primary_genre: 'Drama', genres: 'Drama', vote_average: 7.0, affinity: 5, rec_count: 1, popularity: 1 },
+      { type: 'movie', tmdb_id: 'w2', imdb_id: 'tt_keep', title: 'Kept', year: 2020, primary_genre: 'Drama', genres: 'Drama', vote_average: 6.5, affinity: 4, rec_count: 1, popularity: 1 },
+    ]);
+    store.swapExtra(p.id, 'mdb-war-movies', [meta]);            // curated: dedupe_watched:true, source 'mdblist'
+    store.swapExtra(p.id, 'trakt-watchlist-movies', [meta]);    // Watch Later: dedupe_watched:false, source 'simkl_plantowatch'
+    try {
+      const r = await markWatched.markWatched(mprof, { type: 'movie', imdbId: 'tt_watch', tmdbId: 'w1', title: 'Seen It' }, quiet);
+      assert.strictEqual(r.ok, true);
+      // The captured /sync/history body: MOVIE shape, imdb+tmdb, NO watched_at (Simkl stamps "now").
+      assert.deepStrictEqual(body, { movies: [{ ids: { imdb: 'tt_watch', tmdb: 'w1' } }], shows: [] });
+      assert.ok(!('watched_at' in body.movies[0]), 'no watched_at — Simkl stamps now');
+      // The pending-watched shim pins it immediately (no sync needed).
+      assert.ok(watchedStore.watchedIdSets(p.id).imdb.has('tt_watch'), 'pending shim recorded for immediate serve-prune');
+      // Gone from the AI list (pending union) — the other title stays.
+      const ai = catalogServe.servedCatalog(config.getProfile(p.id), 'ai-recs-movies', { record: false });
+      assert.deepStrictEqual(ai.metas.map((m) => m.id), ['tt_keep'], 'watched title pruned from AI, others kept');
+      // Gone from the curated (dedupe_watched:true) list too.
+      const war = catalogServe.servedCatalog(config.getProfile(p.id), 'mdb-war-movies', { record: false });
+      assert.deepStrictEqual(war.metas.map((m) => m.id), [], 'watched title pruned from the curated list');
+      // …but KEPT in Watch Later (dedupe_watched:false) — the WL-KW guarantee.
+      const wl = catalogServe.servedCatalog(config.getProfile(p.id), 'trakt-watchlist-movies', { record: false });
+      assert.deepStrictEqual(wl.metas.map((m) => m.id), ['tt_watch'], 'WL-KW: watched title kept in Watch Later');
+      // I4: the real synced row supersedes the shim — retired by the upsert, not left as a duplicate.
+      watchedStore.upsertMany(p.id, [{ type: 'movie', title: 'Seen It', year: 2019, tmdb_id: 'w1', imdb_id: 'tt_watch', simkl_id: 9001, watched_at: '2026-09-09T00:00:00Z' }]);
+      assert.ok(watchedStore.watchedIdSets(p.id).imdb.has('tt_watch'), 'still watched (now via the real row)');
+      assert.strictEqual(watchedStore.clearSupersededPending(p.id), 0, 'the pending shim was already retired by the sync upsert (never on a timer, never duplicated)');
+      // Watch Later still keeps it after the real row lands (dedupe_watched:false is absolute).
+      const wl2 = catalogServe.servedCatalog(config.getProfile(p.id), 'trakt-watchlist-movies', { record: false });
+      assert.deepStrictEqual(wl2.metas.map((m) => m.id), ['tt_watch'], 'WL-KW holds across the sync too');
+    } finally {
+      simkl.addToHistory = origHist;
+      watchedStore.deleteForProfile(p.id);
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); store.deleteCache(p.id);
+    }
+  });
+
+  // ── K. A SERIES marks the WHOLE show watched: the body is shows:[{ids:{imdb}}]
+  //      with NO seasons and NO watched_at — the exact contract the I2 live-API
+  //      verification must satisfy before promotion (MW-00).
+  await it('K. markWatched series → whole-show body: shows:[{ids:{imdb}}], no seasons, no watched_at (I2 contract)', async () => {
+    const origHist = simkl.addToHistory;
+    let body = null;
+    simkl.addToHistory = async (_p, b) => { body = b; return {}; };
+    const mprof = { id: 'int-k-' + Date.now(), name: 'INT-K', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    try {
+      const r = await markWatched.markWatched(mprof, { type: 'series', imdbId: 'tt_show', title: 'A Show' }, quiet);
+      assert.strictEqual(r.ok, true);
+      assert.deepStrictEqual(body, { movies: [], shows: [{ ids: { imdb: 'tt_show' } }] });
+      assert.ok(!('seasons' in body.shows[0]), 'whole show — no seasons key');
+      assert.ok(!('watched_at' in body.shows[0]), 'no watched_at — Simkl stamps now');
+    } finally {
+      simkl.addToHistory = origHist;
+      watchedStore.deleteForProfile(mprof.id);
+    }
+  });
+
+  // ── L. "Not interested" reaches a curated list (Christmas) and the AI pool but
+  //      is EXEMPT on Watch Later — proving the exemption is keyed on SOURCE, not
+  //      dedupe_watched: Christmas and Watch Later are BOTH dedupe_watched:false,
+  //      yet only Watch Later is spared (MW-03).
+  await it('L. not-interested: filtered from Christmas + AI, exempt on Watch Later — source-keyed, not dedupe_watched (MW-03)', async () => {
+    const p = config.addProfile('INT-L');
+    const meta = { id: 'tt_xmas', type: 'movie', name: 'Reject Me', poster: null, imdbRating: '6.6', releaseInfo: '2015' };
+    // In the AI pool so suppress resolves the tmdb from the pool row (no network),
+    // and in BOTH dedupe_watched:false lists (Christmas + Watch Later).
+    rs.upsertCandidates(p.id, [
+      { type: 'movie', tmdb_id: 'x1', imdb_id: 'tt_xmas', title: 'Reject Me', year: 2015, primary_genre: 'Comedy', genres: 'Comedy', vote_average: 6.6, affinity: 3, rec_count: 1, popularity: 1 },
+    ]);
+    store.swapExtra(p.id, 'mdb-christmas-movies', [meta]);       // dedupe_watched:false, source 'mdblist'
+    store.swapExtra(p.id, 'trakt-watchlist-movies', [meta]);     // dedupe_watched:false, source 'simkl_plantowatch'
+    try {
+      const r = await dontRecommend.suppress({ id: p.id, name: 'INT-L', keys: {}, filters: {} }, { type: 'movie', imdbId: 'tt_xmas' }, quiet);
+      assert.strictEqual(r.ok, true, 'suppression resolved a tmdb from the pool row (I1: requires a resolvable tmdb)');
+      assert.strictEqual(r.tmdbId, 'x1');
+      // AI: the pool row was deleted by suppress.
+      const ai = catalogServe.servedCatalog(config.getProfile(p.id), 'ai-recs-movies', { record: false });
+      assert.ok(!ai.metas.some((m) => m.id === 'tt_xmas'), 'not-interested left the AI list');
+      // Christmas (source 'mdblist'): filtered by the imdb-keyed suppression.
+      const xmas = catalogServe.servedCatalog(config.getProfile(p.id), 'mdb-christmas-movies', { record: false });
+      assert.deepStrictEqual(xmas.metas.map((m) => m.id), [], 'not-interested reaches the curated Christmas list');
+      // Watch Later (source 'simkl_plantowatch'): EXEMPT — still present.
+      const wl = catalogServe.servedCatalog(config.getProfile(p.id), 'trakt-watchlist-movies', { record: false });
+      assert.deepStrictEqual(wl.metas.map((m) => m.id), ['tt_xmas'], 'Watch Later is exempt from not-interested (source-keyed)');
+    } finally {
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); store.deleteCache(p.id);
+    }
+  });
+
+  // ── M. The Watch Later ✕ is a plan-to-watch REMOVAL, never a suppression: it
+  //      fires a Simkl remove, writes NOTHING to dont_recommend, and the title is
+  //      still served by the AI list afterwards (MW-04). Driven through the real
+  //      companion handler — the actual ✕ path.
+  await it('M. Watch Later ✕ → Simkl plan-to-watch remove, no suppression written, AI still serves the title (MW-04)', async () => {
+    const p = config.addProfile('INT-M');
+    const mprof = { id: p.id, name: 'INT-M', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    rs.upsertCandidates(p.id, [
+      { type: 'movie', tmdb_id: 'm1', imdb_id: 'tt_rm', title: 'Still Recommended', year: 2022, primary_genre: 'Action', genres: 'Action', vote_average: 7.2, affinity: 4, rec_count: 1, popularity: 1 },
+    ]);
+    const origRemove = simkl.removeFromPlanToWatch;
+    let captured = null;
+    simkl.removeFromPlanToWatch = async (_profile, item) => { captured = item; return {}; }; // capture spy
+    try {
+      const res = fakeRes();
+      await companion.watchlistRemoveHandler({ profile: mprof, body: { type: 'movie', imdb_id: 'tt_rm', tmdb_id: 'm1' } }, res);
+      assert.strictEqual(res.statusCode, 200);
+      assert.ok(captured && (captured.imdb_id === 'tt_rm' || String(captured.tmdb_id) === 'm1'), 'the Simkl plan-to-watch remove was called');
+      // NOT a suppression: dont_recommend is untouched — neither the tmdb key nor the imdb set.
+      assert.strictEqual(rs.dontRecommendKeys(p.id).size, 0, 'remove != suppress (no dont_recommend row)');
+      assert.ok(!rs.dontRecommendImdbSet(p.id).has('tt_rm'), 'remove != suppress (no imdb match key)');
+      // And the title is STILL recommended (the whole point of a plain list removal).
+      const ai = catalogServe.servedCatalog(config.getProfile(p.id), 'ai-recs-movies', { record: false });
+      assert.deepStrictEqual(ai.metas.map((m) => m.id), ['tt_rm'], 'a Watch Later removal never stops the AI list recommending the title');
+    } finally {
+      simkl.removeFromPlanToWatch = origRemove;
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); store.deleteCache(p.id);
+    }
+  });
+
+  // ── N. The Companion preview carries `source` for the ✕/eye wiring (MW-02, I6)
+  //      AND still holds the age invariant (CP-02): a Watch Later preview is
+  //      source:'simkl_plantowatch' with NO age field, and an over-band extra on a
+  //      kids profile is a 404 with no age reason.
+  await it('N. preview payload carries source (MW-02/I6) + age invariant intact: WL source, kids over-band 404 no age (CP-02)', async () => {
+    const p = config.addProfile('INT-N');
+    store.swapExtra(p.id, 'trakt-watchlist-movies', [
+      { id: 'tt_n', type: 'movie', name: 'WL Title', poster: null, imdbRating: '7.1', releaseInfo: '2021' },
+    ]);
+    const kid = config.addProfile('INT-N-kid');
+    config.updateProfile(kid.id, { filters: { age_limit: 8 } });
+    try {
+      const wl = fakeRes();
+      companion.catalogPreviewHandler({ profile: config.getProfile(p.id), params: { catalogId: 'trakt-watchlist-movies' } }, wl);
+      assert.strictEqual(wl.statusCode, 200);
+      assert.strictEqual(wl.body.source, 'simkl_plantowatch', 'MW-02: the ✕ branch keys on this source, forwarded by the preview');
+      assert.deepStrictEqual(wl.body.metas.map((m) => m.id), ['tt_n']);
+      assert.ok(!JSON.stringify(wl.body).toLowerCase().includes('age_'), 'source leaks no age field in the preview payload');
+      // Over-band extra on a kids profile → 404, no age reason (regression of the CP cluster's I).
+      const banned = fakeRes();
+      companion.catalogPreviewHandler({ profile: config.getProfile(kid.id), params: { catalogId: 'trakt-anime-teen-series' } }, banned);
+      assert.strictEqual(banned.statusCode, 404);
+      assert.ok(!/age|band|\d+\+/i.test(banned.body.error || ''), 'the 404 reason never mentions age');
+    } finally {
+      config.removeProfile(p.id); config.removeProfile(kid.id);
+      rs.deleteForProfile(p.id); rs.deleteForProfile(kid.id); store.deleteCache(p.id); store.deleteCache(kid.id);
     }
   });
 
