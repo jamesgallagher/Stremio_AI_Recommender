@@ -44,12 +44,51 @@
   .genres label { display: flex; align-items: center; gap: 6px; margin: 0; font-size: 13px; color: var(--text);
     background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px; cursor: pointer; }
   .genres label:has(input:checked) { border-color: var(--err); color: var(--err); }
-  /* Catalog toggles reuse the genre grid but checked = enabled (positive) */
-  .cats { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 6px; margin-top: 6px; }
-  .cats label { display: flex; align-items: center; gap: 6px; margin: 0; font-size: 13px; color: var(--text);
-    background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px; cursor: pointer; }
-  .cats label:has(input:checked) { border-color: var(--ok); color: var(--ok); }
-  .cats label.locked { opacity: 0.7; cursor: default; }
+  /* Catalog toggles (CP-01): each row is a .cat-item holding a flex-grow label
+     (checkbox + title on line 1, restriction on line 2) plus a preview button
+     that sits OUTSIDE the label, so clicking it opens the modal without toggling
+     the enable checkbox. checked = enabled (positive). */
+  .cats { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 6px; margin-top: 6px; }
+  .cat-item { display: flex; align-items: center; gap: 4px; background: var(--card2);
+    border: 1px solid var(--border); border-radius: 8px; padding: 2px 4px 2px 8px; }
+  .cat-item:has(input:checked) { border-color: var(--ok); }
+  .cat-item.locked { opacity: 0.7; }
+  .cat-item > label { flex: 1; min-width: 0; margin: 0; display: flex; flex-direction: column;
+    gap: 2px; font-size: 13px; color: var(--text); padding: 6px 0; cursor: pointer; }
+  .cat-item.locked > label { cursor: default; }
+  .cat-item:has(input:checked) > label .cat-title { color: var(--ok); }
+  .cat-title { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .cat-title .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cat-restrict { font-size: 11px; color: var(--muted); padding-left: 22px; }
+  .cat-preview { flex: 0 0 auto; background: transparent; border: 0; padding: 5px; margin: 0;
+    color: var(--muted); cursor: pointer; display: flex; align-items: center; border-radius: 6px; }
+  .cat-preview:hover { color: var(--ok); background: transparent; }
+  .cat-preview:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  /* Preview modal — centered, theme-aware (portal CSS vars), self-contained. */
+  .cpv-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 100;
+    display: flex; align-items: center; justify-content: center; padding: 20px; }
+  .cpv-dialog { background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    width: min(760px, 100%); max-height: 86vh; display: flex; flex-direction: column; box-shadow: 0 16px 60px rgba(0,0,0,.5); }
+  .cpv-head { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--border); }
+  .cpv-head h3 { margin: 0; font-size: 15px; flex: 1; color: var(--text); }
+  .cpv-count { font-size: 12px; color: var(--muted); }
+  .cpv-x { background: transparent; border: 0; color: var(--muted); font-size: 20px; line-height: 1;
+    cursor: pointer; padding: 2px 6px; border-radius: 6px; }
+  .cpv-x:hover { color: var(--text); background: var(--card2); }
+  .cpv-body { padding: 14px 16px; overflow-y: auto; }
+  .cpv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 12px; }
+  .cpv-cell { font-size: 12px; color: var(--text); }
+  .cpv-cell .poster { position: relative; aspect-ratio: 2/3; border-radius: 8px; overflow: hidden;
+    background: var(--card2); border: 1px solid var(--border); }
+  .cpv-cell .poster img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .cpv-cell .poster .no-poster { position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: center; text-align: center; padding: 6px; color: var(--muted); font-size: 11px; }
+  .cpv-cell .rating { position: absolute; left: 6px; bottom: 6px; background: rgba(0,0,0,.78);
+    color: #ffd34d; font-weight: 700; font-size: 11px; padding: 2px 6px; border-radius: 6px; }
+  .cpv-cell .cap { margin-top: 5px; display: block; line-height: 1.3;
+    overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .cpv-cell .yr { color: var(--muted); }
+  .cpv-msg { padding: 30px 10px; text-align: center; color: var(--muted); font-size: 13px; }
   /* One key per line, with a show/hide eye pinned inside the input */
   .keys-list { display: flex; flex-direction: column; gap: 12px; margin-top: 4px; }
   .keyfield { position: relative; }
@@ -131,6 +170,10 @@ const catsFor = (p) => CATALOG_DEFS.filter(c => catFits(p, c));
 // Feather-style eye / eye-off icons for the key show/hide toggle.
 const EYE = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/></svg>';
 const EYE_OFF = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
+// CP-01 catalog-preview mark: a document glyph with a small eye badge at the
+// bottom-right ("see what's in this list"). Factored out so CP-02 (companion)
+// reuses the exact same icon. ~16px, currentColor.
+const PREVIEW_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h4.5"/><path d="M13 3l5 5v2"/><line x1="8" y1="8" x2="11" y2="8"/><line x1="8" y1="12" x2="13" y2="12"/><path d="M12.5 17.5s1.6-2.5 4.25-2.5 4.25 2.5 4.25 2.5-1.6 2.5-4.25 2.5-4.25-2.5-4.25-2.5z"/><circle cx="16.75" cy="17.5" r="1"/></svg>';
 
 // Password managers (Bitwarden/LastPass/1Password) otherwise pop their autofill
 // menu on every masked field — and because the profile list re-renders every
@@ -327,11 +370,11 @@ function render(profiles) {
       </div>
 
       <div class="tab-panel" data-tab="catalogs">
-        <div class="muted" style="margin-top:4px">The two AI catalogs are always on. <b>Watch Later</b> mirrors this profile's Simkl plan-to-watch list — on by default, refreshed daily, watched titles drop off. The curated MDBList lists refresh daily and <b>drop titles you've already watched</b> (except <b>Christmas</b>, a re-watchable, marked "keeps watched"); popular charts are unfiltered, the rest drop titles rated below IMDb 6, and the kids lists carry 50 titles (MDBList key required). The <b>Kids</b> and <b>Anime TV-14</b> rows are <b>age-gated to their band always</b> (even on adult profiles), so they need a Groq/LLM key to build. On profiles with an age limit, <b>every</b> extra catalog also passes the anime/NSFW gate and the AI age check — the list is kept unpublished if either can't run.</div>
+        <div class="muted" style="margin-top:4px">The two AI recommendation catalogs (<b>Recommended for you</b>, movies + series) are always on. <b>Watch Later</b> mirrors this profile's Simkl plan-to-watch list — on by default, refreshed daily, and now <b>keeps titles you've already watched</b> (if you added it, it stays until you remove it from your Simkl list). The curated MDBList lists refresh daily and <b>drop titles you've already watched</b> (except <b>Christmas</b>, a re-watchable, marked "keeps watched"); popular charts are unfiltered, the rest drop titles rated below IMDb 6, and the kids lists carry 50 titles (MDBList key required). The <b>Kids</b> and <b>Anime TV-14</b> rows are <b>age-gated to their band always</b> (even on adult profiles), so they need a Groq/LLM key to build. On profiles with an age limit, <b>every</b> extra catalog also passes the anime/NSFW gate and the AI age check — the list is kept unpublished if either can't run. Use the <b>preview</b> button on any row to see the exact titles it serves.</div>
         <div class="cats">
-          <label class="locked"><input type="checkbox" checked disabled>Movies recommended for you</label>
-          <label class="locked"><input type="checkbox" checked disabled>Series recommended for you</label>
-          ${catsFor(p).map(c => `<label><input type="checkbox" data-catalog="${esc(c.id)}" ${catOn(p, c) ? 'checked' : ''}>${esc(c.name)}<span class="muted" style="font-size:11px">${c.type === 'series' ? 'series' : 'movies'}${c.source === 'simkl_plantowatch' ? ' · Simkl plan-to-watch' : ''}${c.min_profile_age ? ' · ' + c.min_profile_age + '+ only' : ''}${c.age_band ? ' · age-gated ' + c.age_band + '+' : ''}${c.min_imdb ? ' · IMDb ≥ ' + c.min_imdb : ''}${c.target && c.target !== 20 ? ' · ' + c.target + ' titles' : ''}${c.dedupe_watched === false ? ' · keeps watched' : ''}</span></label>`).join('')}
+          ${catItemHtml({ pid: p.id, id: 'ai-recs-movies', name: 'Recommended for you', type: 'movie', checked: true, locked: true })}
+          ${catItemHtml({ pid: p.id, id: 'ai-recs-series', name: 'Recommended for you', type: 'series', checked: true, locked: true })}
+          ${catsFor(p).map(c => catItemHtml({ pid: p.id, id: c.id, name: c.name, type: c.type, checked: catOn(p, c), locked: false, restrict: catRestrict(c) })).join('')}
         </div>
         ${catsFor(p).some(c => catOn(p, c) && c.source === 'simkl_plantowatch') && !p.simkl_connected ? '<div style="color:var(--err);font-size:12px;margin-top:6px">⚠ Watch Later is enabled but Simkl is not connected — it cannot build until this profile connects Simkl.</div>' : ''}
         ${catsFor(p).some(c => catOn(p, c) && c.source === 'mdblist') && !p.keys_set.mdblist_api_key ? '<div style="color:var(--err);font-size:12px;margin-top:6px">⚠ Curated catalogs are enabled but no MDBList key is set — add one in Server Config (they cannot build without it).</div>' : ''}
@@ -481,6 +524,111 @@ function updateEngineDesc(sel, type) {
 function catOn(p, c) {
   const v = p.catalogs ? p.catalogs[c.id] : undefined;
   return v !== undefined ? !!v : !!c.default_on;
+}
+
+// ---- Catalog rows + preview (CP-01) ----
+// The client auto-appends the type on the board; our own list doesn't get that,
+// so we append "— Movies"/"— Series" ourselves from def.type. This is what makes
+// the two "Watch Later" and two "Recommended for you" rows read distinctly here
+// after the old metadata subtext was removed — a label derived from data.
+function catTypeLabel(t) { return t === 'series' ? 'Series' : 'Movies'; }
+
+// Restriction shown on line 2 (display only — enforcement is server-side).
+function catRestrict(c) {
+  if (c.min_profile_age) return c.min_profile_age + '+ only';
+  if (c.age_band) return 'age-gated ' + c.age_band + '+';
+  return '';
+}
+
+// One catalog row: checkbox + "<Name> — <Type>" on line 1, restriction on line
+// 2, and a preview button OUTSIDE the label so clicking it never toggles enable.
+function catItemHtml({ pid, id, name, type, checked, locked, restrict }) {
+  const title = esc(name) + ' — ' + catTypeLabel(type);
+  return '<div class="cat-item' + (locked ? ' locked' : '') + '">'
+    + '<label><span class="cat-title">'
+    + '<input type="checkbox"' + (checked ? ' checked' : '') + (locked ? ' disabled' : ' data-catalog="' + esc(id) + '"') + '>'
+    + '<span class="name">' + title + '</span></span>'
+    + (restrict ? '<span class="cat-restrict">' + esc(restrict) + '</span>' : '')
+    + '</label>'
+    + '<button type="button" class="cat-preview" title="preview catalog titles" aria-label="Preview ' + esc(name) + ' titles" '
+    + 'onclick="openCatalogPreview(event, \'' + pid + '\', \'' + esc(id) + '\', \'' + esc(title) + '\')">' + PREVIEW_ICON + '</button>'
+    + '</div>';
+}
+
+const CPV_STATE_MSG = {
+  empty: 'This catalog is empty right now — nothing on the list to serve.',
+  not_built: 'This catalog hasn’t been built yet — it builds in the background once enabled.',
+  needs_simkl: 'Connect Simkl for this profile to build this catalog.',
+  needs_mdblist_key: 'This catalog needs an MDBList API key (Server Config) to build.',
+};
+
+let _cpvLastFocus = null;
+function _cpvClose() {
+  const b = document.getElementById('cpvBackdrop');
+  if (b) b.remove();
+  document.removeEventListener('keydown', _cpvKey);
+  if (_cpvLastFocus && _cpvLastFocus.focus) _cpvLastFocus.focus();
+  _cpvLastFocus = null;
+}
+// Esc closes; Tab is trapped inside the dialog (a11y).
+function _cpvKey(e) {
+  if (e.key === 'Escape') { _cpvClose(); return; }
+  if (e.key !== 'Tab') return;
+  const dlg = document.getElementById('cpvDialog');
+  if (!dlg) return;
+  const f = dlg.querySelectorAll('button, [href], input, [tabindex]:not([tabindex="-1"])');
+  if (!f.length) return;
+  const first = f[0], last = f[f.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+}
+
+// Open the preview modal for one catalog. Fetches the SAME served list the addon
+// feeds the client (GET .../catalogs/:id/preview), so it's directly comparable.
+async function openCatalogPreview(ev, pid, catalogId, title) {
+  ev.preventDefault(); ev.stopPropagation();
+  _cpvLastFocus = ev.currentTarget;
+  const backdrop = document.createElement('div');
+  backdrop.className = 'cpv-backdrop'; backdrop.id = 'cpvBackdrop';
+  backdrop.addEventListener('mousedown', (e) => { if (e.target === backdrop) _cpvClose(); });
+  backdrop.innerHTML =
+    '<div class="cpv-dialog" id="cpvDialog" role="dialog" aria-modal="true" aria-label="' + esc(title) + '">'
+    + '<div class="cpv-head"><h3 id="cpvTitle">' + esc(title) + '</h3>'
+    + '<span class="cpv-count" id="cpvCount"></span>'
+    + '<button type="button" class="cpv-x" aria-label="Close preview" onclick="_cpvClose()">✕</button></div>'
+    + '<div class="cpv-body" id="cpvBody"><div class="cpv-msg">Loading…</div></div></div>';
+  document.body.appendChild(backdrop);
+  document.addEventListener('keydown', _cpvKey);
+  const x = document.querySelector('#cpvDialog .cpv-x'); if (x) x.focus();
+  try {
+    const data = await api('/profiles/' + pid + '/catalogs/' + encodeURIComponent(catalogId) + '/preview');
+    _cpvRender(data);
+  } catch (err) {
+    const body = document.getElementById('cpvBody');
+    if (body) body.innerHTML = '<div class="cpv-msg">Couldn’t load preview — ' + esc(err.message) + '</div>';
+  }
+}
+
+function _cpvRender(data) {
+  const head = document.getElementById('cpvTitle');
+  const count = document.getElementById('cpvCount');
+  const body = document.getElementById('cpvBody');
+  if (!body) return;
+  if (head && data.name) head.textContent = data.name + ' — ' + catTypeLabel(data.type);
+  if (count) count.textContent = data.count + ' ' + (data.count === 1 ? 'title' : 'titles');
+  if (!data.count) {
+    body.innerHTML = '<div class="cpv-msg">' + esc(CPV_STATE_MSG[data.state] || 'Nothing to show.') + '</div>';
+    return;
+  }
+  body.innerHTML = '<div class="cpv-grid">' + data.metas.map(m => {
+    const poster = m.poster
+      ? '<img loading="lazy" src="' + esc(m.poster) + '" alt="">'
+      : '<div class="no-poster">' + esc(m.name || 'No poster') + '</div>';
+    const rating = m.imdbRating ? '<span class="rating" title="IMDb rating">★ ' + esc(String(m.imdbRating)) + '</span>' : '';
+    const yr = m.releaseInfo ? ' <span class="yr">' + esc(String(m.releaseInfo)) + '</span>' : '';
+    return '<div class="cpv-cell"><div class="poster">' + poster + rating + '</div>'
+      + '<span class="cap">' + esc(m.name || '') + yr + '</span></div>';
+  }).join('') + '</div>';
 }
 
 // Persistent show/hide — click to reveal, click again to mask (not press-hold).

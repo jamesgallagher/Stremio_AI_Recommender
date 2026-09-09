@@ -138,12 +138,14 @@ under-deliver on "if I added it, don't remove it."
 
 ## Tasks
 
-- [ ] `catalogs.js`: add `dedupe_watched:false` to both Watch Later defs; update
+- [x] `catalogs.js`: add `dedupe_watched:false` to both Watch Later defs; update
       the header-comment bullet to reflect "watched titles are KEPT."
-- [ ] `rebuild.js` `buildWatchlistCatalog`: gate both watched-prune points on
-      `def.dedupe_watched === false`.
-- [ ] Confirm serve-time ([`addon.js:385`](../src/addon.js)) needs no change.
-- [ ] Tests (below).
+- [x] `rebuild.js` `buildWatchlistCatalog`: gate both watched-prune points on
+      `def.dedupe_watched === false` (via `keepWatched`); export it for the build test.
+- [x] Confirm serve-time (now `catalogServe.servedCatalog`, was `addon.js:385`)
+      honours the flag — no change to the prune logic, just relocated by CP-01.
+- [x] Tests: registry shape (both defs `dedupe_watched:false`), inverted serve
+      assertion, and a new build-path case via `buildWatchlistCatalog`.
 
 ## Acceptance criteria
 

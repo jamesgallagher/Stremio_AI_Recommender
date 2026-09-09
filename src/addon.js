@@ -9,7 +9,10 @@ const rebuild = require('./rebuild');
 const catalogs = require('./catalogs');
 const recommendationStore = require('./recommendationStore');
 const dontRecommend = require('./dontRecommend');
-const watchedStore = require('./watchedStore');
+// CP-01: the served-titles assembly + the AI catalog registry + RPDB swap live
+// in one shared module, so the addon route, the portal preview and the companion
+// preview all serve the same list. The route here is a thin Stremio envelope.
+const { AI_CATALOGS: CATALOGS, applyRpdb, servedCatalog } = require('./catalogServe');
 const tmdb = require('./services/tmdb');
 const llm = require('./services/groq');
 const animeMap = require('./services/animeMap');
@@ -18,12 +21,9 @@ const { version } = require('../package.json'); // single source of truth for th
 
 const router = express.Router({ mergeParams: true });
 
-// Always-on AI catalogs. Optional extras (per-profile toggles) live in
-// ./catalogs and are appended to the manifest dynamically.
-const CATALOGS = {
-  'ai-recs-movies': { type: 'movie', name: 'Movies recommended for you' },
-  'ai-recs-series': { type: 'series', name: 'Series recommended for you' },
-};
+// Always-on AI catalogs (CATALOGS) now live in ./catalogServe alongside the
+// shared serve function; imported above. Optional extras (per-profile toggles)
+// live in ./catalogs and are appended to the manifest dynamically.
 
 // Search-only catalogs (extraRequired: search — never shown on the board).
 // Live TMDB search; kids profiles get the same two-layer age protection as
@@ -33,16 +33,8 @@ const SEARCH_CATALOGS = {
   'ai-search-series': { type: 'series' },
 };
 
-// RPDB (ratingposterdb.com): poster images with the rating rendered on them.
-// Pure URL substitution at serve time — cache keeps canonical TMDB posters, so
-// adding/removing a key applies instantly without a rebuild. fallback=true
-// makes RPDB redirect to a plain poster when it doesn't know the title.
-function applyRpdb(metas, rpdbKey) {
-  if (!rpdbKey) return metas;
-  return metas.map((m) => (m.id && m.id.startsWith('tt')
-    ? { ...m, poster: `https://api.ratingposterdb.com/${rpdbKey}/imdb/poster-default/${m.id}.jpg?fallback=true` }
-    : m));
-}
+// applyRpdb (the serve-time RPDB poster swap) moved to ./catalogServe and is
+// imported above — the meta/search paths below still use it directly.
 
 // Watch Later mirrors the Simkl plan-to-watch list, so "empty" is a normal,
 // lasting state — not a list still warming up. Advertising it anyway puts a
@@ -149,6 +141,21 @@ function errorCard(type, description) {
     description,
     releaseInfo: '...',
   };
+}
+
+// The setup/warming-up card wording for a non-'ok' servedCatalog result. Watch
+// Later's empty state never reaches here (the route answers it with []); this
+// covers the AI catalogs (needs Simkl / still building) and the curated MDBList
+// lists (needs a key / still building).
+function emptyCardText(served) {
+  if (served.source === 'ai') {
+    return served.state === 'needs_simkl'
+      ? 'This profile has not connected Simkl yet — open the configure portal to connect it and build your recommendations.'
+      : 'Your recommendations are being generated — check back in a minute or two, or press "Build recommendations" in the configure portal.';
+  }
+  return served.state === 'needs_mdblist_key'
+    ? 'This catalog needs an MDBList API key — add one in the configure portal.'
+    : 'This list is being generated — check back in a minute or two.';
 }
 
 // Resolve profile from token on every request
@@ -323,74 +330,39 @@ router.get('/catalog/:type/:catalogId{/:extra}', async (req, res) => {
   const extra = (req.params.extra || '').replace(/\.json$/, '');
   const skip = parseInt((extra.match(/skip=(\d+)/) || [])[1] || '0', 10);
 
-  // v6 AI recommendations: served from the recommendationStore pool (built in
-  // the background from Simkl history + TMDB). Genre-balanced and filtered at
-  // SERVE time — rating floor, excluded genres, recency, age band — so changing
-  // a filter takes effect immediately with no rebuild. Cache-only, no network.
+  // v6 AI recommendations + v6 extras share ONE serve path now (CP-01):
+  // servedCatalog() returns the exact titles a client receives — genre-balanced,
+  // SERVE-time filtered (rating floor, excluded genres, recency, age band),
+  // watched-pruned, RPDB-swapped — plus a `state` for the empty cases. This
+  // route is the Stremio envelope: SWR triggers, skip pagination, warming-up
+  // cards, cache headers. Cache-only, no network.
   if (aiCatalog) {
     // SWR: fire-and-forget background build when the watched history moved
     // (no-op when fresh/locked). This request serves the current pool.
     if (profile.simkl_auth?.access_token) {
       recommendationStore.ensureBuilt(profile).catch((err) => console.warn(`[rec] ${profile.name}: background build failed — ${err.message}`));
     }
-    const metas = recommendationStore.serveRecommendations(profile, def.type);
-    if (!metas.length) {
-      const description = !profile.simkl_auth?.access_token
-        ? 'This profile has not connected Simkl yet — open the configure portal to connect it and build your recommendations.'
-        : 'Your recommendations are being generated — check back in a minute or two, or press "Build recommendations" in the configure portal.';
-      return res.json({ metas: skip > 0 ? [] : [errorCard(def.type, description)], cacheMaxAge: 5 * 60 });
-    }
-    // Serve-time watched prune: the pool excludes watched at build, this catches
-    // titles watched since. Union of both types — IMDb ids are global and
-    // Simkl/TMDB can disagree on movie vs show.
-    const watched = watchedStore.watchedIdSets(profile.id);
-    const pruned = metas.filter((m) => !watched.imdb.has(m.id));
-    const sliced = skip > 0 ? pruned.slice(skip) : pruned;
-    return res.json({
-      metas: applyRpdb(sliced, settings.keyFor(profile, 'rpdb_api_key')),
-      cacheMaxAge: 3600,
-      staleRevalidate: 12 * 3600,
-    });
+  } else {
+    rebuild.ensureFresh(profile); // SWR: fire-and-forget; this request serves cache
   }
 
-  rebuild.ensureFresh(profile); // SWR: fire-and-forget; this request serves cache
+  // record:true — serving a real client is an impression (fuels the decay
+  // lifecycle). The read-only portal/companion preview passes record:false.
+  const served = servedCatalog(profile, catalogId, { record: true });
 
-  const cache = store.loadCache(profile.id);
-  const entry = extraDef ? cache.extras?.[extraDef.id] : cache[def.type];
-
-  if (!entry || !entry.metas.length) {
-    // An empty Watch Later is a real state, not a pending one — it's dropped
-    // from the manifest, but a client with a cached manifest can still ask for
-    // it. Answer honestly with nothing rather than a warming-up placeholder.
-    if (extraDef?.source === 'simkl_plantowatch') {
+  if (served.state !== 'ok') {
+    // An empty Watch Later is a real, lasting state (its Simkl plan-to-watch
+    // list is just empty), not a pending one — answer honestly with nothing
+    // rather than a warming-up placeholder. Everything else gets a setup card.
+    if (served.source === 'simkl_plantowatch') {
       return res.json({ metas: [], cacheMaxAge: 5 * 60 });
     }
-    // Nothing cached yet (first install / not onboarded) — friendly card, short client cache
-    const description = extraDef.source === 'simkl_plantowatch'
-      ? (!profile.simkl_auth?.access_token
-        ? 'Watch Later mirrors your Simkl plan-to-watch list — connect Simkl in the configure portal.'
-        : 'Your Simkl plan-to-watch list is empty — add titles on simkl.com or from your player, and they appear here.')
-      : (settings.keyFor(profile, 'mdblist_api_key')
-        ? 'This list is being generated — check back in a minute or two.'
-        : 'This catalog needs an MDBList API key — add one in the configure portal.');
-    return res.json({ metas: skip > 0 ? [] : [errorCard(def.type, description)], cacheMaxAge: 5 * 60 });
+    return res.json({ metas: skip > 0 ? [] : [errorCard(def.type, emptyCardText(served))], cacheMaxAge: 5 * 60 });
   }
 
-  // Serve-time watched pruning (v6): de-dupe against the Simkl-backed watched
-  // store — Watch Later always, and every curated list EXCEPT those flagged
-  // dedupe_watched:false (Christmas re-watchables). IMDb IDs are global, so a
-  // title Simkl/TMDB disagree on (movie vs show) is still pruned. Graceful when
-  // there's nothing watched — the list serves in full.
-  let served = entry.metas;
-  if (extraDef.dedupe_watched !== false) {
-    const watchedImdb = watchedStore.watchedIdSets(profile.id).imdb;
-    served = served.filter((m) => !watchedImdb.has(m.id));
-  }
-
-  const sliced = skip > 0 ? served.slice(skip) : served;
-  const metas = applyRpdb(sliced, settings.keyFor(profile, 'rpdb_api_key'));
+  const sliced = skip > 0 ? served.metas.slice(skip) : served.metas;
   res.json({
-    metas,
+    metas: sliced,
     cacheMaxAge: 3600, // short client hint so pruned/rebuilt lists appear quickly
     staleRevalidate: 12 * 3600,
   });

@@ -267,13 +267,19 @@ async function buildWatchlistCatalog(profile, def, log = console) {
   }
   const items = await simkl.getPlanToWatch(profile, def.type);
   log.log(`[watchlist] ${profile.name}/${def.type}: ${items.length} item(s) on the Simkl plan-to-watch list`);
+  // WL-KW: Watch Later ships dedupe_watched:false — a hand-added plan-to-watch
+  // title is KEPT even once it's in the watched store. The flag reaches serve
+  // time already (addon.js); this makes the BUILD honour it too, so the two
+  // prune points below no longer strip watched titles for Watch Later. A future
+  // watchlist-style catalog without the flag still prunes.
+  const keepWatched = def.dedupe_watched === false;
   const watched = watchedStore.watchedIdSets(profile.id);
   const capped = items.slice(0, WATCHLIST_CAP);
   const metas = [];
   for (let i = 0; i < capped.length; i += 25) {
     const chunk = capped.slice(i, i + 25);
     metas.push(...await Promise.all(chunk.map(async (it) => {
-      if (it.imdb_id && watched.imdb.has(it.imdb_id)) return null;
+      if (!keepWatched && it.imdb_id && watched.imdb.has(it.imdb_id)) return null;
       if (it.tmdb_id) {
         const m = await tmdb.metaByTmdbId(profile.keys.tmdb_api_key, def.type, it.tmdb_id, log);
         if (m) return m;
@@ -284,7 +290,9 @@ async function buildWatchlistCatalog(profile, def, log = console) {
         : null;
     })));
   }
-  return metas.filter((m) => m && !watched.imdb.has(m.id)); // cleaned after the age gate
+  return keepWatched
+    ? metas.filter(Boolean)
+    : metas.filter((m) => m && !watched.imdb.has(m.id)); // cleaned after the age gate
 }
 
 async function buildExtraCatalog(profile, def, log = console) {
@@ -413,6 +421,7 @@ module.exports = {
   ensureFresh,
   rebuildProfile,
   buildExtraCatalog,
+  buildWatchlistCatalog,
   status,
   isRebuilding,
   applyCsmGate,

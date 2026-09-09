@@ -196,19 +196,23 @@ it; accepted.
 
 ## Tasks
 
-- [ ] Backend: extract `servedCatalog(profile, catalogId)` (shared); refactor the
-      addon route to use it with **no behavioural change** (assert via existing
-      addon smoke tests).
-- [ ] `portal.js`: `GET /api/profiles/:id/catalogs/:catalogId/preview` (age-gated,
-      empty-state reasons, RPDB applied).
-- [ ] Portal UI: row restructure (title + `— <Type>` appended from `def.type`, on
-      row 1; restriction on line 2), reusable `PREVIEW_ICON` SVG button (right-aligned,
-      doesn't toggle the checkbox), and the centered preview modal (poster grid, rating
-      badge, states, Esc/backdrop close, focus handling).
-- [ ] Naming (§4): `addon.js:24-25` AI names → `"Recommended for you"` (both);
-      **leave** `catalogs.js` Watch Later names as `"Watch Later"`; update copy at
-      [`index.html:330,332-333`](../public/index.html).
-- [ ] Tests (below).
+- [x] Backend: extracted `servedCatalog(profile, catalogId, {record})` into a new
+      `src/catalogServe.js` (with `AI_CATALOGS` + `applyRpdb`); the addon route is
+      now a thin envelope over it — **no behavioural change** (existing addon smoke
+      tests + a new equivalence assertion). `record:false` keeps preview read-only
+      (no decay-impression side effect).
+- [x] `portal.js`: `GET /api/profiles/:id/catalogs/:catalogId/preview` (age-gated
+      404, empty-state `state`, RPDB applied).
+- [x] Portal UI: row restructure (`— <Type>` appended from `def.type` on row 1;
+      restriction on line 2), reusable `PREVIEW_ICON` SVG button (right-aligned,
+      `stopPropagation` so it never toggles the checkbox), and the centered preview
+      modal (poster grid, rating badge, state messages, Esc/backdrop close, focus
+      trap + return). Verified live in the browser preview.
+- [x] Naming (§4): AI names → `"Recommended for you"` (both, now in
+      `catalogServe.js`); Watch Later stays `"Watch Later"`; portal copy + rows
+      updated; our lists append the type themselves.
+- [x] Tests: preview shape + `preview == serve` equivalence, unknown-id 404,
+      over-band 404, empty-state reasons, and the manifest-name assertions.
 
 ## Acceptance criteria
 

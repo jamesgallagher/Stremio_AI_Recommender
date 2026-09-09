@@ -595,11 +595,14 @@ function listSizeFor(profile) {
 // Cache-only + cheap (local writes only, no external calls) — safe for the addon
 // request path. Records one impression per served title (fuels decay). The served
 // count is the profile's list_size filter (an explicit `limit` still overrides).
-function serveRecommendations(profile, type, { limit } = {}) {
+// `record` defaults ON (a real serve is an impression); the read-only portal /
+// companion preview (CP-01) passes record:false so peeking at a catalog never
+// advances the decay lifecycle.
+function serveRecommendations(profile, type, { limit, record = true } = {}) {
   init();
   const rows = getRecommended(profile.id, { type, limit: 100000 });
   const picked = selectServe(rows, profile.filters || {}, { limit: limit ?? listSizeFor(profile) });
-  recordImpressions(profile.id, picked);
+  if (record) recordImpressions(profile.id, picked);
   return picked.map((r) => ({
     id: r.imdb_id,
     type,

@@ -89,6 +89,11 @@ ok('catalogs: registry, defaults, and per-source requirements', () => {
   const wl = catalogs.getExtra('trakt-watchlist-movies');
   assert.strictEqual(wl.source, 'simkl_plantowatch');
   assert.strictEqual(wl.default_on, true);
+  // WL-KW: both Watch Later rows KEEP watched titles (dedupe_watched:false), the
+  // same opt-out Christmas uses — a hand-added plan-to-watch title must not be
+  // silently pruned because it's also in the watched store.
+  assert.strictEqual(wl.dedupe_watched, false);
+  assert.strictEqual(catalogs.getExtra('trakt-watchlist-series').dedupe_watched, false);
   assert.deepStrictEqual(ids.slice(0, 2), ['trakt-watchlist-movies', 'trakt-watchlist-series']);
   // Default-on semantics: absent = on for watchlist, off for curated lists
   assert.deepStrictEqual(catalogs.enabledExtras({}).map(d => d.id),
@@ -1660,7 +1665,10 @@ async function httpTests() {
     manifest.catalogs.map(c => c.id),
     ['ai-recs-movies', 'ai-recs-series', 'ai-search-movies', 'ai-search-series']
   );
-  assert.strictEqual(manifest.catalogs[0].name, 'Movies recommended for you');
+  // CP-01 §4: manifest names carry NO type word — the client auto-appends
+  // "— Movie(s)". Both AI rows are now just "Recommended for you".
+  assert.strictEqual(manifest.catalogs[0].name, 'Recommended for you');
+  assert.strictEqual(manifest.catalogs[1].name, 'Recommended for you');
   assert.deepStrictEqual(manifest.catalogs[2].extraRequired, ['search']); // search-only catalog
   assert.ok(manifest.name.includes('SmokeTest'));
   // ...and it comes back once the watchlist actually has something in it
@@ -1962,8 +1970,9 @@ async function httpTests() {
   assert.deepStrictEqual(wcat.metas, []);
   console.log('  ✓ empty Watch Later serves nothing, not a placeholder card');
 
-  // Watch Later IS pruned by watched status (unlike curated extras) — via the
-  // Simkl-backed watched store now, not the old Trakt snapshot.
+  // WL-KW: Watch Later KEEPS watched titles (dedupe_watched:false), like
+  // Christmas — a hand-added plan-to-watch title stays on the row even once it's
+  // in the watched store (previously it was pruned at serve time).
   const wStore2 = require('../src/watchedStore');
   store.swapExtra(p2.id, 'trakt-watchlist-movies', [
     { id: 'tt0111161', type: 'movie', name: 'Seen Pick', poster: null, description: '', releaseInfo: '2020' },
@@ -1971,9 +1980,32 @@ async function httpTests() {
   ]);
   wStore2.upsertMany(p2.id, [{ type: 'movie', title: 'Seen Pick', year: 2020, tmdb_id: '9111', imdb_id: 'tt0111161', simkl_id: 9111, watched_at: '2026-08-18T00:00:00Z' }]);
   wcat = await (await fetch(`${BASE}/addon/${p2.token}/catalog/movie/trakt-watchlist-movies.json`)).json();
-  assert.deepStrictEqual(wcat.metas.map(m => m.id), ['tt0068646']);
-  console.log('  ✓ Watch Later prunes watched titles at serve time');
+  assert.deepStrictEqual(wcat.metas.map(m => m.id), ['tt0111161', 'tt0068646']); // watched title retained
+  console.log('  ✓ Watch Later keeps watched titles at serve time (WL-KW)');
   wStore2.deleteForProfile(p2.id);
+
+  // WL-KW build path: buildWatchlistCatalog KEEPS a plan-to-watch title that is
+  // already watched. Serve-time honoured the flag before this card; the BUILD
+  // pruned in two places regardless — this covers that gap. Stub the Simkl list
+  // (imdb-only items -> minimal fallback, no TMDB call) and seed the watched
+  // store, then build directly.
+  const simklSvc = require('../src/services/simkl');
+  const wlDef = require('../src/catalogs').getExtra('trakt-watchlist-movies');
+  const origPTW = simklSvc.getPlanToWatch;
+  simklSvc.getPlanToWatch = async () => ([
+    { imdb_id: 'tt0111161', title: 'Seen Later', year: 2020 },   // in the watched store
+    { imdb_id: 'tt0068646', title: 'Fresh Later', year: 1972 },  // not watched
+  ]);
+  const wStoreB = require('../src/watchedStore');
+  wStoreB.upsertMany(p2.id, [{ type: 'movie', title: 'Seen Later', year: 2020, tmdb_id: '9911', imdb_id: 'tt0111161', simkl_id: 9911, watched_at: '2026-08-18T00:00:00Z' }]);
+  const silentLog = { log() {}, warn() {}, error() {} };
+  const built = await rebuild.buildWatchlistCatalog(
+    { id: p2.id, name: 'WL', simkl_auth: { access_token: 't' }, keys: {} }, wlDef, silentLog,
+  );
+  assert.deepStrictEqual(built.map(m => m.id), ['tt0111161', 'tt0068646']); // watched title retained at BUILD
+  simklSvc.getPlanToWatch = origPTW;
+  wStoreB.deleteForProfile(p2.id);
+  console.log('  ✓ Watch Later keeps watched titles at BUILD (WL-KW)');
 
   // Watch Later toggled off -> 404 (explicit false beats default-on)
   await fetch(`${BASE}/api/profiles/${p2.id}`, {
@@ -2013,6 +2045,53 @@ async function httpTests() {
   assert.deepStrictEqual(xcat.metas.map(m => m.id), ['tt0111161']); // NOT pruned — re-watchable
   console.log('  ✓ Christmas exempt from watched de-dupe');
   wStore3.deleteForProfile(p2.id);
+
+  // CP-01: catalog preview API. The preview serves the SAME list the addon feeds
+  // the client (shared servedCatalog), so the configurator can compare them.
+  const catalogServe = require('../src/catalogServe');
+  // Keep mdb-action-movies enabled (the later rebuild test asserts on it); add war.
+  await fetch(`${BASE}/api/profiles/${p2.id}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ catalogs: { 'mdb-war-movies': true, 'mdb-action-movies': true, 'mdb-popular-series': true } }),
+  });
+  store.swapExtra(p2.id, 'mdb-war-movies', [
+    { id: 'tt0110413', type: 'movie', name: 'Léon', poster: 'https://img/leon.jpg', imdbRating: '8.5', releaseInfo: '1994' },
+    { id: 'tt0102926', type: 'movie', name: 'JFK', poster: 'https://img/jfk.jpg', imdbRating: '8.0', releaseInfo: '1991' },
+  ]);
+  const routeWar = await (await fetch(`${BASE}/addon/${p2.token}/catalog/movie/mdb-war-movies.json`)).json();
+  const prevWar = await (await fetch(`${BASE}/api/profiles/${p2.id}/catalogs/mdb-war-movies/preview`)).json();
+  assert.strictEqual(prevWar.state, 'ok');
+  assert.strictEqual(prevWar.count, 2);
+  assert.deepStrictEqual(prevWar.metas.map(m => m.id), routeWar.metas.map(m => m.id)); // preview == serve
+  assert.strictEqual(prevWar.metas[0].imdbRating, '8.5'); // rating carried through for the modal badge
+  // ...and the shared function is exactly what the route serializes, by construction.
+  const sharedWar = catalogServe.servedCatalog(config.getProfile(p2.id), 'mdb-war-movies');
+  assert.deepStrictEqual(sharedWar.metas.map(m => m.id), routeWar.metas.map(m => m.id));
+  console.log('  ✓ catalog preview equals the addon serve (CP-01)');
+
+  // Unknown catalog id -> 404
+  let pv = await fetch(`${BASE}/api/profiles/${p2.id}/catalogs/nope-nope/preview`);
+  assert.strictEqual(pv.status, 404);
+  // Over-band catalog on an age-limited profile -> 404 (age safety, mirrors serve)
+  await fetch(`${BASE}/api/profiles/${p2.id}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filters: { age_limit: 8 } }),
+  });
+  pv = await fetch(`${BASE}/api/profiles/${p2.id}/catalogs/trakt-anime-teen-series/preview`);
+  assert.strictEqual(pv.status, 404);
+  await fetch(`${BASE}/api/profiles/${p2.id}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filters: { age_limit: 0 } }),
+  });
+  // Empty-state reasons the modal renders: AI with no pool + no Simkl -> needs_simkl
+  // (and the type-free name), a curated list with no key -> needs_mdblist_key.
+  const prevAi = await (await fetch(`${BASE}/api/profiles/${p2.id}/catalogs/ai-recs-movies/preview`)).json();
+  assert.strictEqual(prevAi.count, 0);
+  assert.strictEqual(prevAi.state, 'needs_simkl');
+  assert.strictEqual(prevAi.name, 'Recommended for you');
+  const prevKey = await (await fetch(`${BASE}/api/profiles/${p2.id}/catalogs/mdb-horror-movies/preview`)).json();
+  assert.strictEqual(prevKey.state, 'needs_mdblist_key');
+  console.log('  ✓ preview age-gate 404 + empty-state reasons (CP-01)');
 
   // Wrong type for a known extra id -> 404
   res = await fetch(`${BASE}/addon/${p2.token}/catalog/series/mdb-action-movies.json`);

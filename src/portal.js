@@ -18,6 +18,7 @@ const watchedStore = require('./watchedStore');
 const recommendationStore = require('./recommendationStore');
 const dontRecommend = require('./dontRecommend');
 const engines = require('./engines');
+const catalogServe = require('./catalogServe');
 
 const { version } = require('../package.json');
 const USER_AGENT = `AI-Recommender/1.0 (+https://github.com/jamesgallagher/Stremio_AI_Recommender)`;
@@ -491,6 +492,41 @@ router.get('/profiles/:id/recommend', (req, res) => {
     engines: { movie: engines.resolveFor(profile, 'movie').id, series: engines.resolveFor(profile, 'series').id },
     movies: recommendationStore.getRecommended(profile.id, { type: 'movie', limit: 40 }),
     series: recommendationStore.getRecommended(profile.id, { type: 'series', limit: 40 }),
+  });
+});
+
+// CP-01: preview a catalog's served titles for a profile — the SAME list the
+// addon feeds Nuvio (via the shared servedCatalog), so the configurator can
+// compare "what AI Recommender has" against what the client shows. Read-only:
+// record:false, so peeking never advances the recommendation decay lifecycle.
+// Covers the two always-on AI catalogs and every extra id.
+router.get('/profiles/:id/catalogs/:catalogId/preview', (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  const catalogId = req.params.catalogId;
+  // Age safety: refuse an over-band extra (Kids/Anime TV-14) for an age-limited
+  // profile, mirroring the addon route — never surface it even in a preview.
+  const extraDef = catalogs.getExtra(catalogId);
+  if (extraDef && !catalogs.ageAppropriate(profile, extraDef)) {
+    return res.status(404).json({ error: 'Catalog not available for this profile' });
+  }
+  const served = catalogServe.servedCatalog(profile, catalogId, { record: false });
+  if (!served) return res.status(404).json({ error: 'Unknown catalog' });
+  res.json({
+    id: served.id,
+    name: served.name,
+    type: served.type,
+    source: served.source,
+    requirement_met: served.requirement_met,
+    state: served.state,
+    count: served.metas.length,
+    metas: served.metas.map((m) => ({
+      id: m.id,
+      name: m.name,
+      poster: m.poster || null,
+      imdbRating: m.imdbRating || null,
+      releaseInfo: m.releaseInfo || null,
+    })),
   });
 });
 

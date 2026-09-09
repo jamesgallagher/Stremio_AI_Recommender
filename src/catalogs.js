@@ -3,8 +3,12 @@
 // Two sources:
 // - source 'simkl_plantowatch' (Watch Later, v6): mirrors the profile's Simkl
 //   plan-to-watch list (movies + shows + anime). Default ON (default_on),
-//   requires Simkl. Served in the user's own order; watched titles ARE pruned
-//   (a watch-later list must not show what's been seen).
+//   requires Simkl. Served in the user's own order; watched titles are KEPT
+//   (WL-KW, 2026-09-09): if the user hand-added a title to plan-to-watch,
+//   automation must not quietly drop it because it's also in the watched store
+//   (a re-watch, a film queued again years later, a part-watched show). Carried
+//   through the same dedupe_watched:false opt-out Christmas uses. A watched
+//   title stays as long as it remains on the Simkl plan-to-watch list.
 // - source 'mdblist' (curated lists, decided 2026-07-08): popular charts keep
 //   every item unfiltered (max 20); rating-gated catalogs (min_imdb) drop
 //   items below the bar and keep paging until 20; final order shuffled per
@@ -16,8 +20,8 @@
 // re-source so installed manifests don't break — only the underlying list moved.
 const EXTRA_CATALOGS = [
   // Watch Later first — the "3rd catalog" straight after the two AI rows.
-  { id: 'trakt-watchlist-movies', type: 'movie', name: 'Watch Later', source: 'simkl_plantowatch', default_on: true },
-  { id: 'trakt-watchlist-series', type: 'series', name: 'Watch Later', source: 'simkl_plantowatch', default_on: true },
+  { id: 'trakt-watchlist-movies', type: 'movie', name: 'Watch Later', source: 'simkl_plantowatch', default_on: true, dedupe_watched: false },
+  { id: 'trakt-watchlist-series', type: 'series', name: 'Watch Later', source: 'simkl_plantowatch', default_on: true, dedupe_watched: false },
   // Popular — MDBList's official "popular" list. It's ONE combined list: the API
   // (/lists/official/popular/items) returns { movies, shows } arrays and
   // listItemsPage splits by type, so both catalogs share the single slug
