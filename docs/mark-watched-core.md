@@ -228,10 +228,11 @@ either way: it flows from the Simkl write via the existing sync into seeds + de-
       cleared/superseded when the real Simkl-synced row lands.
 - [x] Tests — see Test notes.
 
-> **Build note (v7, 2026-09-09):** built on `v7`, local commit only. I2
-> (whole-show `/sync/history` write) remains a **live-API build-time gate** — the
-> offline suite pins the body shape (`shows:[{ids}]`, no `seasons`/`watched_at`)
-> but a real Simkl account run still needs confirming before promotion.
+> **Build note (v7, 2026-09-09):** built on `v7`. I2 (whole-show `/sync/history`
+> write) **verified live + CLOSED (2026-09-09)**: run against Simkl account "James"
+> via [`test/verify-simkl-live.js`](../test/verify-simkl-live.js) `--confirm`, the
+> `shows:[{ids}]`-no-`seasons` body marked the series **completed** (not "watching").
+> The shipped series shape is correct — no episode-fetch fallback needed.
 
 ## Acceptance criteria
 

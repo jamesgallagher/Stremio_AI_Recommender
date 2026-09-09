@@ -127,8 +127,10 @@ not-interested state for the Watch Later row).
       → Verified against the Simkl API spec (github.com/SIMKL/API `apiary.apib`
       § *"Remove Items from History and from Lists"*): **`POST /sync/history/remove`**
       with no `seasons` removes the whole title from history AND lists (plan-to-watch
-      included). Recorded in the `simkl.js` comment. **I3 live-API gate still open:**
-      confirm against a real plan-to-watch-only item before promotion.
+      included). Recorded in the `simkl.js` comment. **I3 live-API gate CLOSED
+      (2026-09-09):** verified live against Simkl account "James" via
+      [`test/verify-simkl-live.js`](../test/verify-simkl-live.js) `--confirm` — a seeded
+      plan-to-watch title was gone after the remove. PASS.
 - [x] `simkl.js`: `buildRemoveFromListBody` (pure, exported) + `removeFromPlanToWatch`
       (rate-lane, token handling, de-dupe-safe).
 - [x] `mobile/server`: `POST /api/watchlist/remove` handler + route (session-scoped).
@@ -137,7 +139,8 @@ not-interested state for the Watch Later row).
       (optional; the daily rebuild + optimistic UI cover it, per §3).
 - [x] Tests — see Test notes.
 
-> **Build note (v7, 2026-09-09):** built on `v7`, local commit only.
+> **Build note (v7, 2026-09-09):** built on `v7`. I3 live-API gate **verified +
+> closed** (2026-09-09) — see the Tasks note above.
 
 ## Acceptance criteria
 

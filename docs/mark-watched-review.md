@@ -148,12 +148,15 @@ route coverage for the new endpoints — `POST /api/watched` and `POST /api/watc
       **502 (Simkl throws)** for both.
 - [x] `npm test` green (smoke + integration + mobile) on `v7`.
 
-> **Build note (v7, 2026-09-09):** built on `v7`, local commit only. The review's
-> must-fix items (I1/I4/I6) and I5 were already applied in the owning-card commits;
-> this card verifies them and adds the cross-card gate — integration **J–N** and the
-> two connected-route smoke cases — all green. The two live-API gates stay open until
-> a real Simkl account run: **I2** (whole-show `/sync/history` write — J/K pin the
-> body shape only) and **I3** (`/sync/history/remove` for a plan-to-watch-only title).
+> **Build note (v7, 2026-09-09):** built on `v7`. The review's must-fix items
+> (I1/I4/I6) and I5 were already applied in the owning-card commits; this card
+> verifies them and adds the cross-card gate — integration **J–N** and the two
+> connected-route smoke cases — all green. The two live-API gates are now **CLOSED**:
+> run 2026-09-09 against Simkl account "James" via
+> [`test/verify-simkl-live.js`](../test/verify-simkl-live.js) `--confirm`, **I2**
+> (whole-show `/sync/history` write → series marked *completed*) and **I3**
+> (`/sync/history/remove` → title off plan-to-watch) both **PASS**. Nothing open —
+> the MW cluster is clear to promote (docs/engine-abstraction §9).
 
 ## Acceptance criteria
 
