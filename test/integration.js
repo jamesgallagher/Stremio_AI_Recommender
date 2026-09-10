@@ -329,6 +329,80 @@ async function main() {
     }
   });
 
+  // ── G-AV. WL-AV: a not-yet-streamable plan-to-watch title is SUPPRESSED all
+  //      the way through build → cache → served preview (and the Companion preview
+  //      matches), an available one survives, nothing is written to Simkl, the
+  //      released memo records only the terminal AVAILABLE fact, and the whole
+  //      thing SELF-REVERSES once the title goes digital — the emergent property
+  //      the card is built on, proven end to end through the real serve seam.
+  await it('G-AV. WL-AV suppress→serve, no Simkl write, released memo, and self-reversal through the serve seam', async () => {
+    const p = config.addProfile('INT-GAV');
+    const wlDef = catalogs.getExtra('trakt-watchlist-movies');
+    const NOW = Date.now();
+    const past = new Date(NOW - 5 * 864e5).toISOString().slice(0, 10);
+    const future = new Date(NOW + 90 * 864e5).toISOString().slice(0, 10);
+    const digital = (date) => [{ iso_3166_1: 'US', release_dates: [{ type: 4, release_date: date }] }];
+    const origPTW = simkl.getPlanToWatch; const origMeta = tmdb.metaByTmdbId;
+    // Prove NO Simkl write fires from this path: spy the two write entry points.
+    const origAdd = simkl.addToPlanToWatch; const origRemove = simkl.removeFromPlanToWatch;
+    let simklWrites = 0;
+    simkl.addToPlanToWatch = async () => { simklWrites++; return {}; };
+    simkl.removeFromPlanToWatch = async () => { simklWrites++; return {}; };
+    simkl.getPlanToWatch = async () => ([
+      { imdb_id: 'tt_gav_ok', tmdb_id: '7001', title: 'Streamable', year: 2026 },
+      { imdb_id: 'tt_gav_soon', tmdb_id: '7002', title: 'Pre-digital', year: 2027 },
+    ]);
+    // `soonDate` flips from future to past for the self-reversal leg.
+    let soonDate = future;
+    tmdb.metaByTmdbId = async (_k, _t, id, _log, opts = {}) => ({
+      id: id === '7001' ? 'tt_gav_ok' : 'tt_gav_soon', type: 'movie',
+      name: id === '7001' ? 'Streamable' : 'Pre-digital', poster: null, description: '',
+      releaseInfo: id === '7001' ? '2026' : '2027',
+      // Movies get the appended rows; when the memo already knows a title the
+      // build passes append:null, but returning rows anyway is harmless.
+      _release_dates_results: digital(id === '7001' ? past : soonDate),
+    });
+    store.saveReleasedCache({});
+    const prof = { id: p.id, name: 'INT-GAV', simkl_auth: { access_token: 't' }, keys: { tmdb_api_key: 'itest-tmdb' }, filters: {} };
+    try {
+      // BUILD → the pre-digital title is dropped, the streamable one kept.
+      const built = await rebuild.buildWatchlistCatalog(prof, wlDef, quiet);
+      assert.deepStrictEqual(built.map((m) => m.id), ['tt_gav_ok'], 'WL-AV: not-yet title suppressed at BUILD');
+      // CACHE → SERVE via the shared seam: the served row omits it too.
+      store.swapExtra(p.id, wlDef.id, built);
+      const served = catalogServe.servedCatalog(config.getProfile(p.id), wlDef.id, { record: false });
+      assert.strictEqual(served.state, 'ok');
+      assert.deepStrictEqual(served.metas.map((m) => m.id), ['tt_gav_ok'], 'WL-AV: suppression survives to SERVE');
+      // Companion preview delegates to the same seam — identical list.
+      const res = fakeRes();
+      companion.catalogPreviewHandler({ profile: config.getProfile(p.id), params: { catalogId: wlDef.id } }, res);
+      assert.deepStrictEqual(res.body.metas.map((m) => m.id), ['tt_gav_ok'], 'preview == serve (suppressed)');
+      // Released memo: only the terminal AVAILABLE fact, keyed type:id, shared.
+      const memo = store.loadReleasedCache();
+      assert.strictEqual(memo['movie:tt_gav_ok'], true, 'AVAILABLE memoized');
+      assert.ok(!('movie:tt_gav_soon' in memo), 'NOT_YET never memoized (rides the live fetch)');
+      // The suppressed title is STILL on the Simkl list (unchanged) and nothing
+      // was written back — suppress, never remove.
+      assert.strictEqual((await simkl.getPlanToWatch(prof, 'movie')).length, 2, 'title still on the Simkl list');
+      assert.strictEqual(simklWrites, 0, 'WL-AV writes nothing to Simkl');
+
+      // SELF-REVERSAL: the pre-digital title goes digital -> it reappears on the
+      // next build → serve with no other change, and is now memoized too.
+      soonDate = past;
+      const built2 = await rebuild.buildWatchlistCatalog(prof, wlDef, quiet);
+      assert.deepStrictEqual(built2.map((m) => m.id), ['tt_gav_ok', 'tt_gav_soon'], 'WL-AV: reappears once available');
+      store.swapExtra(p.id, wlDef.id, built2);
+      const served2 = catalogServe.servedCatalog(config.getProfile(p.id), wlDef.id, { record: false });
+      assert.deepStrictEqual(served2.metas.map((m) => m.id), ['tt_gav_ok', 'tt_gav_soon'], 'WL-AV: reappearance reaches SERVE');
+      assert.strictEqual(store.loadReleasedCache()['movie:tt_gav_soon'], true, 'newly-available now memoized');
+    } finally {
+      simkl.getPlanToWatch = origPTW; tmdb.metaByTmdbId = origMeta;
+      simkl.addToPlanToWatch = origAdd; simkl.removeFromPlanToWatch = origRemove;
+      store.saveReleasedCache({});
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); store.deleteCache(p.id);
+    }
+  });
+
   // ── H. AI recommendations: the pool's imdb_rating flows serveRecommendations →
   //      servedCatalog → the Companion preview (CP-03 passthrough). Because the
   //      addon route serialises servedCatalog().metas verbatim, this is also the

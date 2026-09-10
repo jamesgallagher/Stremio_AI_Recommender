@@ -9,6 +9,14 @@
 //   (a re-watch, a film queued again years later, a part-watched show). Carried
 //   through the same dedupe_watched:false opt-out Christmas uses. A watched
 //   title stays as long as it remains on the Simkl plan-to-watch list.
+//   Availability suppression (WL-AV, 2026-09-10): both Watch Later rows also
+//   hide titles that aren't streamable at home yet (a film still in its
+//   theatrical/pre-digital window, a show that hasn't aired) — a fixed,
+//   always-on property of these two rows, no toggle or profile flag. It's
+//   suppress-not-remove: nothing is written to Simkl and a title reappears by
+//   itself once available, so the WL-KW "don't quietly drop what I added"
+//   concern doesn't apply (nothing is removed; it comes back). The gate lives in
+//   rebuild.buildWatchlistCatalog; see docs/watch-later-availability.md.
 // - source 'mdblist' (curated lists, decided 2026-07-08): popular charts keep
 //   every item unfiltered (max 20); rating-gated catalogs (min_imdb) drop
 //   items below the bar and keep paging until 20; final order shuffled per

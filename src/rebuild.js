@@ -275,20 +275,52 @@ async function buildWatchlistCatalog(profile, def, log = console) {
   const keepWatched = def.dedupe_watched === false;
   const watched = watchedStore.watchedIdSets(profile.id);
   const capped = items.slice(0, WATCHLIST_CAP);
+  // WL-AV: suppress plan-to-watch titles that aren't yet streamable at home (a
+  // film still in its theatrical/pre-digital window; a show that hasn't aired).
+  // SUPPRESS, NEVER REMOVE — nothing is written to Simkl; the title stays on the
+  // list and reappears by itself the first rebuild after it's available (an
+  // emergent property of build-time filtering + the daily rebuild). "Available"
+  // = a past Digital/Physical/TV release in ANY country (movies) or a past
+  // first_air_date (series). FAIL OPEN: a title TMDB can't resolve, or one with
+  // no usable release rows, is UNKNOWN and shown. NOT_YET/UNKNOWN verdicts are
+  // NEVER persisted — they ride the live TMDB fetch each rebuild, since those
+  // states can still change; a confirmed AVAILABLE title is memoized in the
+  // global released cache (release is a one-way, terminal fact) and skips both
+  // the release_dates append and the verdict on every later rebuild. Always-on
+  // for both Watch Later rows — no toggle. See docs/watch-later-availability.md.
+  const released = store.loadReleasedCache();
+  const keyOf = (it) => `${def.type}:${it.imdb_id || it.tmdb_id}`;
+  const newlyReleased = [];
   const metas = [];
   for (let i = 0; i < capped.length; i += 25) {
     const chunk = capped.slice(i, i + 25);
     metas.push(...await Promise.all(chunk.map(async (it) => {
       if (!keepWatched && it.imdb_id && watched.imdb.has(it.imdb_id)) return null;
       if (it.tmdb_id) {
-        const m = await tmdb.metaByTmdbId(profile.keys.tmdb_api_key, def.type, it.tmdb_id, log);
-        if (m) return m;
+        const known = released[keyOf(it)] === true; // terminal AVAILABLE — never re-checked
+        const m = await tmdb.metaByTmdbId(profile.keys.tmdb_api_key, def.type, it.tmdb_id, log,
+          { append: (!known && def.type === 'movie') ? 'release_dates' : null }); // skip the append when known
+        if (m) {
+          if (known) return m; // already released -> show, no verdict
+          const verdict = def.type === 'series'
+            ? tmdb.seriesAvailability(m._release_date)
+            : tmdb.movieAvailability(m._release_dates_results); // any-country
+          if (verdict === 'NOT_YET') return null;               // suppress (fail-open on UNKNOWN)
+          if (verdict === 'AVAILABLE') newlyReleased.push(keyOf(it)); // memoize the terminal state
+          return m;                                             // AVAILABLE or UNKNOWN -> show
+        }
       }
-      // Minimal fallback — still a valid tt id for Stremio; RPDB poster at serve time.
+      // Minimal fallback — TMDB couldn't resolve it -> UNKNOWN -> kept (fail-open),
+      // not memoized. Still a valid tt id for Stremio; RPDB poster at serve time.
       return it.imdb_id
         ? { id: it.imdb_id, type: def.type, name: it.title, poster: null, description: '', releaseInfo: it.year ? String(it.year) : null }
         : null;
     })));
+  }
+  // Persist any newly-confirmed releases in ONE write (like the CP-03 rating batch).
+  if (newlyReleased.length) {
+    for (const k of newlyReleased) released[k] = true;
+    store.saveReleasedCache(released);
   }
   const built = keepWatched
     ? metas.filter(Boolean)

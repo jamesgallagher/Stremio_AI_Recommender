@@ -513,6 +513,52 @@ ok('tmdb: buildVideos builds playable episode ids, sorts, flags unaired', () => 
   assert.deepStrictEqual(tmdb.buildVideos([], 'tt1', now), []);
 });
 
+ok('tmdb: movieAvailability — home-release verdict, any country, no theatrical-age assumption (WL-AV)', () => {
+  const now = Date.parse('2026-09-10T00:00:00Z');
+  const at = (opts) => ({ nowMs: now, ...opts });
+  const country = (cc, rels) => ({ iso_3166_1: cc, release_dates: rels });
+  const rel = (type, date) => ({ type, release_date: date });
+
+  // Past Digital (4) -> AVAILABLE.
+  assert.strictEqual(tmdb.movieAvailability([country('US', [rel(4, '2026-01-01')])], at()), 'AVAILABLE');
+  // Past Physical (5) only -> AVAILABLE.
+  assert.strictEqual(tmdb.movieAvailability([country('US', [rel(5, '2025-06-01')])], at()), 'AVAILABLE');
+  // Past TV (6) only -> AVAILABLE.
+  assert.strictEqual(tmdb.movieAvailability([country('US', [rel(6, '2024-06-01')])], at()), 'AVAILABLE');
+  // A home release in a NON-AU country only still counts (region-agnostic).
+  assert.strictEqual(tmdb.movieAvailability([country('FR', [rel(4, '2026-02-02')])], at()), 'AVAILABLE');
+  // Digital exists but in the FUTURE -> NOT_YET.
+  assert.strictEqual(tmdb.movieAvailability([country('US', [rel(4, '2027-01-01')])], at()), 'NOT_YET');
+  // Theatrical (3) only, recent -> NOT_YET (theatrical is not a home release).
+  assert.strictEqual(tmdb.movieAvailability([country('US', [rel(3, '2026-08-01')])], at()), 'NOT_YET');
+  // Theatrical (3) only, YEARS ago -> still NOT_YET (no time-window assumption).
+  assert.strictEqual(tmdb.movieAvailability([country('US', [rel(3, '2010-01-01')])], at()), 'NOT_YET');
+  // Mixed: future digital + past theatrical -> NOT_YET (only the theatrical is past).
+  assert.strictEqual(
+    tmdb.movieAvailability([country('US', [rel(3, '2026-06-01'), rel(4, '2027-01-01')])], at()), 'NOT_YET');
+  // No usable rows / null / not-an-array -> UNKNOWN (soft gate).
+  assert.strictEqual(tmdb.movieAvailability([], at()), 'UNKNOWN');
+  assert.strictEqual(tmdb.movieAvailability(null, at()), 'UNKNOWN');
+  assert.strictEqual(tmdb.movieAvailability(undefined, at()), 'UNKNOWN');
+  assert.strictEqual(tmdb.movieAvailability([country('US', [])], at()), 'NOT_YET'); // a row, but no releases
+});
+
+ok('tmdb: seriesAvailability — aired = available, future = not yet, missing = unknown (WL-AV)', () => {
+  const now = Date.parse('2026-09-10T00:00:00Z');
+  assert.strictEqual(tmdb.seriesAvailability('2020-01-01', { nowMs: now }), 'AVAILABLE');
+  assert.strictEqual(tmdb.seriesAvailability('2030-01-01', { nowMs: now }), 'NOT_YET');
+  assert.strictEqual(tmdb.seriesAvailability(null, { nowMs: now }), 'UNKNOWN');
+  assert.strictEqual(tmdb.seriesAvailability('', { nowMs: now }), 'UNKNOWN');
+  assert.strictEqual(tmdb.seriesAvailability('not-a-date', { nowMs: now }), 'UNKNOWN');
+});
+
+ok('store: released cache roundtrip (WL-AV)', () => {
+  store.saveReleasedCache({ 'movie:tt0111161': true });
+  assert.strictEqual(store.loadReleasedCache()['movie:tt0111161'], true);
+  store.saveReleasedCache({}); // reset for other tests
+  assert.deepStrictEqual(store.loadReleasedCache(), {});
+});
+
 ok('store: meta cache roundtrip, per-title files, TTL expiry', () => {
   store.saveMeta('series', 'tt0903747', { id: 'tt0903747', name: 'Cached', videos: [] }, 60000);
   assert.strictEqual(store.loadMeta('series', 'tt0903747').name, 'Cached');
@@ -2154,6 +2200,148 @@ async function httpTests() {
     console.log('  ✓ Watch Later build enriches IMDb rating via the shared cache; TMDB fallback kept without a key (CP-03)');
   }
 
+  // WL-AV: metaByTmdbId surfaces the raw release_dates rows ONLY when asked, and
+  // its default callers are unchanged. Stub global.fetch so the details call is
+  // hermetic (no network); the governor just paces it.
+  {
+    const origFetch = global.fetch;
+    const payload = {
+      title: 'Availability Probe', external_ids: { imdb_id: 'tt_avprobe' }, genres: [],
+      release_dates: { results: [{ iso_3166_1: 'US', release_dates: [{ type: 4, release_date: '2026-01-01' }] }] },
+    };
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => payload });
+    try {
+      const withAppend = await tmdb.metaByTmdbId('k', 'movie', 42, silentLog, { append: 'release_dates' });
+      assert.ok(Array.isArray(withAppend._release_dates_results), 'appended -> rows surfaced');
+      assert.strictEqual(withAppend._release_dates_results[0].iso_3166_1, 'US');
+      assert.strictEqual(tmdb.movieAvailability(withAppend._release_dates_results), 'AVAILABLE');
+      const noAppend = await tmdb.metaByTmdbId('k', 'movie', 42, silentLog);
+      assert.strictEqual(noAppend._release_dates_results, undefined, 'default caller: field absent');
+    } finally {
+      global.fetch = origFetch;
+    }
+    console.log('  ✓ metaByTmdbId surfaces _release_dates_results only when release_dates is appended (WL-AV)');
+  }
+
+  // WL-AV: buildWatchlistCatalog suppresses not-yet-streamable titles, keeps
+  // available + fail-open (unresolved/UNKNOWN) ones, self-reverses when the date
+  // flips, and memoizes only the terminal AVAILABLE fact (skipping the append +
+  // verdict next build). We drive availability off the meta the stub returns:
+  // `_release_dates_results` for movies (movieAvailability reads it) and only ask
+  // for it when the released memo doesn't already know the title.
+  {
+    const tmdbSvc = require('../src/services/tmdb');
+    const origMeta = tmdbSvc.metaByTmdbId;
+    const NOW = Date.now();
+    const past = new Date(NOW - 5 * 864e5).toISOString().slice(0, 10);
+    const future = new Date(NOW + 90 * 864e5).toISOString().slice(0, 10);
+    // The list: an available movie (past digital), a not-yet movie (future
+    // digital), and a movie TMDB can't resolve (no tmdb_id -> minimal fallback).
+    simklSvc.getPlanToWatch = async () => ([
+      { imdb_id: 'tt_av_ok', tmdb_id: '5001', title: 'Out Now', year: 2026 },
+      { imdb_id: 'tt_av_soon', tmdb_id: '5002', title: 'Not Yet', year: 2027 },
+      { imdb_id: 'tt_av_unres', title: 'Unresolvable', year: 2025 }, // no tmdb_id
+    ]);
+    const appendCalls = {}; // tmdb_id -> the append arg it was last called with
+    const digital = (date) => [{ iso_3166_1: 'US', release_dates: [{ type: 4, release_date: date }] }];
+    const metaFor = (id, dateRows) => ({
+      id: id === '5001' ? 'tt_av_ok' : 'tt_av_soon', type: 'movie',
+      name: id === '5001' ? 'Out Now' : 'Not Yet', poster: null, description: '',
+      releaseInfo: id === '5001' ? '2026' : '2027',
+      _release_dates_results: dateRows,
+    });
+    store.saveReleasedCache({}); // clean slate
+    try {
+      tmdbSvc.metaByTmdbId = async (_k, _t, id, _log, opts = {}) => {
+        appendCalls[id] = opts.append || null;
+        if (id === '5001') return metaFor(id, digital(past));   // AVAILABLE
+        if (id === '5002') return metaFor(id, digital(future)); // NOT_YET
+        return null;
+      };
+      const built1 = await rebuild.buildWatchlistCatalog(
+        { id: 'wlav-a', name: 'AV', simkl_auth: { access_token: 't' }, keys: {} }, wlDef, silentLog,
+      );
+      // Available kept, not-yet suppressed, unresolved kept (fail-open).
+      assert.deepStrictEqual(built1.map((m) => m.id), ['tt_av_ok', 'tt_av_unres'],
+        'WL-AV: not-yet suppressed; available + unresolved kept');
+      // First build asked for release_dates on both resolvable movies.
+      assert.strictEqual(appendCalls['5001'], 'release_dates');
+      assert.strictEqual(appendCalls['5002'], 'release_dates');
+      // Only the AVAILABLE title is memoized; NOT_YET/UNKNOWN never written.
+      const memo = store.loadReleasedCache();
+      assert.strictEqual(memo['movie:tt_av_ok'], true, 'AVAILABLE memoized');
+      assert.ok(!('movie:tt_av_soon' in memo), 'NOT_YET never memoized');
+      assert.ok(!('movie:tt_av_unres' in memo), 'UNKNOWN never memoized');
+
+      // Second build: the known-released title skips the append (and the verdict),
+      // the still-NOT_YET title is re-checked WITH the append and stays suppressed.
+      appendCalls['5001'] = 'SENTINEL'; appendCalls['5002'] = 'SENTINEL';
+      const built2 = await rebuild.buildWatchlistCatalog(
+        { id: 'wlav-a', name: 'AV', simkl_auth: { access_token: 't' }, keys: {} }, wlDef, silentLog,
+      );
+      assert.deepStrictEqual(built2.map((m) => m.id), ['tt_av_ok', 'tt_av_unres']);
+      assert.strictEqual(appendCalls['5001'], null, 'known-released -> no release_dates append');
+      assert.strictEqual(appendCalls['5002'], 'release_dates', 'still not-yet -> re-checked with append');
+
+      // Self-reversal: the not-yet movie goes digital (date now in the past) ->
+      // it reappears on the next build with no other change, and is memoized.
+      tmdbSvc.metaByTmdbId = async (_k, _t, id, _log, opts = {}) => {
+        appendCalls[id] = opts.append || null;
+        if (id === '5001') return metaFor(id, digital(past));
+        if (id === '5002') return metaFor(id, digital(past)); // NOW available
+        return null;
+      };
+      const built3 = await rebuild.buildWatchlistCatalog(
+        { id: 'wlav-a', name: 'AV', simkl_auth: { access_token: 't' }, keys: {} }, wlDef, silentLog,
+      );
+      assert.deepStrictEqual(built3.map((m) => m.id), ['tt_av_ok', 'tt_av_soon', 'tt_av_unres'],
+        'WL-AV: title reappears once available (self-reversing)');
+      assert.strictEqual(store.loadReleasedCache()['movie:tt_av_soon'], true, 'newly-available now memoized');
+    } finally {
+      simklSvc.getPlanToWatch = origPTW;
+      tmdbSvc.metaByTmdbId = origMeta;
+      store.saveReleasedCache({});
+    }
+    console.log('  ✓ Watch Later suppresses not-yet titles, keeps available/fail-open, self-reverses + memoizes released (WL-AV)');
+  }
+
+  // WL-AV (series): a show that has aired is kept; one that hasn't is suppressed.
+  {
+    const tmdbSvc = require('../src/services/tmdb');
+    const origMeta = tmdbSvc.metaByTmdbId;
+    const wlSeriesDef = require('../src/catalogs').getExtra('trakt-watchlist-series');
+    const NOW = Date.now();
+    const pastAir = new Date(NOW - 30 * 864e5).toISOString().slice(0, 10);
+    const futureAir = new Date(NOW + 30 * 864e5).toISOString().slice(0, 10);
+    simklSvc.getPlanToWatch = async () => ([
+      { imdb_id: 'tt_s_aired', tmdb_id: '6001', title: 'Aired', year: 2024 },
+      { imdb_id: 'tt_s_upcoming', tmdb_id: '6002', title: 'Upcoming', year: 2027 },
+    ]);
+    store.saveReleasedCache({});
+    try {
+      tmdbSvc.metaByTmdbId = async (_k, _t, id, _log, opts = {}) => {
+        // Series never asks for the release_dates append (movies only).
+        assert.strictEqual(opts.append || null, null, 'series build never appends release_dates');
+        return {
+          id: id === '6001' ? 'tt_s_aired' : 'tt_s_upcoming', type: 'series',
+          name: id === '6001' ? 'Aired' : 'Upcoming', poster: null, description: '',
+          releaseInfo: id === '6001' ? '2024' : '2027',
+          _release_date: id === '6001' ? pastAir : futureAir,
+        };
+      };
+      const built = await rebuild.buildWatchlistCatalog(
+        { id: 'wlav-s', name: 'AVs', simkl_auth: { access_token: 't' }, keys: {} }, wlSeriesDef, silentLog,
+      );
+      assert.deepStrictEqual(built.map((m) => m.id), ['tt_s_aired'], 'WL-AV series: aired kept, upcoming suppressed');
+      assert.strictEqual(store.loadReleasedCache()['series:tt_s_aired'], true);
+    } finally {
+      simklSvc.getPlanToWatch = origPTW;
+      tmdbSvc.metaByTmdbId = origMeta;
+      store.saveReleasedCache({});
+    }
+    console.log('  ✓ Watch Later series availability: aired kept, upcoming suppressed (WL-AV)');
+  }
+
   // Watch Later toggled off -> 404 (explicit false beats default-on)
   await fetch(`${BASE}/api/profiles/${p2.id}`, {
     method: 'PUT', headers: { 'Content-Type': 'application/json' },
@@ -2439,7 +2627,7 @@ async function httpTests() {
     console.log('  ✓ /api/settings SC-07: enable/disable toggle, Genesis-lock + unknown-drop, disable→revert fan-out');
   }
 
-  console.log(`\nAll checks passed (${passed} unit + 52 async/http).`);
+  console.log(`\nAll checks passed (${passed} unit + 55 async/http).`);
   process.exit(0);
 }
 

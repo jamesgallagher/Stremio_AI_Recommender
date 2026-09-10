@@ -74,21 +74,69 @@ function pickLogo(logos) {
   return chosen.file_path ? `https://image.tmdb.org/t/p/w500${chosen.file_path}` : null;
 }
 
+// ---- WL-AV: home-availability verdict (Watch Later suppression) ----
+// Is a title streamable AT HOME yet? Both fns return AVAILABLE / NOT_YET /
+// UNKNOWN; the caller shows on anything but NOT_YET (fail open). Pure and
+// exported. See docs/watch-later-availability.md.
+//
+// Movies: a past release of a HOME type in TMDB's release_dates — Digital (4),
+// Physical (5) or TV (6) — in ANY country (region-agnostic: a home release
+// somewhere is findable, and this leans fail-open). We do NOT assume from
+// theatrical age: a title with only a theatrical/premiere row (no home release
+// yet) stays NOT_YET however long ago it was in cinemas, until TMDB logs a home
+// date — which then flips it to AVAILABLE on the next rebuild. The only escape
+// without a home date is the soft gate: no usable release rows at all -> UNKNOWN
+// -> shown. To tighten to Digital-only, make this Set `new Set([4])` (and clear
+// the released cache, since the verdict basis changed).
+const HOME_RELEASE_TYPES = new Set([4, 5, 6]); // 4 Digital, 5 Physical, 6 TV
+
+// releaseDatesResults = data.release_dates.results (append_to_response:'release_dates').
+function movieAvailability(releaseDatesResults, { nowMs = Date.now() } = {}) {
+  const rows = Array.isArray(releaseDatesResults) ? releaseDatesResults : null;
+  if (!rows || !rows.length) return 'UNKNOWN';                 // no data -> soft gate
+  for (const country of rows) {                                // scan every country
+    for (const rel of country.release_dates || []) {
+      const t = rel.release_date ? Date.parse(rel.release_date) : NaN;
+      if (!Number.isNaN(t) && HOME_RELEASE_TYPES.has(rel.type) && t <= nowMs) {
+        return 'AVAILABLE';                                    // out at home somewhere
+      }
+    }
+  }
+  return 'NOT_YET';   // has release data but no past home release -> not streamable yet
+}
+
+// Series: TMDB has no per-series digital-release concept, so "has it started
+// airing" (first_air_date in the past) is the availability signal. Missing date
+// -> UNKNOWN (fail open).
+function seriesAvailability(firstAirDateIso, { nowMs = Date.now() } = {}) {
+  const t = firstAirDateIso ? Date.parse(firstAirDateIso) : NaN;
+  if (Number.isNaN(t)) return 'UNKNOWN';
+  return t <= nowMs ? 'AVAILABLE' : 'NOT_YET';
+}
+
 // Full meta straight from a TMDB details call, for id-based sources (Trakt
 // recommendations, the Trakt watchlist): details + external_ids + images in
 // ONE request. Returns null when there's no IMDb id (Stremio needs tt ids).
-async function metaByTmdbId(apiKey, type, tmdbId, log = console) {
+// `append` (WL-AV) adds one more append_to_response block (e.g. 'release_dates')
+// and surfaces its `results` as the internal `_release_dates_results` so a
+// caller can compute availability without a second round-trip; default callers
+// pass nothing and are unchanged. The internal field is stripped by cleanMetas.
+async function metaByTmdbId(apiKey, type, tmdbId, log = console, { append = null } = {}) {
   try {
     const base = type === 'series' ? `tv/${tmdbId}` : `movie/${tmdbId}`;
     const data = await get(apiKey, base, {
       language: 'en-US',
-      append_to_response: 'external_ids,images',
+      append_to_response: append ? `external_ids,images,${append}` : 'external_ids,images',
       include_image_language: 'en,null',
     });
     const imdbId = data.external_ids?.imdb_id;
     if (!imdbId) return null;
     const item = { ...data, genre_ids: (data.genres || []).map((g) => g.id) };
-    return toMeta(item, type, imdbId, pickLogo(data.images?.logos));
+    const meta = toMeta(item, type, imdbId, pickLogo(data.images?.logos));
+    if (append && append.split(',').includes('release_dates')) {
+      meta._release_dates_results = data.release_dates?.results || null;
+    }
+    return meta;
   } catch (err) {
     log.warn(`[tmdb] metaByTmdbId ${type}/${tmdbId} failed: ${err.message}`);
     return null;
@@ -365,6 +413,8 @@ module.exports = {
   getGenreMap,
   toMeta,
   pickLogo,
+  movieAvailability,
+  seriesAvailability,
   metaByTmdbId,
   searchTitles,
   resolveTitle,

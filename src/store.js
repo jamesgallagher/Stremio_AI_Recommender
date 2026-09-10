@@ -168,6 +168,27 @@ function saveImdbRatingCache(entries) {
   writeJsonAtomic(IMDB_RATING_FILE, entries);
 }
 
+// ---- Global released-titles cache (WL-AV) ----
+// Whether a title is available to stream at home is a fact about the title, not
+// a profile, and it is MONOTONIC under a fixed availability config: a released
+// title never goes back. So the terminal AVAILABLE verdict is cached forever and
+// shared across profiles — a title on five watchlists is confirmed once, and
+// every later rebuild skips its release_dates append + verdict entirely. Only
+// AVAILABLE is written: NOT_YET/UNKNOWN are transient and must ride the live
+// TMDB fetch each rebuild (caching them would strand a title permanently hidden).
+// Entries: { "movie:tt0111161": true }, keyed `type:id`. Same shape and
+// discipline as the CSM / IMDb-rating caches above. If HOME_RELEASE_TYPES (the
+// availability basis, in services/tmdb.js) is ever changed, clear this file.
+const RELEASED_FILE = path.join(CACHE_DIR, 'released-titles.json');
+
+function loadReleasedCache() {
+  return readJson(RELEASED_FILE, {});
+}
+
+function saveReleasedCache(entries) {
+  writeJsonAtomic(RELEASED_FILE, entries);
+}
+
 // ---- Meta cache (v5 metadata service) ----
 // Meta is a fact about a title, not about a profile, so it's shared. One file
 // PER TITLE rather than one big map: a series meta carries every episode, and
@@ -264,6 +285,8 @@ module.exports = {
   saveCsmCache,
   loadImdbRatingCache,
   saveImdbRatingCache,
+  loadReleasedCache,
+  saveReleasedCache,
   loadMeta,
   saveMeta,
   loadAnimeIndex,
