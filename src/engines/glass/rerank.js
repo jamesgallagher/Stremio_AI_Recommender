@@ -95,13 +95,17 @@ async function rerankCandidates(type, scored, taste, cfg, { chain, chat = llm.ch
     why: matchHint(c),
   }));
 
-  onProgress(10, 'Glass: LLM re-ranking…');
+  // Background call → its own generous timeout (env override wins), NOT the tight
+  // request-path Custom default the age gate shares.
+  const timeoutMs = Number(process.env.GLASS_RERANK_TIMEOUT_MS) || rc.timeout_ms || 120000;
+  onProgress(10, `Glass: LLM re-ranking ${items.length} ${type} candidate(s) (timeout ${Math.round(timeoutMs / 1000)}s)…`);
+  const startedAt = Date.now();
   let ordered;
   try {
     ordered = await chat(chain, [{ role: 'user', content: buildUserPrompt(type, tasteSummary(taste), items) }],
-      { temperature: 0, system: SYSTEM, validate: llm.extractArray }, log);
+      { temperature: 0, system: SYSTEM, validate: llm.extractArray, timeoutMs }, log);
   } catch (err) {
-    log.warn(`[glass] LLM rerank (${type}) skipped — ${err.message}; keeping deterministic order`);
+    log.warn(`[glass] LLM rerank (${type}) skipped after ${Math.round((Date.now() - startedAt) / 1000)}s — ${err.message}; keeping deterministic order`);
     return scored;
   }
   if (!Array.isArray(ordered) || !ordered.length) return scored;
@@ -131,6 +135,7 @@ async function rerankCandidates(type, scored, taste, cfg, { chain, chat = llm.ch
   const band = head.map((c) => c.rankScore);
   for (let i = 0; i < newHead.length; i++) newHead[i].rankScore = band[i];
 
+  log.log(`[glass] LLM rerank (${type}): reordered ${seen.size}/${head.length} in ${Math.round((Date.now() - startedAt) / 1000)}s`);
   onProgress(100, `Glass: LLM re-ranked ${seen.size} ${type} candidate(s)`);
   return [...newHead, ...tail];
 }

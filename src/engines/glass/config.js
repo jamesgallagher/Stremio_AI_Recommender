@@ -106,7 +106,12 @@ const DEFAULTS = {
   // Groq). `enabled:false` turns it off even when a local endpoint exists.
   rerank: {
     enabled: true,
-    candidate_cap: 120,         // top-N sent to the LLM (design says ≈100–300, never thousands)
+    candidate_cap: 120,         // top-N sent to the LLM (design says ≈100–300, never thousands).
+                                //   A local model must emit this many {id,reason} objects, so lower
+                                //   it (e.g. 40–60) if your box is slow — Tier-2 tunable.
+    timeout_ms: 120000,         // the rerank is a BACKGROUND build call, so it gets its own generous
+                                //   timeout — NOT the tight request-path Custom-LLM default (25s) the
+                                //   age gate shares. Env override: GLASS_RERANK_TIMEOUT_MS.
   },
 };
 

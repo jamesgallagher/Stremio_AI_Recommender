@@ -33,7 +33,7 @@ const timeoutFor = (provider) => (provider.type === 'groq' ? GROQ_TIMEOUT_MS : C
 // Custom: minimal body (model/messages/temperature) for maximum local-server
 // compatibility — we lean on tolerant parsing rather than forcing response_format,
 // which many local runtimes reject.
-async function callProvider(provider, model, messages, { temperature = 0 } = {}) {
+async function callProvider(provider, model, messages, { temperature = 0, timeoutMs: timeoutOverride } = {}) {
   const isGroq = provider.type === 'groq';
   const url = isGroq ? GROQ_URL : chatUrl(provider.uri);
   const body = { model, messages, temperature };
@@ -55,8 +55,10 @@ async function callProvider(provider, model, messages, { temperature = 0 } = {})
   // The abort timer starts when the fetch actually fires (inside doFetch), NOT
   // when the call is queued — otherwise a call waiting behind the Groq governor
   // would time out before it ever ran. Only Groq is rate-governed; the local
-  // Custom LLM has no quota to respect.
-  const timeoutMs = timeoutFor(provider);
+  // Custom LLM has no quota to respect. A caller MAY override the per-provider
+  // default (e.g. the Glass background rerank, which legitimately needs far
+  // longer than the request-path age gate the Custom default is sized for).
+  const timeoutMs = timeoutOverride || timeoutFor(provider);
   const doFetch = () => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -94,14 +96,14 @@ function modelsFor(provider) {
 // result or throws — a throw (or an empty/HTTP error) advances to the next
 // model, then the next provider. Throws if the entire chain fails, so callers
 // (age gate, generation) fail-closed exactly as before.
-async function chat(chain, messages, { temperature = 0, validate = (t) => t, system } = {}, log = console) {
+async function chat(chain, messages, { temperature = 0, validate = (t) => t, system, timeoutMs } = {}, log = console) {
   if (!chain.length) throw new Error('No LLM provider configured (set a custom endpoint or a Groq key in Server Config)');
   const msgs = system ? [{ role: 'system', content: system }, ...messages] : messages;
   let lastErr = null;
   for (const provider of chain) {
     for (const model of modelsFor(provider)) {
       try {
-        return validate(await callProvider(provider, model, msgs, { temperature }));
+        return validate(await callProvider(provider, model, msgs, { temperature, timeoutMs }));
       } catch (err) {
         lastErr = err;
         log.warn(`[llm] ${provider.label || provider.type}/${model}: ${err.message} — trying next`);
