@@ -1033,6 +1033,36 @@ ok('glass/scoring: GE-06 features 0–1, weighted rankScore, preResolved fields,
   assert.ok(fresh > heavy);
 });
 
+ok('embeddings: GE-09 cosine (identical/orthogonal/opposite/zero/mismatch) + settings.embedConfig', () => {
+  const emb = require('../src/services/embeddings');
+  assert.ok(Math.abs(emb.cosine([1, 0, 0], [1, 0, 0]) - 1) < 1e-9);   // identical
+  assert.ok(Math.abs(emb.cosine([1, 0], [0, 1])) < 1e-9);             // orthogonal
+  assert.ok(Math.abs(emb.cosine([1, 0], [-1, 0]) + 1) < 1e-9);        // opposite
+  assert.strictEqual(emb.cosine([0, 0], [1, 1]), 0);                  // zero vector → 0 (never NaN)
+  assert.strictEqual(emb.cosine([1, 2, 3], [1, 2]), 0);              // length mismatch → 0
+  // embedConfig: null until embed_model set; falls back to custom_uri/custom_api_key; embed_uri wins.
+  const settings = require('../src/settings');
+  assert.strictEqual(settings.embedConfig({ llm: { embed_model: '', custom_uri: 'http://c' } }), null);
+  assert.deepStrictEqual(settings.embedConfig({ llm: { embed_model: 'nomic', custom_uri: 'http://c', custom_api_key: 'k' } }), { uri: 'http://c', model: 'nomic', apiKey: 'k' });
+  assert.strictEqual(settings.embedConfig({ llm: { embed_model: 'nomic', embed_uri: 'http://e', custom_uri: 'http://c' } }).uri, 'http://e');
+});
+
+ok('glass/embedStore + semantic.contentString: GE-09 Float32 BLOB round-trip, cross-model guard, content text', () => {
+  const embedStore = require('../src/engines/glass/embedStore');
+  const { contentString } = require('../src/engines/glass/semantic');
+  embedStore._clear();
+  embedStore.put('movie', 1, 'nomic', [0.5, -0.25, 1]);
+  const v = embedStore.get('movie', 1, 'nomic');
+  assert.strictEqual(v.length, 3);
+  assert.ok(Math.abs(v[0] - 0.5) < 1e-6 && Math.abs(v[1] + 0.25) < 1e-6);   // Float32 round-trip
+  assert.strictEqual(embedStore.get('movie', 1, 'other-model'), null);       // cross-model → miss (re-embed)
+  const many = embedStore.getMany('movie', [1, 2], 'nomic');
+  assert.strictEqual(many.size, 1);
+  embedStore._clear();
+  const text = contentString({ title: 'Dune', year: 2021, genres: ['Sci-Fi'], overview: 'A boy on a desert planet.', director: ['Villeneuve'], cast: ['Chalamet'], keywords: ['spice'] });
+  assert.ok(text.includes('Dune (2021)') && text.includes('desert planet') && text.includes('Directed by Villeneuve') && text.includes('Themes: spice'));
+});
+
 ok('glass/events: GE-10 weighted event list — watched positive, dont_recommend negative by reason', () => {
   const watchedStore = require('../src/watchedStore');
   const rs = require('../src/recommendationStore');

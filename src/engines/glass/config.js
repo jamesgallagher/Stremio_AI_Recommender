@@ -51,6 +51,9 @@ const DEFAULTS = {
     release_recency: 0.08,      // newer titles nudged up (movies-scoped semantics)
     novelty: 0.08,              // away from the profile's over-represented genres
     exploration: 0.07,          // the reserved exploration candidates
+    semantic_similarity: 0.00,  // GE-09: EVIDENCE-GATED — computed+stored when embeddings.enabled,
+                                //   but weight 0 (measure-only) until the components data proves lift;
+                                //   raise it via Tier-2 once justified (design §8-C, "measure lift vs A/B").
   },
 
   // ── taste_match sub-weights: how each enriched dim contributes to taste_match.
@@ -68,6 +71,19 @@ const DEFAULTS = {
     keywords: 0.07,
   },
   keyword_min_shared: 1,        // floor: keyword intersect needs ≥ this many shared to count
+
+  // ── Vector embeddings (Phase C / GE-09, design §5.2) ──
+  // EVIDENCE-GATED + OPTIONAL. When enabled, Glass embeds candidate + watched
+  // content on the LOCAL /embeddings endpoint (settings.llm.embed_*), builds a
+  // recency-weighted taste vector, and folds cosine similarity in as the
+  // semantic_similarity feature (stored in score_components). Off by default:
+  // the capability exists, but nothing computes/weights it until the data
+  // justifies turning it on and raising weights.semantic_similarity.
+  embeddings: {
+    enabled: false,             // master switch (Tier-2). false → no embed calls, feature omitted.
+    candidate_cap: 150,         // embed at most the top-N scored candidates (cost bound)
+    taste_cap: 150,             // embed at most the N most-recent watched titles for the taste vector
+  },
 
   // ── Output (§4.7, GI-1) ──
   resolve_cap: 300,             // ≤ this many candidates are enriched + returned (≈ STORE_CAP; the resolve budget)

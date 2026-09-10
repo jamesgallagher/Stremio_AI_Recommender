@@ -27,9 +27,11 @@ const glassConfig = require('./glass/config');
 const tasteModel = require('./glass/tasteModel');
 const candidates = require('./glass/candidates');
 const scoring = require('./glass/scoring');
+const semantic = require('./glass/semantic');
 const rerank = require('./glass/rerank');
 const watchedEnrichment = require('./glass/watchedEnrichment');
 const llm = require('../services/llm');
+const embeddings = require('../services/embeddings');
 
 // The trending items for one engine type: movie ← movies; series ← tv ∪ anime
 // (mirrors simkl.js's shows+anime merge; anime keeps its own age band downstream).
@@ -74,12 +76,26 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
 
   // 5. Enrich + weighted score → rankScore + score_components (GE-06). Returns
   //    preResolved candidates (≤ resolve_cap), rankScore-sorted.
-  const scored = await scoring.scoreAll(profile, type, cands, taste, cfg, ctx, {
-    log, onProgress: (p, l) => onProgress(45 + (p / 100) * 45, l),
+  let scored = await scoring.scoreAll(profile, type, cands, taste, cfg, ctx, {
+    log, onProgress: (p, l) => onProgress(45 + (p / 100) * 35, l),
   });
   if (ctx.stats) ctx.stats.kept = scored.length;
 
-  // 6. LLM semantic rerank + "because…" reasons (Phase B / GE-08). PREFER-LOCAL:
+  // 6. Vector embeddings (Phase C / GE-09) — OPTIONAL + evidence-gated. Off unless
+  //    cfg.embeddings.enabled AND a local /embeddings endpoint is configured. Folds
+  //    cosine(taste vector, candidate vector) in as the stored semantic_similarity
+  //    feature (weight 0 by default → measure-only). Degrades to a no-op otherwise.
+  //    Test seam: ctx.glassEmbed injects the embed fn.
+  const embedCfg = settings.embedConfig(ctx.settings);
+  if (cfg.embeddings?.enabled && (ctx.glassEmbed || embedCfg)) {
+    const embedFn = ctx.glassEmbed || ((texts) => embeddings.embed(embedCfg, texts, { log }));
+    scored = await semantic.applySemantic(profile, type, scored, taste, cfg, {
+      model: ctx.glassEmbed ? 'test-embed' : embedCfg.model, embedFn, log,
+      onProgress: (p, l) => onProgress(80 + (p / 100) * 10, l),
+    });
+  }
+
+  // 7. LLM semantic rerank + "because…" reasons (Phase B / GE-08). PREFER-LOCAL:
   //    only the custom/local provider is used — never Groq (no rerank spill onto
   //    cloud quota). Degrades to the deterministic order on any failure/absence.
   //    Test seam: ctx.glassChat injects the chat fn (defaults to llm.chat).

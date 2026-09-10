@@ -364,6 +364,7 @@ function normalizeDeepMeta(data, type, tmdbId) {
     imdb_id: data.external_ids?.imdb_id || null,
     type,
     title: isMovie ? data.title : data.name,
+    overview: data.overview || '',          // GE-09: plot text for the semantic embedding
     year,
     decade: year ? Math.floor(year / 10) * 10 : null,
     poster: data.poster_path ? `${IMG}/w500${data.poster_path}` : null,

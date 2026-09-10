@@ -13,7 +13,7 @@ const secret = require('./services/crypto');
 const store = require('./store');
 
 // Secret fields (sealed on disk). Nested under their sections.
-const LLM_SECRET_FIELDS = ['custom_api_key', 'groq_api_key', 'groq_api_key_backup'];
+const LLM_SECRET_FIELDS = ['custom_api_key', 'groq_api_key', 'groq_api_key_backup', 'embed_api_key'];
 const KEY_SECRET_FIELDS = ['tmdb_api_key', 'mdblist_api_key', 'rpdb_api_key'];
 
 const DEFAULT_RPDB_KEY = 't0-free-rpdb'; // generic free-tier key, as in v5
@@ -26,6 +26,12 @@ function blankSettings() {
       custom_api_key: '',     // may be empty for keyless local servers
       groq_api_key: '',       // cloud fallback #1
       groq_api_key_backup: '', // cloud fallback #2
+      // Glass GE-09 embeddings transport (LOCAL only). A SEPARATE model from the
+      // chat one (chat models embed poorly). embed_uri defaults to custom_uri when
+      // blank (same box); embed_model empty = embeddings not configured.
+      embed_uri: '',
+      embed_model: '',
+      embed_api_key: '',
     },
     keys: {
       tmdb_api_key: '',
@@ -174,6 +180,16 @@ function hasLlm(s = getSettings()) {
   return llmChain(s).length > 0;
 }
 
+// Glass GE-09: the local embeddings transport config, or null when not set up
+// (embed_model blank). embed_uri falls back to the custom LLM base (same box);
+// embed_api_key falls back to the custom key. Consumed by services/embeddings.
+function embedConfig(s = getSettings()) {
+  if (!s || !s.llm.embed_model) return null;
+  const uri = s.llm.embed_uri || s.llm.custom_uri;
+  if (!uri) return null;
+  return { uri, model: s.llm.embed_model, apiKey: s.llm.embed_api_key || s.llm.custom_api_key || '' };
+}
+
 // Effective lookup key for a profile. Keys are GLOBAL (Server Config) in v6; a
 // per-profile key is honoured only as a fallback for older profiles that still
 // carry one. `field` is a keys field (tmdb/mdblist/rpdb_api_key) or groq_api_key.
@@ -191,6 +207,7 @@ module.exports = {
   isComplete,
   llmChain,
   hasLlm,
+  embedConfig,
   keyFor,
   settingsLocked,
   DEFAULT_RPDB_KEY,
