@@ -801,6 +801,46 @@ ok('recommendationStore: GE-01 persists score_components (JSON) + algorithm_vers
   rs.deleteForProfile(pid);
 });
 
+ok('simklTrending: GE-02 parseTrendingItem normalizes ids/ratings/velocity, drops tmdb-less, tolerant rating shapes', () => {
+  const st = require('../src/services/simklTrending');
+  // Nested rating shape + full ids + velocity/momentum.
+  const a = st.parseTrendingItem({
+    ids: { tmdb: 603, imdb: 'tt0133093', simkl: 12345 }, title: 'The Matrix', year: 1999,
+    genres: ['Action', 'Science Fiction'], release_date: '1999-03-31', runtime: 136,
+    country: 'us', original_language: 'en', watched: 4200, drop_rate: -3, rank: 5,
+    ratings: { imdb: { rating: 8.7, votes: 2000000 }, simkl: { rating: 9.0, votes: 5000 } },
+  }, 'movies');
+  assert.strictEqual(a.tmdb_id, '603');       // stringified
+  assert.strictEqual(a.imdb_id, 'tt0133093');
+  assert.strictEqual(a.simkl_id, 12345);
+  assert.strictEqual(a.watched, 4200);
+  assert.strictEqual(a.drop_rate, -3);
+  assert.strictEqual(a.ratings.imdb.rating, 8.7);
+  assert.strictEqual(a.ratings.imdb.votes, 2000000);
+  assert.deepStrictEqual(a.genres, ['Action', 'Science Fiction']);
+  // Flat rating shape + anime cross-ids + numeric-string tmdb.
+  const b = st.parseTrendingItem({ ids: { tmdb: '1', mal: 30, anilist: 21 }, name: 'One Piece', ratings: { mal: 8.6 } }, 'anime');
+  assert.strictEqual(b.tmdb_id, '1');
+  assert.strictEqual(b.mal, 30);
+  assert.strictEqual(b.ratings.mal.rating, 8.6);
+  assert.strictEqual(b.ratings.mal.votes, null);
+  // No tmdb id → dropped (unresolvable into the TMDB-keyed pool).
+  assert.strictEqual(st.parseTrendingItem({ ids: { imdb: 'tt9' }, title: 'X' }, 'movies'), null);
+  assert.strictEqual(st.parseTrendingItem(null, 'movies'), null);
+});
+
+ok('simklTrending: GE-02 parseCombined splits movies/tv/anime; tv falls back to shows', () => {
+  const st = require('../src/services/simklTrending');
+  const out = st.parseCombined({
+    movies: [{ ids: { tmdb: 1 } }, { ids: { imdb: 'tt' } }],  // 2nd has no tmdb → dropped
+    shows: [{ ids: { tmdb: 2 } }],                             // `shows` alias for tv
+    anime: [{ ids: { tmdb: 3 } }],
+  });
+  assert.deepStrictEqual(out.movies.map((x) => x.tmdb_id), ['1']);
+  assert.deepStrictEqual(out.tv.map((x) => x.tmdb_id), ['2']);
+  assert.deepStrictEqual(out.anime.map((x) => x.tmdb_id), ['3']);
+});
+
 ok('recommendationStore: selectServe applies rating/genre/recency at serve time', () => {
   const rs = require('../src/recommendationStore');
   const mk = (o) => ({ imdb_id: 'tt' + o.id, tmdb_id: o.id, type: o.type || 'movie', title: o.id, year: o.year || 2024, primary_genre: o.g, genres: o.genres || o.g, vote_average: o.va ?? 8, imdb_rating: o.imdb, age_classification: o.age || null, affinity: o.aff ?? 1 });

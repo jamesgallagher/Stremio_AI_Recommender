@@ -49,6 +49,9 @@ const tmdb = require('../src/services/tmdb');
 const markWatched = require('../src/markWatched');
 const dontRecommend = require('../src/dontRecommend');
 const { fake, fakeOpen, makeEngine } = require('./fixtures/fake-engine');
+// Glass engine (Phase A) — the trending CDN cache + the enrichment store + the
+// engine itself, exercised end to end with injected fetchers (no real network).
+const simklTrending = require('../src/services/simklTrending');
 
 const quiet = { log() {}, warn() {}, error() {} };
 let passed = 0;
@@ -640,6 +643,40 @@ async function main() {
       config.removeProfile(p.id); config.removeProfile(kid.id);
       rs.deleteForProfile(p.id); rs.deleteForProfile(kid.id); store.deleteCache(p.id); store.deleteCache(kid.id);
     }
+  });
+
+  // ── O. Glass GE-02: Simkl trending CDN cache — refresh, 3-way store, graceful
+  // degrade, TTL-gated ensureFresh — all with an INJECTED fetcher (no network) ──
+  await it('O. GE-02 trending cache: refresh stores 3 lists, degrades to stale on CDN failure, ensureFresh honours TTL', async () => {
+    const combined = {
+      movies: [{ ids: { tmdb: 603, imdb: 'tt0133093' }, title: 'The Matrix', genres: ['Action'], watched: 100, drop_rate: 1, ratings: { imdb: { rating: 8.7, votes: 9 } } }],
+      tv: [{ ids: { tmdb: 1396, imdb: 'tt0903747' }, name: 'Breaking Bad', genres: ['Drama'], watched: 50 }],
+      anime: [{ ids: { tmdb: 30984, mal: 20 }, title: 'Naruto', genres: ['Action'], watched: 30 }],
+    };
+    let calls = 0;
+    const fetcher = async () => { calls++; return combined; };
+    const r1 = await simklTrending.refresh({ fetcher, now: 1_000_000, log: quiet });
+    assert.deepStrictEqual(r1.counts, { movies: 1, tv: 1, anime: 1 });
+    assert.strictEqual(simklTrending.getList('movies')[0].tmdb_id, '603');
+    assert.strictEqual(simklTrending.getList('anime')[0].mal, 20);
+
+    // Graceful degrade: a failing CDN leaves the last good lists in place (never throws).
+    const bad = async () => { throw new Error('CDN 503'); };
+    const r2 = await simklTrending.refresh({ fetcher: bad, now: 2_000_000, log: quiet });
+    assert.strictEqual(r2.ok, false);
+    assert.strictEqual(simklTrending.getList('movies').length, 1, 'stale list survives a failed refresh');
+
+    // ensureFresh: within TTL → skip (no fetch); past TTL → refetch.
+    calls = 0;
+    const fresh = await simklTrending.ensureFresh({ fetcher, ttlMs: simklTrending.REFRESH_TTL_MS, now: 1_000_000 + 3600e3, log: quiet });
+    assert.strictEqual(fresh.skipped, 'fresh');
+    assert.strictEqual(calls, 0, 'a fresh cache is not refetched');
+    const stale = await simklTrending.ensureFresh({ fetcher, ttlMs: simklTrending.REFRESH_TTL_MS, now: 1_000_000 + 25 * 3600e3, log: quiet });
+    assert.strictEqual(stale.ok, true);
+    assert.strictEqual(calls, 1, 'a stale cache triggers exactly one refetch');
+    // maxAgeMs: data at the fetch instant is fresh; older than the tolerance is rejected.
+    assert.strictEqual(simklTrending.getList('movies', { maxAgeMs: 10, now: 1_000_000 + 25 * 3600e3 }).length, 1);
+    assert.strictEqual(simklTrending.getList('movies', { maxAgeMs: 10, now: 1_000_000 + 25 * 3600e3 + 50 }).length, 0);
   });
 
   // Restore a clean-ish shared state for any process that runs after this one.
