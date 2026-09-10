@@ -4,8 +4,14 @@
 // locked option, and everyone keeps today's results (a user-visible no-op until
 // a second engine is registered).
 const genesis = require('./genesis');
+// Glass (Phase A) — the first real second engine. Registered here so it appears
+// in the per-type dropdowns, but it ships GLOBALLY DISABLED (isEnabled below:
+// non-Genesis defaults OFF) until an admin enables it in Server Config (SC-07) —
+// a user-visible no-op until then. Source sign-off + conformance are cleared
+// (docs/engine-glass/, GE-07).
+const glass = require('./glass');
 
-const REGISTRY = new Map([[genesis.id, genesis]]);
+const REGISTRY = new Map([[genesis.id, genesis], [glass.id, glass]]);
 const DEFAULT_ID = 'genesis';
 
 function get(id) { return REGISTRY.get(id) || null; }

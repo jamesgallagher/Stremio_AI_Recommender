@@ -234,6 +234,7 @@ module.exports = {
   refresh,
   ensureFresh,
   getList,
+  upsertList,
   newestFetchedAt,
   currentCounts,
   COMBINED_WEEK_URL,

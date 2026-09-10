@@ -718,9 +718,10 @@ ok('recommendationStore: selectStrong gates on the supplied vote floor (NOT rati
 ok('engines: registry lists Genesis, resolveFor/availableFor honour age gating (I7) + global enablement (SC-07)', () => {
   const engines = require('../src/engines');
   const settings = require('../src/settings');
-  // Single engine → a single, locked option per type (requirement #3).
-  assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['genesis']);
-  assert.deepStrictEqual(engines.listForType('series').map((e) => e.id), ['genesis']);
+  // The registry lists Genesis + Glass for both types (Glass is registered but
+  // ships globally DISABLED, so it's in listForType yet absent from availableFor).
+  assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['genesis', 'glass']);
+  assert.deepStrictEqual(engines.listForType('series').map((e) => e.id), ['genesis', 'glass']);
   // Genesis is the permanent default + safe floor — always enabled (SC-07).
   assert.strictEqual(engines.isEnabled('genesis'), true);
   // resolveFor falls back to Genesis for any profile, incl. a vestigial old id.
@@ -757,8 +758,8 @@ ok('engines: registry lists Genesis, resolveFor/availableFor honour age gating (
     // …and never resolved even if hand-stored — Genesis is the safe floor (I7).
     assert.strictEqual(engines.resolveFor(kid, 'movie').id, 'genesis');
   } finally { dispose(); settings.updateSettings({ engines: { 'open-stub': false } }); }
-  // Registry restored to a single engine after the stub is disposed.
-  assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['genesis']);
+  // Registry restored to the built-in engines after the stub is disposed.
+  assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['genesis', 'glass']);
 });
 
 ok('recommendationStore: purgeBelowVoteFloor drops stored rows under the profile vote floor (movies vs series ⅕)', () => {
@@ -894,6 +895,103 @@ ok('glass/metaStore: GE-03 put/get/getMany round-trip + imdb index', () => {
   assert.strictEqual(many.get('27205').imdb_id, 'tt1375666');
   metaStore._clear();
   assert.strictEqual(metaStore.count(), 0);
+});
+
+ok('glass/tasteModel: GE-05 builds 3-horizon dims, recency-weighted, normalized 0–1, type-scoped', () => {
+  const watchedStore = require('../src/watchedStore');
+  const metaStore = require('../src/engines/glass/metaStore');
+  const { buildTasteModel, topGenres } = require('../src/engines/glass/tasteModel');
+  const { resolveConfig } = require('../src/engines/glass/config');
+  const cfg = resolveConfig(null);
+  const pid = 'glass-taste';
+  const now = Date.parse('2026-09-10T00:00:00Z');
+  watchedStore.deleteForProfile(pid); metaStore._clear();
+  // A recently-watched Drama and a long-ago Comedy (same type).
+  watchedStore.upsertMany(pid, [
+    { type: 'movie', simkl_id: 1, imdb_id: 'tt1', tmdb_id: '101', title: 'Recent', year: 2025, watched_at: '2026-09-08T00:00:00Z' },
+    { type: 'movie', simkl_id: 2, imdb_id: 'tt2', tmdb_id: '102', title: 'Old', year: 2001, watched_at: '2022-01-01T00:00:00Z' },
+    { type: 'series', simkl_id: 3, imdb_id: 'tt3', tmdb_id: '201', title: 'Show', year: 2020, watched_at: '2026-09-01T00:00:00Z' },
+  ]);
+  metaStore.put('movie', 101, { tmdb_id: '101', imdb_id: 'tt1', type: 'movie', genres: ['Drama'], director: ['Nolan'], cast: ['A'], keywords: ['dream'], decade: 2020, original_language: 'en', runtime: 120, collection: { id: 9, name: 'C' } });
+  metaStore.put('movie', 102, { tmdb_id: '102', imdb_id: 'tt2', type: 'movie', genres: ['Comedy'], director: ['X'], decade: 2000, original_language: 'en', runtime: 95 });
+  metaStore.put('series', 201, { tmdb_id: '201', imdb_id: 'tt3', type: 'series', genres: ['Drama'], networks: ['HBO'], decade: 2020, original_language: 'en', runtime: 50 });
+
+  const t = buildTasteModel(pid, 'movie', cfg, { nowMs: now });
+  assert.strictEqual(t.type, 'movie');
+  assert.strictEqual(t.seedCount, 2);                         // type-scoped: series excluded
+  assert.strictEqual(t.enrichedCount, 2);
+  // Recency: the recent Drama outweighs the old Comedy → Drama affinity is the max (1.0).
+  assert.strictEqual(t.dims.genres.Drama, 1);
+  assert.ok(t.dims.genres.Comedy < t.dims.genres.Drama);
+  assert.strictEqual(t.dims.directors.Nolan, 1);
+  assert.ok('c:9' in t.dims.franchises);                      // movie franchise = collection
+  assert.deepStrictEqual(topGenres(t, 1), ['Drama']);
+  // Series model is isolated (only the show seeds it; franchise = network proxy).
+  const ts = buildTasteModel(pid, 'series', cfg, { nowMs: now });
+  assert.strictEqual(ts.seedCount, 1);
+  assert.ok('n:HBO' in ts.dims.franchises);
+  watchedStore.deleteForProfile(pid); metaStore._clear();
+});
+
+ok('glass/candidates: GE-05 dedupe unions sources, preScore ranks, exploration eligibility', () => {
+  const c = require('../src/engines/glass/candidates');
+  const taste = { dims: { genres: { Drama: 1, Action: 0.5 } } };
+  // dedupe merges the same title from two strategies, unioning sources + keeping fields.
+  const merged = c.dedupe([
+    { type: 'movie', tmdb_id: '1', genres: ['Drama'], sources: ['recommendations'], imdb_id: null, reason: 'because you watched X', watched24h: 0 },
+    { type: 'movie', tmdb_id: '1', genres: ['Drama'], sources: ['trending'], imdb_id: 'tt1', reason: null, watched24h: 500 },
+    { type: 'movie', tmdb_id: '2', genres: ['Action'], sources: ['trending'], watched24h: 10 },
+  ]);
+  assert.strictEqual(merged.length, 2);
+  const one = merged.find((x) => x.tmdb_id === '1');
+  assert.deepStrictEqual(one.sources.sort(), ['recommendations', 'trending']);
+  assert.strictEqual(one.imdb_id, 'tt1');            // filled from the trending copy
+  assert.strictEqual(one.reason, 'because you watched X');
+  assert.strictEqual(one.watched24h, 500);           // max
+  // preScore: a Drama (top affinity) outranks an Action title, all else equal.
+  const drama = { genres: ['Drama'], watched24h: 0, drop_rate: null, vote_average: 7, popularity: 0 };
+  const action = { genres: ['Action'], watched24h: 0, drop_rate: null, vote_average: 7, popularity: 0 };
+  assert.ok(c.preScore(drama, taste) > c.preScore(action, taste));
+  // exploration eligibility: outside the top-genre set.
+  assert.strictEqual(c.outsideTopGenres({ genres: ['Horror'] }, new Set(['Drama'])), true);
+  assert.strictEqual(c.outsideTopGenres({ genres: ['Drama'] }, new Set(['Drama'])), false);
+});
+
+ok('glass/scoring: GE-06 features 0–1, weighted rankScore, preResolved fields, intersect bonuses, tt-less dropped', () => {
+  const scoring = require('../src/engines/glass/scoring');
+  const { resolveConfig } = require('../src/engines/glass/config');
+  const cfg = resolveConfig(null);
+  const taste = {
+    genreMass: { Drama: 10, Comedy: 2 },
+    dims: {
+      genres: { Drama: 1 }, decades: { 2020: 1 }, languages: { en: 1 }, runtimeBands: { m_mid: 1 },
+      directors: { Nolan: 1 }, franchises: { 'c:9': 1 }, cast: { A: 1 }, keywords: { dream: 1 },
+    },
+  };
+  const meta = { type: 'movie', imdb_id: 'tt1', poster: 'http://p', genres: ['Drama'], primary_genre: 'Drama', vote_average: 8, vote_count: 5000, popularity: 50, original_language: 'en', runtime: 120, decade: 2020, director: ['Nolan'], cast: ['A'], keywords: ['dream'], collection: { id: 9, name: 'C' }, year: 2024 };
+  const { features, matched } = scoring.computeFeatures({ sources: ['recommendations'], watched24h: 0, drop_rate: null }, meta, taste, cfg, { nowYear: 2026 });
+  for (const v of Object.values(features)) assert.ok(v >= 0 && v <= 1, 'features are 0–1');
+  assert.ok(features.taste_match > 0.9, 'a full-intersect candidate scores near-max taste_match');
+  assert.deepStrictEqual(matched.director, ['Nolan']);
+  assert.deepStrictEqual(matched.franchise, ['C']);
+  // weightedScore matches the manual dot product.
+  const manual = Object.entries(cfg.weights).reduce((s, [f, w]) => s + (features[f] || 0) * w, 0);
+  assert.ok(Math.abs(scoring.weightedScore(features, cfg.weights) - manual) < 1e-9);
+  // scoreCandidate fills preResolved fields + components + version.
+  const cand = { type: 'movie', tmdb_id: '1', sources: ['recommendations'], watched24h: 0, drop_rate: null };
+  const scored = scoring.scoreCandidate(cand, meta, taste, cfg, { nowYear: 2026, animeLoaded: false });
+  assert.strictEqual(scored.imdb_id, 'tt1');
+  assert.strictEqual(scored.genres, 'Drama');
+  assert.strictEqual(scored.primary_genre, 'Drama');
+  assert.strictEqual(scored.algorithm_version, 'glass-a1');
+  assert.ok(scored.score_components.features.taste_match > 0.9);
+  assert.strictEqual(typeof scored.rankScore, 'number');
+  // A candidate whose meta has no tt id is dropped (preResolved contract).
+  assert.strictEqual(scoring.scoreCandidate({ type: 'movie', tmdb_id: '2', sources: [] }, { imdb_id: null, genres: [] }, taste, cfg, { animeLoaded: false }), null);
+  // novelty: an over-represented genre scores LOW; a fresh genre scores HIGH.
+  const fresh = scoring.computeFeatures({ sources: [] }, { ...meta, primary_genre: 'Western', genres: ['Western'] }, taste, cfg, { nowYear: 2026 }).features.novelty;
+  const heavy = scoring.computeFeatures({ sources: [] }, meta, taste, cfg, { nowYear: 2026 }).features.novelty;
+  assert.ok(fresh > heavy);
 });
 
 ok('recommendationStore: selectServe applies rating/genre/recency at serve time', () => {
@@ -1910,13 +2008,15 @@ async function httpTests() {
   console.log('  ✓ /api/genres');
 
   // /api/engines — the static registry for the portal's per-type dropdowns (SC-02).
-  // With one engine registered it advertises exactly Genesis, both types, default id.
+  // It advertises Genesis + Glass (Glass registered but globally disabled), both types.
   const eng = await (await fetch(`${BASE}/api/engines`)).json();
   assert.strictEqual(eng.default, 'genesis');
-  assert.deepStrictEqual(eng.engines.map((e) => e.id), ['genesis']);
+  assert.deepStrictEqual(eng.engines.map((e) => e.id), ['genesis', 'glass']);
   assert.deepStrictEqual(eng.engines[0].supported_types, ['movie', 'series']);
   assert.ok(eng.engines[0].description && eng.engines[0].capabilities.unrestricted === false);
-  console.log('  ✓ /api/engines advertises the registry (Genesis only, both types)');
+  const glassAd = eng.engines.find((e) => e.id === 'glass');
+  assert.ok(glassAd && glassAd.enabled === false && glassAd.capabilities.unrestricted === false);
+  console.log('  ✓ /api/engines advertises the registry (Genesis + Glass, both types)');
 
   // Create a profile through the API
   let res = await fetch(`${BASE}/api/profiles`, {

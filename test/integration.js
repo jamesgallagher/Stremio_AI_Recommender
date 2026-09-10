@@ -736,6 +736,118 @@ async function main() {
     }
   });
 
+  // ── Glass Phase A end-to-end (GE-05/06/07) through the REAL build + serve ─────
+  // Offline: seed the trending cache + the Glass metadata store so every network
+  // hop is a cache hit, and stub tmdb.getRecommendations + getGenreMap. This runs
+  // the actual glass engine through buildRecommendations → shared pipeline (upsert,
+  // preResolved skip) → pool, then buildPool's shared age gate, then serve.
+  const metaStore = require('../src/engines/glass/metaStore');
+  const GENRE_MAP = { 18: 'Drama', 27: 'Horror', 28: 'Action' };
+  // Full deep-metas for every candidate the fixtures below produce.
+  function seedGlassFixtures(pid) {
+    watchedStore.deleteForProfile(pid); metaStore._clear();
+    // Watched Drama seeds (recent) — drive the taste model + A/B recommendations.
+    watchedStore.upsertMany(pid, [
+      { type: 'movie', simkl_id: 1, imdb_id: 'ttw1', tmdb_id: '101', title: 'Watched One', year: 2024, watched_at: '2026-09-08T00:00:00Z' },
+      { type: 'movie', simkl_id: 2, imdb_id: 'ttw2', tmdb_id: '102', title: 'Watched Two', year: 2023, watched_at: '2026-09-05T00:00:00Z' },
+    ]);
+    const mk = (tmdb, imdb, genres, extra = {}) => ({ tmdb_id: String(tmdb), imdb_id: imdb, type: 'movie', genres, primary_genre: genres[0], vote_average: 8, vote_count: 5000, popularity: 40, original_language: 'en', runtime: 120, decade: 2020, director: ['Nolan'], cast: ['A'], keywords: ['dream'], year: 2024, poster: null, ...extra });
+    metaStore.put('movie', 101, mk(101, 'ttw1', ['Drama']));
+    metaStore.put('movie', 102, mk(102, 'ttw2', ['Drama']));
+    // Candidates: 301/302 from recommendations; 401 (Drama, trending) + 402 (Horror,
+    // exploration) from trending.
+    metaStore.put('movie', 301, mk(301, 'tt301', ['Drama']));
+    metaStore.put('movie', 302, mk(302, 'tt302', ['Drama']));
+    metaStore.put('movie', 401, mk(401, 'tt401', ['Drama'], { director: ['Someone'] }));
+    metaStore.put('movie', 402, mk(402, 'tt402', ['Horror'], { director: ['Other'], keywords: [] }));
+    // Trending cache (fresh now) — movies list carries 401 (in-taste) + 402 (outside).
+    simklTrending.upsertList('movies', [
+      { list_type: 'movies', tmdb_id: '401', imdb_id: 'tt401', title: 'Trending Drama', year: 2026, genres: ['Drama'], watched: 5000, drop_rate: 2, ratings: { imdb: { rating: 8.2, votes: 100 } } },
+      { list_type: 'movies', tmdb_id: '402', imdb_id: 'tt402', title: 'Trending Horror', year: 2026, genres: ['Horror'], watched: 9000, drop_rate: 3, ratings: { imdb: { rating: 7.0, votes: 80 } } },
+    ], Date.now());
+    simklTrending.upsertList('tv', [], Date.now());
+    simklTrending.upsertList('anime', [], Date.now());
+  }
+  // Stub the two live TMDB calls glass makes outside the (pre-seeded) meta store.
+  const origRecs = tmdb.getRecommendations;
+  const origGenreMap = tmdb.getGenreMap;
+  function stubTmdb() {
+    tmdb.getRecommendations = async (_k, type, seedId) => (type === 'movie'
+      ? [{ type, tmdb_id: '301', title: 'Rec A', year: 2024, genre_ids: [18], vote_average: 8, vote_count: 5000, popularity: 30, adult: false, poster: null },
+         { type, tmdb_id: '302', title: 'Rec B', year: 2023, genre_ids: [18], vote_average: 7, vote_count: 4000, popularity: 20, adult: false, poster: null }]
+      : []);
+    tmdb.getGenreMap = async () => GENRE_MAP;
+  }
+  function restoreTmdb() { tmdb.getRecommendations = origRecs; tmdb.getGenreMap = origGenreMap; }
+
+  await it('R. Glass builds a preResolved, rankScore-ordered pool with score_components + engine_id (adult, end to end)', async () => {
+    settings.updateSettings({ engines: { glass: true } });
+    stubTmdb();
+    const p = config.addProfile('INT-R');
+    try {
+      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'glass', engine_series: 'glass' } });
+      seedGlassFixtures(p.id);
+      const r = await rs.buildPool(config.getProfile(p.id), quiet);
+      assert.strictEqual(r.engines.movie, 'glass');
+      const rows = rs.getRecommended(p.id, { type: 'movie', limit: 100 });
+      assert.ok(rows.length >= 3, 'glass produced a movie pool');
+      // GE-01: every Glass row carries engine_id + algorithm_version + JSON components.
+      for (const row of rows) {
+        assert.strictEqual(row.engine_id, 'glass');
+        assert.strictEqual(row.algorithm_version, 'glass-a1');
+        const comp = JSON.parse(row.score_components);
+        assert.ok(comp.features && typeof comp.features.taste_match === 'number');
+        assert.ok(Array.isArray(comp.sources));
+        // preResolved (§5.5): the pipeline skipped its own resolve, so these came
+        // from Glass's append call.
+        assert.ok(row.imdb_id && row.genres && row.primary_genre);
+      }
+      // Served in rankScore (affinity) order, genre-balanced — a real served list.
+      const served = rs.serveRecommendations(config.getProfile(p.id), 'movie');
+      assert.ok(served.length >= 1);
+      const affinities = rows.map((x) => x.affinity);
+      assert.deepStrictEqual([...affinities], [...affinities].sort((a, b) => b - a), 'stored affinity is rankScore-ordered');
+      // Strategy breadth (GE-05): the pool carries BOTH a /recommendations-sourced
+      // title (A/B) and an exploration-sourced one (G), not just one strategy.
+      const allSources = new Set(rows.flatMap((x) => JSON.parse(x.score_components).sources));
+      assert.ok(allSources.has('recommendations'), 'A/B recommendations reached the pool');
+      assert.ok(allSources.has('exploration') || allSources.has('trending'), 'a trending/exploration strategy reached the pool');
+    } finally {
+      restoreTmdb();
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id); metaStore._clear();
+      settings.updateSettings({ engines: { glass: false } });
+      simklTrending.upsertList('movies', [], 0); simklTrending.upsertList('tv', [], 0); simklTrending.upsertList('anime', [], 0);
+    }
+  });
+
+  await it('S. Glass conformance safety (I1): the shared age gate drops an over-band Glass title before serve (kids)', async () => {
+    settings.updateSettings({ engines: { glass: true } });
+    stubTmdb();
+    offlineAnimeMap();
+    const p = config.addProfile('INT-S');
+    config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { age_limit: 8, engine_movie: 'glass', engine_series: 'glass' } }); // judged at 9
+    const prev = store.loadAgeVerdicts();
+    try {
+      seedGlassFixtures(p.id);
+      // ACB verdict cache: veto tmdb 401 for a 9-year-old; everything else OK. The
+      // age gate — NOT the engine — is the authority (I1), proven over a Glass pool.
+      store.saveAgeVerdicts({
+        [verdictKey('movie', 9, '301')]: true, [verdictKey('movie', 9, '302')]: true,
+        [verdictKey('movie', 9, '401')]: false, [verdictKey('movie', 9, '402')]: true,
+      });
+      await rs.buildPool(config.getProfile(p.id), quiet);
+      const pool = rs.getRecommended(p.id, { type: 'movie', limit: 100 }).map((x) => x.tmdb_id);
+      assert.ok(!pool.includes('401'), 'the over-band Glass title is removed from the pool by the shared gate');
+      const served = rs.serveRecommendations(config.getProfile(p.id), 'movie').map((m) => m.id);
+      assert.ok(!served.includes('tt401'), 'and never served to the kid');
+    } finally {
+      restoreTmdb(); store.saveAgeVerdicts(prev);
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id); metaStore._clear();
+      settings.updateSettings({ engines: { glass: false } });
+      simklTrending.upsertList('movies', [], 0); simklTrending.upsertList('tv', [], 0); simklTrending.upsertList('anime', [], 0);
+    }
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();
