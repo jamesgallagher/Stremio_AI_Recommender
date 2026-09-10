@@ -64,6 +64,15 @@ function num(v) {
   return Number.isFinite(n) ? n : null;
 }
 
+// A percentage field, as a number. Verified live 2026-09-10: Simkl sends
+// `drop_rate` as a STRING like "0.5%" (always positive; range ~0.1–20; low =
+// sticky/rising, high = falling). parseFloat strips the trailing % → 0.5.
+function pct(v) {
+  if (v == null || v === '') return null;
+  const n = parseFloat(String(v));
+  return Number.isFinite(n) ? n : null;
+}
+
 // Pull one rating source ({rating, votes}) out of an item's `ratings` block,
 // tolerant of the two shapes seen in the wild: nested (`ratings.imdb.rating`)
 // or flat (`ratings.imdb`). Returns { rating, votes } with nulls for absent.
@@ -75,12 +84,15 @@ function pickRating(ratings, source) {
   return { rating: num(r), votes: null };
 }
 
-// The four-digit release year from a release_date/year field, or null.
+// The four-digit release year from a release_date/year field, or null. Verified
+// live 2026-09-10: Simkl `release_date` is "MM/DD/YYYY" (e.g. "09/03/2026"), NOT
+// ISO — so find the 19xx/20xx run rather than slicing the first four chars.
 function yearOf(item) {
-  if (item.year) return num(item.year);
+  const y0 = num(item.year);
+  if (y0 && y0 > 1800) return y0;
   const d = item.release_date || item.first_aired || item.date || null;
-  const y = d ? parseInt(String(d).slice(0, 4), 10) : NaN;
-  return Number.isFinite(y) ? y : null;
+  const m = d ? String(d).match(/(19|20)\d{2}/) : null;
+  return m ? parseInt(m[0], 10) : null;
 }
 
 // PURE: normalize ONE raw CDN item into the field set Glass scores on, all with
@@ -96,7 +108,8 @@ function parseTrendingItem(raw, listType) {
   if (tmdb == null || tmdb === '') return null;             // no tmdb id → unresolvable
   const imdb = ids.imdb ?? raw.imdb ?? null;
   const simkl = ids.simkl ?? ids.simkl_id ?? raw.simkl_id ?? null;
-  const genres = Array.isArray(raw.genres) ? raw.genres.filter(Boolean).map(String) : [];
+  // Genres arrive with duplicates in the wild (["Action","Action",…]) — dedupe.
+  const genres = Array.isArray(raw.genres) ? [...new Set(raw.genres.filter(Boolean).map(String))] : [];
   return {
     list_type: listType,
     tmdb_id: String(tmdb),
@@ -114,8 +127,8 @@ function parseTrendingItem(raw, listType) {
     country: raw.country || null,
     original_language: raw.original_language || raw.lang || null,
     // Velocity + momentum, straight from the file (no time-series needed).
-    watched: num(raw.watched ?? raw.watched_24h ?? raw.plays),   // 24h viewers
-    drop_rate: num(raw.drop_rate),                               // momentum direction
+    watched: num(raw.watched ?? raw.watched_24h ?? raw.plays),   // recent viewers (velocity)
+    drop_rate: pct(raw.drop_rate),                               // % decline (momentum; low = sticky)
     rank: num(raw.rank),
     // Quality, in-file (also resolves the P4 quality-source cleanly downstream).
     ratings: {

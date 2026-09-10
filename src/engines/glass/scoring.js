@@ -91,14 +91,18 @@ function popularity(meta) {
   return p > 0 ? clamp01(Math.log1p(p) / Math.log1p(1000)) : 0;
 }
 
-// trending_momentum from the Simkl in-file signals a candidate carries (velocity
-// = 24h viewers, log-damped; direction = drop_rate nudge). 0 for a candidate with
-// no trending signal (recommendations-only) — momentum rewards what's moving NOW.
+// trending_momentum from the Simkl in-file signals (calibrated to the real CDN,
+// verified 2026-09-10): velocity = recent viewers `watched` (max observed ~1500,
+// so log-damped against WATCHED_SCALE) + stickiness = 1 − drop_rate% (a positive
+// % decline, p50 ~0.3, tail to ~20; low drop = sticky/rising). 0 for a candidate
+// with no trending signal (recommendations-only) — momentum rewards what's moving.
+const WATCHED_SCALE = 2000;
+const DROP_MAX = 10;   // % decline at which stickiness reaches 0
 function trendingMomentum(cand) {
-  const velocity = cand.watched24h > 0 ? clamp01(Math.log1p(cand.watched24h) / Math.log1p(100000)) : 0;
+  const velocity = cand.watched24h > 0 ? clamp01(Math.log1p(cand.watched24h) / Math.log1p(WATCHED_SCALE)) : 0;
   if (velocity === 0 && cand.drop_rate == null) return 0;
-  const direction = cand.drop_rate != null ? clamp01((cand.drop_rate + 10) / 20) : 0.5;
-  return clamp01(0.7 * velocity + 0.3 * direction);
+  const stickiness = cand.drop_rate != null ? clamp01(1 - cand.drop_rate / DROP_MAX) : 0.6;
+  return clamp01(0.75 * velocity + 0.25 * stickiness);
 }
 
 function releaseRecency(meta, nowYear) {

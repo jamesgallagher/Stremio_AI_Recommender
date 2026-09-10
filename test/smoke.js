@@ -867,6 +867,19 @@ ok('simklTrending: GE-02 parseTrendingItem normalizes ids/ratings/velocity, drop
   // No tmdb id → dropped (unresolvable into the TMDB-keyed pool).
   assert.strictEqual(st.parseTrendingItem({ ids: { imdb: 'tt9' }, title: 'X' }, 'movies'), null);
   assert.strictEqual(st.parseTrendingItem(null, 'movies'), null);
+  // REAL Simkl CDN shape (verified live 2026-09-10): MM/DD/YYYY release_date,
+  // drop_rate as a "0.5%" string, duplicate genres, ids.simkl_id.
+  const real = st.parseTrendingItem({
+    ids: { simkl_id: 2185181, imdb: 'tt28014327', tmdb: '1137844' }, title: 'Mayday',
+    release_date: '09/03/2026', drop_rate: '0.5%', watched: 1504, rank: 8892,
+    genres: ['Action', 'Action', 'Adventure'], ratings: { imdb: { rating: 6.9, votes: 16627 } },
+  }, 'movies');
+  assert.strictEqual(real.year, 2026);                 // MM/DD/YYYY parsed, not "09/0"→9
+  assert.strictEqual(real.drop_rate, 0.5);             // "0.5%" → 0.5
+  assert.strictEqual(real.simkl_id, 2185181);          // ids.simkl_id
+  assert.deepStrictEqual(real.genres, ['Action', 'Adventure']); // deduped
+  // ISO dates still parse (backward compatible).
+  assert.strictEqual(st.parseTrendingItem({ ids: { tmdb: 1 }, release_date: '1999-03-31' }, 'movies').year, 1999);
 });
 
 ok('simklTrending: GE-02 parseCombined splits movies/tv/anime; tv falls back to shows', () => {

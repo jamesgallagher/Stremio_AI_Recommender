@@ -112,11 +112,13 @@ function genreAffinity(cand, taste) {
 // Deliberately coarse — GE-06 does the real weighted scoring on the kept set.
 function preScore(cand, taste) {
   const ga = genreAffinity(cand, taste);
-  const velocity = cand.watched24h > 0 ? Math.log1p(cand.watched24h) / Math.log1p(100000) : 0;
-  const momentum = cand.drop_rate != null ? Math.max(0, Math.min(1, (cand.drop_rate + 10) / 20)) : 0.5;
+  // Calibrated to the real Simkl CDN (verified 2026-09-10): watched maxes ~1500;
+  // drop_rate is a positive % decline (low = sticky).
+  const velocity = cand.watched24h > 0 ? Math.log1p(cand.watched24h) / Math.log1p(2000) : 0;
+  const stickiness = cand.drop_rate != null ? Math.max(0, Math.min(1, 1 - cand.drop_rate / 10)) : 0.6;
   const q = (cand.imdb_rating_infile ?? cand.vote_average ?? 0) / 10;
   const pop = cand.popularity > 0 ? Math.log1p(cand.popularity) / Math.log1p(1000) : 0;
-  return 0.45 * ga + 0.20 * velocity + 0.12 * momentum + 0.15 * q + 0.08 * pop;
+  return 0.45 * ga + 0.20 * velocity + 0.12 * stickiness + 0.15 * q + 0.08 * pop;
 }
 
 // Does a candidate fall OUTSIDE the profile's top genres? (exploration eligibility)
@@ -174,12 +176,16 @@ async function generateCandidates(profile, type, ctx, taste, cfg, {
   const topSet = new Set(topGenresList);
   const nowYear = new Date().getFullYear();
   const trend = trendingItems.slice(0, st.trending_take).map((it) => mapTrending(it, type));
+  // Rating for the source-tag predicates: in-file imdb, else vote_average (which
+  // already falls back imdb→simkl, so anime — which carries no imdb — still counts).
+  const ratingOf = (c) => (c.imdb_rating_infile ?? c.vote_average ?? 0);
   for (const c of trend) {
     const inTaste = (c.genres || []).some((g) => topSet.has(g));
     if (!inTaste) continue;                         // C–F are taste-filtered; G handles the rest
     c.sources.push('trending');
     if (c.year && c.year >= nowYear - 1) c.sources.push('recent');
-    if ((c.imdb_rating_infile || 0) >= 7.5 && c.watched24h < 2000) c.sources.push('hidden_gem');
+    // Hidden gem = well-rated but LOWER visibility (watched p90 ≈ 100 on the real feed).
+    if (ratingOf(c) >= 7.5 && (c.watched24h || 0) < 100) c.sources.push('hidden_gem');
     pool.push(c);
   }
 
@@ -196,7 +202,7 @@ async function generateCandidates(profile, type, ctx, taste, cfg, {
   const have = new Set(merged.map((c) => key(c.type, c.tmdb_id)));
   const explore = trendingItems
     .map((it) => mapTrending(it, type))
-    .filter((c) => notExcluded(c) && !have.has(key(c.type, c.tmdb_id)) && outsideTopGenres(c, topSet) && (c.imdb_rating_infile || 0) >= 6.5)
+    .filter((c) => notExcluded(c) && !have.has(key(c.type, c.tmdb_id)) && outsideTopGenres(c, topSet) && (c.imdb_rating_infile ?? c.vote_average ?? 0) >= 6.5)
     .sort((a, b) => num(b.watched24h) - num(a.watched24h))
     .slice(0, reserve)
     .map((c) => { c.sources.push('exploration'); c._preScore = preScore(c, taste) + 0.001; return c; });
