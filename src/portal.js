@@ -728,6 +728,24 @@ function revertDisabledEngines(disabledIds) {
   }
 }
 
+// GE-07 (GD-6): a Tier-2 Glass config change (settings.glass) is BUILD-AFFECTING —
+// it alters the stored rankScore ordering for every Glass profile, exactly like
+// changing the selected engine. So each type currently PRODUCED by Glass has its
+// slice cleared + rebuilt (the same SC-03 clearType path a disable-revert uses).
+// Deliberately heavyweight: it's an algorithm change, not a serve-time preference.
+// dont_recommend is engine-independent and left intact by clearType. Resolves the
+// EFFECTIVE engine per type (so an age-revoked/disabled selection that already
+// floors to Genesis is correctly skipped).
+function rebuildGlassProfiles() {
+  for (const p of config.listProfiles()) {
+    const types = ['movie', 'series'].filter((t) => recommendationStore && require('./engines').resolveFor(p, t).id === 'glass');
+    if (!types.length) continue;
+    for (const t of types) recommendationStore.clearType(p.id, t);
+    recommendationStore.ensureBuilt(p)
+      .catch((err) => console.warn(`[glass] ${p.name}: Tier-2 config rebuild failed — ${err.message}`));
+  }
+}
+
 router.put('/settings', (req, res) => {
   try {
     const patch = {};
@@ -756,11 +774,22 @@ router.put('/settings', (req, res) => {
         .map((e) => e.id);
       patch.engines = validated;
     }
+    // GE-07: Glass Tier-2 admin config. Stored as-is (glass-schema-agnostic here;
+    // engines/glass/config validates on read). Detect a real change so an
+    // unrelated settings save doesn't needlessly rebuild every Glass profile.
+    let glassChanged = false;
+    if (req.body.glass && typeof req.body.glass === 'object') {
+      const before = JSON.stringify(settings.getSettings()?.glass || {});
+      patch.glass = req.body.glass;                    // replace-whole (settings.js)
+      glassChanged = JSON.stringify(req.body.glass) !== before;
+    }
     const updated = settings.updateSettings(patch);
     // Fan out AFTER the write is persisted, so isEnabled already reports the new
     // (disabled) state while the revert runs. resolveFor's disabled→Genesis
     // fallback is the belt-and-suspenders for the window before this finishes.
     if (disabledIds.length) revertDisabledEngines(disabledIds);
+    // Build-affecting Tier-2 change → clear + rebuild every Glass slice (GD-6).
+    if (glassChanged) rebuildGlassProfiles();
     res.json({ settings: updated, complete: settings.isComplete(updated) });
   } catch (err) {
     res.status(423).json({ error: err.message });

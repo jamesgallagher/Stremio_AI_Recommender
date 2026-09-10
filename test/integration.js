@@ -820,6 +820,30 @@ async function main() {
     }
   });
 
+  await it('R2. Glass Tier-2 config is build-affecting: a settings.glass reweight rebuilds a different pool ordering', async () => {
+    settings.updateSettings({ engines: { glass: true }, glass: {} });
+    stubTmdb();
+    const p = config.addProfile('INT-R2');
+    try {
+      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'glass', engine_series: 'glass' } });
+      seedGlassFixtures(p.id);
+      await rs.buildPool(config.getProfile(p.id), quiet);
+      const before = rs.getRecommended(p.id, { type: 'movie', limit: 100 }).map((x) => `${x.tmdb_id}:${x.affinity.toFixed(4)}`);
+      // Tier-2 reweight: crank exploration + momentum to the exclusion of taste, then
+      // rebuild the slice (the SC-03 clearType path a real admin change fans out).
+      settings.updateSettings({ glass: { weights: { taste_match: 0, quality: 0, trending_momentum: 0.5, popularity: 0, release_recency: 0, novelty: 0.2, exploration: 0.3 } } });
+      rs.clearType(p.id, 'movie');
+      await rs.buildPool(config.getProfile(p.id), quiet);
+      const after = rs.getRecommended(p.id, { type: 'movie', limit: 100 }).map((x) => `${x.tmdb_id}:${x.affinity.toFixed(4)}`);
+      assert.notDeepStrictEqual(after, before, 'a Tier-2 reweight changes the stored rankScore ordering/values');
+    } finally {
+      restoreTmdb();
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id); metaStore._clear();
+      settings.updateSettings({ engines: { glass: false }, glass: {} });
+      simklTrending.upsertList('movies', [], 0); simklTrending.upsertList('tv', [], 0); simklTrending.upsertList('anime', [], 0);
+    }
+  });
+
   await it('S. Glass conformance safety (I1): the shared age gate drops an over-band Glass title before serve (kids)', async () => {
     settings.updateSettings({ engines: { glass: true } });
     stubTmdb();

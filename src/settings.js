@@ -39,6 +39,14 @@ function blankSettings() {
     // seal path below skips it). settings.js stays registry-agnostic — validation
     // (drop unknown ids, force genesis:true) lives in the portal write path.
     engines: {},
+    // Glass Tier-2 global admin config (GE-07 / GD-6). The backend control panel
+    // for the Glass engine's tuning (half-lives, weights, per-strategy counts —
+    // see engines/glass/config.js DEFAULTS). Empty = pure Tier-1 defaults. Not a
+    // secret: plaintext like `engines`. BUILD-AFFECTING — a change here fans out
+    // clearType+rebuild across Glass profiles (portal write path). settings.js
+    // stays glass-schema-agnostic: it stores the blob as-is; engines/glass/config
+    // .resolveConfig merges it over the defaults and ignores unknown keys.
+    glass: {},
     created_at: null, // null until Server Config is first saved
   };
 }
@@ -48,7 +56,7 @@ function settingsLocked() { return locked; }
 
 // ---- sealing ----
 function sealSettings(s) {
-  const q = { llm: { ...s.llm }, keys: { ...s.keys }, engines: { ...(s.engines || {}) }, created_at: s.created_at };
+  const q = { llm: { ...s.llm }, keys: { ...s.keys }, engines: { ...(s.engines || {}) }, glass: { ...(s.glass || {}) }, created_at: s.created_at };
   for (const f of LLM_SECRET_FIELDS) if (q.llm[f]) q.llm[f] = secret.seal(q.llm[f]);
   for (const f of KEY_SECRET_FIELDS) if (q.keys[f]) q.keys[f] = secret.seal(q.keys[f]);
   return q;
@@ -71,6 +79,7 @@ function applyDefaults(s) {
     llm: { ...base.llm, ...(s.llm || {}) },
     keys: { ...base.keys, ...(s.keys || {}) },
     engines: { ...base.engines, ...(s.engines || {}) }, // seeds {} on older files (SC-07)
+    glass: { ...base.glass, ...(s.glass || {}) },        // seeds {} on older files (GE-07)
     created_at: s.created_at ?? null,
   };
   return merged;
@@ -107,6 +116,11 @@ function updateSettings(patch) {
   // SC-07: merge the engine-enablement map (already validated by the caller —
   // settings.js stores it as-is; enablement is resolved by engines.isEnabled).
   if (patch.engines) Object.assign(current.engines, patch.engines);
+  // GE-07: Glass Tier-2 config. REPLACE-whole (the admin control panel reads the
+  // current blob then writes it back in full); any section left out just reverts to
+  // its Tier-1 default, since engines/glass/config.resolveConfig backfills from
+  // DEFAULTS. Stored as-is (plaintext). `{}` is a true reset to pure defaults.
+  if (patch.glass !== undefined) current.glass = (patch.glass && typeof patch.glass === 'object') ? patch.glass : {};
   if (!current.created_at) current.created_at = Date.now();
   store.saveSettings(sealSettings(current));
   return current;

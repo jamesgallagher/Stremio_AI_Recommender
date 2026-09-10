@@ -606,6 +606,33 @@ ok('settings: roundtrip, migration seeds from "James", isComplete, llmChain', ()
   const raw = require('fs').readFileSync(require('path').join(process.env.DATA_DIR, 'settings.json'), 'utf8');
   assert.ok(!raw.includes('JAMES-GROQ')); // groq key sealed, not plaintext on disk
   assert.ok(!raw.includes('JAMES-TMDB'));
+
+  // GE-07: Glass Tier-2 config roundtrips as PLAINTEXT (not a secret), seeds {} on
+  // older files, REPLACES-whole (unmentioned sections revert to Tier-1 default via
+  // resolveConfig), and `{}` is a true reset.
+  assert.deepStrictEqual(s.glass, {});
+  settings.updateSettings({ glass: { weights: { taste_match: 0.6 } } });
+  assert.deepStrictEqual(settings.getSettings().glass, { weights: { taste_match: 0.6 } });
+  const raw2 = require('fs').readFileSync(require('path').join(process.env.DATA_DIR, 'settings.json'), 'utf8');
+  assert.ok(raw2.includes('taste_match')); // plaintext on disk (config metadata, not a secret)
+  settings.updateSettings({ glass: {} }); // true reset for other tests
+  assert.deepStrictEqual(settings.getSettings().glass, {});
+});
+
+ok('glass/config: GE-07 resolveConfig merges Tier-2 over Tier-1 by section, ignores unknown keys, clones', () => {
+  const { resolveConfig, DEFAULTS, ALGORITHM_VERSION } = require('../src/engines/glass/config');
+  const base = resolveConfig(null);
+  assert.strictEqual(base.weights.taste_match, DEFAULTS.weights.taste_match);
+  assert.strictEqual(ALGORITHM_VERSION, 'glass-a1');
+  // Tier-2 overrides only the named section keys; other sections stay default.
+  const over = resolveConfig({ glass: { weights: { taste_match: 0.6 }, resolve_cap: 150, bogus: 1 } });
+  assert.strictEqual(over.weights.taste_match, 0.6);
+  assert.strictEqual(over.weights.quality, DEFAULTS.weights.quality); // sibling key preserved
+  assert.strictEqual(over.resolve_cap, 150);
+  assert.ok(!('bogus' in over)); // unknown top-level key ignored
+  // Returned config is an independent clone (mutating it can't corrupt DEFAULTS).
+  over.weights.taste_match = 0.99;
+  assert.strictEqual(resolveConfig(null).weights.taste_match, DEFAULTS.weights.taste_match);
 });
 
 ok('simkl: parseWatchedItems maps the real all-items shape (verified fixtures)', () => {
@@ -760,6 +787,18 @@ ok('engines: registry lists Genesis, resolveFor/availableFor honour age gating (
   } finally { dispose(); settings.updateSettings({ engines: { 'open-stub': false } }); }
   // Registry restored to the built-in engines after the stub is disposed.
   assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['genesis', 'glass']);
+
+  // GE-07 conformance: Glass ships DISABLED (absent from dropdowns), and once
+  // enabled it is a GATED engine (unrestricted:false) — offered to an age-limited
+  // profile too (the shared age gate makes it safe), unlike an open engine.
+  assert.strictEqual(engines.isEnabled('glass'), false);
+  assert.ok(!engines.availableFor({ filters: {} }, 'movie').some((e) => e.id === 'glass'));
+  try {
+    settings.updateSettings({ engines: { glass: true } });
+    assert.ok(engines.availableFor({ filters: {} }, 'movie').some((e) => e.id === 'glass'));         // adult
+    assert.ok(engines.availableFor({ filters: { age_limit: 8 } }, 'series').some((e) => e.id === 'glass')); // kid: gated engine IS offered
+    assert.strictEqual(engines.resolveFor({ filters: { age_limit: 8, engine_series: 'glass' } }, 'series').id, 'glass');
+  } finally { settings.updateSettings({ engines: { glass: false } }); }
 });
 
 ok('recommendationStore: purgeBelowVoteFloor drops stored rows under the profile vote floor (movies vs series ⅕)', () => {
