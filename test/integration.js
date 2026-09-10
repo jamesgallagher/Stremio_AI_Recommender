@@ -679,6 +679,27 @@ async function main() {
     assert.strictEqual(simklTrending.getList('movies', { maxAgeMs: 10, now: 1_000_000 + 25 * 3600e3 + 50 }).length, 0);
   });
 
+  // ── P. Glass GE-03: the deep-metadata store enriches once, then serves cache ──
+  await it('P. GE-03 metaStore.enrich fetches once, caches permanently, does not cache a failed fetch', async () => {
+    const metaStore = require('../src/engines/glass/metaStore');
+    metaStore._clear();
+    let calls = 0;
+    const fetcher = async (_k, type, tmdbId) => { calls++; return { tmdb_id: String(tmdbId), imdb_id: 'tt' + tmdbId, type, director: ['D'], keywords: ['k'] }; };
+    const a = await metaStore.enrich('k', 'movie', 500, quiet, { fetcher });
+    assert.strictEqual(a.imdb_id, 'tt500');
+    assert.strictEqual(calls, 1);
+    const b = await metaStore.enrich('k', 'movie', 500, quiet, { fetcher });   // cache hit → no call
+    assert.strictEqual(calls, 1);
+    assert.strictEqual(b.director[0], 'D');
+    // A null fetch (TMDB failure) is NOT cached — it retries next time.
+    const nullFetch = async () => { calls++; return null; };
+    assert.strictEqual(await metaStore.enrich('k', 'movie', 501, quiet, { fetcher: nullFetch }), null);
+    assert.strictEqual(metaStore.has('movie', 501), false);
+    assert.strictEqual(await metaStore.enrich('k', 'movie', 501, quiet, { fetcher: nullFetch }), null);
+    assert.strictEqual(calls, 3, 'a failed enrich retries rather than caching the miss');
+    metaStore._clear();
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();

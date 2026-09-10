@@ -841,6 +841,61 @@ ok('simklTrending: GE-02 parseCombined splits movies/tv/anime; tv falls back to 
   assert.deepStrictEqual(out.anime.map((x) => x.tmdb_id), ['3']);
 });
 
+ok('tmdb: GE-03 normalizeDeepMeta — movie director+collection, series showrunner+networks, keyword-key asymmetry', () => {
+  const movie = tmdb.normalizeDeepMeta({
+    title: 'Inception', release_date: '2010-07-16', runtime: 148, original_language: 'en',
+    genres: [{ id: 28, name: 'Action' }, { id: 878, name: 'Science Fiction' }],
+    vote_average: 8.4, vote_count: 34000, popularity: 90,
+    credits: { crew: [{ job: 'Director', name: 'Christopher Nolan' }, { job: 'Writer', name: 'x' }], cast: [{ name: 'Leonardo DiCaprio' }, { name: 'Joseph Gordon-Levitt' }, { name: 'Elliot Page' }, { name: 'Tom Hardy' }] },
+    keywords: { keywords: [{ name: 'dream' }, { name: 'heist' }] },
+    external_ids: { imdb_id: 'tt1375666' },
+    belongs_to_collection: null,
+  }, 'movie', 27205);
+  assert.strictEqual(movie.tmdb_id, '27205');
+  assert.strictEqual(movie.imdb_id, 'tt1375666');
+  assert.strictEqual(movie.year, 2010);
+  assert.strictEqual(movie.decade, 2010);
+  assert.deepStrictEqual(movie.director, ['Christopher Nolan']);   // Director crew only
+  assert.deepStrictEqual(movie.cast, ['Leonardo DiCaprio', 'Joseph Gordon-Levitt', 'Elliot Page']); // top-3
+  assert.deepStrictEqual(movie.keywords, ['dream', 'heist']);      // movie: keywords.keywords
+  assert.strictEqual(movie.primary_genre, 'Action');
+  assert.strictEqual(movie.runtime, 148);
+
+  const withColl = tmdb.normalizeDeepMeta({ title: 'X', release_date: '2003-07-09', genres: [], belongs_to_collection: { id: 295, name: 'Pirates Collection' }, external_ids: {} }, 'movie', 22);
+  assert.deepStrictEqual(withColl.collection, { id: 295, name: 'Pirates Collection' });
+
+  const series = tmdb.normalizeDeepMeta({
+    name: 'Breaking Bad', first_air_date: '2008-01-20', episode_run_time: [47], genres: [{ id: 18, name: 'Drama' }],
+    created_by: [{ name: 'Vince Gilligan' }], networks: [{ name: 'AMC' }],
+    credits: { cast: [{ name: 'Bryan Cranston' }, { name: 'Aaron Paul' }] },
+    keywords: { results: [{ name: 'drugs' }] },   // tv: keywords.results
+    external_ids: { imdb_id: 'tt0903747' },
+  }, 'series', 1396);
+  assert.deepStrictEqual(series.director, ['Vince Gilligan']);     // showrunner proxy
+  assert.deepStrictEqual(series.networks, ['AMC']);                // franchise proxy
+  assert.deepStrictEqual(series.keywords, ['drugs']);
+  assert.strictEqual(series.collection, null);                     // movie-only
+  assert.strictEqual(series.runtime, 47);
+  assert.strictEqual(tmdb.normalizeDeepMeta(null, 'movie', 1), null);
+});
+
+ok('glass/metaStore: GE-03 put/get/getMany round-trip + imdb index', () => {
+  const metaStore = require('../src/engines/glass/metaStore');
+  metaStore._clear();
+  metaStore.put('movie', 27205, { tmdb_id: '27205', imdb_id: 'tt1375666', director: ['Nolan'], keywords: ['dream'] });
+  metaStore.put('movie', 22, { tmdb_id: '22', imdb_id: 'tt0325980', collection: { id: 295, name: 'Pirates' } });
+  const got = metaStore.get('movie', 27205);
+  assert.strictEqual(got.imdb_id, 'tt1375666');
+  assert.deepStrictEqual(got.director, ['Nolan']);
+  assert.strictEqual(metaStore.get('movie', 999), null);
+  assert.strictEqual(metaStore.has('movie', 22), true);
+  const many = metaStore.getMany('movie', [27205, 22, 999]);
+  assert.strictEqual(many.size, 2);
+  assert.strictEqual(many.get('27205').imdb_id, 'tt1375666');
+  metaStore._clear();
+  assert.strictEqual(metaStore.count(), 0);
+});
+
 ok('recommendationStore: selectServe applies rating/genre/recency at serve time', () => {
   const rs = require('../src/recommendationStore');
   const mk = (o) => ({ imdb_id: 'tt' + o.id, tmdb_id: o.id, type: o.type || 'movie', title: o.id, year: o.year || 2024, primary_genre: o.g, genres: o.genres || o.g, vote_average: o.va ?? 8, imdb_rating: o.imdb, age_classification: o.age || null, affinity: o.aff ?? 1 });

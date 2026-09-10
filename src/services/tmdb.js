@@ -330,6 +330,78 @@ async function getRecommendations(apiKey, type, tmdbId, { page = 1 } = {}) {
   }));
 }
 
+// ---- Glass deep metadata (GE-03) ----
+// The taste-dimension enrichment the Glass engine scores intersects on
+// (director / franchise / lead cast / keywords / decade), plus the imdb_id +
+// poster + genres the pipeline would otherwise resolve. The KEY FINDING (design
+// §5.5): the pipeline already pays one call per candidate — imdbFor →
+// /external_ids — that returns ONLY the imdb id and discards the rest. Upgrading
+// it to `append_to_response=credits,keywords,external_ids` (TMDB counts append as
+// ONE request) returns imdb_id PLUS credits+keywords+collection+genres+poster in
+// the same round-trip. Glass makes THIS call inside generate() and returns the
+// candidate preResolved, so the pipeline SKIPS its own imdbFor — candidate-side
+// cost stays ≈ Genesis's today. Movie/series asymmetry: `belongs_to_collection`
+// (franchise) is movie-only; a series proxies "franchise" via created_by
+// (showrunner) + networks.
+
+// PURE: normalize a TMDB append_to_response payload into Glass's taste-dimension
+// shape. Exported for tests. `null` imdb_id is allowed here (the caller decides
+// whether a tt-less candidate is droppable); everything else degrades to
+// empty/absent rather than throwing on a partial payload.
+function normalizeDeepMeta(data, type, tmdbId) {
+  if (!data || typeof data !== 'object') return null;
+  const isMovie = type === 'movie';
+  const date = isMovie ? data.release_date : data.first_air_date;
+  const year = date ? parseInt(String(date).slice(0, 4), 10) || null : null;
+  const genres = (data.genres || []).map((g) => g.name).filter(Boolean);
+  // Keywords live under different keys for movie vs tv.
+  const kwList = isMovie ? data.keywords?.keywords : data.keywords?.results;
+  const keywords = (kwList || []).map((k) => k.name).filter(Boolean);
+  // Director: a film's credited Director(s); a series' showrunner(s) (created_by).
+  const director = isMovie ? crewNames(data.credits?.crew, 'Director') : peopleNames(data.created_by, 3);
+  return {
+    tmdb_id: String(tmdbId),
+    imdb_id: data.external_ids?.imdb_id || null,
+    type,
+    title: isMovie ? data.title : data.name,
+    year,
+    decade: year ? Math.floor(year / 10) * 10 : null,
+    poster: data.poster_path ? `${IMG}/w500${data.poster_path}` : null,
+    genres,                                  // names
+    primary_genre: genres[0] || null,
+    vote_average: data.vote_average || 0,
+    vote_count: data.vote_count || 0,
+    popularity: data.popularity || 0,
+    original_language: data.original_language || null,
+    runtime: isMovie ? (data.runtime || null) : (data.episode_run_time?.[0] || null),
+    director,                                // [names]
+    cast: peopleNames(data.credits?.cast, 3), // top-3 leads
+    keywords,                                // [names]
+    // Franchise: movie = collection; series proxy = networks (created_by already
+    // folded into `director` as the showrunner intersect).
+    collection: isMovie && data.belongs_to_collection
+      ? { id: data.belongs_to_collection.id, name: data.belongs_to_collection.name } : null,
+    networks: isMovie ? [] : peopleNames(data.networks, 5),
+  };
+}
+
+// Fetch + normalize the deep metadata for one tmdb id in a single append call.
+// Governor-paced like every TMDB call. Returns the normalized object, or null on
+// failure (the caller treats a null as "enrich later", never a crash).
+async function deepMeta(apiKey, type, tmdbId, log = console) {
+  try {
+    const base = type === 'series' ? `tv/${tmdbId}` : `movie/${tmdbId}`;
+    const data = await get(apiKey, base, {
+      language: 'en-US',
+      append_to_response: 'credits,keywords,external_ids',
+    });
+    return normalizeDeepMeta(data, type, tmdbId);
+  } catch (err) {
+    log.warn(`[tmdb] deepMeta ${type}/${tmdbId} failed: ${err.message}`);
+    return null;
+  }
+}
+
 // tmdb id -> imdb tt id, via the LIGHTEST possible call (external_ids only, no
 // images/credits). Used to make stored recommendation-pool candidates servable
 // to Stremio, which needs tt ids. Returns null when TMDB has no imdb id (those
@@ -408,6 +480,8 @@ module.exports = {
   genreAndCert,
   pickCertification,
   getRecommendations,
+  deepMeta,
+  normalizeDeepMeta,
   imdbFor,
   posterUrl,
   getGenreMap,
