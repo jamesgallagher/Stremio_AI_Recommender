@@ -700,6 +700,42 @@ async function main() {
     metaStore._clear();
   });
 
+  // ── Q. Glass GE-04: watched-history enrichment — paced, capped, cached once ──
+  await it('Q. GE-04 enrichWatchedBatch fills the Glass meta store, honours the cap, and is idempotent', async () => {
+    const metaStore = require('../src/engines/glass/metaStore');
+    const we = require('../src/engines/glass/watchedEnrichment');
+    metaStore._clear();
+    const p = config.addProfile('INT-Q');
+    try {
+      // Seed 5 watched movies (newest first via watched_at).
+      const items = [];
+      for (let i = 1; i <= 5; i++) items.push({ type: 'movie', simkl_id: 900 + i, imdb_id: `ttq${i}`, tmdb_id: String(1000 + i), title: `Q${i}`, year: 2020, watched_at: `2026-09-0${i}T00:00:00Z` });
+      watchedStore.upsertMany(p.id, items);
+      let calls = 0;
+      const fetcher = async (_k, type, tmdbId) => { calls++; return { tmdb_id: String(tmdbId), imdb_id: 'tt' + tmdbId, type, director: ['D' + tmdbId], keywords: ['k'] }; };
+      // Cap 3 → only 3 of 5 enriched this run; 2 remain.
+      const r1 = await we.enrichWatchedBatch(p.id, 'movie', 'tmdbkey', { cap: 3, fetcher, log: quiet });
+      assert.strictEqual(r1.enriched, 3);
+      assert.strictEqual(r1.remaining, 2);
+      assert.strictEqual(r1.total, 5);
+      assert.strictEqual(calls, 3);
+      assert.strictEqual(metaStore.count(), 3);
+      // Newest-first: tmdb 1005 (watched 09-05) enriched before 1001.
+      assert.ok(metaStore.has('movie', 1005));
+      // Second run finishes the rest; the first 3 are cache hits (no re-fetch).
+      calls = 0;
+      const r2 = await we.enrichWatchedBatch(p.id, 'movie', 'tmdbkey', { cap: 10, fetcher, log: quiet });
+      assert.strictEqual(r2.enriched, 2);
+      assert.strictEqual(r2.remaining, 0);
+      assert.strictEqual(calls, 2, 'only the 2 uncached titles are fetched');
+      assert.strictEqual(metaStore.count(), 5);
+      // No TMDB key → skipped, no calls.
+      assert.strictEqual((await we.enrichWatchedBatch(p.id, 'movie', '', { fetcher, log: quiet })).skipped, 'no TMDB key');
+    } finally {
+      config.removeProfile(p.id); watchedStore.deleteForProfile(p.id); metaStore._clear();
+    }
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();
