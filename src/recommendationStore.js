@@ -84,6 +84,9 @@ function init() {
       affinity    REAL,                   -- recency-weighted score (primary rank)
       rec_count   INTEGER,                -- raw # of watched titles that recommended it
       because_title TEXT,                 -- strongest-contributing watched title (debug "why")
+      score_components TEXT,              -- GE-01: JSON per-feature breakdown behind rankScore (engine-agnostic; null when an engine doesn't emit it)
+      algorithm_version TEXT,             -- GE-01: the scoring version that produced score_components/affinity, so a stored row stays interpretable across weight changes
+      engine_id   TEXT,                   -- GE-01: which engine produced this row (stamped by the shared pipeline)
       popularity  REAL,
       poster      TEXT,
       first_shown_at INTEGER,             -- first-ever impression (informational)
@@ -114,7 +117,9 @@ function init() {
   // Migrate older beta DBs that predate the serve-time-filter columns. ADD COLUMN
   // throws "duplicate column" once present, so each is best-effort.
   for (const [col, decl] of [['genres', 'TEXT'], ['vote_average', 'REAL'], ['imdb_rating', 'REAL'], ['imdb_rating_at', 'INTEGER'], ['vote_count', 'INTEGER'], ['because_title', 'TEXT'],
-    ['streak_started_at', 'INTEGER'], ['times_shown_in_streak', 'INTEGER DEFAULT 0'], ['last_shown_at', 'INTEGER']]) {
+    ['streak_started_at', 'INTEGER'], ['times_shown_in_streak', 'INTEGER DEFAULT 0'], ['last_shown_at', 'INTEGER'],
+    // GE-01: score-components store (engine-agnostic). Best-effort on older DBs.
+    ['score_components', 'TEXT'], ['algorithm_version', 'TEXT'], ['engine_id', 'TEXT']]) {
     try { db.get().exec(`ALTER TABLE recommended ADD COLUMN ${col} ${decl}`); } catch { /* already present */ }
   }
   // MW-03: persist the imdb id alongside the tmdb-keyed suppression row so a
@@ -219,20 +224,25 @@ function upsertCandidates(profileId, candidates, { ratingCheckedAt = null } = {}
   init();
   const conn = db.get();
   const stmt = conn.prepare(`
-    INSERT INTO recommended (profile_id, type, tmdb_id, imdb_id, title, year, primary_genre, genres, vote_average, imdb_rating, imdb_rating_at, vote_count, affinity, rec_count, because_title, popularity, poster, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO recommended (profile_id, type, tmdb_id, imdb_id, title, year, primary_genre, genres, vote_average, imdb_rating, imdb_rating_at, vote_count, affinity, rec_count, because_title, score_components, algorithm_version, engine_id, popularity, poster, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(profile_id, type, tmdb_id) DO UPDATE SET
       affinity = excluded.affinity, rec_count = excluded.rec_count, popularity = excluded.popularity,
       primary_genre = excluded.primary_genre, genres = excluded.genres, vote_average = excluded.vote_average,
       imdb_rating = COALESCE(excluded.imdb_rating, recommended.imdb_rating),
       imdb_rating_at = COALESCE(excluded.imdb_rating_at, recommended.imdb_rating_at), vote_count = excluded.vote_count,
-      because_title = excluded.because_title, title = excluded.title, year = excluded.year, poster = excluded.poster
+      because_title = excluded.because_title, title = excluded.title, year = excluded.year, poster = excluded.poster,
+      score_components = excluded.score_components, algorithm_version = excluded.algorithm_version, engine_id = excluded.engine_id
   `);
   conn.prepare('BEGIN').run();
   try {
     const now = Date.now();
     for (const c of candidates) {
-      stmt.run(profileId, c.type, c.tmdb_id, c.imdb_id || null, c.title, c.year, c.primary_genre || null, c.genres || null, c.vote_average ?? null, c.imdb_rating ?? null, ratingCheckedAt, c.vote_count ?? null, c.affinity, c.rec_count, c.because_title || null, c.popularity, c.poster || null, now);
+      // GE-01: score_components accepts an object (stored as JSON) or a pre-stringified
+      // string; null when the engine doesn't emit it (e.g. Genesis today).
+      const comps = c.score_components == null ? null
+        : (typeof c.score_components === 'string' ? c.score_components : JSON.stringify(c.score_components));
+      stmt.run(profileId, c.type, c.tmdb_id, c.imdb_id || null, c.title, c.year, c.primary_genre || null, c.genres || null, c.vote_average ?? null, c.imdb_rating ?? null, ratingCheckedAt, c.vote_count ?? null, c.affinity, c.rec_count, c.because_title || null, comps, c.algorithm_version || null, c.engine_id || null, c.popularity, c.poster || null, now);
     }
     conn.prepare('COMMIT').run();
   } catch (err) { conn.prepare('ROLLBACK').run(); throw err; }

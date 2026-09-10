@@ -774,6 +774,33 @@ ok('recommendationStore: purgeBelowVoteFloor drops stored rows under the profile
   assert.strictEqual(rs.purgeBelowVoteFloor(pid, { vote_count_floor: 0 }), 0);
 });
 
+ok('recommendationStore: GE-01 persists score_components (JSON) + algorithm_version + engine_id, engine-agnostic', () => {
+  const rs = require('../src/recommendationStore');
+  const pid = 'ge01-store';
+  rs.upsertCandidates(pid, [
+    // An engine that emits the components store (object → JSON) + version + id.
+    { type: 'movie', tmdb_id: 'gc1', imdb_id: 'ttgc1', title: 'X', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, affinity: 5, rec_count: 1, popularity: 1, poster: null,
+      score_components: { taste_match: 0.8, quality: 0.6 }, algorithm_version: 'glass-1', engine_id: 'glass' },
+    // A legacy engine that emits none of it → all three stay null (no crash).
+    { type: 'movie', tmdb_id: 'gc2', imdb_id: 'ttgc2', title: 'Y', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 7, vote_count: 4000, affinity: 4, rec_count: 1, popularity: 1, poster: null },
+  ]);
+  const rows = rs.getRecommended(pid, { type: 'movie', limit: 10 });
+  const a = rows.find((r) => r.tmdb_id === 'gc1');
+  const b = rows.find((r) => r.tmdb_id === 'gc2');
+  assert.deepStrictEqual(JSON.parse(a.score_components), { taste_match: 0.8, quality: 0.6 });
+  assert.strictEqual(a.algorithm_version, 'glass-1');
+  assert.strictEqual(a.engine_id, 'glass');
+  assert.strictEqual(b.score_components, null);
+  assert.strictEqual(b.algorithm_version, null);
+  assert.strictEqual(b.engine_id, null);
+  // A pre-stringified components value is stored verbatim (not double-encoded).
+  rs.upsertCandidates(pid, [{ type: 'movie', tmdb_id: 'gc1', imdb_id: 'ttgc1', title: 'X', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, affinity: 5, rec_count: 1, popularity: 1, poster: null, score_components: '{"popularity":0.3}', algorithm_version: 'glass-2', engine_id: 'glass' }]);
+  const a2 = rs.getRecommended(pid, { type: 'movie', limit: 10 }).find((r) => r.tmdb_id === 'gc1');
+  assert.deepStrictEqual(JSON.parse(a2.score_components), { popularity: 0.3 });
+  assert.strictEqual(a2.algorithm_version, 'glass-2');
+  rs.deleteForProfile(pid);
+});
+
 ok('recommendationStore: selectServe applies rating/genre/recency at serve time', () => {
   const rs = require('../src/recommendationStore');
   const mk = (o) => ({ imdb_id: 'tt' + o.id, tmdb_id: o.id, type: o.type || 'movie', title: o.id, year: o.year || 2024, primary_genre: o.g, genres: o.genres || o.g, vote_average: o.va ?? 8, imdb_rating: o.imdb, age_classification: o.age || null, affinity: o.aff ?? 1 });

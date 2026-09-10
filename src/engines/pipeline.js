@@ -32,6 +32,11 @@ function normalize(c) {
   c.affinity = c.rankScore ?? c.affinity ?? 0;
   c.because_title = c.reason ?? c.because_title ?? null;
   c.rec_count = c.recCount ?? c.rec_count ?? null;
+  // GE-01: score-components store (engine-agnostic). Accept either the contract
+  // camelCase (scoreComponents/algorithmVersion — what a conformant engine emits)
+  // or the internal snake_case; upsertCandidates JSON-stringifies an object.
+  c.score_components = c.scoreComponents ?? c.score_components ?? null;
+  c.algorithm_version = c.algorithmVersion ?? c.algorithm_version ?? null;
   return c;
 }
 
@@ -116,6 +121,11 @@ async function runEngineBuild(profile, type, engine, ctx, onProgress = () => {})
     } catch (err) { log.warn(`[rec] IMDb-rating enrichment (${type}) failed: ${err.message}`); }
   }
   onProgress(95, `Storing ${servable.length} ${type} recommendation(s)…`);
+
+  // GE-01: stamp the producing engine on every row (the store persists it beside
+  // the score_components/algorithm_version the engine emitted). Engine-agnostic:
+  // an engine that emits no components still gets an accurate engine_id.
+  for (const c of servable) c.engine_id = engine.id;
 
   // 5. Upsert (I4). Stamp imdb_rating_at only when a key was present, so the heal
   //    pass re-checks these rows later once a key is configured.
