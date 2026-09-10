@@ -872,6 +872,79 @@ async function main() {
     }
   });
 
+  // ── T. Glass GE-08: LLM rerank reorders + explains; degrades to deterministic ─
+  await it('T. GE-08 rerank reorders the head, writes reasons, keeps the score band, and degrades on every failure', async () => {
+    const rerank = require('../src/engines/glass/rerank');
+    const cfg = require('../src/engines/glass/config').resolveConfig(null);
+    const taste = { dims: { genres: { Drama: 1 }, directors: {}, franchises: {}, keywords: {}, decades: {} } };
+    const mk = (id, score) => ({ tmdb_id: id, title: `T${id}`, year: 2024, genres: 'Drama', rankScore: score, reason: `det ${id}`, sources: ['recommendations'], score_components: { features: {}, matched: {} } });
+    const scored = [mk('1', 0.9), mk('2', 0.8), mk('3', 0.7), mk('4', 0.6)];
+    const chain = [{ type: 'custom', name: 'q', uri: 'http://x' }];
+
+    // The model reverses the top-3 (cap kept default; here all 4 are head) and gives reasons.
+    const chat = async () => ([{ id: '3', reason: 'freshest pick' }, { id: '1', reason: 'core taste' }, { id: '2' }, { id: '4', reason: 'x' }]);
+    const out = await rerank.rerankCandidates('movie', scored.map((c) => ({ ...c, score_components: { ...c.score_components } })), taste, cfg, { chain, chat, log: quiet });
+    assert.deepStrictEqual(out.map((c) => c.tmdb_id), ['3', '1', '2', '4']);          // model order
+    assert.deepStrictEqual(out.map((c) => c.rankScore), [0.9, 0.8, 0.7, 0.6]);        // original band re-stamped desc
+    assert.strictEqual(out[0].reason, 'freshest pick');                              // → because_title
+    assert.strictEqual(out[0].score_components.rerank.by, 'llm');
+    assert.strictEqual(out[2].reason, 'det 2');                                       // no reason from model → deterministic kept
+
+    // Unknown/duplicate ids are ignored (can't invent); dropped head items appended in order.
+    const partial = async () => ([{ id: '999' }, { id: '2', reason: 'ok' }, { id: '2' }]);
+    const out2 = await rerank.rerankCandidates('movie', scored.map((c) => ({ ...c })), taste, cfg, { chain, chat: partial, log: quiet });
+    assert.deepStrictEqual(out2.map((c) => c.tmdb_id), ['2', '1', '3', '4']);         // 2 first, rest original order
+    assert.deepStrictEqual(out2.map((c) => c.rankScore), [0.9, 0.8, 0.7, 0.6]);
+
+    // Degrade paths → the deterministic input is returned UNCHANGED, never throws.
+    const same = (arr) => arr.map((c) => c.tmdb_id);
+    assert.deepStrictEqual(same(await rerank.rerankCandidates('movie', scored, taste, cfg, { chain: [], chat, log: quiet })), ['1', '2', '3', '4']); // no local endpoint
+    assert.deepStrictEqual(same(await rerank.rerankCandidates('movie', scored, taste, cfg, { chain, chat: async () => { throw new Error('timeout'); }, log: quiet })), ['1', '2', '3', '4']);
+    assert.deepStrictEqual(same(await rerank.rerankCandidates('movie', scored, taste, cfg, { chain, chat: async () => [], log: quiet })), ['1', '2', '3', '4']); // empty reply
+    assert.deepStrictEqual(same(await rerank.rerankCandidates('movie', scored, taste, cfg, { chain, chat: async () => [{ id: 'nope' }], log: quiet })), ['1', '2', '3', '4']); // all-unknown
+    // enabled:false disables it even with a local endpoint.
+    const offCfg = require('../src/engines/glass/config').resolveConfig({ glass: { rerank: { enabled: false } } });
+    assert.deepStrictEqual(same(await rerank.rerankCandidates('movie', scored, taste, offCfg, { chain, chat, log: quiet })), ['1', '2', '3', '4']);
+  });
+
+  // ── U. Glass GE-08 through the engine: local-only chain, reasons reach the pool ─
+  await it('U. Glass engine invokes the rerank with a LOCAL-ONLY chain; reasons land in because_title', async () => {
+    const metaStore = require('../src/engines/glass/metaStore');
+    const glass = require('../src/engines/glass');
+    const pipeline = require('../src/engines/pipeline');
+    settings.updateSettings({ engines: { glass: true } });
+    stubTmdb();
+    const p = config.addProfile('INT-U');
+    try {
+      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'glass', engine_series: 'glass' } });
+      seedGlassFixtures(p.id);
+      let sawChain = null;
+      const glassChat = async (chain) => { sawChain = chain; return [{ id: '402', reason: 'a bold, trending choice' }, { id: '301', reason: 'matches your Nolan streak' }]; };
+      // Drive the shared pipeline directly so we can inject ctx (build path passes none).
+      const ctx = {
+        tmdbKey: 'itest-tmdb', mdblistKey: '', log: quiet, filters: config.getProfile(p.id).filters,
+        settings: { llm: { custom_uri: 'http://local', custom_name: 'qwen', groq_api_key: 'GROQKEY' } }, // both configured…
+        glassChat, glassRecsFetcher: async (_k, type) => (type === 'movie'
+          ? [{ type, tmdb_id: '301', title: 'Rec A', year: 2024, genre_ids: [18], vote_average: 8, vote_count: 5000, popularity: 30, adult: false, poster: null }] : []),
+      };
+      await pipeline.runEngineBuild(config.getProfile(p.id), 'movie', glass, ctx, () => {});
+      // …yet the rerank chain is LOCAL-ONLY (no Groq spill).
+      assert.ok(Array.isArray(sawChain) && sawChain.length === 1 && sawChain[0].type === 'custom', 'rerank used only the local provider');
+      const rows = rs.getRecommended(p.id, { type: 'movie', limit: 100 });
+      const r402 = rows.find((x) => x.tmdb_id === '402');
+      const r301 = rows.find((x) => x.tmdb_id === '301');
+      assert.ok(r402 && r402.because_title === 'a bold, trending choice', 'LLM reason persisted to because_title (§39)');
+      assert.ok(r301 && r301.because_title === 'matches your Nolan streak');
+      assert.ok(r402.affinity >= r301.affinity, 'the model put 402 first → it holds the top score slot');
+      assert.strictEqual(JSON.parse(r402.score_components).rerank.by, 'llm');
+    } finally {
+      restoreTmdb();
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id); metaStore._clear();
+      settings.updateSettings({ engines: { glass: false } });
+      simklTrending.upsertList('movies', [], 0); simklTrending.upsertList('tv', [], 0); simklTrending.upsertList('anime', [], 0);
+    }
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();

@@ -27,7 +27,9 @@ const glassConfig = require('./glass/config');
 const tasteModel = require('./glass/tasteModel');
 const candidates = require('./glass/candidates');
 const scoring = require('./glass/scoring');
+const rerank = require('./glass/rerank');
 const watchedEnrichment = require('./glass/watchedEnrichment');
+const llm = require('../services/llm');
 
 // The trending items for one engine type: movie ← movies; series ← tv ∪ anime
 // (mirrors simkl.js's shows+anime merge; anime keeps its own age band downstream).
@@ -73,11 +75,21 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
   // 5. Enrich + weighted score → rankScore + score_components (GE-06). Returns
   //    preResolved candidates (≤ resolve_cap), rankScore-sorted.
   const scored = await scoring.scoreAll(profile, type, cands, taste, cfg, ctx, {
-    log, onProgress: (p, l) => onProgress(45 + (p / 100) * 55, l),
+    log, onProgress: (p, l) => onProgress(45 + (p / 100) * 45, l),
   });
   if (ctx.stats) ctx.stats.kept = scored.length;
-  onProgress(100, `Glass: ${scored.length} ${type} candidate(s)`);
-  return scored;
+
+  // 6. LLM semantic rerank + "because…" reasons (Phase B / GE-08). PREFER-LOCAL:
+  //    only the custom/local provider is used — never Groq (no rerank spill onto
+  //    cloud quota). Degrades to the deterministic order on any failure/absence.
+  //    Test seam: ctx.glassChat injects the chat fn (defaults to llm.chat).
+  const localChain = settings.llmChain(ctx.settings).filter((p) => p.type === 'custom');
+  const finalCands = await rerank.rerankCandidates(type, scored, taste, cfg, {
+    chain: localChain, chat: ctx.glassChat || llm.chat, log,
+    onProgress: (p, l) => onProgress(90 + (p / 100) * 10, l),
+  });
+  onProgress(100, `Glass: ${finalCands.length} ${type} candidate(s)`);
+  return finalCands;
 }
 
 // User-facing copy (GD-8, frozen slug; copy iterable). Shown verbatim in the

@@ -71,6 +71,15 @@ const DEFAULTS = {
 
   // ── Output (§4.7, GI-1) ──
   resolve_cap: 300,             // ≤ this many candidates are enriched + returned (≈ STORE_CAP; the resolve budget)
+
+  // ── LLM semantic rerank (Phase B / GE-08, design §4.4) ──
+  // The free LOCAL LLM reorders the strongest slice + writes "because…" reasons.
+  // Optional + degrades to the deterministic order (prefer-local; never spills to
+  // Groq). `enabled:false` turns it off even when a local endpoint exists.
+  rerank: {
+    enabled: true,
+    candidate_cap: 120,         // top-N sent to the LLM (design says ≈100–300, never thousands)
+  },
 };
 
 // Resolve the EFFECTIVE Glass config for a build: Tier-1 defaults with a Tier-2

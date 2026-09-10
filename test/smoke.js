@@ -1033,6 +1033,21 @@ ok('glass/scoring: GE-06 features 0–1, weighted rankScore, preResolved fields,
   assert.ok(fresh > heavy);
 });
 
+ok('glass/rerank: GE-08 taste summary (names only), match hint, prompt shape', () => {
+  const rr = require('../src/engines/glass/rerank');
+  const taste = { dims: { genres: { Drama: 1, Action: 0.4 }, directors: { Nolan: 1 }, franchises: { 'c:9': 1, 'n:HBO': 0.8 }, keywords: { heist: 1 }, decades: { 2010: 1 } } };
+  const s = rr.tasteSummary(taste);
+  assert.deepStrictEqual(s.genres, ['Drama', 'Action']);
+  assert.deepStrictEqual(s.directors, ['Nolan']);
+  assert.deepStrictEqual(s.franchises, ['HBO']);   // collection-id key `c:9` excluded (not human-readable)
+  // match hint from stored intersects.
+  const hint = rr.matchHint({ score_components: { matched: { director: ['Nolan'], franchise: ['Pirates'] } }, sources: ['exploration'] });
+  assert.ok(hint.includes('director Nolan') && hint.includes('franchise Pirates') && hint.includes('fresh direction'));
+  // prompt carries the ids + is JSON-only instruction.
+  const prompt = rr.buildUserPrompt('movie', s, [{ id: '1', title: 'Heat', year: 1995, genres: ['Crime'], why: 'director Mann' }]);
+  assert.ok(prompt.includes('1: "Heat" (1995)') && /JSON array/i.test(prompt) && /each exactly once/i.test(prompt));
+});
+
 ok('recommendationStore: selectServe applies rating/genre/recency at serve time', () => {
   const rs = require('../src/recommendationStore');
   const mk = (o) => ({ imdb_id: 'tt' + o.id, tmdb_id: o.id, type: o.type || 'movie', title: o.id, year: o.year || 2024, primary_genre: o.g, genres: o.genres || o.g, vote_average: o.va ?? 8, imdb_rating: o.imdb, age_classification: o.age || null, affinity: o.aff ?? 1 });
