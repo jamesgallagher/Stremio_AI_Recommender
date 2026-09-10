@@ -98,11 +98,17 @@ async function rerankCandidates(type, scored, taste, cfg, { chain, chat = llm.ch
   // Background call → its own generous timeout (env override wins), NOT the tight
   // request-path Custom default the age gate shares.
   const timeoutMs = Number(process.env.GLASS_RERANK_TIMEOUT_MS) || rc.timeout_ms || 120000;
+  const userPrompt = buildUserPrompt(type, tasteSummary(taste), items);
+  // GLASS_DEBUG_PROMPT=1 → dump the EXACT prompt to the log, so it can be hand-run
+  // against the local model to measure latency (ships in the image; no test/ file).
+  if (process.env.GLASS_DEBUG_PROMPT) {
+    log.log(`[glass] rerank prompt (${type}, ${items.length} candidates, ~${Math.round((SYSTEM.length + userPrompt.length) / 4)} input tokens):\n===== SYSTEM =====\n${SYSTEM}\n===== USER =====\n${userPrompt}\n===== END =====`);
+  }
   onProgress(10, `Glass: LLM re-ranking ${items.length} ${type} candidate(s) (timeout ${Math.round(timeoutMs / 1000)}s)…`);
   const startedAt = Date.now();
   let ordered;
   try {
-    ordered = await chat(chain, [{ role: 'user', content: buildUserPrompt(type, tasteSummary(taste), items) }],
+    ordered = await chat(chain, [{ role: 'user', content: userPrompt }],
       { temperature: 0, system: SYSTEM, validate: llm.extractArray, timeoutMs }, log);
   } catch (err) {
     log.warn(`[glass] LLM rerank (${type}) skipped after ${Math.round((Date.now() - startedAt) / 1000)}s — ${err.message}; keeping deterministic order`);
