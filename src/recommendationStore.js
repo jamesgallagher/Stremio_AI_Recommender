@@ -181,6 +181,16 @@ function dontRecommendImdbSet(profileId, nowMs = Date.now()) {
   return out;
 }
 
+// GE-10: raw dont_recommend rows (type/tmdb_id/reason/at) for one type, for the
+// Glass feedback event list (a rejected title's dims steer taste AWAY). Unlike
+// dontRecommendKeys (a serve/build exclusion Set that drops decayed rows past
+// cooldown), this returns EVERY row — the taste model recency-decays each by `at`,
+// so an old rejection fades on its own without a hard cooldown cliff.
+function getDontRecommendRows(profileId, type) {
+  init();
+  return db.get().prepare('SELECT type, tmdb_id, reason, at FROM dont_recommend WHERE profile_id = ? AND type = ?').all(profileId, type);
+}
+
 // Undo a USER rejection (Mobile Companion "Undo" after a swipe-remove). Scoped to
 // reason='user' so it can NEVER resurrect a decayed-out title mid-cooldown — the
 // decay lifecycle stays intact. Returns the number of flags cleared (0 or 1).
@@ -804,6 +814,7 @@ module.exports = {
   countRecommended,
   dontRecommendKeys,
   dontRecommendImdbSet,
+  getDontRecommendRows,
   addDontRecommend,
   removeDontRecommend,
   deleteForProfile,

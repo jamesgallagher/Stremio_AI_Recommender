@@ -10,9 +10,9 @@
 // the deep dims (director/franchise/cast/keywords/decade/language/runtime); a
 // not-yet-enriched title contributes only its thin watched-store genre (graceful
 // degradation — the model just gets shallower, never wrong). PURE of network.
-const watchedStore = require('../../watchedStore');
 const metaStore = require('./metaStore');
 const { halfLivesFor } = require('./config');
+const { buildEventList } = require('./events');
 
 const DAY_MS = 24 * 3600e3;
 
@@ -38,42 +38,49 @@ function bump(map, k, weight) {
   map[k] = (map[k] || 0) + weight;
 }
 
-// Normalize a dim accumulator to 0–1 by its MAX (so the profile's strongest value
-// in a dim → 1.0, a rare value → small). Returns a fresh object.
+// Normalize a dim accumulator to [-1, 1] by its MAX ABSOLUTE value, preserving
+// sign — so the strongest-magnitude value in a dim → ±1 and a REJECTED value
+// stays negative (GE-10). Identical to a plain max-normalize when every value is
+// positive (the pre-feedback case). Returns a fresh object.
 function normByMax(map) {
   const vals = Object.values(map);
-  const max = vals.length ? Math.max(...vals) : 0;
+  const max = vals.length ? Math.max(...vals.map((v) => Math.abs(v))) : 0;
   if (max <= 0) return {};
   const out = {};
   for (const [k, v] of Object.entries(map)) out[k] = v / max;
   return out;
 }
 
-// Build the taste model for one (profile, type). `cfg` is the resolved Glass
-// config; `nowMs` injectable for tests. Returns dims as 0–1 affinity objects plus
-// the raw seed/weight totals (used for novelty + summaries).
-function buildTasteModel(profileId, type, cfg, { nowMs = Date.now() } = {}) {
+// Build the taste model for one (profile, type) from the WEIGHTED EVENT LIST
+// (GE-10): watched titles (positive) + dont_recommend (negative) each contribute
+// their SIGNED event weight × recency to every dim, so a rejected title's
+// director/genre/franchise steer taste away from similar candidates. `cfg` is the
+// resolved Glass config; `nowMs`/`events` injectable for tests. Returns dims as
+// [-1,1] affinity objects plus the raw seed/weight totals (novelty + summaries).
+function buildTasteModel(profileId, type, cfg, { nowMs = Date.now(), events } = {}) {
   const hl = halfLivesFor(cfg, type);
   const blend = cfg.horizon_blend;
-  const watched = watchedStore.getWatched(profileId, { type }).filter((w) => w.tmdb_id);
-  const metas = metaStore.getMany(type, watched.map((w) => w.tmdb_id));
+  const evs = events || buildEventList(profileId, type, cfg, { nowMs });
+  const metas = metaStore.getMany(type, evs.map((e) => e.tmdb_id));
 
   const acc = { genres: {}, keywords: {}, directors: {}, cast: {}, franchises: {}, decades: {}, languages: {}, runtimeBands: {} };
-  // Raw genre counts (un-normalized) for the novelty feature — how represented a
-  // genre is in the profile's history, by blended weight.
+  // Raw genre mass for the novelty feature — how represented a genre is in what
+  // the profile WATCHES. Positive (watched) events only: a rejection doesn't make
+  // a genre "over-watched".
   const genreMass = {};
   let totalWeight = 0;
   let enrichedCount = 0;
+  let seedCount = 0;
 
-  for (const w of watched) {
-    const ts = w.watched_at ? Date.parse(w.watched_at) : NaN;
-    const days = Number.isNaN(ts) ? 0 : Math.max(0, (nowMs - ts) / DAY_MS);
-    const weight = blendedWeight(days, hl, blend);
-    totalWeight += weight;
-    const m = metas.get(String(w.tmdb_id));
+  for (const ev of evs) {
+    if (ev.kind === 'watched') seedCount++;
+    const days = Number.isNaN(ev.ts) ? 0 : Math.max(0, (nowMs - ev.ts) / DAY_MS);
+    const weight = ev.weight * blendedWeight(days, hl, blend);   // SIGNED
+    totalWeight += Math.abs(weight);
+    const m = metas.get(ev.tmdb_id);
     if (m) {
       enrichedCount++;
-      for (const g of m.genres || []) { bump(acc.genres, g, weight); bump(genreMass, g, weight); }
+      for (const g of m.genres || []) { bump(acc.genres, g, weight); if (weight > 0) bump(genreMass, g, weight); }
       for (const k of m.keywords || []) bump(acc.keywords, k, weight);
       for (const d of m.director || []) bump(acc.directors, d, weight);
       for (const c of m.cast || []) bump(acc.cast, c, weight);
@@ -84,19 +91,19 @@ function buildTasteModel(profileId, type, cfg, { nowMs = Date.now() } = {}) {
       if (m.original_language) bump(acc.languages, m.original_language, weight);
       const band = runtimeBand(m.runtime, type);
       if (band) bump(acc.runtimeBands, band, weight);
-    } else if (w.primary_genre) {
-      // Thin fallback for a not-yet-enriched title.
-      bump(acc.genres, w.primary_genre, weight);
-      bump(genreMass, w.primary_genre, weight);
+    } else if (ev.fallback_genre) {
+      // Thin fallback for a not-yet-enriched WATCHED title.
+      bump(acc.genres, ev.fallback_genre, weight);
+      if (weight > 0) bump(genreMass, ev.fallback_genre, weight);
     }
   }
 
   return {
     type,
-    seedCount: watched.length,
+    seedCount,
     enrichedCount,
     totalWeight,
-    genreMass,   // raw (un-normalized) blended mass per genre → novelty
+    genreMass,   // raw (un-normalized) POSITIVE blended mass per genre → novelty
     dims: {
       genres: normByMax(acc.genres),
       keywords: normByMax(acc.keywords),

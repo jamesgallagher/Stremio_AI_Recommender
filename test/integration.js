@@ -945,6 +945,38 @@ async function main() {
     }
   });
 
+  // ── V. Glass GE-10: a user rejection steers taste away from similar candidates ─
+  await it('V. GE-10 feedback wiring: rejecting a title down-weights a candidate sharing its director, end to end', async () => {
+    const metaStore = require('../src/engines/glass/metaStore');
+    settings.updateSettings({ engines: { glass: true } });
+    stubTmdb();
+    const p = config.addProfile('INT-V');
+    try {
+      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'glass', engine_series: 'glass' } });
+      seedGlassFixtures(p.id);            // watched 101/102 + candidates all dir 'Nolan'
+      // Give the taste model a SECOND director so Nolan isn't the lone max (which
+      // normalization would pin to 1.0 regardless of magnitude): watched 102 → Villeneuve.
+      metaStore.put('movie', 102, { tmdb_id: '102', imdb_id: 'ttw2', type: 'movie', genres: ['Drama'], primary_genre: 'Drama', director: ['Villeneuve'], cast: ['A'], keywords: ['dream'], decade: 2020, original_language: 'en', runtime: 120, networks: [] });
+      await rs.buildPool(config.getProfile(p.id), quiet);
+      const before = rs.getRecommended(p.id, { type: 'movie', limit: 100 }).find((x) => x.tmdb_id === '301').affinity;
+
+      // Reject a (Nolan) title the profile has NOT watched. Its cached deep-meta
+      // pushes the 'Nolan' director dim toward negative, so candidate 301 (also
+      // Nolan) loses taste_match on the rebuild. dont_recommend is engine-agnostic.
+      metaStore.put('movie', 501, { tmdb_id: '501', imdb_id: 'tt501', type: 'movie', genres: ['Drama'], director: ['Nolan'], cast: ['A'], keywords: ['dream'], decade: 2020, original_language: 'en', runtime: 120, networks: [] });
+      rs.addDontRecommend(p.id, 'movie', '501', 'user');
+      rs.clearType(p.id, 'movie');
+      await rs.buildPool(config.getProfile(p.id), quiet);
+      const after = rs.getRecommended(p.id, { type: 'movie', limit: 100 }).find((x) => x.tmdb_id === '301').affinity;
+      assert.ok(after < before, `rejection lowered the similar candidate's score (${after} < ${before})`);
+    } finally {
+      restoreTmdb();
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id); metaStore._clear();
+      settings.updateSettings({ engines: { glass: false } });
+      simklTrending.upsertList('movies', [], 0); simklTrending.upsertList('tv', [], 0); simklTrending.upsertList('anime', [], 0);
+    }
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();

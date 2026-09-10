@@ -1033,6 +1033,57 @@ ok('glass/scoring: GE-06 features 0–1, weighted rankScore, preResolved fields,
   assert.ok(fresh > heavy);
 });
 
+ok('glass/events: GE-10 weighted event list — watched positive, dont_recommend negative by reason', () => {
+  const watchedStore = require('../src/watchedStore');
+  const rs = require('../src/recommendationStore');
+  const { buildEventList } = require('../src/engines/glass/events');
+  const { resolveConfig } = require('../src/engines/glass/config');
+  const cfg = resolveConfig(null);
+  const pid = 'glass-events';
+  watchedStore.deleteForProfile(pid); rs.deleteForProfile(pid);
+  watchedStore.upsertMany(pid, [{ type: 'movie', simkl_id: 1, imdb_id: 'ttw', tmdb_id: '10', title: 'W', year: 2024, watched_at: '2026-09-01T00:00:00Z' }]);
+  rs.addDontRecommend(pid, 'movie', '20', 'user', Date.parse('2026-09-05T00:00:00Z'));
+  rs.addDontRecommend(pid, 'movie', '30', 'decayed', Date.parse('2026-08-01T00:00:00Z'));
+  const evs = buildEventList(pid, 'movie', cfg, {});
+  const byId = Object.fromEntries(evs.map((e) => [e.tmdb_id, e]));
+  assert.strictEqual(byId['10'].weight, 1.0);         // watched +
+  assert.strictEqual(byId['10'].kind, 'watched');
+  assert.strictEqual(byId['20'].weight, -1.5);        // user rejection strong-negative
+  assert.strictEqual(byId['30'].weight, -0.5);        // decayed mild-negative
+  assert.ok(Number.isFinite(byId['20'].ts));
+  // Series is type-scoped: no movie events leak in.
+  assert.strictEqual(buildEventList(pid, 'series', cfg, {}).length, 0);
+  watchedStore.deleteForProfile(pid); rs.deleteForProfile(pid);
+});
+
+ok('glass/tasteModel+scoring: GE-10 a rejected dim goes negative and PENALIZES similar candidates', () => {
+  const { buildTasteModel } = require('../src/engines/glass/tasteModel');
+  const metaStore = require('../src/engines/glass/metaStore');
+  const scoring = require('../src/engines/glass/scoring');
+  const { resolveConfig } = require('../src/engines/glass/config');
+  const cfg = resolveConfig(null);
+  metaStore._clear();
+  // Enrich a watched title (dir Villeneuve, Drama) and a REJECTED title (dir Bay, Action).
+  metaStore.put('movie', 1, { tmdb_id: '1', imdb_id: 'tt1', type: 'movie', genres: ['Drama'], director: ['Villeneuve'], decade: 2020, cast: [], keywords: [], networks: [] });
+  metaStore.put('movie', 2, { tmdb_id: '2', imdb_id: 'tt2', type: 'movie', genres: ['Action'], director: ['Bay'], decade: 2020, cast: [], keywords: [], networks: [] });
+  const now = Date.parse('2026-09-10T00:00:00Z');
+  const events = [
+    { type: 'movie', tmdb_id: '1', weight: 1.0, ts: Date.parse('2026-09-08T00:00:00Z'), kind: 'watched', fallback_genre: null },
+    { type: 'movie', tmdb_id: '2', weight: -1.5, ts: Date.parse('2026-09-07T00:00:00Z'), kind: 'rejected_user', fallback_genre: null },
+  ];
+  const taste = buildTasteModel('x', 'movie', cfg, { nowMs: now, events });
+  assert.ok(taste.dims.directors.Villeneuve > 0, 'liked director positive');
+  assert.ok(taste.dims.directors.Bay < 0, 'rejected director negative');
+  assert.ok(!('Action' in taste.genreMass), 'a rejected genre is NOT counted as over-watched (novelty)');
+  // A candidate by the rejected director scores LOWER taste_match than an identical
+  // one by an unknown (neutral) director.
+  const base = { type: 'movie', imdb_id: 'tt', genres: ['Drama'], primary_genre: 'Drama', decade: 2010, cast: [], keywords: [], networks: [], vote_average: 7, year: 2024 };
+  const rejectedDir = scoring.computeFeatures({ sources: [] }, { ...base, director: ['Bay'] }, taste, cfg, { nowYear: 2026 }).features.taste_match;
+  const unknownDir = scoring.computeFeatures({ sources: [] }, { ...base, director: ['Nobody'] }, taste, cfg, { nowYear: 2026 }).features.taste_match;
+  assert.ok(rejectedDir < unknownDir, 'sharing a rejected director penalizes taste_match');
+  metaStore._clear();
+});
+
 ok('glass/rerank: GE-08 taste summary (names only), match hint, prompt shape', () => {
   const rr = require('../src/engines/glass/rerank');
   const taste = { dims: { genres: { Drama: 1, Action: 0.4 }, directors: { Nolan: 1 }, franchises: { 'c:9': 1, 'n:HBO': 0.8 }, keywords: { heist: 1 }, decades: { 2010: 1 } } };

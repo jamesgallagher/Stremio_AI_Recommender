@@ -72,6 +72,18 @@ const DEFAULTS = {
   // ── Output (§4.7, GI-1) ──
   resolve_cap: 300,             // ≤ this many candidates are enriched + returned (≈ STORE_CAP; the resolve budget)
 
+  // ── Feedback event weights (Phase D / GE-10, design §4.1/§5.4) ──
+  // The taste model is a WEIGHTED EVENT LIST, not just "watched titles at +1", so
+  // richer signals slot in without a rewrite. v1 maps only what already exists as
+  // durable data: watched (positive base) + dont_recommend (negative — a rejected
+  // title's dims push taste AWAY from similar candidates). Recency-decayed by the
+  // same three-horizon blend as watched, so old rejections fade.
+  feedback: {
+    watched: 1.0,
+    dont_recommend_user: -1.5,      // an explicit "not interested" — strong negative
+    dont_recommend_decayed: -0.5,   // shown repeatedly, never engaged — mild negative
+  },
+
   // ── LLM semantic rerank (Phase B / GE-08, design §4.4) ──
   // The free LOCAL LLM reorders the strongest slice + writes "because…" reasons.
   // Optional + degrades to the deterministic order (prefer-local; never spills to

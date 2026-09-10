@@ -19,45 +19,60 @@ const { runtimeBand } = require('./tasteModel');
 
 // ── individual features (all pure, all 0–1) ──
 
+// Best SIGNED affinity among the candidate's keys that appear in the taste map;
+// 0 when none appear (GE-10). A liked key (positive) wins over a rejected one, but
+// a candidate whose ONLY shared key was rejected goes negative — pulling
+// taste_match down. Absent key → 0 (neutral), never a penalty.
+function bestAff(keys, map) {
+  let best = 0; let hit = false;
+  for (const k of keys) {
+    const v = map[k];
+    if (v === undefined || v === 0) continue;
+    if (!hit || v > best) { best = v; hit = true; }
+  }
+  return hit ? best : 0;
+}
+
 // taste_match: dim-intersect affinity vs the taste model. Genre/decade/language/
 // runtime are the dense BASE; director/franchise/cast/keyword are sparse BONUSES
-// (design §5.5). Sub-weights sum to ~1 so the result stays in [0,1]. Also returns
-// the matched dims (for explanations / score_components richness).
+// (design §5.5). Signed (GE-10): a rejected dim contributes NEGATIVELY, and the
+// final score is clamped to [0,1]. `matched` records only the POSITIVE hits (the
+// "because…" explanation never cites a rejection).
 function tasteMatch(meta, taste, cfg) {
   const d = taste.dims;
   const sw = cfg.taste_dims;
   const matched = {};
 
-  const genreAff = Math.max(0, ...(meta.genres || []).map((g) => d.genres[g] || 0), 0);
+  const genreAff = bestAff(meta.genres || [], d.genres);
   const decadeAff = meta.decade != null ? (d.decades[String(meta.decade)] || 0) : 0;
   const langAff = meta.original_language ? (d.languages[meta.original_language] || 0) : 0;
   const band = runtimeBand(meta.runtime, meta.type);
   const runtimeAff = band ? (d.runtimeBands[band] || 0) : 0;
 
-  const dirHits = (meta.director || []).filter((x) => (d.directors[x] || 0) > 0);
-  const directorAff = Math.max(0, ...dirHits.map((x) => d.directors[x]), 0);
-  if (dirHits.length) matched.director = dirHits;
+  const directorAff = bestAff(meta.director || [], d.directors);
+  const dirPos = (meta.director || []).filter((x) => (d.directors[x] || 0) > 0);
+  if (dirPos.length) matched.director = dirPos;
 
-  let franchiseAff = 0;
-  const frHits = [];
-  if (meta.collection?.id != null && (d.franchises[`c:${meta.collection.id}`] || 0) > 0) {
-    franchiseAff = d.franchises[`c:${meta.collection.id}`]; frHits.push(meta.collection.name || `collection:${meta.collection.id}`);
-  }
-  for (const n of meta.networks || []) {
-    const a = d.franchises[`n:${n}`] || 0;
-    if (a > 0) { franchiseAff = Math.max(franchiseAff, a); frHits.push(n); }
-  }
-  if (frHits.length) matched.franchise = frHits;
+  const frKeys = [];
+  if (meta.collection?.id != null) frKeys.push(`c:${meta.collection.id}`);
+  for (const n of meta.networks || []) frKeys.push(`n:${n}`);
+  const franchiseAff = bestAff(frKeys, d.franchises);
+  const frPos = frKeys.filter((k) => (d.franchises[k] || 0) > 0)
+    .map((k) => (k.startsWith('c:') ? (meta.collection?.name || k) : k.slice(2)));
+  if (frPos.length) matched.franchise = frPos;
 
-  const castHits = (meta.cast || []).filter((x) => (d.cast[x] || 0) > 0);
-  const castAff = Math.max(0, ...castHits.map((x) => d.cast[x]), 0);
-  if (castHits.length) matched.cast = castHits;
+  const castAff = bestAff(meta.cast || [], d.cast);
+  const castPos = (meta.cast || []).filter((x) => (d.cast[x] || 0) > 0);
+  if (castPos.length) matched.cast = castPos;
 
-  const kwHits = (meta.keywords || []).filter((x) => (d.keywords[x] || 0) > 0);
+  // keyword: gated by a minimum shared-count floor (any non-zero shared keyword
+  // counts, liked or rejected), then the best signed affinity.
+  const kwShared = (meta.keywords || []).filter((x) => (d.keywords[x] ?? 0) !== 0);
   let keywordAff = 0;
-  if (kwHits.length >= (cfg.keyword_min_shared || 1)) {
-    keywordAff = Math.max(0, ...kwHits.map((x) => d.keywords[x]), 0);
-    matched.keywords = kwHits;
+  if (kwShared.length >= (cfg.keyword_min_shared || 1)) {
+    keywordAff = bestAff(meta.keywords || [], d.keywords);
+    const kwPos = kwShared.filter((x) => d.keywords[x] > 0);
+    if (kwPos.length) matched.keywords = kwPos;
   }
 
   const score = sw.genres * genreAff + sw.decade * decadeAff + sw.language * langAff
