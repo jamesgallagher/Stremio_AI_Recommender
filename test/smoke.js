@@ -2310,6 +2310,38 @@ ok('marquee ME-05: buildSuggestPrompt — filter rules in words, never age/suita
   assert.ok(!/age|suitab|classif|child/i.test(p), 'no age wording: ' + p);
 });
 
+// ---- Marquee ME-07 (pure) ----
+ok('marquee ME-07: parseFit — invented id ignored, duplicate first wins, clamp, non-number missing, reason truncate', () => {
+  const llmFit = require('../src/engines/marquee/llmFit');
+  const words20 = Array.from({ length: 20 }, (_, i) => 'w' + i).join(' ');
+  const m = llmFit.parseFit([
+    { id: 'x', fit: 9 }, // invented (not in the batch) → ignored
+    { id: '1', fit: -3 }, // clamp → 0
+    { id: '1', fit: 14 }, // duplicate → first wins
+    { id: '2', fit: 'high' }, // non-number → missing
+    { id: '3', fit: 8, reason: words20 }, // 20 words → truncated to 14
+    { id: '4', fit: 5, reason: null },
+  ], ['1', '2', '3', '4']);
+  assert.ok(!m.has('x'), 'invented id ignored');
+  assert.deepStrictEqual(m.get('1'), { fit: 0, reason: null }, 'fit -3 → 0, duplicate first wins');
+  assert.ok(!m.has('2'), 'non-number fit → item missing');
+  assert.strictEqual(m.get('3').fit, 8);
+  assert.strictEqual(m.get('3').reason.split(/\s+/).length, 14, '20-word reason truncated to 14 words');
+  assert.deepStrictEqual(m.get('4'), { fit: 5, reason: null });
+});
+
+ok('marquee ME-07: buildFitPrompt — brief + item data, cert as context only, no age/suitability wording', () => {
+  const llmFit = require('../src/engines/marquee/llmFit');
+  const p = llmFit.buildFitPrompt(
+    { loves: ['Action'], avoids: ['Horror'], moods: ['thrilling'], eras: ['2010s'], standout_titles: ['Inception'] },
+    [{ id: '1', title: 'Alpha', year: 2020, overview: 'ov', director: 'D', keywords: ['k1'], cert: 'M' }],
+  );
+  assert.ok(p.includes('Action') && p.includes('Horror'), 'brief content present');
+  assert.ok(p.includes('Alpha'), 'item title present');
+  assert.ok(p.includes('Classification: M'), 'cert as descriptive context');
+  assert.ok(!/suitab|appropriate|child|kid|age limit|for ages/i.test(p), 'no age/suitability wording: ' + p);
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');

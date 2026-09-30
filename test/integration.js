@@ -1664,6 +1664,28 @@ async function main() {
     };
     return { f, calls };
   };
+  // ME-07: a scored list from ME-06 over invented candidates (deepMeta stubbed).
+  const mqScored = async (cands, filters) => {
+    glassMeta._clear();
+    const env = mqEnvelope(filters || { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 });
+    const ctx = mqCtx(filters || { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 });
+    const { f } = mqScoreFetchers({ deepMeta: (id) => mqFullMeta(id) });
+    const { scored } = await mqScoring.scoreCandidates({ id: 'p-mqfit', name: 'MQFIT', filters }, ctx, cands, {
+      taste: mqTaste, envelope: env, cfg: mqCfgResolved, gatherMeta: { weekN: 0, dayN: 0, hadTrending: false },
+      fetchers: f, nowYear: 2026, nowMs: Date.parse('2026-06-01T00:00:00Z'), log: quiet,
+    });
+    return scored;
+  };
+  // ME-07: a chat stub mirroring llm.chat (content passes through opts.validate),
+  // with per-call recording. `respond(callNumber, messages)` returns the raw text.
+  const mqFitChat = (respond) => {
+    const calls = { n: 0 };
+    const chat = async (chain, messages, opts) => {
+      calls.n += 1;
+      return opts.validate(respond(calls.n, messages));
+    };
+    return { chat, calls };
+  };
 
   await it('marquee ME-05: source tagging + merge (one title from S1 recs/similar, S3, S5)', async () => {
     glassMeta._clear();
@@ -1999,6 +2021,113 @@ async function main() {
     assert.strictEqual(new Set(ids).size, ids.length, 'no duplicate tmdb_ids');
     assert.ok(candidates.length <= mqCfgResolved.lookup_cap, '≤ lookup_cap');
     assert.strictEqual(ctx.stats.sources.S2_reserved, 40, 'S2_reserved counted');
+  });
+
+  // ── Marquee ME-07 (P4): LLM fit ──
+  const mqLlmFit = require('../src/engines/marquee/llmFit');
+  const mqLlmCache = require('../src/engines/marquee/llmCache');
+  const mqBrief = { loves: ['Action'], avoids: ['Horror'], moods: ['thrilling'], eras: ['2010s'], standout_titles: ['Inception'] };
+  const mqFitNow = Date.parse('2026-06-01T00:00:00Z');
+  const mqFitOpts = (over) => ({
+    brief: mqBrief, briefHash: 'h-fit', cfg: mqCfgResolved, chain: [{ type: 'custom', name: 'local', uri: 'http://x' }],
+    log: quiet, now: mqFitNow, ...over,
+  });
+
+  await it('marquee ME-07: fit — invented id ignored, missing items fit 5 and NOT cached', async () => {
+    mqLlmCache._clear();
+    const scored = await mqScored(Array.from({ length: 20 }, (_, i) => mqCand('f' + i)));
+    const { chat, calls } = mqFitChat(() => {
+      const arr = [{ id: 'zzz', fit: 9, reason: 'invented' }];
+      for (let i = 0; i < 18; i += 1) arr.push({ id: 'f' + i, fit: 9, reason: 'action taste' });
+      return JSON.stringify(arr);
+    });
+    const out = await mqLlmFit.applyLlmFit('p-mqfit1', scored, mqFitOpts({ chat }));
+    assert.strictEqual(calls.n, 1, 'one batch');
+    const byId = new Map(out.map((r) => [r.tmdb_id, r]));
+    assert.deepStrictEqual(byId.get('f0').scoreComponents.llm, { fit: 9, reason: 'action taste', cached: false }, 'returned item folded in');
+    for (const id of ['f18', 'f19']) {
+      assert.strictEqual(byId.get(id).scoreComponents.llm.fit, 5, id + ' missing → fit 5');
+      assert.strictEqual(byId.get(id).scoreComponents.llm.reason, null);
+      assert.strictEqual(mqLlmCache.get('p-mqfit1', 'fit', `${id}:${'h-fit'}`), null, id + ' not cached');
+    }
+    assert.ok(mqLlmCache.get('p-mqfit1', 'fit', 'f0:h-fit'), 'f0 cached');
+  });
+
+  await it('marquee ME-07: fit — cache hit (second run, same brief → chat not called)', async () => {
+    mqLlmCache._clear();
+    const scored = await mqScored(Array.from({ length: 20 }, (_, i) => mqCand('c' + i)));
+    const { chat, calls } = mqFitChat(() => JSON.stringify(Array.from({ length: 20 }, (_, i) => ({ id: 'c' + i, fit: 7, reason: 'ok' }))));
+    const r1 = await mqLlmFit.applyLlmFit('p-mqfit2', scored, mqFitOpts({ chat }));
+    assert.strictEqual(calls.n, 1, 'first run: one batch');
+    const r2 = await mqLlmFit.applyLlmFit('p-mqfit2', r1, mqFitOpts({ chat }));
+    assert.strictEqual(calls.n, 1, 'second run: chat not called (all cached)');
+    assert.ok(r2.every((r) => r.scoreComponents.llm.cached), 'every row cached on the second run');
+  });
+
+  await it('marquee ME-07: fit — one failing batch (batch 2 of 3 throws → batches 1 and 3 applied)', async () => {
+    mqLlmCache._clear();
+    // Distinct vote_average per candidate (via the deepMeta stub — features are
+    // computed from the meta, not the candidate) → strictly distinct rankScores
+    // → the scored order is b0..b44 (a tie would sort by tmdb_id STRING order).
+    glassMeta._clear();
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const ctx = mqCtx(filters);
+    const { f } = mqScoreFetchers({ deepMeta: (id) => mqFullMeta(id, { vote_average: 7 - Number(id.slice(1)) * 0.01 }) });
+    const { scored } = await mqScoring.scoreCandidates({ id: 'p-mqfit', name: 'MQFIT', filters }, ctx, Array.from({ length: 45 }, (_, i) => mqCand('b' + i)), {
+      taste: mqTaste, envelope: env, cfg: mqCfgResolved, gatherMeta: { weekN: 0, dayN: 0, hadTrending: false },
+      fetchers: f, nowYear: 2026, nowMs: Date.parse('2026-06-01T00:00:00Z'), log: quiet,
+    });
+    const { chat, calls } = mqFitChat((n) => {
+      if (n === 2) throw new Error('gpu timeout');
+      const start = (n - 1) * 20;
+      const arr = [];
+      for (let i = start; i < Math.min(start + 20, 45); i += 1) arr.push({ id: 'b' + i, fit: 8, reason: 'fits' });
+      return JSON.stringify(arr);
+    });
+    const logLines = [];
+    const out = await mqLlmFit.applyLlmFit('p-mqfit3', scored, mqFitOpts({
+      chat, log: { log() {}, warn(m) { logLines.push(m); }, error() {} },
+    }));
+    assert.strictEqual(calls.n, 3, 'three batches attempted');
+    const byId = new Map(out.map((r) => [r.tmdb_id, r]));
+    for (const i of [0, 44]) assert.strictEqual(byId.get('b' + i).scoreComponents.llm.fit, 8, 'batches 1 and 3 applied');
+    for (let i = 20; i < 40; i += 1) {
+      assert.strictEqual(byId.get('b' + i).scoreComponents.llm.fit, 5, 'batch 2 rows fit 5');
+      assert.strictEqual(mqLlmCache.get('p-mqfit3', 'fit', `b${i}:h-fit`), null, 'batch 2 rows not cached');
+    }
+    assert.ok(logLines.some((l) => l === '[marquee] fit batch 2/3 failed: gpu timeout'), 'failure logged, next batch still ran');
+  });
+
+  await it('marquee ME-07: fit — reason (LLM reason → because_title after normalize; no reason → because you watched <seed>)', async () => {
+    mqLlmCache._clear();
+    const cands = [
+      mqCand('r1'),
+      mqCand('r2'),
+      mqCand('r3', { seeds: new Set(['s3']), seedTitles: new Map([['s3', 'Seed Three']]), _seedWeights: new Map([['s3', 1.0]]) }),
+    ];
+    const scored = await mqScored(cands);
+    const { chat } = mqFitChat(() => JSON.stringify([{ id: 'r1', fit: 9, reason: 'action taste' }]));
+    const out = await mqLlmFit.applyLlmFit('p-mqfit4', scored, mqFitOpts({ chat }));
+    const byId = new Map(out.map((r) => [r.tmdb_id, r]));
+    assert.strictEqual(byId.get('r1').reason, 'action taste', 'LLM reason on the row');
+    pipeline.normalize(byId.get('r1'));
+    assert.strictEqual(byId.get('r1').because_title, 'action taste', 'pipeline.normalize maps reason → because_title');
+    assert.strictEqual(byId.get('r2').reason, null, 'no LLM reason, no seed → null');
+    assert.strictEqual(byId.get('r3').reason, 'because you watched Seed Three', 'seed fallback reason');
+  });
+
+  await it('marquee ME-07: no local LLM / no brief / disabled → P3 output unchanged (same array, order, scores)', async () => {
+    mqLlmCache._clear();
+    const scored = await mqScored(Array.from({ length: 30 }, (_, i) => mqCand('n' + i)));
+    const { chat } = mqFitChat(() => '[]');
+    const out1 = await mqLlmFit.applyLlmFit('p-mqfit5', scored, mqFitOpts({ chat, chain: [] }));
+    assert.strictEqual(out1, scored, 'empty chain → same array returned unchanged');
+    const out2 = await mqLlmFit.applyLlmFit('p-mqfit5', scored, mqFitOpts({ chat, brief: null, briefHash: null }));
+    assert.strictEqual(out2, scored, 'no brief → same array returned unchanged');
+    const out3 = await mqLlmFit.applyLlmFit('p-mqfit5', scored, mqFitOpts({ chat, cfg: { ...mqCfgResolved, llm_fit: { ...mqCfgResolved.llm_fit, enabled: false } } }));
+    assert.strictEqual(out3, scored, 'disabled → same array returned unchanged');
+    assert.deepStrictEqual(out1.map((r) => [r.tmdb_id, r.rankScore]), scored.map((r) => [r.tmdb_id, r.rankScore]), 'order and scores identical to P3');
   });
 
   await it('marquee ME-05: S5 per-list isolation (S1) — simklTrending throws, TMDB week/day kept, hadTrending true', async () => {

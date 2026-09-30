@@ -67,14 +67,32 @@ const DEFAULTS = {
   decayed_collection_penalty: 0.05,
   lookup_chunk: 8,
   availability_recheck_days: 7,
+
+  // ── ME-07 (spec §4.6/§6.2) — LLM fit ──
+  // The LOCAL LLM judges the top candidate_cap by the taste brief, in batches
+  // of `batch`, sequential (single GPU). ttl_days bounds the fit cache.
+  llm_fit: { enabled: true, candidate_cap: 250, batch: 20, ttl_days: 14, timeout_ms: 60000 },
 };
 
-// For now returns a deep clone of DEFAULTS, ignoring `settings` — P4 adds the
-// Tier-2 merge (a Marquee admin blob over these defaults), the same pattern as
-// Glass's resolveConfig but on Marquee's own blob.
+// Resolve the EFFECTIVE Marquee config for a build: Tier-1 defaults with a
+// Tier-2 global admin override (settings.marquee) shallow-merged per section —
+// the same pattern as Glass's resolveConfig (glass/config.js), but on
+// Marquee's own blob (spec §4.5: do NOT import Glass's). Unknown sections are
+// ignored; a malformed blob never throws — it just doesn't apply.
+const clone = (o) => JSON.parse(JSON.stringify(o));
 function resolveConfig(settings) {
-  void settings;
-  return JSON.parse(JSON.stringify(DEFAULTS));
+  const cfg = clone(DEFAULTS);
+  const over = settings && typeof settings.marquee === 'object' ? settings.marquee : null;
+  if (over) {
+    for (const section of Object.keys(DEFAULTS)) {
+      if (over[section] && typeof over[section] === 'object' && typeof DEFAULTS[section] === 'object') {
+        Object.assign(cfg[section], over[section]);
+      } else if (over[section] !== undefined && typeof DEFAULTS[section] !== 'object') {
+        cfg[section] = over[section];
+      }
+    }
+  }
+  return cfg;
 }
 
 module.exports = { ALGORITHM_VERSION, DEFAULTS, resolveConfig };
