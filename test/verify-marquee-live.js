@@ -88,26 +88,58 @@ function record(name, pass, detail) {
   console.log(`  ${name}: ${tag} — ${detail}`);
 }
 
+// V1/V2 inspection logic, exported as pure functions so the offline smoke
+// test can exercise them without running main() (require.main guard below).
+// describeRatings reports the real Simkl shape — the top-level shape, the
+// entry key list, the movie key list, the id path (movie.ids vs ids), the
+// rating field name and the rated-at field name — self-sufficient for P2.
+function describeRatings(body) {
+  const topShape = Array.isArray(body) ? 'array'
+    : `object (keys: ${Object.keys(body || {}).join(', ') || 'none'})`;
+  const entries = Array.isArray(body) ? body : (body.movies || []);
+  if (!Array.isArray(entries) || !entries.length) {
+    return { ok: false, detail: `no movie rating entries found (top-level ${topShape})`, entries: [] };
+  }
+  const first = entries[0];
+  const entryKeys = Object.keys(first || {});
+  const movie = first?.movie;
+  const movieKeys = movie ? Object.keys(movie) : [];
+  const ids = first?.movie?.ids ?? first?.ids ?? null;
+  const idPath = first?.movie?.ids ? 'movie.ids' : (first?.ids ? 'ids' : 'absent');
+  const ratingField = entryKeys.find((k) => /rating/i.test(k));
+  const ratedAt = entryKeys.find((k) => /rated_at|rating_date|updated/i.test(k));
+  const detail =
+    `top-level ${topShape}; ${entries.length} entries; `
+    + `entry keys: ${entryKeys.join(', ')}; `
+    + `movie keys: ${movieKeys.join(', ') || '(none)'}; `
+    + `id path: ${idPath}; `
+    + `ids: tmdb=${ids?.tmdb != null ? 'present' : 'absent'} `
+    + `imdb=${ids?.imdb != null ? 'present' : 'absent'} `
+    + `simkl=${ids?.simkl != null ? 'present' : 'absent'}; `
+    + `rating field "${ratingField || '?'}"; rated-at "${ratedAt || '?'}"`;
+  return { ok: true, detail, entries };
+}
+
+// The simkl seed ids from rating/watched entries, reading the nested
+// movie.ids path first and falling back to the flat ids path.
+function seedIdsFrom(entries) {
+  return (Array.isArray(entries) ? entries : [])
+    .map((e) => (e?.movie?.ids?.simkl ?? e?.ids?.simkl))
+    .filter((x) => x != null);
+}
+
 // V1: GET /sync/ratings/movies — the user's movie ratings (the strongest
 // explicit taste signal, spec §2).
 async function checkV1(profile) {
   const data = await simklGet(profile, '/sync/ratings/movies');
-  const topShape = Array.isArray(data) ? 'array' : `object (keys: ${Object.keys(data || {}).join(', ') || 'none'})`;
-  const entries = Array.isArray(data) ? data : (data.movies || []);
-  if (!Array.isArray(entries) || !entries.length) {
-    record('V1', false, `no movie rating entries found (top-level ${topShape})`);
+  const desc = describeRatings(data);
+  if (!desc.ok) {
+    record('V1', false, desc.detail);
     return null;
   }
-  const first = entries[0];
-  const ratingField = Object.keys(first || {}).find((k) => /rating/i.test(k));
-  const ids = first?.ids || {};
-  const ratedAt = Object.keys(first || {}).find((k) => /rated_at|rating_date|updated/i.test(k));
-  record('V1', true,
-    `top-level ${topShape}; ${entries.length} entries; rating field "${ratingField || '?'}"; `
-    + `ids: tmdb=${ids.tmdb != null ? 'present' : 'absent'} imdb=${ids.imdb != null ? 'present' : 'absent'} `
-    + `simkl=${ids.simkl != null ? 'present' : 'absent'}; rated-at "${ratedAt || '?'}"`);
-  console.log('  sample (redacted): ' + JSON.stringify(redact(first)));
-  return entries;
+  record('V1', true, desc.detail);
+  console.log('  sample (redacted): ' + JSON.stringify(redact(desc.entries[0])));
+  return desc.entries;
 }
 
 // V1b: GET /sync/activities — the movies ratings timestamp P2 gates its
@@ -125,13 +157,13 @@ async function checkV1b(profile) {
 // V2: GET /movies/{simkl_id} for 3 watched movies — is users_recommendations
 // present by default, or does it need ?extended=full?
 async function checkV2(profile, ratedEntries) {
-  let simklIds = (ratedEntries || []).map((e) => e?.ids?.simkl).filter((x) => x != null);
+  let simklIds = seedIdsFrom(ratedEntries);
   if (simklIds.length < 3) {
     // Top up from the watched store (one governed GET, read-only).
     const items = await simklGet(profile, '/sync/all-items/movies/completed');
     const arr = Array.isArray(items) ? items : (items.movies || []);
     for (const it of arr) {
-      const sid = it?.movie?.ids?.simkl;
+      const sid = seedIdsFrom([it])[0];
       if (sid != null && !simklIds.includes(sid)) simklIds.push(sid);
       if (simklIds.length >= 3) break;
     }
@@ -312,4 +344,9 @@ async function main() {
   process.exit(anyFail ? 1 : 0);
 }
 
-main().catch((e) => { console.error('\n✗ verification errored:', e.message); process.exit(2); });
+if (require.main === module) {
+  main().catch((e) => { console.error('\n✗ verification errored:', e.message); process.exit(2); });
+}
+
+// Pure inspection logic, exported for the offline smoke test (F1).
+module.exports = { describeRatings, seedIdsFrom };
