@@ -36,6 +36,7 @@ const scoring = require('./marquee/scoring');
 const llmFit = require('./marquee/llmFit');
 const shape = require('./marquee/shape');
 const simklCache = require('./marquee/simklCache');
+const engagement = require('./marquee/engagement');
 const recommendationStore = require('../recommendationStore');
 
 // Test-only seam (ME-09): a process-wide injection for the Tier-2 rebuild
@@ -63,6 +64,7 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
     ...sources.defaultFetchers(ctx, profile, cfg, log),
     ...scoring.defaultFetchers(ctx, log),
     syncRatings: simklCache.syncRatings,
+    pullProgress: undefined, // engagement: default = the profile's watch provider (Nuvio)
     ...(ctx.marqueeFetchers || {}),
     ...(_testSeams?.fetchers || {}),
   };
@@ -77,10 +79,19 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
     catch (err) { log.warn(`[marquee] ratings sync failed: ${err.message}`); }
   }
 
+  // m2 engagement (0–5): the watch provider's progress — finished = liked (the
+  // watched base), abandoned before halfway = didn't enjoy it. Skipped with the
+  // ratings sync in the backtest (the snapshot's stored observations are used).
+  if (ctx.marqueeSkipSync !== true) {
+    await engagement.syncEngagement(profile, cfg, { pull: f.pullProgress, resolveTmdb: f.resolveTmdb, now: nowMs, log });
+  }
+  const abandoned = engagement.abandonedFor(profile.id, cfg, { now: nowMs });
+  ctx.marqueeAbandoned = abandoned;
+
   // 5–20: the rating-weighted taste model + seeds + the cached local-LLM brief
   // (ME-04). Enrichment rides the deepMeta seam (hermetic under a stub).
   onProgress(5, 'Marquee: building taste model…');
-  const tasteModel = await taste.buildTaste(profile.id, ctx.tmdbKey, cfg, { nowMs, enrichFetcher: f.deepMeta, log });
+  const tasteModel = await taste.buildTaste(profile.id, ctx.tmdbKey, cfg, { nowMs, abandoned, enrichFetcher: f.deepMeta, log });
   const seeds = taste.seedsFor(profile.id, cfg, { nowMs });
   onProgress(12, 'Marquee: building taste brief…');
   const brief = await taste.tasteBrief(profile.id, tasteModel, { chain, chat, cfg, log, now: nowMs });
@@ -126,7 +137,7 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
   }
   if (ctx.stats) ctx.stats.kept = final.length;
   const st = ctx.stats || {};
-  log.log(`[marquee] ${profile.name}: seeds ${st.seeds ?? 0} → raw ${st.raw ?? 0} → strong ${st.strong ?? 0} → scored ${st.scored ?? 0} → stored ${final.length} (llm fit: ${fitOn ? 'on' : 'off'}, brief: ${brief ? 'on' : 'off'})`);
+  log.log(`[marquee] ${profile.name}: seeds ${st.seeds ?? 0} → raw ${st.raw ?? 0} → strong ${st.strong ?? 0} → scored ${st.scored ?? 0} → stored ${final.length} (llm fit: ${fitOn ? 'on' : 'off'}, brief: ${brief ? 'on' : 'off'}, abandoned: ${abandoned.size})`);
   onProgress(100, `Marquee: ${final.length} movie(s)`);
   return final;
 }

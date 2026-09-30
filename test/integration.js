@@ -3135,6 +3135,112 @@ async function main() {
     assert.ok(out.includes('marquee truncated (pre-score rank 512/900)'), 'Marquee fate shown');
   });
 
+  // ── Marquee m2 engagement: finished = liked, abandoned before halfway = not ──
+  const mqEngagement = require('../src/engines/marquee/engagement');
+  const DAYMS = 24 * 3600e3;
+  const engNow = Date.parse('2026-06-01T00:00:00Z');
+  const engRow = (imdbId, percent, daysAgo, over) => ({ type: 'movie', imdbId, percent, updatedAtMs: engNow - daysAgo * DAYMS, ...over });
+
+  await it('marquee m2 engagement: sync stores movie progress, keeps it after the provider prunes it, throttles, never throws', async () => {
+    mqEngagement._clear();
+    const profile = { id: 'p-eng1', name: 'ENG1' };
+    const resolve = async (imdbId) => imdbId.replace('tt', 'tm');
+    let rows = [engRow('tt1', 30, 10), engRow('tt2', 95, 10), { type: 'series', imdbId: 'tt3', percent: 20, updatedAtMs: engNow }];
+    const pull = async () => rows;
+    let r = await mqEngagement.syncEngagement(profile, mqCfgResolved, { pull, resolveTmdb: resolve, now: engNow, log: quiet });
+    assert.strictEqual(r.movies, 2, 'series rows ignored');
+    // Within sync_hours → throttled, no pull.
+    let pulled = 0;
+    r = await mqEngagement.syncEngagement(profile, mqCfgResolved, { pull: async () => { pulled += 1; return []; }, resolveTmdb: resolve, now: engNow + 3600e3, log: quiet });
+    assert.deepStrictEqual(r, { skipped: 'fresh' });
+    assert.strictEqual(pulled, 0);
+    // The provider prunes its rows: the stored observation survives.
+    rows = [];
+    await mqEngagement.syncEngagement(profile, mqCfgResolved, { pull, resolveTmdb: resolve, now: engNow + 7 * 3600e3, log: quiet });
+    assert.ok(mqEngagement.abandonedFor(profile.id, mqCfgResolved, { now: engNow }).has('tm1'), 'abandoned film remembered after prune');
+    // Provider down → never throws, observations kept.
+    r = await mqEngagement.syncEngagement(profile, mqCfgResolved, { pull: async () => { throw new Error('nuvio down'); }, now: engNow + 14 * 3600e3, log: quiet });
+    assert.strictEqual(r.ok, false);
+    assert.ok(mqEngagement.abandonedFor(profile.id, mqCfgResolved, { now: engNow }).has('tm1'));
+    // No progress source (e.g. no Nuvio configured) → a clean skip.
+    r = await mqEngagement.syncEngagement({ id: 'p-eng1b', name: 'X' }, mqCfgResolved, { pull: async () => null, now: engNow, log: quiet });
+    assert.deepStrictEqual(r, { skipped: 'no progress source' });
+    mqEngagement._clear();
+  });
+
+  await it('marquee m2 engagement: abandoned = below 50%, untouched 7+ days, not finished later', async () => {
+    mqEngagement._clear();
+    const profile = { id: 'p-eng2', name: 'ENG2' };
+    watchedStore.upsertMany(profile.id, [{ simkl_id: 9, type: 'movie', imdb_id: 'ttF', tmdb_id: 'tmF', title: 'Finished later', year: 2020, watched_at: '2026-05-20T00:00:00Z' }]);
+    const rows = [
+      engRow('ttA', 30, 10),   // abandoned
+      engRow('ttB', 30, 2),    // paused recently → not yet a verdict
+      engRow('ttC', 70, 30),   // past halfway → neutral
+      engRow('ttF', 20, 40),   // started, later FINISHED → never abandoned
+      engRow('ttN', 10, 30),   // tmdb unresolved → ignored
+    ];
+    await mqEngagement.syncEngagement(profile, mqCfgResolved, {
+      pull: async () => rows, resolveTmdb: async (id) => (id === 'ttN' ? null : id.replace('tt', 'tm')), now: engNow, log: quiet,
+    });
+    const ab = mqEngagement.abandonedFor(profile.id, mqCfgResolved, { now: engNow });
+    assert.deepStrictEqual([...ab.keys()], ['tmA']);
+    assert.strictEqual(ab.get('tmA').percent, 30);
+    // Disabled via Tier-2 config → nothing is abandoned.
+    assert.strictEqual(mqEngagement.abandonedFor(profile.id, mqCfg.resolveConfig({ marquee: { engagement: { enabled: false } } }), { now: engNow }).size, 0);
+    watchedStore.deleteForProfile(profile.id);
+    mqEngagement._clear();
+  });
+
+  await it('marquee m2 engagement: an abandoned film is a negative taste event (its director turns negative)', async () => {
+    const taste = require('../src/engines/marquee/taste');
+    const profileId = 'p-eng3';
+    glassMeta._clear();
+    watchedStore.upsertMany(profileId, [{ simkl_id: 1, type: 'movie', imdb_id: 'ttw1', tmdb_id: 'w1', title: 'Liked', year: 2020, watched_at: '2026-05-01T00:00:00Z' }]);
+    glassMeta.put('movie', 'w1', { genres: ['Drama'], director: ['Director Liked'], imdb_id: 'ttw1' });
+    const abandoned = new Map([['ab1', { percent: 25, ts: engNow - 20 * DAYMS }]]);
+    const events = taste.buildEvents(profileId, mqCfgResolved, { nowMs: engNow, ratings: new Map(), abandoned });
+    const ev = events.find((e) => e.tmdb_id === 'ab1');
+    assert.strictEqual(ev.kind, 'abandoned');
+    assert.strictEqual(ev.weight, -1.0);
+    // The abandoned film's meta is enriched (bounded), then its director goes negative.
+    const tm = await taste.buildTaste(profileId, 'k', mqCfgResolved, {
+      nowMs: engNow, ratings: new Map(), abandoned, log: quiet,
+      enrichFetcher: async (_k, _t, id) => (id === 'ab1' ? { tmdb_id: 'ab1', imdb_id: 'ttab1', genres: ['Horror'], director: ['Director Disliked'] } : null),
+    });
+    assert.ok(tm.dims.directors['Director Disliked'] < 0, 'abandoned film pushes its director negative');
+    assert.ok(tm.dims.directors['Director Liked'] > 0, 'finished film stays positive');
+    watchedStore.deleteForProfile(profileId);
+    glassMeta._clear();
+  });
+
+  await it('marquee m2 engagement: generate never recommends an abandoned film back (and traces why)', async () => {
+    mqEngagement._clear();
+    glassMeta._clear();
+    const p = config.addProfile('INT-MQENG');
+    try {
+      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { vote_count_floor: 100 } });
+      watchedStore.upsertMany(p.id, [{ simkl_id: 1, type: 'movie', imdb_id: 'ttes1', tmdb_id: 'es1', title: 'Seed', year: 2024, watched_at: '2026-05-01T00:00:00Z' }]);
+      const trace = { generated: new Map(), dropped: new Map() };
+      const ctx = {
+        tmdbKey: 'k', mdblistKey: '', settings: {}, filters: { vote_count_floor: 100 }, log: quiet, nowMs: engNow,
+        watchedIds: watchedStore.watchedIdSets(p.id), dont: new Set(), stats: {}, marqueeChain: [], marqueeTrace: trace,
+        marqueeFetchers: {
+          ...mqSeam({ recs: () => [mqItem('keep1'), mqItem('gone1')] }),
+          syncRatings: async () => ({ skipped: 'test' }),
+          pullProgress: async () => [engRow('ttgone1', 20, 30)],
+          resolveTmdb: async (imdbId) => imdbId.slice(2),
+        },
+      };
+      const out = await marqueeEngine.generate(config.getProfile(p.id), 'movie', ctx);
+      assert.ok(out.some((r) => r.tmdb_id === 'keep1'), 'normal candidate kept');
+      assert.ok(!out.some((r) => r.tmdb_id === 'gone1'), 'abandoned film not recommended back');
+      assert.strictEqual(trace.dropped.get('gone1'), 'abandoned');
+    } finally {
+      config.removeProfile(p.id); watchedStore.deleteForProfile(p.id); rs.deleteForProfile(p.id);
+      mqEngagement._clear(); glassMeta._clear();
+    }
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();

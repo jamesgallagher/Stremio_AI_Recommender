@@ -498,6 +498,9 @@ async function gatherCandidates(profile, ctx, {
   merged = merged.filter((c) => {
     if (watchedTmdb.has(c.tmdb_id)) return drop(c, 'watched');
     if (dont.has(`movie:${c.tmdb_id}`)) return drop(c, 'dont_recommend');
+    // m2 engagement: a film this profile started and abandoned before halfway
+    // is never recommended back by Marquee (Marquee-only by design).
+    if (ctx.marqueeAbandoned && ctx.marqueeAbandoned.has(c.tmdb_id)) return drop(c, 'abandoned');
     if (c.adult) return drop(c, 'adult');
     const onlyS2orLLM = [...c.sources].every((s) => s === 'simkl_recs' || s === 'llm');
     const item = (onlyS2orLLM && c.vote_count === 0) ? { ...c, vote_count: Infinity, vote_average: 0 } : c;

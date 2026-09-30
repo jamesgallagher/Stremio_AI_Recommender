@@ -2310,6 +2310,26 @@ ok('marquee ME-06: renormalize — sums to 1 without llm_fit / without trending_
   assert.deepStrictEqual(f.renormalize({ a: 0, b: 0 }, ['a', 'b']), {});
 });
 
+ok('nuvio: normalizeProgressRow — Nuvio unit rules, percent, movie vs series (m2 engagement)', () => {
+  const nuvio = require('../src/services/nuvio');
+  // Explicit *_ms pair.
+  let r = nuvio.normalizeProgressRow({ content_id: 'tt1', content_type: 'movie', position_ms: 1800000, duration_ms: 7200000, updated_at: '2026-05-01T00:00:00Z' });
+  assert.strictEqual(r.type, 'movie'); assert.strictEqual(r.percent, 25); assert.strictEqual(r.updatedAtMs, Date.parse('2026-05-01T00:00:00Z'));
+  // Legacy unitless pair in SECONDS (duration ≤ 8 h) → ms.
+  r = nuvio.normalizeProgressRow({ content_id: 'tt2', position: 3600, duration: 7200 });
+  assert.strictEqual(r.positionMs, 3600000); assert.strictEqual(r.durationMs, 7200000); assert.strictEqual(r.percent, 50);
+  // Legacy unitless pair already in MILLISECONDS (duration > 8 h as seconds) → kept.
+  r = nuvio.normalizeProgressRow({ content_id: 'tt3', position: 720000, duration: 7200000 });
+  assert.strictEqual(r.durationMs, 7200000); assert.strictEqual(r.percent, 10);
+  // The row's own progress_percent wins; trakt_history counts as finished.
+  assert.strictEqual(nuvio.normalizeProgressRow({ content_id: 'tt4', progress_percent: 42, position_ms: 1, duration_ms: 100 }).percent, 42);
+  assert.strictEqual(nuvio.normalizeProgressRow({ content_id: 'tt5', progress_percent: 60, source: 'trakt_history' }).percent, 100);
+  // Episodes are series; non-tt ids are dropped; epoch-seconds timestamps convert.
+  assert.strictEqual(nuvio.normalizeProgressRow({ content_id: 'tt6', content_type: 'series', season: 1, episode: 2, position_ms: 1, duration_ms: 2 }).type, 'series');
+  assert.strictEqual(nuvio.normalizeProgressRow({ content_id: 'kitsu:1', position_ms: 1, duration_ms: 2 }), null);
+  assert.strictEqual(nuvio.normalizeProgressRow({ content_id: 'tt7', position_ms: 1, duration_ms: 2, updated_at: 1780000000 }).updatedAtMs, 1780000000000);
+});
+
 ok('marquee m2: preScore — seed agreement leads; trending counts only in proportion to genre fit', () => {
   const f = require('../src/engines/marquee/features');
   const taste = { dims: { genres: { Action: 0.8 } } };

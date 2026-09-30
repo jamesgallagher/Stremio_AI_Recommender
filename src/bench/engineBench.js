@@ -126,6 +126,12 @@ function removeHoldout(profileId, targetIds, { db, noCache = false }) {
   if (tableExists(conn, 'marquee_ratings')) {
     conn.prepare('DELETE FROM marquee_ratings WHERE profile_id = ? AND tmdb_id IN (' + inList + ')').run(profileId, ...targetIds);
   }
+  // m2 engagement: a held-out film the profile FINISHED may still carry an old
+  // mid-watch progress row. With the film removed from `watched`, that row would
+  // read as "abandoned" and Marquee would exclude it — an unfair miss. Clear it.
+  if (tableExists(conn, 'marquee_engagement')) {
+    conn.prepare('DELETE FROM marquee_engagement WHERE profile_id = ? AND tmdb_id IN (' + inList + ')').run(profileId, ...targetIds);
+  }
   if (noCache && tableExists(conn, 'marquee_llm_cache')) {
     conn.prepare("DELETE FROM marquee_llm_cache WHERE profile_id = ? AND kind IN ('brief','fit','suggest')").run(profileId);
   }

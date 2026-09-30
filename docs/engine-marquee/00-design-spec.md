@@ -341,4 +341,32 @@ and was led by broad genre affinity, while a 500-title Simkl trending feed crowd
   hard_filter:<reason> / franchise_cap / store_cap). The bench now reports, per held-out film, whether
   it is reachable under the profile's filters, each engine's rank, and Marquee's loss stage, plus
   `hit@20r` (hits among reachable targets). All of it is Tier-2 tunable via `settings.marquee`.
+- **Intersecting recommendations** ("A says B, C, D, E; R says B, E, F → B and E count twice") is
+  exactly `seed_affinity`: every candidate remembers which of your films produced it (TMDB
+  recommendations/similar and Simkl "users also liked"), and each distinct seed adds its recency
+  weight, so a film several recent watches point at outranks one only a single watch suggests.
+
+### Engagement: finished = liked, abandoned = not (James, 2026-09-30)
+
+This family doesn't rate films, so the Simkl-ratings path (ME-03/04) is a no-op in practice. The
+real signal is completion:
+
+| Watch outcome | Marquee treatment |
+|---|---|
+| Finished (Simkl "completed") | positive taste event (the existing watched base, +1) and eligible seed |
+| Started, left **below 50%**, untouched **7+ days** | **negative** taste event (−1.0, recency-decayed); never recommended back; never a seed |
+| Past 50% but not finished, or touched in the last 7 days | neutral (no event) |
+| Abandoned, then finished later | finished wins |
+
+- **Source:** Nuvio's watch progress (`sync_pull_watch_progress`, params `{ p_profile_id }`; RPC
+  name, params and row shape taken from Nuvio's open-source client), read via the profile's
+  existing scrobble credentials. Simkl has no progress for this family (§12:
+  `movies.playback`/`dropped` are null).
+- Stored in the engine-owned `marquee_engagement` table, pulled at most every 6 h, and **kept after
+  Nuvio prunes its "continue watching" row**. **Marquee only** (James's decision): Genesis and Glass
+  never read it.
+- Config: `engagement: { enabled, abandon_below: 50, grace_days: 7, weight: -1.0, sync_hours: 6,
+  resolve_cap: 30, enrich_cap: 30 }`, all Tier-2 tunable.
+- To confirm retention live: `test/verify-marquee-live.js` check **V7** prints movie progress rows
+  by bucket and age (counts only).
 - Next: re-run the bench (ideally `--holdout 30` and every profile) and record run 2 here.

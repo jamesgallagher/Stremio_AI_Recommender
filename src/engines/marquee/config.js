@@ -44,6 +44,12 @@ const DEFAULTS = {
   // how many recent watches point at a title — out-recalling Marquee; more
   // seeds is the cheapest way to widen that agreement signal (2 TMDB calls/seed).
   seed_cap: 100,
+  // m2 ENGAGEMENT (James, 2026-09-30): this family doesn't rate films. A film
+  // watched to the end = liked (the watched base); a film started but left
+  // below abandon_below % and untouched for grace_days = didn't enjoy it: a
+  // negative taste event of `weight`, never recommended back by Marquee, never
+  // a seed. Source: the watch provider's progress (Nuvio). Marquee only.
+  engagement: { enabled: true, abandon_below: 50, grace_days: 7, weight: -1.0, sync_hours: 6, resolve_cap: 30, enrich_cap: 30 },
   enrich_cap: 60,
   llm_timeout_ms: 60000,
   brief: { input_cap: 60 },
