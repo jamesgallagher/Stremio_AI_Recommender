@@ -1960,6 +1960,29 @@ async function main() {
     assert.ok(h1._preScore > 0.2, 'hydrated pre-score > 0.2 for an on-taste genre');
   });
 
+  await it('marquee ME-05: S5 per-list isolation (S1) — simklTrending throws, TMDB week/day kept, hadTrending true', async () => {
+    glassMeta._clear();
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const { f, calls } = mqFetchers({
+      trendingWeek: [mqItem('w1', { rank: 1 }), mqItem('w2', { rank: 2 })],
+      trendingDay: [mqItem('d1', { rank: 1 })],
+    });
+    // The stub returns its override as-is, so install a throwing fetcher here.
+    f.simklTrending = async () => { calls.simklTrending += 1; throw new Error('cdn down'); };
+    const ctx = mqCtx(filters);
+    const { candidates, meta } = await mqSources.gatherCandidates({ id: 'p-mq-s1', name: 'MQS1', filters }, ctx, {
+      taste: mqTaste, brief: null, briefHash: 'h', seeds: [], envelope: env, cfg: mqCfgResolved, genreMap: mqGenreMap, fetchers: f, chain: [], log: quiet,
+    });
+    const ids = candidates.map((c) => c.tmdb_id);
+    assert.ok(ids.includes('w1') && ids.includes('w2'), 'TMDB week candidates kept');
+    assert.ok(ids.includes('d1'), 'TMDB day candidate kept');
+    assert.strictEqual(calls.simklTrending, 1, 'simklTrending attempted once');
+    assert.strictEqual(meta.hadTrending, true, 'hadTrending from the lists that succeeded');
+    assert.strictEqual(meta.weekN, 2, 'weekN from the week list');
+    assert.strictEqual(meta.dayN, 1, 'dayN from the day list');
+  });
+
   await it('marquee ME-05/06: call budget (40 seeds → 40 recs + 40 similar; discover ≤ 16; collection ≤ 10; simklRecs once; deepMeta ≤ 400)', async () => {
     glassMeta._clear();
     const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };

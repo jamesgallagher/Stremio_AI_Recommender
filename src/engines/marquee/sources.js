@@ -392,38 +392,42 @@ async function gatherCandidates(profile, ctx, {
 
   // S5 — trending (TMDB week/day + Simkl). Trending items enter whether or not
   // they match taste (MD-2 — the taste gate in ME-06 keeps off-taste low).
+  // Review round 1 (S1): each list has its OWN try/catch — one CDN failing must
+  // not throw away the other lists (which would also flip hadTrending and drop
+  // trending_eff from the ME-06 weights).
   let weekN = 0, dayN = 0, hadTrending = false;
-  try {
-    const week = await f.trendingWeek();
-    const day = await f.trendingDay();
-    const simkl = await f.simklTrending();
-    weekN = week.length;
-    dayN = day.length;
-    hadTrending = week.length > 0 || day.length > 0 || simkl.length > 0;
-    for (const it of week) {
-      const c = makeCand(it, genreMap);
-      c.trending.tmdbWeekRank = it.rank;
-      c.sources.add('trending');
-      pool.push(c);
-      srcCounts.S5 += 1;
-    }
-    for (const it of day) {
-      const c = makeCand(it, genreMap);
-      c.trending.tmdbDayRank = it.rank;
-      c.sources.add('trending');
-      pool.push(c);
-      srcCounts.S5 += 1;
-    }
-    for (const it of simkl) {
-      const c = makeCand({ tmdb_id: it.tmdb_id, title: it.title, year: it.year, genre_ids: [], vote_average: it.ratings?.imdb?.rating ?? 0, vote_count: it.ratings?.imdb?.votes ?? 0, popularity: 0, adult: false, poster: null }, genreMap);
-      c.genres = it.genres || [];
-      c.trending.simklWatched = it.watched || 0;
-      c.trending.simklDrop = it.drop_rate ?? null;
-      c.sources.add('trending');
-      pool.push(c);
-      srcCounts.S5 += 1;
-    }
-  } catch (err) { log.warn(`[marquee] S5 trending failed: ${err.message}`); }
+  let week = [];
+  let day = [];
+  let simkl = [];
+  try { week = (await f.trendingWeek()) || []; } catch (err) { log.warn(`[marquee] S5 trendingWeek failed: ${err.message}`); }
+  try { day = (await f.trendingDay()) || []; } catch (err) { log.warn(`[marquee] S5 trendingDay failed: ${err.message}`); }
+  try { simkl = (await f.simklTrending()) || []; } catch (err) { log.warn(`[marquee] S5 simklTrending failed: ${err.message}`); }
+  weekN = week.length;
+  dayN = day.length;
+  hadTrending = weekN > 0 || dayN > 0 || simkl.length > 0;
+  for (const it of week) {
+    const c = makeCand(it, genreMap);
+    c.trending.tmdbWeekRank = it.rank;
+    c.sources.add('trending');
+    pool.push(c);
+    srcCounts.S5 += 1;
+  }
+  for (const it of day) {
+    const c = makeCand(it, genreMap);
+    c.trending.tmdbDayRank = it.rank;
+    c.sources.add('trending');
+    pool.push(c);
+    srcCounts.S5 += 1;
+  }
+  for (const it of simkl) {
+    const c = makeCand({ tmdb_id: it.tmdb_id, title: it.title, year: it.year, genre_ids: [], vote_average: it.ratings?.imdb?.rating ?? 0, vote_count: it.ratings?.imdb?.votes ?? 0, popularity: 0, adult: false, poster: null }, genreMap);
+    c.genres = it.genres || [];
+    c.trending.simklWatched = it.watched || 0;
+    c.trending.simklDrop = it.drop_rate ?? null;
+    c.sources.add('trending');
+    pool.push(c);
+    srcCounts.S5 += 1;
+  }
   onProgress(50, 'Gathered trending');
 
   // S6 — LLM suggestions (only when brief is non-null and a local chain is set).
