@@ -745,9 +745,10 @@ ok('recommendationStore: selectStrong gates on the supplied vote floor (NOT rati
 ok('engines: registry lists Genesis, resolveFor/availableFor honour age gating (I7) + global enablement (SC-07)', () => {
   const engines = require('../src/engines');
   const settings = require('../src/settings');
-  // The registry lists Genesis + Glass for both types (Glass is registered but
-  // ships globally DISABLED, so it's in listForType yet absent from availableFor).
-  assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['genesis', 'glass']);
+  // The registry lists Genesis + Glass for both types, and Marquee (movie-only)
+  // for movie. All ship globally DISABLED, so each is in listForType yet absent
+  // from availableFor until an admin enables it (SC-07).
+  assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['genesis', 'glass', 'marquee']);
   assert.deepStrictEqual(engines.listForType('series').map((e) => e.id), ['genesis', 'glass']);
   // Genesis is the permanent default + safe floor — always enabled (SC-07).
   assert.strictEqual(engines.isEnabled('genesis'), true);
@@ -786,7 +787,7 @@ ok('engines: registry lists Genesis, resolveFor/availableFor honour age gating (
     assert.strictEqual(engines.resolveFor(kid, 'movie').id, 'genesis');
   } finally { dispose(); settings.updateSettings({ engines: { 'open-stub': false } }); }
   // Registry restored to the built-in engines after the stub is disposed.
-  assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['genesis', 'glass']);
+  assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['genesis', 'glass', 'marquee']);
 
   // GE-07 conformance: Glass ships DISABLED (absent from dropdowns), and once
   // enabled it is a GATED engine (unrestricted:false) — offered to an age-limited
@@ -2310,6 +2311,115 @@ ok('marquee ME-05: buildSuggestPrompt — filter rules in words, never age/suita
   assert.ok(!/age|suitab|classif|child/i.test(p), 'no age wording: ' + p);
 });
 
+// ---- Marquee ME-07 (pure) ----
+ok('marquee ME-07: parseFit — invented id ignored, duplicate first wins, clamp, non-number missing, reason truncate', () => {
+  const llmFit = require('../src/engines/marquee/llmFit');
+  const words20 = Array.from({ length: 20 }, (_, i) => 'w' + i).join(' ');
+  const m = llmFit.parseFit([
+    { id: 'x', fit: 9 }, // invented (not in the batch) → ignored
+    { id: '1', fit: -3 }, // clamp → 0
+    { id: '1', fit: 14 }, // duplicate → first wins
+    { id: '2', fit: 'high' }, // non-number → missing
+    { id: '3', fit: 8, reason: words20 }, // 20 words → truncated to 14
+    { id: '4', fit: 5, reason: null },
+  ], ['1', '2', '3', '4']);
+  assert.ok(!m.has('x'), 'invented id ignored');
+  assert.deepStrictEqual(m.get('1'), { fit: 0, reason: null }, 'fit -3 → 0, duplicate first wins');
+  assert.ok(!m.has('2'), 'non-number fit → item missing');
+  assert.strictEqual(m.get('3').fit, 8);
+  assert.strictEqual(m.get('3').reason.split(/\s+/).length, 14, '20-word reason truncated to 14 words');
+  assert.deepStrictEqual(m.get('4'), { fit: 5, reason: null });
+});
+
+ok('marquee ME-07: buildFitPrompt — brief + item data, cert as context only, no age/suitability wording', () => {
+  const llmFit = require('../src/engines/marquee/llmFit');
+  const p = llmFit.buildFitPrompt(
+    { loves: ['Action'], avoids: ['Horror'], moods: ['thrilling'], eras: ['2010s'], standout_titles: ['Inception'] },
+    [{ id: '1', title: 'Alpha', year: 2020, overview: 'ov', director: 'D', keywords: ['k1'], cert: 'M' }],
+  );
+  assert.ok(p.includes('Action') && p.includes('Horror'), 'brief content present');
+  assert.ok(p.includes('Alpha'), 'item title present');
+  assert.ok(p.includes('Classification: M'), 'cert as descriptive context');
+  assert.ok(!/suitab|appropriate|child|kid|age limit|for ages/i.test(p), 'no age/suitability wording: ' + p);
+});
+
+// ---- Marquee ME-08 (pure) ----
+ok('marquee ME-08: shapeOutput — franchise cap, store cap, exact shortfall line, _fit/_preScore stripped', () => {
+  const shape = require('../src/engines/marquee/shape');
+  const cfg = require('../src/engines/marquee/config').DEFAULTS;
+  const mk = (id, cid, score) => ({
+    type: 'movie', tmdb_id: id, rankScore: score, reason: null,
+    scoreComponents: { features: {}, weights: {}, penalty: 0, inputs: { collection_id: cid }, llm: { fit: 5, reason: null, cached: false } },
+    _fit: { overview: 'x' }, _preScore: 0.5,
+  });
+  const warn = [];
+  const log = { log() {}, warn(m) { warn.push(m); }, error() {} };
+
+  // 5 rows, one collection → at most 2 of it kept; no-collection rows uncapped.
+  const rows = [mk('a1', 1, 5), mk('a2', 1, 4), mk('a3', 1, 3), mk('b1', null, 2), mk('b2', null, 1)];
+  const out = shape.shapeOutput(rows, { cfg, listSize: 20, envelopeStats: {}, log });
+  assert.deepStrictEqual(out.map((r) => r.tmdb_id), ['a1', 'a2', 'b1', 'b2'], 'franchise cap 2 on the collection');
+  assert.ok(out.every((r) => !('_fit' in r) && !('_preScore' in r)), '_fit/_preScore stripped');
+
+  // Store cap.
+  const outCap = shape.shapeOutput(rows, { cfg: { ...cfg, store_cap: 3 }, listSize: 20, envelopeStats: {}, log });
+  assert.deepStrictEqual(outCap.map((r) => r.tmdb_id), ['a1', 'a2', 'b1'], 'store cap 3');
+
+  // Exact shortfall line — the 4 largest non-zero counters, descending.
+  warn.length = 0;
+  shape.shapeOutput(rows, { cfg, listSize: 20, envelopeStats: { cert_over: 10, votes: 7, genre: 3, adult: 2, rating: 1 }, log });
+  assert.deepStrictEqual(warn, ['[marquee] : shortfall 4/150 — blockers: cert_over 10, votes 7, genre 3, adult 2'], 'shortfall line, dominant blocker first');
+
+  // No non-zero counters → 'blockers: none recorded'.
+  warn.length = 0;
+  shape.shapeOutput(rows, { cfg, listSize: 20, envelopeStats: { no_imdb: 0, votes: 0 }, log });
+  assert.deepStrictEqual(warn, ['[marquee] : shortfall 4/150 — blockers: none recorded'], 'none recorded');
+
+  // No shortfall → no warn.
+  warn.length = 0;
+  const big = Array.from({ length: 150 }, (_, i) => mk('z' + i, null, 150 - i));
+  shape.shapeOutput(big, { cfg, listSize: 20, envelopeStats: {}, log });
+  assert.deepStrictEqual(warn, [], 'no warn at target');
+});
+
+// ---- Marquee ME-09 (pure) ----
+ok('marquee ME-09: resolveConfig — Tier-2 merge semantics (spec §4.5)', () => {
+  const mc = require('../src/engines/marquee/config');
+
+  // A nested override changes only that leaf; siblings keep defaults.
+  const r1 = mc.resolveConfig({ marquee: { weights: { quality: 0.5 } } });
+  assert.strictEqual(r1.weights.quality, 0.5, 'weights.quality overridden');
+  assert.strictEqual(r1.weights.taste_match, 0.28, 'sibling weight untouched');
+  assert.strictEqual(r1.franchise_cap, 2, 'unrelated section untouched');
+
+  // Top-level scalar override.
+  const r2 = mc.resolveConfig({ marquee: { franchise_cap: 1, store_cap: 50 } });
+  assert.strictEqual(r2.franchise_cap, 1, 'franchise_cap overridden');
+  assert.strictEqual(r2.store_cap, 50, 'store_cap overridden');
+  assert.strictEqual(r2.min_supply, 150, 'min_supply untouched');
+
+  // Unknown sections are ignored (no throw, no leak into cfg).
+  const r3 = mc.resolveConfig({ marquee: { bogus: { x: 1 }, other: 42 } });
+  assert.ok(!('bogus' in r3) && !('other' in r3), 'unknown sections ignored');
+  assert.deepStrictEqual(r3, mc.resolveConfig({}), 'unknown-only blob → pure defaults');
+
+  // Malformed blob: non-object marquee → defaults, never throws.
+  assert.deepStrictEqual(mc.resolveConfig({ marquee: 'x' }), mc.resolveConfig({}), "marquee: 'x' → defaults");
+  assert.deepStrictEqual(mc.resolveConfig({ marquee: null }), mc.resolveConfig({}), 'marquee: null → defaults');
+  assert.deepStrictEqual(mc.resolveConfig({}), mc.resolveConfig(null), 'no settings → defaults');
+
+  // A glass blob never touches Marquee's config (independent blobs, spec §4.5).
+  const r4 = mc.resolveConfig({ glass: { weights: { quality: 0.99 } }, marquee: {} });
+  assert.strictEqual(r4.weights.quality, 0.14, 'glass blob does not leak into Marquee');
+
+  // The result is a fresh clone — mutating it never touches DEFAULTS.
+  const r5 = mc.resolveConfig({ marquee: { franchise_cap: 7 } });
+  r5.franchise_cap = 999;
+  r5.weights.quality = 999;
+  assert.strictEqual(mc.DEFAULTS.franchise_cap, 2, 'DEFAULTS untouched');
+  assert.strictEqual(mc.DEFAULTS.weights.quality, 0.14, 'DEFAULTS untouched');
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');
@@ -2863,15 +2973,16 @@ async function httpTests() {
   console.log('  ✓ /api/genres');
 
   // /api/engines — the static registry for the portal's per-type dropdowns (SC-02).
-  // It advertises Genesis + Glass (Glass registered but globally disabled), both types.
+  // It advertises Genesis + Glass (both types) + Marquee (movie-only), Glass and
+  // Marquee registered but globally disabled.
   const eng = await (await fetch(`${BASE}/api/engines`)).json();
   assert.strictEqual(eng.default, 'genesis');
-  assert.deepStrictEqual(eng.engines.map((e) => e.id), ['genesis', 'glass']);
+  assert.deepStrictEqual(eng.engines.map((e) => e.id), ['genesis', 'glass', 'marquee']);
   assert.deepStrictEqual(eng.engines[0].supported_types, ['movie', 'series']);
   assert.ok(eng.engines[0].description && eng.engines[0].capabilities.unrestricted === false);
   const glassAd = eng.engines.find((e) => e.id === 'glass');
   assert.ok(glassAd && glassAd.enabled === false && glassAd.capabilities.unrestricted === false);
-  console.log('  ✓ /api/engines advertises the registry (Genesis + Glass, both types)');
+  console.log('  ✓ /api/engines advertises the registry (Genesis + Glass both types, Marquee movie-only)');
 
   // Create a profile through the API
   let res = await fetch(`${BASE}/api/profiles`, {

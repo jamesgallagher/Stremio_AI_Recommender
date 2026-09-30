@@ -53,6 +53,12 @@ function blankSettings() {
     // stays glass-schema-agnostic: it stores the blob as-is; engines/glass/config
     // .resolveConfig merges it over the defaults and ignores unknown keys.
     glass: {},
+    // Marquee Tier-2 global admin config (ME-09) — the same pattern as Glass
+    // (GE-07) but Marquee's own blob: engines/marquee/config.resolveConfig
+    // merges it over Marquee's DEFAULTS and ignores unknown keys. Empty =
+    // pure Tier-1 defaults. BUILD-AFFECTING — a change fans out
+    // clearType+rebuild across Marquee movie slices (portal write path).
+    marquee: {},
     created_at: null, // null until Server Config is first saved
   };
 }
@@ -62,7 +68,8 @@ function settingsLocked() { return locked; }
 
 // ---- sealing ----
 function sealSettings(s) {
-  const q = { llm: { ...s.llm }, keys: { ...s.keys }, engines: { ...(s.engines || {}) }, glass: { ...(s.glass || {}) }, created_at: s.created_at };
+  // ME-09: the Marquee Tier-2 blob is sealed like glass (plain object, no secrets).
+  const q = { llm: { ...s.llm }, keys: { ...s.keys }, engines: { ...(s.engines || {}) }, glass: { ...(s.glass || {}) }, marquee: { ...(s.marquee || {}) }, created_at: s.created_at };
   for (const f of LLM_SECRET_FIELDS) if (q.llm[f]) q.llm[f] = secret.seal(q.llm[f]);
   for (const f of KEY_SECRET_FIELDS) if (q.keys[f]) q.keys[f] = secret.seal(q.keys[f]);
   return q;
@@ -86,6 +93,7 @@ function applyDefaults(s) {
     keys: { ...base.keys, ...(s.keys || {}) },
     engines: { ...base.engines, ...(s.engines || {}) }, // seeds {} on older files (SC-07)
     glass: { ...base.glass, ...(s.glass || {}) },        // seeds {} on older files (GE-07)
+    marquee: { ...base.marquee, ...(s.marquee || {}) },  // seeds {} on older files (ME-09)
     created_at: s.created_at ?? null,
   };
   return merged;
@@ -127,6 +135,11 @@ function updateSettings(patch) {
   // its Tier-1 default, since engines/glass/config.resolveConfig backfills from
   // DEFAULTS. Stored as-is (plaintext). `{}` is a true reset to pure defaults.
   if (patch.glass !== undefined) current.glass = (patch.glass && typeof patch.glass === 'object') ? patch.glass : {};
+  // ME-09: Marquee Tier-2 config — the same replace-whole semantics as Glass
+  // (GE-07): any section left out reverts to its Tier-1 default, since
+  // engines/marquee/config.resolveConfig backfills from DEFAULTS. `{}` is a
+  // true reset to pure defaults.
+  if (patch.marquee !== undefined) current.marquee = (patch.marquee && typeof patch.marquee === 'object') ? patch.marquee : {};
   if (!current.created_at) current.created_at = Date.now();
   store.saveSettings(sealSettings(current));
   return current;

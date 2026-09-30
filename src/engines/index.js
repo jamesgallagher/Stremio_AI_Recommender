@@ -10,8 +10,13 @@ const genesis = require('./genesis');
 // a user-visible no-op until then. Source sign-off + conformance are cleared
 // (docs/engine-glass/, GE-07).
 const glass = require('./glass');
+// Marquee (ME-09) — movie-only. Registered here so it appears in the movie
+// dropdown, but it ships GLOBALLY DISABLED (isEnabled below: non-Genesis
+// defaults OFF) until an admin enables it in Server Config (SC-07) — a
+// user-visible no-op until then.
+const marquee = require('./marquee');
 
-const REGISTRY = new Map([[genesis.id, genesis], [glass.id, glass]]);
+const REGISTRY = new Map([[genesis.id, genesis], [glass.id, glass], [marquee.id, marquee]]);
 const DEFAULT_ID = 'genesis';
 
 function get(id) { return REGISTRY.get(id) || null; }

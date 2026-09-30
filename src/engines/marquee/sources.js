@@ -508,19 +508,30 @@ async function gatherCandidates(profile, ctx, {
   // that do NOT already rank inside the main slice, ranked by distinct-seed
   // count, then max seed weight, then tmdb_id. The 'collab_reserve' tag is
   // deliberately NOT counted by features.countedGroups (no consensus change).
+  //
+  // P4 carry-over (build prompt §4.0): the reserve's pool extends to every
+  // title OUTSIDE the final main slice — from rank (mainCap − collab_reserve),
+  // not mainCap. A title ranked between the two was previously dropped by BOTH
+  // the pool (slice(mainCap)) and the main slice (mainCap − collab_reserve),
+  // while weaker S2 titles below mainCap got reserved instead.
   const mainCap = Math.max(0, cfg.lookup_cap - explore.length);
   const maxSeedWeight = (c) => { let m = null; for (const [, w] of c._seedWeights) if (m == null || w > m) m = w; return m; };
+  const poolStart = Math.max(0, mainCap - cfg.simkl.collab_reserve);
   const collab = nonExplore
-    .slice(mainCap)
+    .slice(poolStart)
     .filter((c) => c.sources.has('simkl_recs'))
     .sort((a, b) => (b.seeds.size - a.seeds.size) || ((maxSeedWeight(b) || 0) - (maxSeedWeight(a) || 0)) || (a.tmdb_id < b.tmdb_id ? -1 : 1))
     .slice(0, cfg.simkl.collab_reserve);
   for (const c of collab) c.sources.add('collab_reserve');
   srcCounts.S2_reserved = collab.length;
 
-  // Main slice = the top (lookup_cap − explore − collab) by pre-score; total
-  // stays ≤ lookup_cap (MI-5 unchanged).
-  const mainSlice = nonExplore.slice(0, Math.max(0, cfg.lookup_cap - explore.length - collab.length));
+  // Main slice = the top (mainCap − collab) of nonExplore, excluding anything
+  // reserved (a reserved title inside the main range must not appear twice);
+  // total stays ≤ lookup_cap (MI-5 unchanged).
+  const collabSet = new Set(collab.map((c) => c.tmdb_id));
+  const mainSlice = nonExplore
+    .filter((c) => !collabSet.has(c.tmdb_id))
+    .slice(0, Math.max(0, mainCap - collab.length));
   const candidates = [...mainSlice, ...collab, ...explore];
   const kept = candidates.length;
 
@@ -537,6 +548,7 @@ async function gatherCandidates(profile, ctx, {
 
 module.exports = {
   gatherCandidates,
+  defaultFetchers,
   parseSuggestions,
   buildSuggestPrompt,
   buildDiscoverQueries,

@@ -1,7 +1,7 @@
 # Marquee Engine — scope cards
 
-**Status:** DESIGN ONLY (no code). A **movie-only** candidate-producer engine behind
-the engine abstraction. It fixes four gaps shared by Genesis/Glass: filters are
+**Status:** **MVP built (P4, v7.16.3-beta), ships globally disabled**. A **movie-only**
+candidate-producer engine behind the engine abstraction. It fixes four gaps shared by Genesis/Glass: filters are
 enforced only at serve, movies reach the age gate without a real classification,
 trending lists include titles not yet streamable, and the LLM only re-orders.
 
