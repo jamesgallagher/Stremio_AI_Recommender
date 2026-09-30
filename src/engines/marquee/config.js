@@ -7,7 +7,10 @@
 // are independent: a Marquee tuning change must not move Glass, and vice versa.
 // Do NOT import Glass's resolveConfig here (spec §4.5) — that would couple the
 // two engines' config blobs.
-const ALGORITHM_VERSION = 'marquee-m1';
+// m2 (2026-09-30, after the first live backtest): seed agreement became a
+// first-class signal (pre-score + final score), more seeds, a capped + taste-
+// gated trending intake. See spec §15.
+const ALGORITHM_VERSION = 'marquee-m2';
 
 const DEFAULTS = {
   // ── Copies of Glass's taste-model knobs (spec §4.5) ──
@@ -37,7 +40,10 @@ const DEFAULTS = {
   // Rating → event weight bands (spec §4.3): 9–10 → +2.0, 7–8 → +1.2,
   // 5–6 → +0.4, 1–4 → −1.2.
   rating_weights: { r9_10: 2.0, r7_8: 1.2, r5_6: 0.4, r1_4: -1.2 },
-  seed_cap: 40,
+  // m2: 100 seeds (was 40). The backtest showed Genesis — 150 seeds, ranked by
+  // how many recent watches point at a title — out-recalling Marquee; more
+  // seeds is the cheapest way to widen that agreement signal (2 TMDB calls/seed).
+  seed_cap: 100,
   enrich_cap: 60,
   llm_timeout_ms: 60000,
   brief: { input_cap: 60 },
@@ -53,13 +59,24 @@ const DEFAULTS = {
 
   // ── ME-05/ME-06 (spec §4.4/§4.5/§5/§7/§8) ──
   lookup_cap: 400,                 // MI-5: resolve budget — ≤ this many lookups per build
-  recs_per_seed: 12,              // S1: top N of /recommendations AND /similar, per seed
+  recs_per_seed: 12,              // S1: top N of /recommendations per seed
+  similar_per_seed: 6,            // m2: /similar is genre/keyword-based and noisier than /recommendations
   discover: { queries: 8, pages: 2 },
   collections: { max: 10 },        // S4: at most N collections expanded per build
-  trending: { week_pages: 5, day_pages: 2, rising_top: 50, rising_bonus: 0.1 },
+  // m2: simkl_take caps Simkl's week_500 list to its top N by rank. The full
+  // 500 flooded the 400-slot lookup budget with generic popular titles
+  // (backtest: 95% of Marquee's top 20 carried the trending tag).
+  trending: { week_pages: 5, day_pages: 2, rising_top: 50, rising_bonus: 0.1, simkl_take: 100 },
   exploration_pct: 0.05,           // S7
   suggest: { count: 60, avoid_recent: 40, ttl_days: 7 },
-  weights: { taste_match: 0.28, llm_fit: 0.20, trending_eff: 0.20, quality: 0.14, consensus: 0.12, freshness: 0.06 },
+  // m2 weights. seed_affinity = the summed (recency × rating) weight of every
+  // seed that recommended the title, normalised to the build's max — Genesis's
+  // winning signal. consensus (distinct SOURCE groups) is kept but smaller.
+  weights: { taste_match: 0.24, seed_affinity: 0.20, llm_fit: 0.18, trending_eff: 0.16, quality: 0.10, consensus: 0.06, freshness: 0.06 },
+  // m2: the cheap pre-score that picks the 400 titles worth a lookup. Seed
+  // agreement leads; trending only counts in proportion to genre fit
+  // (trending_genre_gate), so off-taste blockbusters stop crowding the budget.
+  prescore: { seed_affinity: 0.35, genre: 0.30, trending: 0.15, quality: 0.10, sources: 0.10, trending_genre_gate: 0.5 },
   trending_gate: 0.35,
   quality_prior: { m: 2000, C: 6.5 },
   freshness_default_window: 30,

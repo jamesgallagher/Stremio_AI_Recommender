@@ -5,7 +5,7 @@
 //
 // Pure apart from log: no network, no DB. The _fit/_preScore working fields
 // never leave this function (they must not reach the DB).
-function shapeOutput(scored, { cfg, listSize = 0, envelopeStats = {}, log = console, profileName = '' } = {}) {
+function shapeOutput(scored, { cfg, listSize = 0, envelopeStats = {}, log = console, profileName = '', trace = null } = {}) {
   // (1) Franchise cap: at most cfg.franchise_cap per non-null collection,
   // walking the rankScore order (scored is already sorted desc); no-collection
   // rows are uncapped.
@@ -15,7 +15,7 @@ function shapeOutput(scored, { cfg, listSize = 0, envelopeStats = {}, log = cons
     const cid = r.scoreComponents?.inputs?.collection_id;
     if (cid != null) {
       const n = seen.get(cid) || 0;
-      if (n >= cfg.franchise_cap) continue;
+      if (n >= cfg.franchise_cap) { if (trace?.dropped) trace.dropped.set(r.tmdb_id, 'franchise_cap'); continue; }
       seen.set(cid, n + 1);
     }
     capped.push(r);
@@ -23,6 +23,7 @@ function shapeOutput(scored, { cfg, listSize = 0, envelopeStats = {}, log = cons
 
   // (2) Truncate to the store cap.
   const final = capped.slice(0, cfg.store_cap);
+  if (trace?.dropped) for (const r of capped.slice(cfg.store_cap)) trace.dropped.set(r.tmdb_id, 'store_cap');
 
   // (3) Oversupply: warn with the dominant blockers when short of target.
   const target = Math.max(cfg.min_supply, listSize * cfg.supply_factor);

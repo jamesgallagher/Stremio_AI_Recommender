@@ -121,6 +121,7 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
     onProgress(95, 'Marquee: shaping output…');
     final = shape.shapeOutput(fitScored, {
       cfg, listSize: recommendationStore.listSizeFor(profile), envelopeStats, log, profileName: profile.name,
+      trace: ctx.marqueeTrace || null, // m2 diagnostics (backtest only)
     });
   }
   if (ctx.stats) ctx.stats.kept = final.length;

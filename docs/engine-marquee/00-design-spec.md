@@ -296,4 +296,49 @@ replaced with "movie 1–3" (the repo is public).
   `PUT /settings`.
 
 ## 14. Backtest results (ME-10)
-_Pending — James runs `node --experimental-sqlite scripts/bench-engines.js "<profile>" --json` for each real profile and pastes the tables here. Marquee is enabled for the family only if it beats Genesis on hit@20 for most profiles (James decides)._
+Run with `node --experimental-sqlite scripts/bench-engines.js "<profile>" --json`. Marquee is
+enabled for the family only if it beats Genesis on hit@20 for most profiles (James decides).
+**Metrics only:** held-out titles are a person's watch history and never go into this public repo.
+
+### Run 1 — 2026-09-30, one profile, holdout 10, algorithm `marquee-m1` (v7.16.4-beta)
+
+| engine | hit@20 | recall@100 | meanRank | filterPass | trending@20 | stored | build (s) |
+|---|---|---|---|---|---|---|---|
+| genesis | 2/10 | 20.0% | 23.0 | 31.7% | n/a | 300 | 39.5 |
+| glass | 1/10 | 0.0% | 121.5 | 33.2% | 90.0% | 229 | 45.3 |
+| marquee (m1) | 0/10 | 10.0% | 72.0 | **100.0%** | 95.0% | 232 | 156.6 |
+
+**Reading:**
+- G1 is confirmed fixed: only ~⅓ of what Genesis/Glass store passes the profile's filters; every Marquee row does.
+- Marquee m1's candidate recall was poor: only 1 of the 10 targets reached its pool at all.
+- Several targets can't be served by ANY filter-respecting engine (a trailer-style short under the
+  vote floor, films older than the recency window, possibly not-yet-streamable releases), so the
+  real ceiling was well under 10. m1's bench didn't report this; m2's does (`hit@20r`).
+- One profile × 10 titles is a small sample: a 1–2 hit difference is mostly noise.
+- trending@20 is inflated as a measure: Simkl's list had 500 movies, so most popular titles carry the tag.
+
+## 15. m2 tuning (2026-09-30, after run 1)
+
+`ALGORITHM_VERSION` `marquee-m1` → **`marquee-m2`**. What Genesis did better: it seeds from 150
+recent watches and ranks purely by **how many of them point at a title** (recency-weighted).
+Marquee m1's cheap pre-score (which picks the ~400 titles worth a lookup) ignored that agreement
+and was led by broad genre affinity, while a 500-title Simkl trending feed crowded the budget.
+
+| Change | m1 | m2 |
+|---|---|---|
+| Seeds | 40 | **100** |
+| `/similar` per seed | 12 | **6** (noisier than `/recommendations`) |
+| Simkl trending intake | all 500 | **top 100 by rank** (`trending.simkl_take`) |
+| Pre-score | 0.45 genre + 0.20 trending + 0.15 quality + 0.20 sources | **0.35 seed agreement** + 0.30 genre + 0.15 trending × genre-fit gate + 0.10 quality + 0.10 sources (`prescore`) |
+| Final weights | taste .28, llm_fit .20, trending .20, quality .14, consensus .12, freshness .06 | taste .24, **seed_affinity .20**, llm_fit .18, trending .16, quality .10, consensus .06, freshness .06 |
+
+- `seed_affinity` = Σ (recency × rating) weight of every distinct seed whose S1/S2 list produced the
+  title, normalised to the build's max. MD-2 still holds: trending stays taste-gated, now ~16%.
+- Bug fixed: rows were stamped `algorithm_version = 'marquee-m1'` from a hard-coded fallback; they now
+  carry the real constant.
+- **Backtest diagnostics:** Marquee records where each title is lost (`ctx.marqueeTrace`:
+  not generated / watched / prefilter:<reason> / truncated (pre-score rank) / lookup_failed /
+  hard_filter:<reason> / franchise_cap / store_cap). The bench now reports, per held-out film, whether
+  it is reachable under the profile's filters, each engine's rank, and Marquee's loss stage, plus
+  `hit@20r` (hits among reachable targets). All of it is Tier-2 tunable via `settings.marquee`.
+- Next: re-run the bench (ideally `--holdout 30` and every profile) and record run 2 here.

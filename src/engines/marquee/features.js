@@ -103,16 +103,36 @@ function weightedSum(features, weights) {
   return sum;
 }
 
-// preScore (spec §5): the CHEAP truncation score over free/in-file fields only
-// (no network). 0.45·genreAffinity + 0.20·trending_raw + 0.15·(vote_average/10)
-// + 0.20·min(1, countedSources/3). genreAffinity is Glass's (cand.genres as
-// names). countedSources uses the same groups as consensus.
-function preScore(cand, taste, { weekN, dayN } = {}) {
-  const ga = glassCandidates.genreAffinity(cand, taste);
-  const tr = trendingRaw(cand.trending, { weekN, dayN });
+// m2: the raw seed agreement of a candidate — the summed weight (recency ×
+// rating, from taste.seedsFor) of every DISTINCT seed whose S1/S2 list produced
+// it. This is Genesis's recency-weighted collaborative affinity, the signal the
+// first live backtest showed Marquee was missing. 0 for titles no seed produced.
+function seedAffinityRaw(cand) {
+  let sum = 0;
+  for (const w of (cand._seedWeights || new Map()).values()) if (w > 0) sum += w;
+  return sum;
+}
+
+// The m2 pre-score defaults (mirrors config DEFAULTS.prescore; used when a
+// caller passes no weights).
+const PRESCORE_DEFAULTS = { seed_affinity: 0.35, genre: 0.30, trending: 0.15, quality: 0.10, sources: 0.10, trending_genre_gate: 0.5 };
+
+// preScore (spec §5, m2): the CHEAP truncation score over free/in-file fields
+// only (no network), deciding which ~400 titles get a metadata lookup.
+//   seed_affinity · (seedAffinityRaw / maxSeedAff)     — seed agreement leads
+// + genre · genreAffinity                              — Glass's, cand.genres as names
+// + trending · trending_raw × clamp01(genreAff / gate) — trending only for on-taste titles
+// + quality · vote_average/10
+// + sources · min(1, countedSources/3)                 — same groups as consensus
+// `maxSeedAff` is the build's max seedAffinityRaw (0 → the term is 0).
+function preScore(cand, taste, { weekN, dayN, maxSeedAff = 0, weights = PRESCORE_DEFAULTS } = {}) {
+  const w = { ...PRESCORE_DEFAULTS, ...(weights || {}) };
+  const ga = Math.max(0, glassCandidates.genreAffinity(cand, taste));
+  const sa = maxSeedAff > 0 ? clamp01(seedAffinityRaw(cand) / maxSeedAff) : 0;
+  const tr = trendingRaw(cand.trending, { weekN, dayN }) * clamp01(ga / (w.trending_genre_gate || 1));
   const q = (cand.vote_average || 0) / 10;
   const cs = countedGroups(cand.sources);
-  return 0.45 * ga + 0.20 * tr + 0.15 * q + 0.20 * Math.min(1, cs / 3);
+  return w.seed_affinity * sa + w.genre * ga + w.trending * tr + w.quality * q + w.sources * Math.min(1, cs / 3);
 }
 
 module.exports = {
@@ -126,4 +146,6 @@ module.exports = {
   renormalize,
   weightedSum,
   preScore,
+  seedAffinityRaw,
+  PRESCORE_DEFAULTS,
 };

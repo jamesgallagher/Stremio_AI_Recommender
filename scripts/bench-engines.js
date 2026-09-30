@@ -93,6 +93,33 @@ async function main() {
       deps: {
         engines, pipeline, rs, watchedStore, db, settings,
         selectServe: rs.selectServe, log: quiet, noCache: a.noCache,
+        // m2: could each held-out film be served at all under this profile's
+        // filters? Cached deep meta first; a read-only TMDB fetch (≤ holdout
+        // calls) only when the cache lacks it or predates availability data.
+        reachability: async (targetIds, filters) => {
+          const metaStore = require('../src/engines/glass/metaStore');
+          const tmdb = require('../src/services/tmdb');
+          const mdblist = require('../src/services/mdblist');
+          const animeMap = require('../src/services/animeMap');
+          const { compileEnvelope } = require('../src/engines/marquee/filters');
+          await animeMap.ensureLoaded(quiet).catch(() => {});
+          const tmdbKey = settings.keyFor(profile, 'tmdb_api_key');
+          const mdbKey = settings.keyFor(profile, 'mdblist_api_key');
+          return bench.assessReachability(targetIds, filters, {
+            compileEnvelope,
+            metaFor: async (id) => {
+              const cached = metaStore.get('movie', id);
+              if (cached && 'availability' in cached) return cached;
+              const fresh = await tmdb.deepMeta(tmdbKey, 'movie', id, quiet);
+              if (fresh) metaStore.put('movie', id, fresh); // the bench copy only
+              return fresh || cached;
+            },
+            imdbRatingFor: async (imdbId) => (mdbKey
+              ? (await mdblist.cachedImdbRatings(mdbKey, 'movie', [imdbId], quiet)).get(imdbId) ?? null
+              : null),
+            isAnime: (imdbId, tmdbId) => animeMap.isAnime(imdbId, tmdbId),
+          });
+        },
       },
     });
   } finally {
@@ -113,7 +140,7 @@ async function main() {
       at: new Date().toISOString(),
       holdout: results.holdout,
       targets: results.targets,
-      engines: Object.fromEntries(Object.entries(results.engines).map(([id, e]) => [id, { metrics: e.metrics, hitTargets: e.hitTargets }])),
+      engines: Object.fromEntries(Object.entries(results.engines).map(([id, e]) => [id, { metrics: e.metrics, hitTargets: e.hitTargets, positions: e.positions }])),
     };
     fs.writeFileSync(outFile, JSON.stringify(payload, null, 2));
     console.log('JSON report written to: ' + outFile);
