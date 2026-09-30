@@ -1880,6 +1880,71 @@ ok('marquee envelope: stats counters (both stages + copy semantics)', () => {
   assert.strictEqual(env.stats().adult, 1);
 });
 
+ok('tmdb: normalizeDeepMeta movie cert/availability + series has no keys (ME-02)', () => {
+  const tmdb = require('../src/services/tmdb');
+  // movie with AU + US certs and a past home release → AVAILABLE
+  const movie = {
+    id: 603, title: 'Inception', release_date: '2010-07-16',
+    genres: [{ id: 18, name: 'Drama' }],
+    keywords: { keywords: [{ name: 'dream' }] },
+    credits: { crew: [{ name: 'N', job: 'Director' }], cast: [{ name: 'A' }, { name: 'B' }] },
+    external_ids: { imdb_id: 'tt1375666' },
+    poster_path: '/p.jpg', vote_average: 8.8, vote_count: 15000, popularity: 5,
+    original_language: 'en', runtime: 148,
+    belongs_to_collection: { id: 123, name: 'C' },
+    overview: 'o',
+    release_dates: { results: [
+      { iso_3166_1: 'AU', release_dates: [{ certification: 'M', release_date: '2010-09-01', type: 3 }, { certification: 'M', release_date: '2010-09-15', type: 4 }] },
+      { iso_3166_1: 'US', release_dates: [{ certification: 'PG-13', release_date: '2010-07-16', type: 3 }] },
+    ] },
+  };
+  const m = tmdb.normalizeDeepMeta(movie, 'movie', 603);
+  assert.strictEqual(m.certAU, 'M');
+  assert.strictEqual(m.certUS, 'PG-13');
+  assert.strictEqual(m.availability, 'AVAILABLE');
+  // theatrical-only → NOT_YET
+  const theatrical = { ...movie, release_dates: { results: [{ iso_3166_1: 'US', release_dates: [{ certification: 'R', release_date: '2010-07-16', type: 3 }] }] } };
+  const t = tmdb.normalizeDeepMeta(theatrical, 'movie', 603);
+  assert.strictEqual(t.availability, 'NOT_YET');
+  assert.strictEqual(t.certUS, 'R');
+  // no release_dates → UNKNOWN + null certs
+  const noRel = { ...movie }; delete noRel.release_dates;
+  const n = tmdb.normalizeDeepMeta(noRel, 'movie', 603);
+  assert.strictEqual(n.availability, 'UNKNOWN');
+  assert.strictEqual(n.certAU, null);
+  assert.strictEqual(n.certUS, null);
+  // series → NO cert/availability keys
+  const series = {
+    id: 1234, name: 'Show', first_air_date: '2020-01-01',
+    genres: [{ id: 18, name: 'Drama' }],
+    keywords: { results: [{ name: 'k' }] },
+    created_by: [{ name: 'C' }],
+    external_ids: { imdb_id: 'tt1' },
+    poster_path: '/s.jpg', vote_average: 8, vote_count: 1000, popularity: 2,
+    original_language: 'en', episode_run_time: [30],
+    networks: [{ name: 'Net' }],
+  };
+  const s = tmdb.normalizeDeepMeta(series, 'series', 1234);
+  assert.ok(!('certAU' in s), 'series has no certAU');
+  assert.ok(!('certUS' in s), 'series has no certUS');
+  assert.ok(!('availability' in s), 'series has no availability');
+});
+
+ok('tmdb: pickCertification unchanged (ME-02 refactor)', () => {
+  const tmdb = require('../src/services/tmdb');
+  // AU + US → AU first
+  assert.strictEqual(tmdb.pickCertification([
+    { iso_3166_1: 'AU', release_dates: [{ certification: 'M' }] },
+    { iso_3166_1: 'US', release_dates: [{ certification: 'PG-13' }] },
+  ], 'movie'), 'M');
+  // US only → US
+  assert.strictEqual(tmdb.pickCertification([{ iso_3166_1: 'US', release_dates: [{ certification: 'PG-13' }] }], 'movie'), 'PG-13');
+  // other only (GB '12') → '12'
+  assert.strictEqual(tmdb.pickCertification([{ iso_3166_1: 'GB', release_dates: [{ certification: '12' }] }], 'movie'), '12');
+  // empty certifications → null
+  assert.strictEqual(tmdb.pickCertification([{ iso_3166_1: 'US', release_dates: [{ certification: '' }] }], 'movie'), null);
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');

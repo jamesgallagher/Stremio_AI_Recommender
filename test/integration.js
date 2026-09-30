@@ -1063,6 +1063,148 @@ async function main() {
     }
   });
 
+  // ── Marquee ME-02: TMDB list endpoints + trending cache (stubbed fetch / injected fetcher) ─
+  await it('marquee trendingMovies: rank continuous across pages + failure/short-page handling', async () => {
+    const mkItem = (id) => ({ id, title: 'T' + id, release_date: '2024-01-01', genre_ids: [18], vote_average: 7, vote_count: 100, popularity: 1, adult: false, poster_path: '/p' + id + '.jpg' });
+    const page1 = [], page2 = [], page3 = [];
+    for (let i = 1; i <= 20; i += 1) page1.push(mkItem(i));
+    for (let i = 21; i <= 38; i += 1) page2.push(mkItem(i));
+    for (let i = 39; i <= 58; i += 1) page3.push(mkItem(i));
+    const origFetch = global.fetch;
+    try {
+      let call = 0;
+      global.fetch = async (url) => {
+        call += 1;
+        const page = new URL(url).searchParams.get('page');
+        const results = page === '1' ? page1 : page === '2' ? page2 : page === '3' ? page3 : [];
+        return { ok: true, status: 200, json: async () => ({ results }) };
+      };
+      const out = await tmdb.trendingMovies('key', 'week', 3);
+      assert.strictEqual(out.length, 58);
+      for (let i = 0; i < 58; i += 1) assert.strictEqual(out[i].rank, i + 1, `rank gap at ${i}`);
+      assert.strictEqual(out[20].rank, 21, 'page-2 first item is rank 21');
+      assert.strictEqual(out[38].rank, 39, 'page-3 first item is rank 39');
+      assert.strictEqual(call, 3);
+      // unknown window rejects
+      await assert.rejects(() => tmdb.trendingMovies('key', 'month', 1), /unknown window/);
+      // a fetch throwing on page 3 → 38 items (pages 1+2)
+      global.fetch = async (url) => {
+        const page = new URL(url).searchParams.get('page');
+        if (page === '3') throw new Error('boom');
+        const results = page === '1' ? page1 : page === '2' ? page2 : [];
+        return { ok: true, status: 200, json: async () => ({ results }) };
+      };
+      assert.strictEqual((await tmdb.trendingMovies('key', 'week', 3)).length, 38);
+      // a short (empty) page ends the loop → 20 items, page 3 not fetched
+      const fetchedPages = [];
+      global.fetch = async (url) => {
+        const page = new URL(url).searchParams.get('page');
+        fetchedPages.push(page);
+        const results = page === '1' ? page1 : [];
+        return { ok: true, status: 200, json: async () => ({ results }) };
+      };
+      assert.strictEqual((await tmdb.trendingMovies('key', 'week', 3)).length, 20);
+      assert.ok(!fetchedPages.includes('3'), 'page 3 not fetched after a short page');
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  await it('marquee deepMeta: movie appends release_dates, series does not (ME-02)', async () => {
+    const origFetch = global.fetch;
+    try {
+      const urls = [];
+      global.fetch = async (url) => {
+        urls.push(String(url));
+        return { ok: true, status: 200, json: async () => ({}) };
+      };
+      await tmdb.deepMeta('key', 'movie', 603, quiet);
+      await tmdb.deepMeta('key', 'series', 1234, quiet);
+      assert.strictEqual(urls.length, 2);
+      const movieUrl = new URL(urls[0]);
+      const seriesUrl = new URL(urls[1]);
+      assert.ok(movieUrl.pathname.includes('movie/603'), 'movie path');
+      assert.ok(seriesUrl.pathname.includes('tv/1234'), 'series path');
+      assert.strictEqual(movieUrl.searchParams.get('append_to_response'), 'credits,keywords,external_ids,release_dates');
+      assert.strictEqual(seriesUrl.searchParams.get('append_to_response'), 'credits,keywords,external_ids');
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  await it('marquee TMDB list endpoints: getSimilar/discoverMovies/collectionParts + item shape (ME-02)', async () => {
+    const origFetch = global.fetch;
+    const item = { id: 42, title: 'T', release_date: '2024-01-01', genre_ids: [28, 18], vote_average: 7.5, vote_count: 900, popularity: 3, adult: false, poster_path: '/p.jpg' };
+    const expected = { type: 'movie', tmdb_id: '42', title: 'T', year: 2024, genre_ids: [28, 18], vote_average: 7.5, vote_count: 900, popularity: 3, adult: false, poster: '/p.jpg' };
+    const mkResponse = (payload) => ({ ok: true, status: 200, json: async () => payload });
+    try {
+      global.fetch = async (url) => {
+        const u = new URL(url);
+        assert.ok(u.pathname.includes('movie/603/similar'), 'similar path');
+        assert.strictEqual(u.searchParams.get('page'), '2');
+        assert.strictEqual(u.searchParams.get('language'), 'en-US');
+        return mkResponse({ results: [item] });
+      };
+      assert.deepStrictEqual(await tmdb.getSimilar('key', 603, { page: 2 }), [expected]);
+      global.fetch = async (url) => {
+        const u = new URL(url);
+        assert.ok(u.pathname.includes('discover/movie'), 'discover path');
+        assert.strictEqual(u.searchParams.get('language'), 'en-US');
+        assert.strictEqual(u.searchParams.get('include_adult'), 'false');
+        assert.strictEqual(u.searchParams.get('vote_count.gte'), '1000');
+        return mkResponse({ results: [item] });
+      };
+      assert.deepStrictEqual(await tmdb.discoverMovies('key', { include_adult: 'false', 'vote_count.gte': '1000' }, { page: 1 }), [expected]);
+      global.fetch = async (url) => {
+        const u = new URL(url);
+        assert.ok(u.pathname.includes('collection/77'), 'collection path');
+        return mkResponse({ parts: [{ ...item, release_date: '2024-01-01' }] });
+      };
+      assert.deepStrictEqual(await tmdb.collectionParts('key', 77), [{ ...expected, release_date: '2024-01-01' }]);
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  await it('marquee trending cache: ensureFresh/refresh per-window + stale degradation (ME-02)', async () => {
+    const cache = require('../src/engines/marquee/trendingCache');
+    const mkItems = (window, n) => {
+      const out = [];
+      for (let i = 1; i <= n; i += 1) out.push({ type: 'movie', tmdb_id: `${window}-${i}`, title: 'T', rank: i });
+      return out;
+    };
+    try {
+      // empty table → ensureFresh runs refresh (week 5 + day 2)
+      const calls = [];
+      const fetcher = async (_k, window, pages) => { calls.push(window); return mkItems(window, window === 'week' ? 5 : 2); };
+      const res1 = await cache.ensureFresh({ apiKey: 'k', now: 1000, fetcher, log: quiet });
+      assert.strictEqual(res1.ok, true);
+      assert.deepStrictEqual(calls, ['week', 'day']);
+      assert.strictEqual(cache.getWindow('week').length, 5);
+      assert.strictEqual(cache.getWindow('day').length, 2);
+      // within TTL → skipped 'fresh', no fetch
+      const calls2 = [];
+      const fetcher2 = async (_k, window, pages) => { calls2.push(window); return mkItems(window, 1); };
+      const res2 = await cache.ensureFresh({ apiKey: 'k', now: 1000 + 3600e3, fetcher: fetcher2, log: quiet });
+      assert.deepStrictEqual(res2, { ok: true, skipped: 'fresh' });
+      assert.deepStrictEqual(calls2, []);
+      // past TTL with a throwing fetcher → ok:false, stale rows still served
+      const res3 = await cache.ensureFresh({ apiKey: 'k', now: 1000 + 7 * 3600e3, fetcher: async () => { throw new Error('down'); }, log: quiet });
+      assert.strictEqual(res3.ok, false);
+      assert.strictEqual(cache.getWindow('week').length, 5, 'stale week rows served');
+      assert.strictEqual(cache.getWindow('day').length, 2, 'stale day rows served');
+      // refresh with week returning [] keeps old week rows while day refreshes independently
+      const partial = async (_k, window, pages) => (window === 'week' ? [] : mkItems('day', 2));
+      await cache.refresh({ apiKey: 'k', now: 1000 + 8 * 3600e3, fetcher: partial, log: quiet });
+      assert.strictEqual(cache.getWindow('week').length, 5, 'week rows kept on an empty refresh');
+      const dayItems = cache.getWindow('day');
+      assert.strictEqual(dayItems.length, 2);
+      for (let i = 0; i < 2; i += 1) assert.strictEqual(dayItems[i].rank, i + 1);
+    } finally {
+      require('../src/db').get().exec('DELETE FROM marquee_trending');
+    }
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();
