@@ -1681,7 +1681,7 @@ ok('marquee envelope: MI-1 parity matrix (envelope never looser than selectServe
     28: 'Action', 12: 'Adventure', 16: 'Animation', 35: 'Comedy', 80: 'Crime',
     99: 'Documentary', 18: 'Drama', 10751: 'Family', 14: 'Fantasy', 36: 'History',
     27: 'Horror', 10402: 'Music', 9648: 'Mystery', 10749: 'Romance',
-    878: 'Science Fiction', 10770: 'TV Movie', 53: 'War', 10752: 'Western',
+    878: 'Science Fiction', 10770: 'TV Movie', 53: 'Thriller', 10752: 'War', 37: 'Western',
   };
   const configs = {
     adult:    { min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 0 },
@@ -1844,7 +1844,7 @@ ok('marquee envelope: discoverParams (spec §3.1)', () => {
     28: 'Action', 12: 'Adventure', 16: 'Animation', 35: 'Comedy', 80: 'Crime',
     99: 'Documentary', 18: 'Drama', 10751: 'Family', 14: 'Fantasy', 36: 'History',
     27: 'Horror', 10402: 'Music', 9648: 'Mystery', 10749: 'Romance',
-    878: 'Science Fiction', 10770: 'TV Movie', 53: 'War', 10752: 'Western',
+    878: 'Science Fiction', 10770: 'TV Movie', 53: 'Thriller', 10752: 'War', 37: 'Western',
   };
   const compile = (filters) => marquee.compileEnvelope(filters, { nowYear: 2026, genreMap }).discoverParams();
   // adult default → exactly the three always-on params
