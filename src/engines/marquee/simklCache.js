@@ -71,31 +71,43 @@ async function syncRatings(profile, {
     // One GET for the whole account (spec §4.2(3): ~hundreds of entries).
     const ratings = await fetchRatings(profile, 'movies');
 
-    // Replace this profile's rows in one transaction (zero rated entries is
-    // valid → the table is empty for this profile).
+    // Resolve all imdb-only entries to a tmdb id BEFORE the transaction. The
+    // shared db.get() connection must never have a transaction open across an
+    // await: while a resolver lookup is pending, another writer's BEGIN would
+    // throw "cannot start a transaction within a transaction", and unrelated
+    // writes (e.g. recordImpressions on a catalog serve) would silently join
+    // this transaction and be discarded on a ROLLBACK. So the lookups happen
+    // first; the transaction below is fully synchronous (BEGIN → DELETE →
+    // inserts → COMMIT), as in upsertCandidates and trendingCache.replaceWindow.
     let unresolved = 0;
-    let synced = 0;
     let resolveCount = 0;
+    const rows = [];
+    for (const r of ratings) {
+      let tmdbId = r.tmdb_id;
+      if (!tmdbId && r.imdb_id && resolveCount < resolveCap) {
+        resolveCount += 1;
+        try { tmdbId = await resolver(r.imdb_id); } catch { /* counted unresolved below */ }
+      }
+      if (!tmdbId) { unresolved += 1; continue; } // no tmdb id — the table's primary key
+      rows.push({ tmdbId, imdb: r.imdb_id || null, simkl: r.simkl_id != null ? r.simkl_id : null, rating: r.rating, ratedAt: r.rated_at || null });
+    }
+
+    // Replace this profile's rows in one fully-synchronous transaction (zero
+    // rated entries is valid → the table is empty for this profile).
     const conn = db.get();
     conn.exec('BEGIN');
     try {
       conn.prepare('DELETE FROM marquee_ratings WHERE profile_id = ?').run(profileId);
       const ins = conn.prepare('INSERT INTO marquee_ratings (profile_id, tmdb_id, imdb_id, simkl_id, rating, rated_at) VALUES (?, ?, ?, ?, ?, ?)');
-      for (const r of ratings) {
-        let tmdbId = r.tmdb_id;
-        if (!tmdbId && r.imdb_id && resolveCount < resolveCap) {
-          resolveCount += 1;
-          try { tmdbId = await resolver(r.imdb_id); } catch { /* counted unresolved below */ }
-        }
-        if (!tmdbId) { unresolved += 1; continue; } // no tmdb id — the table's primary key
-        ins.run(profileId, tmdbId, r.imdb_id || null, r.simkl_id != null ? r.simkl_id : null, r.rating, r.rated_at || null);
-        synced += 1;
+      for (const row of rows) {
+        ins.run(profileId, row.tmdbId, row.imdb, row.simkl, row.rating, row.ratedAt);
       }
       conn.exec('COMMIT');
     } catch (err) {
       try { conn.exec('ROLLBACK'); } catch { /* commit already ran */ }
       throw err;
     }
+    const synced = rows.length;
     // Upsert the sync cursor with the current value (possibly null — §12 L2).
     // In degraded mode (key absent) record the degraded-pull timestamp; in
     // hasKey mode clear it so a future degraded stretch starts fresh.
