@@ -1960,6 +1960,47 @@ async function main() {
     assert.ok(h1._preScore > 0.2, 'hydrated pre-score > 0.2 for an on-taste genre');
   });
 
+  await it('marquee ME-05: collab reserve pool extends outside the main slice (P4 carry-over §4.0)', async () => {
+    glassMeta._clear();
+    const nowMs = Date.parse('2026-06-01T00:00:00Z');
+    // One S2-only title whose hydrated pre-score (Action genre, vote 7) lands at
+    // rank 361 — index 360 = mainCap − collab_reserve (400 − 40), i.e. between
+    // the old pool start (mainCap = 400) and the main slice end.
+    glassMeta.put('movie', 'q360', mqFullMeta('q360', { genres: ['Action'] }), nowMs);
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const seeds = Array.from({ length: 40 }, (_, i) => mqSeed('s' + i, { simkl_id: 5000 + i }));
+    // 960 S1 titles: 360 at pre-score 0.58417 (vote 7.5), 600 at 0.54667 (vote 5),
+    // so q360 (0.57667) sorts between them at index 360.
+    const { f } = mqFetchers({
+      recs: (id) => Array.from({ length: 12 }, (_, j) => mqItem('r' + id + '-' + j, { vote_average: j < 6 ? 7.5 : 5 })),
+      similar: (id) => Array.from({ length: 12 }, (_, j) => mqItem('s' + id + '-' + j, { vote_average: j < 3 ? 7.5 : 5 })),
+      simklRecs: (ids) => {
+        const m = new Map();
+        for (const sid of ids) {
+          const i = sid - 5000;
+          const recs = [];
+          if (i < 2) recs.push({ tmdb_id: 'q360', title: 'Q360', year: 2020 }); // 2 seeds → ranks first in the reserve
+          for (let j = 0; j < 20; j += 1) {
+            const w = i === 0 ? 'w' + j : (i === 1 ? 'w' + (20 + j) : 'w' + (40 + (i - 2)));
+            recs.push({ tmdb_id: w, title: 'W' + w.slice(1), year: 2020 });
+          }
+          m.set(sid, recs);
+        }
+        return m;
+      },
+    });
+    const ctx = mqCtx(filters);
+    const { candidates } = await mqSources.gatherCandidates({ id: 'p-mq-f1c', name: 'MQF1c', filters }, ctx, {
+      taste: mqTaste, brief: null, briefHash: 'h', seeds, envelope: env, cfg: mqCfgResolved, genreMap: mqGenreMap, fetchers: f, chain: [], log: quiet,
+    });
+    const ids = candidates.map((c) => c.tmdb_id);
+    assert.ok(ids.includes('q360'), 'rank-360 S2 title is in the output (reserve pool starts at mainCap − collab_reserve)');
+    assert.strictEqual(new Set(ids).size, ids.length, 'no duplicate tmdb_ids');
+    assert.ok(candidates.length <= mqCfgResolved.lookup_cap, '≤ lookup_cap');
+    assert.strictEqual(ctx.stats.sources.S2_reserved, 40, 'S2_reserved counted');
+  });
+
   await it('marquee ME-05: S5 per-list isolation (S1) — simklTrending throws, TMDB week/day kept, hadTrending true', async () => {
     glassMeta._clear();
     const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
