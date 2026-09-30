@@ -120,7 +120,7 @@ function isUnfinishedRow(item) {
 }
 
 // listHistory — the per-profile watch-history listing (spec §6). Returns
-// { items, page, pageSize, total, counts, training } on success, or
+// { ok:true, items, page, pageSize, total, counts, training } on success, or
 // { ok:false, reason } on a bad type/view.
 async function listHistory(profile, { type: typeIn, view = 'all', q = null, page = 1, pageSize = 25 } = {}, deps = {}) {
   const D = mergeDeps(deps);
@@ -251,6 +251,7 @@ async function listHistory(profile, { type: typeIn, view = 'all', q = null, page
 
   const training = D.tasteFeedback.getTraining(profile.id);
   return {
+    ok: true,
     items: pageItems,
     page: pg,
     pageSize: ps,

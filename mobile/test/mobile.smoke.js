@@ -625,6 +625,92 @@ async function unitTests() {
     } finally { simkl.addToHistory = origHist; wStore.deleteForProfile(pid); }
   });
 
+  await ok('handlers: trainer T1 — rate/ignore/finished/list act on the session profile only (M1/M2/M10)', async () => {
+    const wStore = require('../../src/watchedStore');
+    const tasteFeedback = require('../../src/tasteFeedback');
+    const metaStore = require('../../src/engines/glass/metaStore');
+    const jobs = require('../../src/jobs');
+    const origSet = simkl.setRatings;
+    const origRemove = simkl.removeRatings;
+    const origBuild = recommendationStore.buildPool;
+    let setCalls = []; let removeCalls = [];
+    simkl.setRatings = async (profile, items) => { setCalls.push({ profile: profile.id, items }); return {}; };
+    simkl.removeRatings = async (profile, items) => { removeCalls.push({ profile: profile.id, items }); return {}; };
+    const pid = 'trainer-h-' + Date.now();
+    const prof = { id: pid, name: 'Trainer', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    try {
+      // Seed one watched movie + a cached deep-meta so listHistory's lazy enrichment is a cache hit (no network, M11).
+      wStore.upsertMany(pid, [{ simkl_id: 101, type: 'movie', imdb_id: 'tt1', tmdb_id: '603', title: 'Alpha', year: 2020, watched_at: new Date().toISOString() }]);
+      metaStore.put('movie', '603', { poster: 'p', title: 'Alpha', primary_genre: 'Drama', year: 2020 });
+
+      // listHistory — the session profile's history, one movie, unrated.
+      let res = fakeRes();
+      await handlers.trainerHandler({ profile: prof, query: { type: 'movie' } }, res);
+      assert.strictEqual(res.statusCode, 200);
+      assert.strictEqual(res.body.items.length, 1);
+      assert.strictEqual(res.body.items[0].tmdb_id, '603');
+      assert.strictEqual(res.body.items[0].rating, null);
+      assert.strictEqual(res.body.items[0].loved, false);
+      assert.strictEqual(res.body.counts.unrated, 1);
+
+      // rate — Simkl authority (M1): setRatings called for the session profile (M10), local row written only on success.
+      res = fakeRes();
+      await handlers.trainerRateHandler({ profile: prof, body: { type: 'movie', tmdb_id: '603', rating: 7, profile_id: 'B' } }, res);
+      assert.strictEqual(res.statusCode, 200);
+      assert.strictEqual(setCalls.length, 1);
+      assert.strictEqual(setCalls[0].profile, pid, 'session profile, NOT body.profile_id');
+      assert.strictEqual(res.body.item.rating, 7);
+      assert.strictEqual(tasteFeedback.getRating(pid, 'movie', '603'), 7);
+
+      // rate — a thrown Simkl write → 502, local row unchanged (M1).
+      simkl.setRatings = async () => { throw new Error('token rejected'); };
+      res = fakeRes();
+      await handlers.trainerRateHandler({ profile: prof, body: { type: 'movie', tmdb_id: '603', rating: 8 } }, res);
+      assert.strictEqual(res.statusCode, 502);
+      assert.strictEqual(tasteFeedback.getRating(pid, 'movie', '603'), 7, 'local row unchanged after a failed write');
+      simkl.setRatings = origSet;
+
+      // rate — bad-rating (0) → 400; series → not-supported → 400; not-in-history → 404.
+      res = fakeRes();
+      await handlers.trainerRateHandler({ profile: prof, body: { type: 'movie', tmdb_id: '603', rating: 0 } }, res);
+      assert.strictEqual(res.statusCode, 400);
+      res = fakeRes();
+      await handlers.trainerRateHandler({ profile: prof, body: { type: 'series', tmdb_id: '603', rating: 5 } }, res);
+      assert.strictEqual(res.statusCode, 400);
+      res = fakeRes();
+      await handlers.trainerRateHandler({ profile: prof, body: { type: 'movie', tmdb_id: '999999', rating: 5 } }, res);
+      assert.strictEqual(res.statusCode, 404);
+
+      // ignore — local only (M2): no Simkl call, watched row untouched, ignored set recorded.
+      res = fakeRes();
+      await handlers.trainerIgnoreHandler({ profile: prof, body: { type: 'movie', tmdb_id: '603', ignored: true } }, res);
+      assert.strictEqual(res.statusCode, 200);
+      assert.strictEqual(removeCalls.length, 0, 'ignore never calls Simkl');
+      assert.ok(wStore.watchedIdSets(pid).tmdb.has('603'), 'ignored film stays in watchedIdSets');
+      assert.ok(tasteFeedback.ignoredSet(pid, 'movie').has('603'));
+
+      // finished — no abandoned row → not-in-history → 404.
+      res = fakeRes();
+      await handlers.trainerFinishedHandler({ profile: prof, body: { type: 'movie', tmdb_id: '603' } }, res);
+      assert.strictEqual(res.statusCode, 404);
+
+      // rebuild — 202 + started (buildPool stubbed so no network); join the in-flight job so it settles before restore.
+      recommendationStore.buildPool = async () => ({ ok: true });
+      res = fakeRes();
+      handlers.trainerRebuildHandler({ profile: prof }, res);
+      assert.strictEqual(res.statusCode, 202);
+      assert.strictEqual(res.body.started, true);
+      await jobs.enqueue(pid, 'recs', async () => ({})); // dedup returns the in-flight promise
+    } finally {
+      simkl.setRatings = origSet;
+      simkl.removeRatings = origRemove;
+      recommendationStore.buildPool = origBuild;
+      wStore.deleteForProfile(pid);
+      tasteFeedback.deleteForProfile(pid);
+      metaStore._clear();
+    }
+  });
+
   await ok('regression: recommendations are per-profile (isolation)', () => {
     const A = 'iso-A-' + Date.now(); const B = 'iso-B-' + Date.now();
     recommendationStore.upsertCandidates(A, [mkCand({ imdb_id: 'ttA', tmdb_id: '603', title: 'A-movie' })]);

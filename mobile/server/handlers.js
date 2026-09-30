@@ -11,6 +11,7 @@ const recommendationStore = require('../../src/recommendationStore');
 const watchedStore = require('../../src/watchedStore');
 const dontRecommend = require('../../src/dontRecommend');
 const markWatched = require('../../src/markWatched');
+const trainer = require('../../src/trainer');
 const catalogServe = require('../../src/catalogServe');
 
 const TYPES = ['movie', 'series'];
@@ -380,10 +381,73 @@ function settingsPostHandler(req, res) {
   res.json({ ok: true, ...companionSettings(updated) });
 }
 
+// ---- Trainer T1 — the per-profile taste-trainer surface (session-scoped) ----
+// These act on req.profile ONLY — never a client-supplied profile id (M10).
+// Each parses input + calls the SAME transport-agnostic core the portal uses
+// (src/trainer.js) + maps with the shared status mapper (M6). A thrown Simkl
+// write is a 502 (never a silent failure).
+
+// GET /api/trainer?type=&view=&q=&page=&page_size= — list this profile's watch history.
+async function trainerHandler(req, res) {
+  const { type, view, q, page, page_size: pageSize } = req.query || {};
+  try {
+    const r = await trainer.listHistory(req.profile, { type, view, q, page, pageSize });
+    res.status(trainer.httpStatus(r)).json(r.ok ? r : { error: r.reason });
+  } catch (err) {
+    res.status(502).json({ error: `Simkl write failed — ${err.message}` });
+  }
+}
+
+// POST /api/trainer/rate  { type, tmdb_id?, imdb_id?, simkl_id?, rating }
+// Rate a title 1–10 (or null to clear). Simkl is the authority (M1).
+async function trainerRateHandler(req, res) {
+  const { type, tmdb_id, imdb_id, simkl_id, rating } = req.body || {};
+  try {
+    const r = await trainer.rate(req.profile, { type, tmdb_id, imdb_id, simkl_id }, rating);
+    res.status(trainer.httpStatus(r)).json(r.ok ? r : { error: r.reason });
+  } catch (err) {
+    res.status(502).json({ error: `Simkl write failed — ${err.message}` });
+  }
+}
+
+// POST /api/trainer/ignore  { type, tmdb_id?, imdb_id?, simkl_id?, ignored }
+// Ignore / un-ignore a title (local only — M2: never calls Simkl, never touches watched).
+async function trainerIgnoreHandler(req, res) {
+  const { type, tmdb_id, imdb_id, simkl_id, ignored } = req.body || {};
+  try {
+    const r = await trainer.setIgnored(req.profile, { type, tmdb_id, imdb_id, simkl_id }, ignored);
+    res.status(trainer.httpStatus(r)).json(r.ok ? r : { error: r.reason });
+  } catch (err) {
+    res.status(502).json({ error: `Simkl write failed — ${err.message}` });
+  }
+}
+
+// POST /api/trainer/finished  { type, tmdb_id?, imdb_id?, title? }
+// Mark an unfinished (abandoned) film finished (delegates to the shared markWatched).
+async function trainerFinishedHandler(req, res) {
+  const { type, tmdb_id, imdb_id, title } = req.body || {};
+  try {
+    const r = await trainer.markFinished(req.profile, { type, tmdb_id, imdb_id, title });
+    res.status(trainer.httpStatus(r)).json(r.ok ? r : { error: r.reason });
+  } catch (err) {
+    res.status(502).json({ error: `Simkl write failed — ${err.message}` });
+  }
+}
+
+// POST /api/trainer/rebuild — trigger a recommendation rebuild (T2 will wire the
+// taste-feedback trigger; T1 exposes the same job the portal's rebuild uses).
+function trainerRebuildHandler(req, res) {
+  const jobs = require('../../src/jobs');
+  jobs.enqueue(req.profile.id, 'recs', (progress) => recommendationStore.buildPool(req.profile, console, progress))
+    .catch((err) => console.warn(`[rec] ${req.profile.name}: pool build failed — ${err.message}`));
+  res.status(202).json({ started: true, job: jobs.snapshot(req.profile.id) });
+}
+
 module.exports = {
   toTitleDTO, searchHandler, watchlistHandler, watchlistRemoveHandler,
   toRecDTO, recommendationsHandler, suppressHandler, unsuppressHandler, watchedHandler,
   toCompanionFilters, companionCatalogs, companionSettings, settingsGetHandler, settingsPostHandler,
   catalogPreviewHandler,
+  trainerHandler, trainerRateHandler, trainerIgnoreHandler, trainerFinishedHandler, trainerRebuildHandler,
   TYPES, COMPANION_FILTERS, SEARCH_LIMIT, SEARCH_LIMIT_MAX,
 };

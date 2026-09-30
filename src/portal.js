@@ -18,6 +18,8 @@ const watchedStore = require('./watchedStore');
 const recommendationStore = require('./recommendationStore');
 const dontRecommend = require('./dontRecommend');
 const markWatched = require('./markWatched');
+const trainer = require('./trainer');
+const tasteFeedback = require('./tasteFeedback');
 const engines = require('./engines');
 const catalogServe = require('./catalogServe');
 
@@ -257,7 +259,7 @@ router.put('/profiles/:id', (req, res) => {
 router.delete('/profiles/:id', (req, res) => {
   if (!config.removeProfile(req.params.id)) return res.status(404).json({ error: 'Profile not found' });
   simklFlows.delete(req.params.id);
-  try { watchedStore.deleteForProfile(req.params.id); recommendationStore.deleteForProfile(req.params.id); } catch (err) { console.warn(`[store] cleanup failed for ${req.params.id}: ${err.message}`); }
+  try { watchedStore.deleteForProfile(req.params.id); recommendationStore.deleteForProfile(req.params.id); tasteFeedback.deleteForProfile(req.params.id); } catch (err) { console.warn(`[store] cleanup failed for ${req.params.id}: ${err.message}`); }
   res.json({ ok: true });
 });
 
@@ -579,6 +581,62 @@ router.post('/profiles/:id/recommend/suppress', async (req, res) => {
     return res.status(result.reason === 'bad-type' ? 400 : 422).json({ error: `could not suppress (${result.reason})` });
   }
   res.json({ ok: true, title: result.title, total: recommendationStore.countRecommended(profile.id) });
+});
+
+// Trainer T1 — the per-profile taste-trainer surface. The portal is admin-guarded
+// (an :id in the path); the companion is session-scoped (req.profile only). Both
+// delegate to the SAME transport-agnostic core (src/trainer.js), so the two
+// surfaces can't drift apart (TD-7). The routes only parse input + call the core
+// + map with the shared status mapper (M6); a thrown Simkl write is a 502.
+router.get('/profiles/:id/trainer', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  const { type, view, q, page, page_size: pageSize } = req.query || {};
+  try {
+    const r = await trainer.listHistory(profile, { type, view, q, page, pageSize });
+    res.status(trainer.httpStatus(r)).json(r.ok ? r : { error: r.reason });
+  } catch (err) {
+    res.status(502).json({ error: `Simkl write failed — ${err.message}` });
+  }
+});
+
+router.post('/profiles/:id/trainer/rate', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  const { type, tmdb_id, imdb_id, simkl_id, rating } = req.body || {};
+  const ref = { type, tmdb_id, imdb_id, simkl_id };
+  try {
+    const r = await trainer.rate(profile, ref, rating);
+    res.status(trainer.httpStatus(r)).json(r.ok ? r : { error: r.reason });
+  } catch (err) {
+    res.status(502).json({ error: `Simkl write failed — ${err.message}` });
+  }
+});
+
+router.post('/profiles/:id/trainer/ignore', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  const { type, tmdb_id, imdb_id, simkl_id, ignored } = req.body || {};
+  const ref = { type, tmdb_id, imdb_id, simkl_id };
+  try {
+    const r = await trainer.setIgnored(profile, ref, ignored);
+    res.status(trainer.httpStatus(r)).json(r.ok ? r : { error: r.reason });
+  } catch (err) {
+    res.status(502).json({ error: `Simkl write failed — ${err.message}` });
+  }
+});
+
+router.post('/profiles/:id/trainer/finished', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  const { type, tmdb_id, imdb_id, title } = req.body || {};
+  const ref = { type, tmdb_id, imdb_id, title };
+  try {
+    const r = await trainer.markFinished(profile, ref);
+    res.status(trainer.httpStatus(r)).json(r.ok ? r : { error: r.reason });
+  } catch (err) {
+    res.status(502).json({ error: `Simkl write failed — ${err.message}` });
+  }
 });
 
 // MW-04 — remove a title from the profile's Simkl plan-to-watch list (the ✕ on a
