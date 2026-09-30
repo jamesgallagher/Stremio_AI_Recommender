@@ -1753,13 +1753,13 @@ ok('marquee envelope: MI-1 parity matrix (envelope never looser than selectServe
   let rejected = 0;
   for (const [name, cfg] of Object.entries(configs)) {
     const env = marquee.compileEnvelope(cfg, { nowYear: 2026, genreMap });
-    for (const row of rows) {
+    for (const [idx, row] of rows.entries()) {
       const res = env.hardFilter(row);
       if (res.ok) {
         kept += 1;
         const served = recommendationStore.selectServe([asPoolRow(row)], cfg, { nowYear: 2026 });
         assert.strictEqual(served.length, 1,
-          `MI-1 violated: ${name} kept row ${row.imdb_id} that selectServe dropped`);
+          `MI-1 violated: ${name} kept row ${idx + 1} that selectServe dropped`);
       } else {
         rejected += 1;
       }
