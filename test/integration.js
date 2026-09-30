@@ -1217,12 +1217,12 @@ async function main() {
     let ratingsCalls = 0;
     // The fetchRatings seam returns PARSED ratings (the simkl.getRatings contract).
     const fetchRatings = async () => { ratingsCalls += 1; return simkl.parseRatings(body); };
-    // First sync: no marquee_sync row → pull once; null rated_at stored as SQL NULL (§12 L2).
+    // First sync: no taste_ratings_sync row → pull once; null rated_at stored as SQL NULL (§12 L2).
     let res = await simklCache.syncRatings(profile, { fetchActivities: async () => ({ movies: { rated_at: null } }), fetchRatings, now: 1000, log: quiet });
     assert.deepStrictEqual(res, { ok: true, synced: 1, unresolved: 0 });
     assert.strictEqual(ratingsCalls, 1);
-    const row = db.get().prepare('SELECT ratings_activity, synced_at FROM marquee_sync WHERE profile_id = ?').get('p-simkl');
-    assert.strictEqual(row.ratings_activity, null);
+    const row = db.get().prepare("SELECT activity, synced_at FROM taste_ratings_sync WHERE profile_id = ? AND type = 'movie'").get('p-simkl');
+    assert.strictEqual(row.activity, null);
     // Unchanged (null === null) → skip, no ratings call.
     res = await simklCache.syncRatings(profile, { fetchActivities: async () => ({ movies: { rated_at: null } }), fetchRatings, now: 2000, log: quiet });
     assert.deepStrictEqual(res, { ok: true, skipped: 'unchanged' });
@@ -1248,7 +1248,7 @@ async function main() {
     assert.strictEqual(res.ok, false);
     assert.ok(res.error);
     assert.deepStrictEqual([...simklCache.getRatingsMap('p-simkl').entries()], [['1', 8]]); // rows preserved
-    db.get().exec('DELETE FROM marquee_ratings; DELETE FROM marquee_sync');
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ratings_sync');
   });
 
   await it('marquee ME-03: syncRatings replace semantics + zero rated + resolve cap 50 (B4)', async () => {
@@ -1258,7 +1258,7 @@ async function main() {
     const profile = { id: 'p-replace', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
     const activities = async () => ({ movies: { rated_at: null } });
     // Seed another profile's row — must survive this profile's replace.
-    db.get().prepare('INSERT INTO marquee_ratings (profile_id, tmdb_id, rating) VALUES (?, ?, ?)').run('p-other', '99', 5);
+    db.get().prepare("INSERT INTO taste_ratings (profile_id, type, tmdb_id, rating) VALUES (?, ?, ?, ?)").run('p-other', 'movie', '99', 5);
     // Zero rated entries → this profile's table empty (valid state, §12 L3).
     let res = await simklCache.syncRatings(profile, { fetchActivities: activities, fetchRatings: async () => simkl.parseRatings({ movies: [{ user_rating: null, movie: { ids: { tmdb: '1' } } }] }), now: 1000, log: quiet });
     assert.deepStrictEqual(res, { ok: true, synced: 0, unresolved: 0 });
@@ -1281,7 +1281,7 @@ async function main() {
     res = await simklCache.syncRatings(profile, { fetchActivities: activities, fetchRatings: async () => simkl.parseRatings({ movies: [{ user_rating: 6, movie: { ids: { imdb: 'ttX' } } }] }), resolveTmdb: async () => { throw new Error('nope'); }, now: 3000, log: quiet, force: true });
     assert.deepStrictEqual(res, { ok: true, synced: 0, unresolved: 1 });
     assert.deepStrictEqual([...simklCache.getRatingsMap('p-replace').entries()], []);
-    db.get().exec('DELETE FROM marquee_ratings; DELETE FROM marquee_sync');
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ratings_sync');
   });
 
   await it('Trainer T1: buildRatingsBody shapes ids/ratings by type (test 1)', () => {
@@ -1350,6 +1350,88 @@ async function main() {
       global.fetch = realFetch;
       governor.schedule = realSchedule;
     }
+  });
+
+  await it('Trainer T1: tasteFeedback.syncRatings — type-scoped, series throws not-supported, movie never touches series rows (test 3)', async () => {
+    const tasteFeedback = require('../src/tasteFeedback');
+    const simkl = require('../src/services/simkl');
+    const db = require('../src/db');
+    const profile = { id: 'p-tf', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    tasteFeedback.init();
+    // Seed a type='series' row for the same profile — a movie sync must NOT touch it.
+    db.get().prepare("INSERT INTO taste_ratings (profile_id, type, tmdb_id, rating) VALUES (?, ?, ?, ?)").run('p-tf', 'series', '500', 4);
+    const fetchRatings = async () => simkl.parseRatings({ movies: [
+      { user_rating: 9, user_rated_at: '2026-01-01T00:00:00Z', movie: { title: 'A', ids: { simkl: 1, imdb: 'tt1', tmdb: '1' } } },
+      { user_rating: 5, movie: { title: 'B', ids: { tmdb: '2' } } },
+    ] });
+    // A movie sync (force) replaces only type='movie' rows.
+    let res = await tasteFeedback.syncRatings(profile, { type: 'movie', fetchActivities: async () => ({ movies: { rated_at: null } }), fetchRatings, now: 1000, log: quiet, force: true });
+    assert.deepStrictEqual(res, { ok: true, synced: 2, unresolved: 0 });
+    assert.deepStrictEqual([...tasteFeedback.getRatingsMap('p-tf', 'movie').entries()], [['1', 9], ['2', 5]]);
+    // the series row is untouched.
+    assert.deepStrictEqual([...tasteFeedback.getRatingsMap('p-tf', 'series').entries()], [['500', 4]]);
+    // A second movie sync with the same gate → unchanged (null === null).
+    res = await tasteFeedback.syncRatings(profile, { type: 'movie', fetchActivities: async () => ({ movies: { rated_at: null } }), fetchRatings, now: 2000, log: quiet });
+    assert.deepStrictEqual(res, { ok: true, skipped: 'unchanged' });
+    // series → not-supported (the ONLY throw in the store).
+    await assert.rejects(() => tasteFeedback.syncRatings(profile, { type: 'series', fetchActivities: async () => ({ movies: { rated_at: null } }), fetchRatings, now: 3000, log: quiet }), /not-supported/);
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ratings_sync');
+  });
+
+  await it('Trainer T1: simklCache delegates to tasteFeedback — upsertRating rows surface in getRatingsMap; syncRatings writes taste_ratings (test 4)', async () => {
+    const simklCache = require('../src/engines/marquee/simklCache');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const simkl = require('../src/services/simkl');
+    const db = require('../src/db');
+    const profile = { id: 'p-deleg', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    simklCache.init();
+    // upsertRating (movie) → visible through the Marquee getRatingsMap (delegation).
+    tasteFeedback.upsertRating('p-deleg', { type: 'movie', tmdb_id: '10', imdb_id: 'tt10', simkl_id: 10, rating: 8, rated_at: '2026-01-01T00:00:00Z' });
+    assert.deepStrictEqual([...simklCache.getRatingsMap('p-deleg').entries()], [['10', 8]]);
+    // a series rating is NOT visible through the movie-scoped getRatingsMap.
+    tasteFeedback.upsertRating('p-deleg', { type: 'series', tmdb_id: '10', rating: 7 });
+    assert.deepStrictEqual([...simklCache.getRatingsMap('p-deleg').entries()], [['10', 8]]);
+    // simklCache.syncRatings (movies only) writes taste_ratings with type='movie'.
+    const fetchRatings = async () => simkl.parseRatings({ movies: [
+      { user_rating: 6, user_rated_at: '2026-02-01T00:00:00Z', movie: { title: 'C', ids: { tmdb: '20', imdb: 'tt20' } } },
+    ] });
+    const res = await simklCache.syncRatings(profile, { fetchActivities: async () => ({ movies: { rated_at: null } }), fetchRatings, now: 1000, log: quiet, force: true });
+    assert.deepStrictEqual(res, { ok: true, synced: 1, unresolved: 0 });
+    const row = db.get().prepare("SELECT type, tmdb_id, rating FROM taste_ratings WHERE profile_id = ? AND tmdb_id = '20'").get('p-deleg');
+    assert.strictEqual(row.type, 'movie');
+    assert.strictEqual(row.rating, 6);
+    // the series row for tmdb 10 is still intact (movie sync never touched it).
+    assert.deepStrictEqual([...tasteFeedback.getRatingsMap('p-deleg', 'series').entries()], [['10', 7]]);
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ratings_sync');
+  });
+
+  await it('Trainer T1: deleteForProfile removes all taste_* rows for that profile, none for another (test 10)', () => {
+    const tasteFeedback = require('../src/tasteFeedback');
+    const db = require('../src/db');
+    tasteFeedback.init();
+    const A = 'p-del-a';
+    const B = 'p-del-b';
+    // A: rows in all four tables.
+    tasteFeedback.upsertRating(A, { type: 'movie', tmdb_id: '1', rating: 8 });
+    db.get().prepare("INSERT INTO taste_ratings_sync (profile_id, type, activity, synced_at, degraded_synced_at) VALUES (?, ?, ?, ?, ?)").run(A, 'movie', null, 1000, null);
+    tasteFeedback.setIgnored(A, { type: 'movie', tmdb_id: '2', simkl_id: 2 }, true, 1000);
+    tasteFeedback.recordChange(A, 1000);
+    tasteFeedback.recordChange(A, 2000);
+    // B: its own rows.
+    tasteFeedback.upsertRating(B, { type: 'movie', tmdb_id: '3', rating: 9 });
+    tasteFeedback.setIgnored(B, { type: 'movie', tmdb_id: '4', simkl_id: 4 }, true, 1000);
+    tasteFeedback.recordChange(B, 1000);
+    tasteFeedback.deleteForProfile(A);
+    // A: all four tables empty.
+    assert.deepStrictEqual([...tasteFeedback.getRatingsMap(A, 'movie').entries()], []);
+    assert.strictEqual(db.get().prepare('SELECT COUNT(*) AS n FROM taste_ratings_sync WHERE profile_id = ?').get(A).n, 0);
+    assert.deepStrictEqual([...tasteFeedback.ignoredSet(A, 'movie')], []);
+    assert.deepStrictEqual(tasteFeedback.getTraining(A), { changed_at: null, changes_since_build: 0 });
+    // B: untouched.
+    assert.deepStrictEqual([...tasteFeedback.getRatingsMap(B, 'movie').entries()], [['3', 9]]);
+    assert.deepStrictEqual([...tasteFeedback.ignoredSet(B, 'movie')], ['4']);
+    assert.deepStrictEqual(tasteFeedback.getTraining(B), { changed_at: 1000, changes_since_build: 1 });
+    tasteFeedback.deleteForProfile(B);
   });
 
   await it('marquee ME-03: ensureRecs sequential fetch, cap, stale served, per-id error (B6)', async () => {
@@ -1567,7 +1649,7 @@ async function main() {
     // Both writes persist: the profile's rating row AND the concurrent writer's row.
     assert.deepStrictEqual([...simklCache.getRatingsMap('p-txn').entries()], [['tmdb-ttF1', 7]]);
     assert.deepStrictEqual(db.get().prepare('SELECT note FROM test_scratch').all().map((r) => r.note), ['concurrent-write']);
-    db.get().exec('DELETE FROM marquee_ratings; DELETE FROM marquee_sync; DELETE FROM test_scratch');
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ratings_sync; DELETE FROM test_scratch');
     db.get().exec('DROP TABLE IF EXISTS test_scratch');
   });
 
@@ -3016,8 +3098,8 @@ async function main() {
       // Held-out ratings: a target's rating must NOT steer the build.
       simklCache.init();
       const conn = db.get();
-      const ins = conn.prepare('INSERT INTO marquee_ratings (profile_id, tmdb_id, imdb_id, simkl_id, rating, rated_at) VALUES (?, ?, ?, ?, ?, ?)');
-      for (const t of expectedTargets.slice(0, 5)) ins.run(p.id, t, 'tt' + t, null, 8, Date.now());
+      const ins = conn.prepare("INSERT INTO taste_ratings (profile_id, type, tmdb_id, imdb_id, simkl_id, rating, rated_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
+      for (const t of expectedTargets.slice(0, 5)) ins.run(p.id, 'movie', t, 'tt' + t, null, 8, Date.now());
       const results = await bench.runBench({
         profile: config.getProfile(p.id), engineIds: ['bench-stub'], holdout: 10,
         deps: { engines, pipeline, rs, watchedStore, db, settings, selectServe: rs.selectServe, log: quiet },
@@ -3026,7 +3108,7 @@ async function main() {
       const sets = watchedStore.watchedIdSets(p.id);
       for (const t of expectedTargets) assert.ok(!sets.tmdb.has(t), 'no target in the watched set: ' + t);
       for (const t of expectedTargets) {
-        assert.ok(!conn.prepare('SELECT tmdb_id FROM marquee_ratings WHERE profile_id = ? AND tmdb_id = ?').get(p.id, t), 'no marquee_ratings row for target: ' + t);
+        assert.ok(!conn.prepare("SELECT tmdb_id FROM taste_ratings WHERE profile_id = ? AND type = 'movie' AND tmdb_id = ?").get(p.id, t), 'no taste_ratings row for target: ' + t);
       }
     } finally {
       dispose();
