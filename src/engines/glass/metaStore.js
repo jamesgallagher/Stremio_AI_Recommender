@@ -37,6 +37,17 @@ function get(type, tmdbId) {
   try { return JSON.parse(row.meta); } catch { return null; }
 }
 
+// The cached deep-meta PLUS its fetched_at timestamp, or null if not enriched
+// yet (Marquee ME-06, spec §4.6): the same query as get, plus the column, so
+// the caller can decide whether a NOT_YET title is due for an availability
+// recheck. Additive — no existing function is changed.
+function getWithAge(type, tmdbId) {
+  init();
+  const row = db.get().prepare('SELECT meta, fetched_at FROM glass_metadata WHERE type = ? AND tmdb_id = ?').get(type, String(tmdbId));
+  if (!row || !row.meta) return null;
+  try { return { meta: JSON.parse(row.meta), fetched_at: row.fetched_at }; } catch { return null; }
+}
+
 // A Map<tmdb_id, meta> for many ids of one type (one query). Absent ids are
 // simply missing from the map.
 function getMany(type, tmdbIds) {
@@ -88,4 +99,4 @@ function _clear() {
   db.get().prepare('DELETE FROM glass_metadata').run();
 }
 
-module.exports = { init, get, getMany, put, has, enrich, count, _clear };
+module.exports = { init, get, getWithAge, getMany, put, has, enrich, count, _clear };
