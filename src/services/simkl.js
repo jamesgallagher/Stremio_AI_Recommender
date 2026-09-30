@@ -149,6 +149,69 @@ function parseRatings(body) {
   return out;
 }
 
+// ---- Trainer T1: Simkl rating WRITEs (the /sync/ratings POST pair) ----
+// Simkl is the authority for ratings (mandate M1): a rating is written here
+// first, and the local taste_ratings row is written only after this succeeds.
+// Both writes ride the governed simkl_post lane (mandate M7 — hard 1 POST/s
+// write cap; exceeding it risks account suspension). No retries, no loops.
+
+// PURE: build a /sync/ratings body from items. `items` is
+// [{ type, simkl_id?, imdb_id?, tmdb_id?, rating? }]. Output is
+// { movies: [...], shows: [...] } — both keys always present. `type 'series'`
+// → shows, everything else → movies. ids: simkl a Number (finite only), imdb a
+// String (truthy only), tmdb a String (non-null/non-empty only); an item with
+// no ids is dropped. `rating` is included only when `withRating` is true AND it
+// is an integer 1–10. Exported for tests.
+function buildRatingsBody(items, { withRating = true } = {}) {
+  const movies = [];
+  const shows = [];
+  for (const it of Array.isArray(items) ? items : [items]) {
+    if (!it) continue;
+    const ids = {};
+    if (it.simkl_id != null && Number.isFinite(Number(it.simkl_id))) ids.simkl = Number(it.simkl_id);
+    if (it.imdb_id) ids.imdb = String(it.imdb_id);
+    if (it.tmdb_id != null && it.tmdb_id !== '') ids.tmdb = String(it.tmdb_id);
+    if (!ids.simkl && !ids.imdb && !ids.tmdb) continue; // no ids — dropped
+    const entry = { ids };
+    if (withRating && Number.isInteger(it.rating) && it.rating >= 1 && it.rating <= 10) entry.rating = it.rating;
+    (it.type === 'series' ? shows : movies).push(entry);
+  }
+  return { movies, shows };
+}
+
+// POST /sync/ratings — set ratings. Rate-governed at the hard 1-POST/s Simkl
+// write cap (the simkl_post lane), exactly like addToHistory. Throws on a
+// rejected token or a non-ok response; the caller maps that to a 502.
+async function setRatings(profile, items) {
+  const clientId = profile.keys.simkl_client_id;
+  const token = profile.simkl_auth?.access_token;
+  if (!clientId || !token) throw new Error('Simkl is not connected for this profile');
+  const body = buildRatingsBody(items);
+  if (!body.movies.length && !body.shows.length) throw new Error('nothing to rate');
+  const res = await governor.schedule('simkl_post', () => fetch(withParams(clientId, '/sync/ratings'), {
+    method: 'POST', headers: headers(token), body: JSON.stringify(body),
+  }));
+  if (res.status === 401 || res.status === 403) throw new Error('Simkl token rejected — reconnect the account');
+  if (!res.ok) throw new Error(`Simkl POST /sync/ratings failed (${res.status})`);
+  return res.json().catch(() => ({}));
+}
+
+// POST /sync/ratings/remove — clear ratings (withRating:false → no rating field).
+// Same lane and error contract as setRatings.
+async function removeRatings(profile, items) {
+  const clientId = profile.keys.simkl_client_id;
+  const token = profile.simkl_auth?.access_token;
+  if (!clientId || !token) throw new Error('Simkl is not connected for this profile');
+  const body = buildRatingsBody(items, { withRating: false });
+  if (!body.movies.length && !body.shows.length) throw new Error('nothing to rate');
+  const res = await governor.schedule('simkl_post', () => fetch(withParams(clientId, '/sync/ratings/remove'), {
+    method: 'POST', headers: headers(token), body: JSON.stringify(body),
+  }));
+  if (res.status === 401 || res.status === 403) throw new Error('Simkl token rejected — reconnect the account');
+  if (!res.ok) throw new Error(`Simkl POST /sync/ratings/remove failed (${res.status})`);
+  return res.json().catch(() => ({}));
+}
+
 // GET /movies/{simklId} — §12 L4: users_recommendations ("users also liked")
 // is present BY DEFAULT (no extra query params), so none are sent.
 async function getMovieSummary(profile, simklId) {
@@ -365,6 +428,9 @@ module.exports = {
   getActivities,
   getRatings,
   parseRatings,
+  buildRatingsBody,
+  setRatings,
+  removeRatings,
   getMovieSummary,
   parseMovieSummary,
   getAllItems,

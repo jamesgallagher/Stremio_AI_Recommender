@@ -1284,6 +1284,74 @@ async function main() {
     db.get().exec('DELETE FROM marquee_ratings; DELETE FROM marquee_sync');
   });
 
+  await it('Trainer T1: buildRatingsBody shapes ids/ratings by type (test 1)', () => {
+    const simkl = require('../src/services/simkl');
+    // numeric simkl, string imdb/tmdb, movie → movies
+    let b = simkl.buildRatingsBody([{ type: 'movie', simkl_id: 5, imdb_id: 'tt1', tmdb_id: '10', rating: 8 }]);
+    assert.deepStrictEqual(b, { movies: [{ ids: { simkl: 5, imdb: 'tt1', tmdb: '10' }, rating: 8 }], shows: [] });
+    // series → shows
+    b = simkl.buildRatingsBody([{ type: 'series', simkl_id: 7, imdb_id: 'tt2', tmdb_id: '20', rating: 9 }]);
+    assert.deepStrictEqual(b, { movies: [], shows: [{ ids: { simkl: 7, imdb: 'tt2', tmdb: '20' }, rating: 9 }] });
+    // no ids → dropped
+    b = simkl.buildRatingsBody([{ type: 'movie', rating: 5 }]);
+    assert.deepStrictEqual(b, { movies: [], shows: [] });
+    // ratings 0, 11, 7.5, '8' → omitted (ids kept)
+    b = simkl.buildRatingsBody([
+      { type: 'movie', tmdb_id: '1', rating: 0 },
+      { type: 'movie', tmdb_id: '2', rating: 11 },
+      { type: 'movie', tmdb_id: '3', rating: 7.5 },
+      { type: 'movie', tmdb_id: '4', rating: '8' },
+    ]);
+    assert.deepStrictEqual(b, { movies: [{ ids: { tmdb: '1' } }, { ids: { tmdb: '2' } }, { ids: { tmdb: '3' } }, { ids: { tmdb: '4' } }], shows: [] });
+    // withRating:false → no rating field
+    b = simkl.buildRatingsBody([{ type: 'movie', tmdb_id: '1', rating: 8 }], { withRating: false });
+    assert.deepStrictEqual(b, { movies: [{ ids: { tmdb: '1' } }], shows: [] });
+    // both keys always present (empty input)
+    assert.deepStrictEqual(simkl.buildRatingsBody([]), { movies: [], shows: [] });
+  });
+
+  await it('Trainer T1: setRatings/removeRatings governed POST + error contract (test 2)', async () => {
+    const simkl = require('../src/services/simkl');
+    const governor = require('../src/services/governor');
+    const profile = { id: 'p-rate', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    const realFetch = global.fetch;
+    const realSchedule = governor.schedule;
+    let fetchCalls = [];
+    let laneCalls = [];
+    // Spy on governor.schedule: record the lane, run the fetch fn directly (no pacing in the test).
+    governor.schedule = (lane, fn) => { laneCalls.push(lane); return fn(); };
+    let fetchRes = { ok: true, status: 200, json: async () => ({}) };
+    global.fetch = (url, opts) => { fetchCalls.push({ url: String(url), opts }); return Promise.resolve(fetchRes); };
+    try {
+      // setRatings: /sync/ratings, POST, JSON body, simkl_post lane
+      await simkl.setRatings(profile, [{ type: 'movie', simkl_id: 5, tmdb_id: '10', rating: 8 }]);
+      assert.strictEqual(fetchCalls.length, 1);
+      assert.match(fetchCalls[0].url, /\/sync\/ratings\?/);
+      assert.strictEqual(fetchCalls[0].opts.method, 'POST');
+      assert.deepStrictEqual(JSON.parse(fetchCalls[0].opts.body), { movies: [{ ids: { simkl: 5, tmdb: '10' }, rating: 8 }], shows: [] });
+      assert.deepStrictEqual(laneCalls, ['simkl_post']);
+      // removeRatings: /sync/ratings/remove, withRating:false → no rating field
+      fetchCalls = []; laneCalls = [];
+      await simkl.removeRatings(profile, [{ type: 'movie', tmdb_id: '10' }]);
+      assert.match(fetchCalls[0].url, /\/sync\/ratings\/remove\?/);
+      assert.deepStrictEqual(JSON.parse(fetchCalls[0].opts.body), { movies: [{ ids: { tmdb: '10' } }], shows: [] });
+      assert.deepStrictEqual(laneCalls, ['simkl_post']);
+      // 401 → the token-rejected message
+      fetchRes = { ok: false, status: 401, json: async () => ({}) };
+      await assert.rejects(() => simkl.setRatings(profile, [{ type: 'movie', tmdb_id: '10', rating: 8 }]), /token rejected/);
+      // 500 → throws with the status
+      fetchRes = { ok: false, status: 500, json: async () => ({}) };
+      await assert.rejects(() => simkl.setRatings(profile, [{ type: 'movie', tmdb_id: '10', rating: 8 }]), /500/);
+      // empty body → throws with ZERO fetches
+      fetchCalls = [];
+      await assert.rejects(() => simkl.setRatings(profile, [{ type: 'movie' }]), /nothing to rate/);
+      assert.strictEqual(fetchCalls.length, 0);
+    } finally {
+      global.fetch = realFetch;
+      governor.schedule = realSchedule;
+    }
+  });
+
   await it('marquee ME-03: ensureRecs sequential fetch, cap, stale served, per-id error (B6)', async () => {
     const simklCache = require('../src/engines/marquee/simklCache');
     const db = require('../src/db');
