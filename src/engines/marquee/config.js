@@ -45,7 +45,28 @@ const DEFAULTS = {
     recs_max_uncached: 40,
     recs_ttl_days: 30,
     ratings_resolve_cap: 50,
+    // F1 (review round 1): S2-only candidates carry no list payload (pre-score
+    // ~0.067), so pure pre-score truncation starves the collaborative signal.
+    // A reserved slice (10% of lookup_cap) keeps the best of them.
+    collab_reserve: 40,
   },
+
+  // ── ME-05/ME-06 (spec §4.4/§4.5/§5/§7/§8) ──
+  lookup_cap: 400,                 // MI-5: resolve budget — ≤ this many lookups per build
+  recs_per_seed: 12,              // S1: top N of /recommendations AND /similar, per seed
+  discover: { queries: 8, pages: 2 },
+  collections: { max: 10 },        // S4: at most N collections expanded per build
+  trending: { week_pages: 5, day_pages: 2, rising_top: 50, rising_bonus: 0.1 },
+  exploration_pct: 0.05,           // S7
+  suggest: { count: 60, avoid_recent: 40, ttl_days: 7 },
+  weights: { taste_match: 0.28, llm_fit: 0.20, trending_eff: 0.20, quality: 0.14, consensus: 0.12, freshness: 0.06 },
+  trending_gate: 0.35,
+  quality_prior: { m: 2000, C: 6.5 },
+  freshness_default_window: 30,
+  freshness_floor: 0.2,
+  decayed_collection_penalty: 0.05,
+  lookup_chunk: 8,
+  availability_recheck_days: 7,
 };
 
 // For now returns a deep clone of DEFAULTS, ignoring `settings` — P4 adds the

@@ -1587,6 +1587,647 @@ async function main() {
     watchedStore.deleteForProfile(profileId);
   });
 
+  // ── Marquee ME-05/ME-06 (P3): candidate sources + hard filter + scoring ──
+  const mqSources = require('../src/engines/marquee/sources');
+  const mqScoring = require('../src/engines/marquee/scoring');
+  const mqFilters = require('../src/engines/marquee/filters');
+  const mqCfg = require('../src/engines/marquee/config');
+  const glassMeta = require('../src/engines/glass/metaStore');
+  const pipeline = require('../src/engines/pipeline');
+
+  const mqGenreMap = { 28: 'Action', 18: 'Drama', 878: 'Science Fiction' };
+  const mqTaste = {
+    type: 'movie',
+    dims: {
+      genres: { Action: 0.9, Drama: 0.5 },
+      franchises: { 'c:100': 0.8 },
+      keywords: {}, directors: {}, cast: {}, decades: {}, languages: {}, runtimeBands: {},
+    },
+    genreMass: {},
+  };
+  const mqCfgResolved = mqCfg.resolveConfig({});
+  const mqItem = (id, over) => ({
+    type: 'movie', tmdb_id: id, title: 'T' + id, year: 2020, genre_ids: [28],
+    vote_average: 7, vote_count: 1000, popularity: 5, adult: false, poster: '/p' + id + '.jpg', ...over,
+  });
+  const mqSeed = (id, over) => ({
+    tmdb_id: id, simkl_id: null, imdb_id: 'tt' + id, title: 'Seed' + id, year: 2020,
+    rating: 8, weight: 1.0, watched_at: '2026-05-01T00:00:00Z', ...over,
+  });
+  const mqFullMeta = (id, over) => ({
+    tmdb_id: String(id), imdb_id: 'tt' + id, type: 'movie', title: 'M' + id,
+    overview: 'ov ' + id, year: 2020, decade: 2020,
+    poster: 'https://image.tmdb.org/t/p/w500/p' + id + '.jpg',
+    genres: ['Action'], primary_genre: 'Action',
+    vote_average: 7, vote_count: 1000, popularity: 5,
+    original_language: 'en', runtime: 120,
+    director: ['D1'], cast: ['C1'], keywords: ['k1'],
+    collection: null, networks: [],
+    certAU: 'M', certUS: 'R', availability: 'AVAILABLE',
+    ...over,
+  });
+  const mqCand = (id, over) => ({
+    type: 'movie', tmdb_id: id, title: 'M' + id, year: 2020, genre_ids: [28], genres: ['Action'],
+    vote_average: 7, vote_count: 1000, popularity: 5, adult: false, poster: null,
+    sources: new Set(['tmdb_recs']), seeds: new Set(), seedTitles: new Map(), _seedWeights: new Map(),
+    trending: { tmdbWeekRank: null, tmdbDayRank: null, simklWatched: 0, simklDrop: null }, _preScore: 0, ...over,
+  });
+  const mqEnvelope = (filters) => mqFilters.compileEnvelope(filters, { nowYear: 2026, genreMap: mqGenreMap });
+  const mqCtx = (filters, over) => ({
+    tmdbKey: 'k', mdblistKey: '', settings: {}, filters, log: quiet,
+    watchedIds: { tmdb: new Set(), imdb: new Set() }, dont: new Set(), stats: {}, ...over,
+  });
+  // ME-05 fetchers with call recording (all injectable, no network).
+  const mqFetchers = (over) => {
+    const calls = { recs: [], similar: [], discover: [], collection: [], trendingWeek: 0, trendingDay: 0, simklTrending: 0, simklRecs: [], chat: [], resolve: [] };
+    const f = {
+      recs: async (id) => { calls.recs.push(id); return over.recs ? over.recs(id) : []; },
+      similar: async (id) => { calls.similar.push(id); return over.similar ? over.similar(id) : []; },
+      discover: async (params, page) => { calls.discover.push({ params, page }); return over.discover ? over.discover(params, page) : []; },
+      collection: async (id) => { calls.collection.push(id); return over.collection ? over.collection(id) : []; },
+      trendingWeek: async () => { calls.trendingWeek += 1; return over.trendingWeek || []; },
+      trendingDay: async () => { calls.trendingDay += 1; return over.trendingDay || []; },
+      simklTrending: async () => { calls.simklTrending += 1; return over.simklTrending || []; },
+      simklRecs: async (ids) => { calls.simklRecs.push(ids); return over.simklRecs ? over.simklRecs(ids) : new Map(); },
+      // Mirrors llm.chat: the raw text is passed through opts.validate (parseSuggestions).
+      chat: async (chain, messages, opts) => { calls.chat.push(messages); return opts.validate(over.chat ? over.chat(chain, messages, opts) : '[]'); },
+      resolve: async (title, year) => { calls.resolve.push({ title, year }); return over.resolve ? over.resolve(title, year) : null; },
+    };
+    return { f, calls };
+  };
+  // ME-06 fetchers with call recording.
+  const mqScoreFetchers = (over) => {
+    const calls = { deepMeta: [], imdbRatings: [] };
+    const f = {
+      deepMeta: async (apiKey, type, id) => { calls.deepMeta.push(id); return over.deepMeta ? over.deepMeta(id) : null; },
+      imdbRatings: async (ids) => { calls.imdbRatings.push(ids); return over.imdbRatings ? over.imdbRatings(ids) : new Map(); },
+    };
+    return { f, calls };
+  };
+
+  await it('marquee ME-05: source tagging + merge (one title from S1 recs/similar, S3, S5)', async () => {
+    glassMeta._clear();
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const { f } = mqFetchers({
+      recs: () => [mqItem('100')],
+      similar: () => [mqItem('100')],
+      discover: () => [mqItem('100')],
+      trendingWeek: [{ ...mqItem('100'), rank: 3 }],
+      trendingDay: [{ ...mqItem('100'), rank: 5 }],
+    });
+    const ctx = mqCtx(filters);
+    const { candidates } = await mqSources.gatherCandidates({ id: 'p-mq1', name: 'MQ1', filters }, ctx, {
+      taste: mqTaste, brief: null, briefHash: 'h', seeds: [mqSeed('10')], envelope: env, cfg: mqCfgResolved, genreMap: mqGenreMap, fetchers: f, chain: [], log: quiet,
+    });
+    const c = candidates.find((x) => x.tmdb_id === '100');
+    assert.ok(c, 'merged candidate present');
+    assert.ok(c.sources.has('tmdb_recs') && c.sources.has('tmdb_similar') && c.sources.has('discover') && c.sources.has('trending'), 'all four tags');
+    assert.deepStrictEqual([...c.seeds], ['10']);
+    assert.strictEqual(c.trending.tmdbWeekRank, 3, 'best week rank kept');
+    assert.strictEqual(c.trending.tmdbDayRank, 5, 'best day rank kept');
+    assert.strictEqual(c.title, 'T100');
+  });
+
+  await it('marquee ME-05: exclusions (watched, dont_recommend, adult never appear)', async () => {
+    glassMeta._clear();
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const { f } = mqFetchers({
+      recs: () => [mqItem('200'), mqItem('300'), mqItem('400', { adult: true }), mqItem('500')],
+    });
+    const ctx = mqCtx(filters, {
+      watchedIds: { tmdb: new Set(['200']), imdb: new Set() },
+      dont: new Set(['movie:300']),
+    });
+    const { candidates } = await mqSources.gatherCandidates({ id: 'p-mq2', name: 'MQ2', filters }, ctx, {
+      taste: mqTaste, brief: null, briefHash: 'h', seeds: [mqSeed('10')], envelope: env, cfg: mqCfgResolved, genreMap: mqGenreMap, fetchers: f, chain: [], log: quiet,
+    });
+    const ids = candidates.map((x) => x.tmdb_id);
+    assert.ok(!ids.includes('200'), 'watched excluded');
+    assert.ok(!ids.includes('300'), 'dont_recommend excluded');
+    assert.ok(!ids.includes('400'), 'adult excluded');
+    assert.ok(ids.includes('500'), 'clean item kept');
+  });
+
+  await it('marquee ME-05: prefilter drops excluded-genre + below-vote-floor before lookup', async () => {
+    glassMeta._clear();
+    const filters = { min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: ['Drama'], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const { f } = mqFetchers({
+      recs: () => [mqItem('601', { genre_ids: [18] }), mqItem('602', { vote_count: 500 }), mqItem('603')],
+    });
+    const ctx = mqCtx(filters);
+    const { candidates } = await mqSources.gatherCandidates({ id: 'p-mq3', name: 'MQ3', filters }, ctx, {
+      taste: mqTaste, brief: null, briefHash: 'h', seeds: [mqSeed('10')], envelope: env, cfg: mqCfgResolved, genreMap: mqGenreMap, fetchers: f, chain: [], log: quiet,
+    });
+    const ids = candidates.map((x) => x.tmdb_id);
+    assert.ok(!ids.includes('601'), 'excluded genre dropped by prefilter');
+    assert.ok(!ids.includes('602'), 'below vote floor dropped by prefilter');
+    assert.ok(ids.includes('603'), 'clean item kept');
+    // Proves they were dropped BEFORE lookup: run ME-06 and assert deepMeta is never called for them.
+    const sf = mqScoreFetchers({ deepMeta: (id) => mqFullMeta(id) });
+    await mqScoring.scoreCandidates({ id: 'p-mq3', name: 'MQ3', filters }, ctx, candidates, {
+      taste: mqTaste, envelope: env, cfg: mqCfgResolved, gatherMeta: { weekN: 0, dayN: 0, hadTrending: false }, fetchers: sf.f, nowYear: 2026, nowMs: Date.parse('2026-06-01T00:00:00Z'), log: quiet,
+    });
+    assert.ok(!sf.calls.deepMeta.includes('601') && !sf.calls.deepMeta.includes('602'), 'deepMeta never called for prefiltered items');
+  });
+
+  await it('marquee ME-05/06: S2-only item survives prefilter, judged by hard filter after lookup', async () => {
+    glassMeta._clear();
+    const filters = { min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const { f } = mqFetchers({
+      simklRecs: () => new Map([[100, [{ tmdb_id: '700', title: 'S2Title', year: 2020 }]]]),
+    });
+    const ctx = mqCtx(filters);
+    const { candidates } = await mqSources.gatherCandidates({ id: 'p-mq4', name: 'MQ4', filters }, ctx, {
+      taste: mqTaste, brief: null, briefHash: 'h', seeds: [mqSeed('10', { simkl_id: 100 })], envelope: env, cfg: mqCfgResolved, genreMap: mqGenreMap, fetchers: f, chain: [], log: quiet,
+    });
+    const s2 = candidates.find((x) => x.tmdb_id === '700');
+    assert.ok(s2, 'S2-only item survives prefilter');
+    assert.ok(s2.sources.has('simkl_recs'));
+    assert.strictEqual(s2.vote_count, 0, 'no list payload');
+    const sf = mqScoreFetchers({ deepMeta: (id) => mqFullMeta(id) });
+    const { scored } = await mqScoring.scoreCandidates({ id: 'p-mq4', name: 'MQ4', filters }, ctx, candidates, {
+      taste: mqTaste, envelope: env, cfg: mqCfgResolved, gatherMeta: { weekN: 0, dayN: 0, hadTrending: false }, fetchers: sf.f, nowYear: 2026, nowMs: Date.parse('2026-06-01T00:00:00Z'), log: quiet,
+    });
+    assert.ok(scored.some((x) => x.tmdb_id === '700'), 'S2-only item passes hard filter after lookup');
+  });
+
+  await it('marquee ME-05: discover carries the envelope (kids config → certification.lte present)', async () => {
+    glassMeta._clear();
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 10 };
+    const env = mqEnvelope(filters);
+    const expected = env.discoverParams();
+    const { f, calls } = mqFetchers({ discover: () => [] });
+    const ctx = mqCtx(filters);
+    await mqSources.gatherCandidates({ id: 'p-mq5', name: 'MQ5', filters }, ctx, {
+      taste: mqTaste, brief: null, briefHash: 'h', seeds: [mqSeed('10')], envelope: env, cfg: mqCfgResolved, genreMap: mqGenreMap, fetchers: f, chain: [], log: quiet,
+    });
+    assert.ok(calls.discover.length > 0, 'discover called');
+    assert.ok('certification.lte' in expected, 'kids config has certification.lte');
+    for (const { params } of calls.discover) {
+      for (const k of Object.keys(expected)) {
+        assert.ok(k in params, `discover params carry ${k}`);
+        assert.strictEqual(params[k], expected[k], `${k} matches the envelope`);
+      }
+    }
+  });
+
+  await it('marquee ME-05: S4 gives only unwatched, released collection parts', async () => {
+    glassMeta._clear();
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const { f } = mqFetchers({
+      collection: () => [
+        mqItem('801', { release_date: '2020-01-01' }),  // released, unwatched → kept
+        mqItem('802', { release_date: '2020-01-01' }),  // watched → dropped
+        mqItem('803', { release_date: '2027-01-01' }),  // future → dropped
+        mqItem('804', { release_date: null }),           // no date → dropped
+      ],
+    });
+    const ctx = mqCtx(filters, { watchedIds: { tmdb: new Set(['802']), imdb: new Set() } });
+    const { candidates } = await mqSources.gatherCandidates({ id: 'p-mq6', name: 'MQ6', filters }, ctx, {
+      taste: mqTaste, brief: null, briefHash: 'h', seeds: [mqSeed('10')], envelope: env, cfg: mqCfgResolved, genreMap: mqGenreMap, fetchers: f, chain: [], log: quiet,
+    });
+    const ids = candidates.map((x) => x.tmdb_id);
+    assert.ok(ids.includes('801'), 'released unwatched part kept');
+    assert.ok(!ids.includes('802'), 'watched part dropped');
+    assert.ok(!ids.includes('803'), 'future part dropped');
+    assert.ok(!ids.includes('804'), 'no-date part dropped');
+  });
+
+  await it('marquee ME-05: S6 skipped (brief null / empty chain → chat never called)', async () => {
+    glassMeta._clear();
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    // brief null → chat not called.
+    {
+      const { f, calls } = mqFetchers({});
+      const ctx = mqCtx(filters);
+      await mqSources.gatherCandidates({ id: 'p-mq7a', name: 'MQ7a', filters }, ctx, {
+        taste: mqTaste, brief: null, briefHash: 'h', seeds: [mqSeed('10')], envelope: env, cfg: mqCfgResolved, genreMap: mqGenreMap, fetchers: f, chain: [{ type: 'custom', uri: 'http://x' }], log: quiet,
+      });
+      assert.strictEqual(calls.chat.length, 0, 'brief null → no chat');
+    }
+    // empty chain → chat not called.
+    {
+      const { f, calls } = mqFetchers({});
+      const ctx = mqCtx(filters);
+      await mqSources.gatherCandidates({ id: 'p-mq7b', name: 'MQ7b', filters }, ctx, {
+        taste: mqTaste, brief: { loves: ['A'] }, briefHash: 'h', seeds: [mqSeed('10')], envelope: env, cfg: mqCfgResolved, genreMap: mqGenreMap, fetchers: f, chain: [], log: quiet,
+      });
+      assert.strictEqual(calls.chat.length, 0, 'empty chain → no chat');
+    }
+  });
+
+  await it('marquee ME-05: S6 cached (two builds → one chat, one resolve per title)', async () => {
+    glassMeta._clear();
+    const llmCache = require('../src/engines/marquee/llmCache');
+    llmCache._clear();
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const { f, calls } = mqFetchers({
+      chat: () => JSON.stringify([{ title: 'Good', year: 2020 }, { title: 'Dud', year: 2020 }]),
+      resolve: (title) => (title === 'Good' ? { _tmdb_id: 900, releaseInfo: '2020', _genre_ids: [28], _vote_average: 7, _vote_count: 1000 } : null),
+    });
+    const ctx = mqCtx(filters);
+    const profile = { id: 'p-mq8', name: 'MQ8', filters };
+    const args = { taste: mqTaste, brief: { loves: ['A'] }, briefHash: 'h', seeds: [mqSeed('10')], envelope: env, cfg: mqCfgResolved, genreMap: mqGenreMap, fetchers: f, chain: [{ type: 'custom', uri: 'http://x' }], log: quiet };
+    await mqSources.gatherCandidates(profile, ctx, args);
+    assert.strictEqual(calls.chat.length, 1, 'first build: one chat');
+    assert.strictEqual(calls.resolve.length, 2, 'first build: resolve each title');
+    await mqSources.gatherCandidates(profile, ctx, args);
+    assert.strictEqual(calls.chat.length, 1, 'second build: cache hit, no chat');
+    assert.strictEqual(calls.resolve.length, 2, 'second build: no re-resolve (cached list)');
+    llmCache._clear();
+  });
+
+  await it('marquee ME-05/06: S6 untrusted (unresolved dropped; resolved-but-failing hard filter dropped)', async () => {
+    glassMeta._clear();
+    const llmCache = require('../src/engines/marquee/llmCache');
+    llmCache._clear();
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const { f } = mqFetchers({
+      chat: () => JSON.stringify([{ title: 'Good', year: 2020 }, { title: 'Dud', year: 2020 }]),
+      resolve: (title) => (title === 'Good' ? { _tmdb_id: 901, releaseInfo: '2020', _genre_ids: [28], _vote_average: 7, _vote_count: 1000 } : null),
+    });
+    const ctx = mqCtx(filters);
+    const profile = { id: 'p-mq9', name: 'MQ9', filters };
+    const { candidates } = await mqSources.gatherCandidates(profile, ctx, {
+      taste: mqTaste, brief: { loves: ['A'] }, briefHash: 'h', seeds: [mqSeed('10')], envelope: env, cfg: mqCfgResolved, genreMap: mqGenreMap, fetchers: f, chain: [{ type: 'custom', uri: 'http://x' }], log: quiet,
+    });
+    const ids = candidates.map((x) => x.tmdb_id);
+    assert.ok(ids.includes('901'), 'resolved suggestion kept');
+    assert.ok(candidates.find((x) => x.tmdb_id === '901').sources.has('llm'), 'tagged llm');
+    assert.ok(candidates.every((x) => x.tmdb_id !== null), 'unresolved (Dud) dropped');
+    // ME-06: resolved 'Good' fails the hard filter (NOT_YET) → dropped.
+    const sf = mqScoreFetchers({ deepMeta: (id) => mqFullMeta(id, { availability: 'NOT_YET' }) });
+    const { scored } = await mqScoring.scoreCandidates(profile, ctx, candidates, {
+      taste: mqTaste, envelope: env, cfg: mqCfgResolved, gatherMeta: { weekN: 0, dayN: 0, hadTrending: false }, fetchers: sf.f, nowYear: 2026, nowMs: Date.parse('2026-06-01T00:00:00Z'), log: quiet,
+    });
+    assert.ok(!scored.some((x) => x.tmdb_id === '901'), 'resolved but NOT_YET → dropped by hard filter');
+    llmCache._clear();
+  });
+
+  await it('marquee ME-05: S7 exploration reserve (≤ 20, outside the top-6 genres)', async () => {
+    glassMeta._clear();
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const outside = Array.from({ length: 30 }, (_, i) => ({ ...mqItem('1000' + i, { genre_ids: [878], vote_average: 7 }), rank: i + 1 }));
+    const { f } = mqFetchers({ trendingWeek: outside });
+    const ctx = mqCtx(filters);
+    const { candidates } = await mqSources.gatherCandidates({ id: 'p-mq10', name: 'MQ10', filters }, ctx, {
+      taste: mqTaste, brief: null, briefHash: 'h', seeds: [mqSeed('10')], envelope: env, cfg: mqCfgResolved, genreMap: mqGenreMap, fetchers: f, chain: [], log: quiet,
+    });
+    const explore = candidates.filter((x) => x.sources.has('exploration'));
+    assert.ok(explore.length <= 20, 'reserve ≤ 20');
+    assert.ok(explore.length > 0, 'some exploration');
+    for (const c of explore) {
+      assert.ok(!c.genres.some((g) => ['Action', 'Drama'].includes(g)), 'outside the top-6 genres');
+    }
+  });
+
+  await it('marquee ME-05: truncation (960 raw → ≤ lookup_cap, exploration included)', async () => {
+    glassMeta._clear();
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const seeds = Array.from({ length: 40 }, (_, i) => mqSeed('s' + i));
+    const { f } = mqFetchers({
+      recs: (id) => Array.from({ length: 12 }, (_, j) => mqItem('r' + id + '-' + j)),
+      similar: (id) => Array.from({ length: 12 }, (_, j) => mqItem('s' + id + '-' + j)),
+    });
+    const ctx = mqCtx(filters);
+    const { candidates } = await mqSources.gatherCandidates({ id: 'p-mq11', name: 'MQ11', filters }, ctx, {
+      taste: mqTaste, brief: null, briefHash: 'h', seeds, envelope: env, cfg: mqCfgResolved, genreMap: mqGenreMap, fetchers: f, chain: [], log: quiet,
+    });
+    assert.ok(candidates.length <= mqCfgResolved.lookup_cap, '≤ lookup_cap');
+    assert.strictEqual(ctx.stats.raw, 960, 'raw counted');
+    assert.strictEqual(ctx.stats.kept, candidates.length, 'kept = returned length');
+  });
+
+  await it('marquee ME-05: Simkl collaborative reserve (F1) — 960 S1 + 60 S2-only → exactly 40 S2-only survive, multi-seed first', async () => {
+    glassMeta._clear();
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const seeds = Array.from({ length: 40 }, (_, i) => mqSeed('s' + i, { simkl_id: 5000 + i }));
+    // Per-seed S2 lists: 10 multi-seed titles q0..q9 (each in exactly 2 seeds)
+    // + 50 single-seed titles q10..q59 → 60 S2-only candidates total.
+    const s2List = (i) => {
+      const out = [];
+      if (i < 10) out.push({ tmdb_id: 'q' + i, title: 'Q' + i, year: 2020 });
+      if (i > 0 && i <= 10) out.push({ tmdb_id: 'q' + (i - 1), title: 'Q' + (i - 1), year: 2020 });
+      out.push({ tmdb_id: 'q' + (10 + i), title: 'Q' + (10 + i), year: 2020 });
+      if (i < 10) out.push({ tmdb_id: 'q' + (40 + i), title: 'Q' + (40 + i), year: 2020 });
+      return out;
+    };
+    const { f } = mqFetchers({
+      recs: (id) => Array.from({ length: 12 }, (_, j) => mqItem('r' + id + '-' + j)),
+      similar: (id) => Array.from({ length: 12 }, (_, j) => mqItem('s' + id + '-' + j)),
+      simklRecs: (ids) => { const m = new Map(); for (const sid of ids) m.set(sid, s2List(sid - 5000)); return m; },
+    });
+    const ctx = mqCtx(filters);
+    const { candidates } = await mqSources.gatherCandidates({ id: 'p-mq-f1a', name: 'MQF1a', filters }, ctx, {
+      taste: mqTaste, brief: null, briefHash: 'h', seeds, envelope: env, cfg: mqCfgResolved, genreMap: mqGenreMap, fetchers: f, chain: [], log: quiet,
+    });
+    assert.ok(candidates.length <= mqCfgResolved.lookup_cap, '≤ lookup_cap');
+    const s2Only = candidates.filter((c) => c.sources.has('simkl_recs') && !c.sources.has('tmdb_recs') && !c.sources.has('tmdb_similar'));
+    assert.strictEqual(s2Only.length, 40, 'exactly collab_reserve S2-only titles survive');
+    for (let i = 0; i < 10; i += 1) {
+      assert.ok(s2Only.some((c) => c.tmdb_id === 'q' + i), 'multi-seed title q' + i + ' is in the reserve');
+    }
+    assert.strictEqual(ctx.stats.sources.S2_reserved, 40, 'S2_reserved counted');
+  });
+
+  await it('marquee ME-05: Simkl collaborative reserve (F1) — cached meta hydrates genres/votes, pre-score > 0.2 on-taste', async () => {
+    glassMeta._clear();
+    const nowMs = Date.parse('2026-06-01T00:00:00Z');
+    glassMeta.put('movie', 'h1', mqFullMeta('h1', { genres: ['Drama'] }), nowMs);
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const seeds = [mqSeed('s1', { simkl_id: 6000 })];
+    const { f } = mqFetchers({ simklRecs: (ids) => { const m = new Map(); for (const sid of ids) m.set(sid, [{ tmdb_id: 'h1', title: 'H1', year: 2020 }]); return m; } });
+    const ctx = mqCtx(filters);
+    const { candidates } = await mqSources.gatherCandidates({ id: 'p-mq-f1b', name: 'MQF1b', filters }, ctx, {
+      taste: mqTaste, brief: null, briefHash: 'h', seeds, envelope: env, cfg: mqCfgResolved, genreMap: mqGenreMap, fetchers: f, chain: [], log: quiet,
+    });
+    const h1 = candidates.find((c) => c.tmdb_id === 'h1');
+    assert.ok(h1, 'hydrated candidate present');
+    assert.deepStrictEqual(h1.genres, ['Drama'], 'genres hydrated from cached meta');
+    assert.strictEqual(h1.vote_count, 1000, 'vote_count hydrated');
+    assert.ok(h1._preScore > 0.2, 'hydrated pre-score > 0.2 for an on-taste genre');
+  });
+
+  await it('marquee ME-05: S5 per-list isolation (S1) — simklTrending throws, TMDB week/day kept, hadTrending true', async () => {
+    glassMeta._clear();
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const { f, calls } = mqFetchers({
+      trendingWeek: [mqItem('w1', { rank: 1 }), mqItem('w2', { rank: 2 })],
+      trendingDay: [mqItem('d1', { rank: 1 })],
+    });
+    // The stub returns its override as-is, so install a throwing fetcher here.
+    f.simklTrending = async () => { calls.simklTrending += 1; throw new Error('cdn down'); };
+    const ctx = mqCtx(filters);
+    const { candidates, meta } = await mqSources.gatherCandidates({ id: 'p-mq-s1', name: 'MQS1', filters }, ctx, {
+      taste: mqTaste, brief: null, briefHash: 'h', seeds: [], envelope: env, cfg: mqCfgResolved, genreMap: mqGenreMap, fetchers: f, chain: [], log: quiet,
+    });
+    const ids = candidates.map((c) => c.tmdb_id);
+    assert.ok(ids.includes('w1') && ids.includes('w2'), 'TMDB week candidates kept');
+    assert.ok(ids.includes('d1'), 'TMDB day candidate kept');
+    assert.strictEqual(calls.simklTrending, 1, 'simklTrending attempted once');
+    assert.strictEqual(meta.hadTrending, true, 'hadTrending from the lists that succeeded');
+    assert.strictEqual(meta.weekN, 2, 'weekN from the week list');
+    assert.strictEqual(meta.dayN, 1, 'dayN from the day list');
+  });
+
+  await it('marquee ME-05/06: call budget (40 seeds → 40 recs + 40 similar; discover ≤ 16; collection ≤ 10; simklRecs once; deepMeta ≤ 400)', async () => {
+    glassMeta._clear();
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const seeds = Array.from({ length: 40 }, (_, i) => mqSeed('b' + i, { simkl_id: 1000 + i }));
+    const { f, calls } = mqFetchers({
+      recs: () => [mqItem('x1')],
+      similar: () => [mqItem('x2')],
+      simklRecs: () => new Map(),
+    });
+    const ctx = mqCtx(filters);
+    const { candidates } = await mqSources.gatherCandidates({ id: 'p-mq12', name: 'MQ12', filters }, ctx, {
+      taste: mqTaste, brief: null, briefHash: 'h', seeds, envelope: env, cfg: mqCfgResolved, genreMap: mqGenreMap, fetchers: f, chain: [], log: quiet,
+    });
+    assert.strictEqual(calls.recs.length, 40, 'exactly 40 recs calls');
+    assert.strictEqual(calls.similar.length, 40, 'exactly 40 similar calls');
+    assert.ok(calls.discover.length <= 16, 'discover ≤ 8×2');
+    assert.ok(calls.collection.length <= 10, 'collection ≤ 10');
+    assert.strictEqual(calls.simklRecs.length, 1, 'simklRecs once');
+    const sf = mqScoreFetchers({ deepMeta: (id) => mqFullMeta(id) });
+    await mqScoring.scoreCandidates({ id: 'p-mq12', name: 'MQ12', filters }, ctx, candidates, {
+      taste: mqTaste, envelope: env, cfg: mqCfgResolved, gatherMeta: { weekN: 0, dayN: 0, hadTrending: false }, fetchers: sf.f, nowYear: 2026, nowMs: Date.parse('2026-06-01T00:00:00Z'), log: quiet,
+    });
+    assert.ok(sf.calls.deepMeta.length <= 400, 'deepMeta ≤ 400');
+  });
+
+  await it('marquee ME-05: a source fails (similar throws → build still returns candidates; S1 counts only recs)', async () => {
+    glassMeta._clear();
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const { f } = mqFetchers({
+      recs: () => [mqItem('y1')],
+      similar: () => { throw new Error('TMDB down'); },
+    });
+    const ctx = mqCtx(filters);
+    const { candidates } = await mqSources.gatherCandidates({ id: 'p-mq13', name: 'MQ13', filters }, ctx, {
+      taste: mqTaste, brief: null, briefHash: 'h', seeds: [mqSeed('10')], envelope: env, cfg: mqCfgResolved, genreMap: mqGenreMap, fetchers: f, chain: [], log: quiet,
+    });
+    assert.ok(candidates.some((x) => x.tmdb_id === 'y1'), 'recs candidate survives similar failure');
+    assert.strictEqual(ctx.stats.sources.S1, 1, 'S1 counts only the recs item');
+  });
+
+  await it('marquee ME-06: lookup refetch (no availability → refetch; NOT_YET 8d → refetch; NOT_YET 2d → no refetch)', async () => {
+    glassMeta._clear();
+    const nowMs = Date.parse('2026-06-01T00:00:00Z');
+    const DAY = 24 * 3600e3;
+    glassMeta.put('movie', 'a1', { ...mqFullMeta('a1'), availability: undefined }, nowMs); // pre-ME-02 (no availability key)
+    glassMeta.put('movie', 'b1', mqFullMeta('b1', { availability: 'NOT_YET' }), nowMs - 8 * DAY);
+    glassMeta.put('movie', 'c1', mqFullMeta('c1', { availability: 'NOT_YET' }), nowMs - 2 * DAY);
+    glassMeta.put('movie', 'd1', mqFullMeta('d1', { availability: 'AVAILABLE' }), nowMs - 2 * DAY);
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const cands = ['a1', 'b1', 'c1', 'd1'].map((id) => mqCand(id));
+    const { f, calls } = mqScoreFetchers({ deepMeta: (id) => mqFullMeta(id) });
+    const ctx = mqCtx(filters);
+    await mqScoring.scoreCandidates({ id: 'p-mq14', name: 'MQ14', filters }, ctx, cands, {
+      taste: mqTaste, envelope: env, cfg: mqCfgResolved, gatherMeta: { weekN: 0, dayN: 0, hadTrending: false }, fetchers: f, nowYear: 2026, nowMs, log: quiet,
+    });
+    assert.ok(calls.deepMeta.includes('a1'), 'no-availability refetched');
+    assert.ok(calls.deepMeta.includes('b1'), 'NOT_YET 8d refetched');
+    assert.ok(!calls.deepMeta.includes('c1'), 'NOT_YET 2d not refetched');
+    assert.ok(!calls.deepMeta.includes('d1'), 'fresh AVAILABLE not refetched');
+    glassMeta._clear();
+  });
+
+  await it('marquee ME-06: hard filter (NOT_YET dropped; kids unknown-cert + M@10 dropped; adult unknown kept)', async () => {
+    glassMeta._clear();
+    const nowMs = Date.parse('2026-06-01T00:00:00Z');
+    glassMeta.put('movie', 'h1', mqFullMeta('h1', { availability: 'NOT_YET' }), nowMs);
+    glassMeta.put('movie', 'h2', mqFullMeta('h2', { certAU: null, certUS: null }), nowMs);
+    glassMeta.put('movie', 'h3', mqFullMeta('h3', { certAU: 'M', certUS: null }), nowMs);
+    glassMeta.put('movie', 'h4', mqFullMeta('h4', { certAU: null, certUS: null }), nowMs);
+    const cands = ['h1', 'h2', 'h3', 'h4'].map((id) => mqCand(id));
+    // Kids profile (age_limit 10 → judgement age 11).
+    {
+      const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 10 };
+      const env = mqEnvelope(filters);
+      const ctx = mqCtx(filters);
+      const { scored } = await mqScoring.scoreCandidates({ id: 'p-mq15a', name: 'MQ15a', filters }, ctx, cands, {
+        taste: mqTaste, envelope: env, cfg: mqCfgResolved, gatherMeta: { weekN: 0, dayN: 0, hadTrending: false }, fetchers: mqScoreFetchers({}).f, nowYear: 2026, nowMs, log: quiet,
+      });
+      const ids = scored.map((x) => x.tmdb_id);
+      assert.ok(!ids.includes('h1'), 'NOT_YET dropped (kids)');
+      assert.ok(!ids.includes('h2'), 'kids unknown cert dropped');
+      assert.ok(!ids.includes('h3'), 'kids M@10 dropped');
+      assert.ok(!ids.includes('h4'), 'kids unknown cert dropped');
+    }
+    // Adult profile (age_limit 0): unknown cert is kept (fail open).
+    {
+      const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+      const env = mqEnvelope(filters);
+      const ctx = mqCtx(filters);
+      const { scored } = await mqScoring.scoreCandidates({ id: 'p-mq15b', name: 'MQ15b', filters }, ctx, cands, {
+        taste: mqTaste, envelope: env, cfg: mqCfgResolved, gatherMeta: { weekN: 0, dayN: 0, hadTrending: false }, fetchers: mqScoreFetchers({}).f, nowYear: 2026, nowMs, log: quiet,
+      });
+      const ids = scored.map((x) => x.tmdb_id);
+      assert.ok(!ids.includes('h1'), 'NOT_YET dropped (adult)');
+      assert.ok(ids.includes('h2'), 'adult unknown cert kept');
+      assert.ok(ids.includes('h3'), 'adult M kept (no cert gate)');
+      assert.ok(ids.includes('h4'), 'adult unknown cert kept');
+    }
+    glassMeta._clear();
+  });
+
+  await it('marquee ME-06: Anime tag (movie isAnime → genres start with Anime; excluded_genres Anime → dropped)', async () => {
+    glassMeta._clear();
+    const nowMs = Date.parse('2026-06-01T00:00:00Z');
+    animeMap._setIndex({ at: Date.now(), etag: 'itest', byImdb: { ttA1: { mal: 1 } }, byTmdb: { A1: { mal: 1 } } });
+    glassMeta.put('movie', 'A1', mqFullMeta('A1', { genres: ['Animation'] }), nowMs);
+    const cands = [mqCand('A1', { genre_ids: [16], genres: ['Animation'] })];
+    // No Anime exclusion → tagged.
+    {
+      const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+      const env = mqEnvelope(filters);
+      const ctx = mqCtx(filters);
+      const { scored } = await mqScoring.scoreCandidates({ id: 'p-mq16a', name: 'MQ16a', filters }, ctx, cands, {
+        taste: mqTaste, envelope: env, cfg: mqCfgResolved, gatherMeta: { weekN: 0, dayN: 0, hadTrending: false }, fetchers: mqScoreFetchers({}).f, nowYear: 2026, nowMs, log: quiet,
+      });
+      const c = scored.find((x) => x.tmdb_id === 'A1');
+      assert.ok(c, 'anime candidate present');
+      assert.ok(c.genres.startsWith('Anime,'), 'genres start with Anime');
+    }
+    // Anime excluded → dropped.
+    {
+      const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: ['Anime'], age_limit: 0 };
+      const env = mqEnvelope(filters);
+      const ctx = mqCtx(filters);
+      const { scored } = await mqScoring.scoreCandidates({ id: 'p-mq16b', name: 'MQ16b', filters }, ctx, cands, {
+        taste: mqTaste, envelope: env, cfg: mqCfgResolved, gatherMeta: { weekN: 0, dayN: 0, hadTrending: false }, fetchers: mqScoreFetchers({}).f, nowYear: 2026, nowMs, log: quiet,
+      });
+      assert.ok(!scored.some((x) => x.tmdb_id === 'A1'), 'excluded_genres Anime → dropped');
+    }
+    offlineAnimeMap();
+  });
+
+  await it('marquee ME-06: no imdb_rating key (I4) — value only in scoreComponents.inputs', async () => {
+    glassMeta._clear();
+    const nowMs = Date.parse('2026-06-01T00:00:00Z');
+    glassMeta.put('movie', 'i1', mqFullMeta('i1'), nowMs);
+    const cands = [mqCand('i1')];
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const ctx = mqCtx(filters, { mdblistKey: 'k' });
+    const { f } = mqScoreFetchers({ deepMeta: (id) => mqFullMeta(id), imdbRatings: () => new Map([['tti1', 8.5]]) });
+    const { scored } = await mqScoring.scoreCandidates({ id: 'p-mq17', name: 'MQ17', filters }, ctx, cands, {
+      taste: mqTaste, envelope: env, cfg: mqCfgResolved, gatherMeta: { weekN: 0, dayN: 0, hadTrending: false }, fetchers: f, nowYear: 2026, nowMs, log: quiet,
+    });
+    assert.ok(scored.length > 0, 'a row returned');
+    for (const row of scored) assert.ok(!('imdb_rating' in row), 'no top-level imdb_rating key');
+    assert.strictEqual(scored.find((x) => x.tmdb_id === 'i1').scoreComponents.inputs.imdb_rating, 8.5, 'imdb_rating in scoreComponents.inputs');
+  });
+
+  await it('marquee ME-06: output contract (genres CSV, poster not double-prefixed, sorted desc, every row passes hardFilter)', async () => {
+    glassMeta._clear();
+    const nowMs = Date.parse('2026-06-01T00:00:00Z');
+    glassMeta.put('movie', 'o1', mqFullMeta('o1'), nowMs);
+    glassMeta.put('movie', 'o2', mqFullMeta('o2'), nowMs);
+    glassMeta.put('movie', 'o3', mqFullMeta('o3'), nowMs);
+    const cands = ['o1', 'o2', 'o3'].map((id) => mqCand(id, { seeds: new Set(['s1']), seedTitles: new Map([['s1', 'Seed1']]), _seedWeights: new Map([['s1', 1.0]]) }));
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const ctx = mqCtx(filters);
+    const { scored } = await mqScoring.scoreCandidates({ id: 'p-mq18', name: 'MQ18', filters }, ctx, cands, {
+      taste: mqTaste, envelope: env, cfg: mqCfgResolved, gatherMeta: { weekN: 0, dayN: 0, hadTrending: false }, fetchers: mqScoreFetchers({ deepMeta: (id) => mqFullMeta(id) }).f, nowYear: 2026, nowMs, log: quiet,
+    });
+    assert.strictEqual(scored.length, 3, 'all three scored');
+    for (const row of scored) {
+      assert.ok(typeof row.genres === 'string', 'genres is a CSV string');
+      assert.ok(row.poster.startsWith('https://image.tmdb.org/t/p/'), 'poster is a full URL');
+      assert.ok(!row.poster.includes('/t/p/w500https'), 'poster not double-prefixed');
+      const meta = glassMeta.get('movie', row.tmdb_id);
+      assert.ok(env.hardFilter({
+        imdb_id: row.imdb_id, imdb_rating: row.scoreComponents.inputs.imdb_rating,
+        vote_average: row.vote_average, vote_count: row.vote_count, year: row.year,
+        genres: row.genres.split(','), availability: row.scoreComponents.inputs.availability,
+        certAU: meta.certAU, certUS: meta.certUS,
+      }).ok, 'row passes hardFilter');
+    }
+    for (let i = 1; i < scored.length; i++) assert.ok(scored[i - 1].rankScore >= scored[i].rankScore, 'sorted by rankScore desc');
+    glassMeta._clear();
+  });
+
+  await it('marquee ME-06: pipeline round trip (normalize + upsert → affinity/rec_count/score_components/algorithm_version)', async () => {
+    glassMeta._clear();
+    const nowMs = Date.parse('2026-06-01T00:00:00Z');
+    glassMeta.put('movie', 'r1', mqFullMeta('r1'), nowMs);
+    const cands = [mqCand('r1', { sources: new Set(['tmdb_recs', 'simkl_recs']), seeds: new Set(['s1']), seedTitles: new Map([['s1', 'Seed1']]), _seedWeights: new Map([['s1', 1.0]]) })];
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const ctx = mqCtx(filters);
+    const { scored } = await mqScoring.scoreCandidates({ id: 'p-mq19', name: 'MQ19', filters }, ctx, cands, {
+      taste: mqTaste, envelope: env, cfg: mqCfgResolved, gatherMeta: { weekN: 0, dayN: 0, hadTrending: false }, fetchers: mqScoreFetchers({ deepMeta: (id) => mqFullMeta(id) }).f, nowYear: 2026, nowMs, log: quiet,
+    });
+    assert.strictEqual(scored.length, 1, 'one row scored');
+    const row = scored[0];
+    const normalized = pipeline.normalize(row);
+    rs.upsertCandidates('p-mq19', [normalized], { ratingCheckedAt: null });
+    const stored = rs.getRecommended('p-mq19', { type: 'movie', limit: 10 })[0];
+    assert.strictEqual(stored.affinity, row.rankScore, 'affinity = rankScore');
+    assert.strictEqual(stored.rec_count, row.recCount, 'rec_count = recCount');
+    assert.strictEqual(stored.algorithm_version, 'marquee-m1', 'algorithm_version = marquee-m1');
+    const comps = JSON.parse(stored.score_components);
+    assert.ok(comps.features && comps.weights, 'score_components JSON parses');
+    rs.deleteForProfile('p-mq19');
+    glassMeta._clear();
+  });
+
+  await it('marquee ME-06: decayed penalty (two decayed rows in collection X → candidate in X loses 0.10)', async () => {
+    glassMeta._clear();
+    const nowMs = Date.parse('2026-06-01T00:00:00Z');
+    rs.addDontRecommend('p-mq20', 'movie', 'd1', 'decayed', nowMs);
+    rs.addDontRecommend('p-mq20', 'movie', 'd2', 'decayed', nowMs);
+    glassMeta.put('movie', 'd1', mqFullMeta('d1', { collection: { id: 100, name: 'Coll X' } }), nowMs);
+    glassMeta.put('movie', 'd2', mqFullMeta('d2', { collection: { id: 100, name: 'Coll X' } }), nowMs);
+    glassMeta.put('movie', 'x1', mqFullMeta('x1', { collection: { id: 100, name: 'Coll X' } }), nowMs);
+    glassMeta.put('movie', 'x2', mqFullMeta('x2'), nowMs);
+    const cands = ['x1', 'x2'].map((id) => mqCand(id));
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const ctx = mqCtx(filters);
+    const { scored } = await mqScoring.scoreCandidates({ id: 'p-mq20', name: 'MQ20', filters }, ctx, cands, {
+      taste: mqTaste, envelope: env, cfg: mqCfgResolved, gatherMeta: { weekN: 0, dayN: 0, hadTrending: false }, fetchers: mqScoreFetchers({ deepMeta: (id) => mqFullMeta(id) }).f, nowYear: 2026, nowMs, log: quiet,
+    });
+    const x1 = scored.find((x) => x.tmdb_id === 'x1');
+    const x2 = scored.find((x) => x.tmdb_id === 'x2');
+    assert.ok(x1 && x2, 'both candidates scored');
+    assert.strictEqual(x1.scoreComponents.penalty, 0.10, 'x1 penalty = 2 × 0.05');
+    assert.strictEqual(x2.scoreComponents.penalty, 0, 'x2 no penalty');
+    rs.deleteForProfile('p-mq20');
+    glassMeta._clear();
+  });
+
+  await it('marquee ME-06: no_imdb in envelopeStats (S2) — a lookup-null candidate is counted there', async () => {
+    glassMeta._clear();
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const ctx = mqCtx(filters);
+    // No cached meta row; the deepMeta stub returns null → the candidate is dropped at lookup.
+    const { scored, envelopeStats } = await mqScoring.scoreCandidates({ id: 'p-mq21', name: 'MQ21', filters }, ctx, [mqCand('n1')], {
+      taste: mqTaste, envelope: env, cfg: mqCfgResolved, gatherMeta: { weekN: 0, dayN: 0, hadTrending: false }, fetchers: mqScoreFetchers({ deepMeta: () => null }).f, nowYear: 2026, nowMs: Date.parse('2026-06-01T00:00:00Z'), log: quiet,
+    });
+    assert.strictEqual(scored.length, 0, 'lookup-null candidate dropped');
+    assert.strictEqual(envelopeStats.no_imdb, 1, 'no_imdb included in the returned envelopeStats');
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();
