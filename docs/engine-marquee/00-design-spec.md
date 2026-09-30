@@ -250,3 +250,8 @@ It ships **globally disabled** (SC-07), and series keep whatever engine the prof
 - **Q2:** Once real distributions exist from `score_components`, tune the weights (Tier-2) and
   the trending gate threshold of 0.35.
 - **Q3:** A series counterpart ("Marquee TV") would reuse ~70% of this. That's out of scope.
+
+---
+
+## 12. Live findings (ME-00)
+_Pending — James runs `node --experimental-sqlite test/verify-marquee-live.js --profile="<name>"` and pastes its findings block here. P2 (ME-03) is blocked until this section is filled._
