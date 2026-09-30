@@ -1791,6 +1791,14 @@ ok('marquee envelope: kids cert filtering (MD-3)', () => {
   assert.deepStrictEqual(run(null, 'G'), { ok: true });
   // R 18+ (Infinity) → cert_over
   assert.deepStrictEqual(run('R 18+', null), { ok: false, reason: 'cert_over' });
+  // age_limit 14 (judgement 15): M and MA 15+ kept, R over (T1)
+  const kids14 = marquee.compileEnvelope({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 14 }, { nowYear: 2026, genreMap });
+  assert.strictEqual(kids14.judgementAge, 15);
+  assert.deepStrictEqual(kids14.hardFilter({ ...base, certAU: 'M', certUS: null }), { ok: true });
+  assert.deepStrictEqual(kids14.hardFilter({ ...base, certAU: 'MA 15+', certUS: null }), { ok: true });
+  assert.deepStrictEqual(kids14.hardFilter({ ...base, certAU: null, certUS: 'R' }), { ok: false, reason: 'cert_over' });
+  // strictestMinAge('M','PG') === 15 (the prompt's example)
+  assert.strictEqual(marquee.strictestMinAge('M', 'PG'), 15);
   // an adult envelope (age_limit 0) ignores certs entirely
   const adult = marquee.compileEnvelope({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 0 }, { nowYear: 2026, genreMap });
   assert.strictEqual(adult.kids, false);
