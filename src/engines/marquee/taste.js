@@ -217,7 +217,7 @@ async function tasteBrief(profileId, taste, { chain = [], chat = llm.chat, cfg, 
   const input = buildBriefInput(profileId, taste, cfg, { nowMs: now, ratings });
   const timeoutMs = Number(process.env.MARQUEE_LLM_TIMEOUT_MS) || cfg.llm_timeout_ms;
   try {
-    const brief = await chat(chain, [{ role: 'user', content: buildBriefPrompt(input) }], { temperature: 0, timeoutMs, validate: parseBrief, log });
+    const brief = await chat(chain, [{ role: 'user', content: buildBriefPrompt(input) }], { temperature: 0, timeoutMs, validate: parseBrief }, log);
     const stored = { ...brief, hash: key };
     llmCache.put(profileId, 'brief', key, stored, now);
     return stored;
