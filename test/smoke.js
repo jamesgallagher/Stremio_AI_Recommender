@@ -1986,6 +1986,183 @@ ok('tmdb: pickCertification unchanged (ME-02 refactor)', () => {
   assert.strictEqual(tmdb.pickCertification([{ iso_3166_1: 'US', release_dates: [{ certification: '' }] }], 'movie'), null);
 });
 
+// ---- Marquee ME-03/ME-04 (pure) ----
+
+ok('marquee ME-03: parseRatings keeps integer 1–10 ratings, ids from movie.ids, drops id-less (B1)', () => {
+  const simkl = require('../src/services/simkl');
+  const body = { movies: [
+    { user_rating: 8, user_rated_at: '2026-01-01T00:00:00Z', movie: { title: 'T1', ids: { simkl: 53078, imdb: 'tt1', tmdb: '603' } } },
+    { user_rating: null, user_rated_at: null, movie: { title: 'T2', ids: { simkl: 1, imdb: 'tt2', tmdb: '2' } } }, // unrated → dropped
+    { user_rating: 10, user_rated_at: '2026-01-02T00:00:00Z', movie: { title: 'T3', ids: { simkl: 2, imdb: 'tt3', tmdb: '3' } } },
+    { user_rating: 0, movie: { title: 'T4', ids: { simkl: 3, imdb: 'tt4', tmdb: '4' } } }, // out of range → dropped
+    { user_rating: 11, movie: { title: 'T5', ids: { simkl: 4, imdb: 'tt5', tmdb: '5' } } }, // out of range → dropped
+    { user_rating: 4.5, movie: { title: 'T6', ids: { simkl: 5, imdb: 'tt6', tmdb: '6' } } }, // non-integer → dropped
+    { user_rating: 1, movie: { title: 'T7', ids: { simkl: 6, imdb: 'tt7', tmdb: '7' } } }, // 1 → kept
+    { user_rating: 4, movie: { title: 'T8', ids: { simkl: 7, imdb: 'tt8', tmdb: '8' } } }, // 4 → kept
+    { user_rating: 5, movie: { title: 'no ids' } }, // no ids anywhere → dropped
+    { user_rating: 9, ids: { simkl: 9, imdb: 'tt9', tmdb: '9' } }, // flat ids fallback → kept
+  ] };
+  assert.deepStrictEqual(simkl.parseRatings(body), [
+    { tmdb_id: '603', imdb_id: 'tt1', simkl_id: 53078, rating: 8, rated_at: '2026-01-01T00:00:00Z' },
+    { tmdb_id: '3', imdb_id: 'tt3', simkl_id: 2, rating: 10, rated_at: '2026-01-02T00:00:00Z' },
+    { tmdb_id: '7', imdb_id: 'tt7', simkl_id: 6, rating: 1, rated_at: null },
+    { tmdb_id: '8', imdb_id: 'tt8', simkl_id: 7, rating: 4, rated_at: null },
+    { tmdb_id: '9', imdb_id: 'tt9', simkl_id: 9, rating: 9, rated_at: null },
+  ]);
+  // bare array tolerated; missing movies key / null body → []
+  assert.deepStrictEqual(simkl.parseRatings([{ user_rating: 6, movie: { ids: { tmdb: '11' } } }]),
+    [{ tmdb_id: '11', imdb_id: null, simkl_id: null, rating: 6, rated_at: null }]);
+  assert.deepStrictEqual(simkl.parseRatings({}), []);
+  assert.deepStrictEqual(simkl.parseRatings(null), []);
+});
+
+ok('marquee ME-03: parseMovieSummary users_recommendations, ids from item.ids, missing → [] (B2)', () => {
+  const simkl = require('../src/services/simkl');
+  const body = {
+    movie: { title: 'Seed', ids: { simkl: 53078 } },
+    users_recommendations: [
+      { title: 'R1', year: 2010, type: 'movie', ids: { simkl: 101, imdb: 'tt101', tmdb: '11' } },
+      { title: 'R2', year: 2011, type: 'movie', ids: { simkl: 102, imdb: 'tt102', tmdb: '12' } },
+      { title: 'no-ids' },
+    ],
+  };
+  assert.deepStrictEqual(simkl.parseMovieSummary(body), { users_recommendations: [
+    { simkl_id: 101, tmdb_id: '11', imdb_id: 'tt101', title: 'R1', year: 2010 },
+    { simkl_id: 102, tmdb_id: '12', imdb_id: 'tt102', title: 'R2', year: 2011 },
+  ] });
+  assert.deepStrictEqual(simkl.parseMovieSummary({}), { users_recommendations: [] });
+  assert.deepStrictEqual(simkl.parseMovieSummary(null), { users_recommendations: [] });
+});
+
+ok('marquee ME-04: ratingWeight bands (spec §4.3) + unrated → null (B7)', () => {
+  const taste = require('../src/engines/marquee/taste');
+  const cfg = require('../src/engines/marquee/config').DEFAULTS;
+  assert.strictEqual(taste.ratingWeight(10, cfg), 2.0);
+  assert.strictEqual(taste.ratingWeight(9, cfg), 2.0);
+  assert.strictEqual(taste.ratingWeight(8, cfg), 1.2);
+  assert.strictEqual(taste.ratingWeight(7, cfg), 1.2);
+  assert.strictEqual(taste.ratingWeight(6, cfg), 0.4);
+  assert.strictEqual(taste.ratingWeight(5, cfg), 0.4);
+  assert.strictEqual(taste.ratingWeight(4, cfg), -1.2);
+  assert.strictEqual(taste.ratingWeight(3, cfg), -1.2);
+  assert.strictEqual(taste.ratingWeight(1, cfg), -1.2);
+  assert.strictEqual(taste.ratingWeight(null, cfg), null);
+  assert.strictEqual(taste.ratingWeight(undefined, cfg), null);
+  assert.strictEqual(taste.ratingWeight(0, cfg), null);
+});
+
+ok('marquee ME-04: parseBrief — fences/prose, five keys, coerce, throw on empty (B10)', () => {
+  const taste = require('../src/engines/marquee/taste');
+  const b = taste.parseBrief('{"loves":["Sci-fi","Heist"],"avoids":["Horror"],"moods":["tense"],"eras":["2010s"],"standout_titles":["Inception"]}');
+  assert.deepStrictEqual(b, { loves: ['Sci-fi', 'Heist'], avoids: ['Horror'], moods: ['tense'], eras: ['2010s'], standout_titles: ['Inception'] });
+  // code fence + leading prose
+  const fenced = taste.parseBrief('Here is the brief:\n```json\n{"loves":["A"],"avoids":[],"moods":["B"],"eras":["C"],"standout_titles":["D"]}\n```');
+  assert.deepStrictEqual(fenced, { loves: ['A'], avoids: [], moods: ['B'], eras: ['C'], standout_titles: ['D'] });
+  // coerce: non-array → [value]; trim; drop empties; cap 8; cap 60 chars
+  const coerced = taste.parseBrief(JSON.stringify({
+    loves: 'One', avoids: ['  x  ', '', 'y'], moods: Array(9).fill('m'), eras: null, standout_titles: ['a'.repeat(80)],
+  }));
+  assert.deepStrictEqual(coerced.loves, ['One']);
+  assert.deepStrictEqual(coerced.avoids, ['x', 'y']);
+  assert.strictEqual(coerced.moods.length, 8);
+  assert.deepStrictEqual(coerced.eras, []);
+  assert.strictEqual(coerced.standout_titles[0].length, 60);
+  // all five empty → throw (makes chat try the next model/provider)
+  assert.throws(() => taste.parseBrief('{"loves":[],"avoids":[],"moods":[],"eras":[],"standout_titles":[]}'));
+  assert.throws(() => taste.parseBrief('no json here'));
+});
+
+ok('marquee ME-04: buildBriefPrompt carries history + dims, never age/classification (B10)', () => {
+  const taste = require('../src/engines/marquee/taste');
+  const prompt = taste.buildBriefPrompt({
+    watch_history: [
+      { title: 'Inception', year: 2010, rating: 9, genres: ['Sci-Fi', 'Thriller'] },
+      { title: 'Old Movie', year: null, rating: null, genres: [] },
+    ],
+    tastes: [{ dim: 'genres', values: ['Sci-Fi', 'Drama'] }, { dim: 'decades', values: ['2010'] }],
+  });
+  assert.ok(prompt.includes('Inception (2010) — rated 9/10 — Sci-Fi, Thriller'));
+  assert.ok(prompt.includes('Old Movie (n.d.) — unrated — genre unknown'));
+  assert.ok(prompt.includes('genres: Sci-Fi, Drama'));
+  assert.ok(prompt.includes('decades: 2010'));
+  // age belongs to the shared gate (I1) — the brief must not mention it
+  assert.ok(!/age|classification|suitable|child|kid/i.test(prompt), 'prompt must not mention age/classification/children');
+});
+
+ok('marquee ME-04: config copies Glass values independently + resolveConfig deep clone (spec §4.5)', () => {
+  const marqueeCfg = require('../src/engines/marquee/config');
+  const glassCfg = require('../src/engines/glass/config');
+  // intentionally start equal to Glass's (spec §4.5), but independent copies
+  assert.deepStrictEqual(marqueeCfg.DEFAULTS.half_life_days, glassCfg.DEFAULTS.half_life_days);
+  assert.deepStrictEqual(marqueeCfg.DEFAULTS.horizon_blend, glassCfg.DEFAULTS.horizon_blend);
+  assert.deepStrictEqual(marqueeCfg.DEFAULTS.feedback, glassCfg.DEFAULTS.feedback);
+  assert.deepStrictEqual(marqueeCfg.DEFAULTS.taste_dims, glassCfg.DEFAULTS.taste_dims);
+  assert.deepStrictEqual(marqueeCfg.DEFAULTS.keyword_min_shared, glassCfg.DEFAULTS.keyword_min_shared);
+  // Marquee-specific knobs
+  assert.deepStrictEqual(marqueeCfg.DEFAULTS.rating_weights, { r9_10: 2.0, r7_8: 1.2, r5_6: 0.4, r1_4: -1.2 });
+  assert.strictEqual(marqueeCfg.DEFAULTS.seed_cap, 40);
+  assert.strictEqual(marqueeCfg.DEFAULTS.enrich_cap, 60);
+  assert.strictEqual(marqueeCfg.DEFAULTS.llm_timeout_ms, 60000);
+  assert.deepStrictEqual(marqueeCfg.DEFAULTS.brief, { input_cap: 60 });
+  assert.deepStrictEqual(marqueeCfg.DEFAULTS.simkl, { recs_max_uncached: 40, recs_ttl_days: 30, ratings_resolve_cap: 50 });
+  assert.strictEqual(marqueeCfg.ALGORITHM_VERSION, 'marquee-m1');
+  // resolveConfig: deep clone — mutating the result must not touch DEFAULTS
+  const resolved = marqueeCfg.resolveConfig({});
+  resolved.half_life_days.movie.recent = 999;
+  resolved.seed_cap = 1;
+  assert.strictEqual(marqueeCfg.DEFAULTS.half_life_days.movie.recent, 21);
+  assert.strictEqual(marqueeCfg.DEFAULTS.seed_cap, 40);
+});
+
+ok('marquee ME-04: llmCache put/get/getMany/prune + expired/corrupt = miss (spec §4.4)', () => {
+  const llmCache = require('../src/engines/marquee/llmCache');
+  llmCache._clear();
+  llmCache.put('p1', 'brief', 'k1', { loves: ['A'] }, 1000);
+  assert.deepStrictEqual(llmCache.get('p1', 'brief', 'k1', { now: 1010 }), { loves: ['A'] });
+  // expired → miss
+  assert.strictEqual(llmCache.get('p1', 'brief', 'k1', { now: 1010, ttlMs: 5 }), null);
+  // corrupt value → miss
+  require('../src/db').get().prepare('UPDATE marquee_llm_cache SET value = ? WHERE profile_id = ? AND key = ?').run('not json{', 'p1', 'k1');
+  assert.strictEqual(llmCache.get('p1', 'brief', 'k1', { now: 1010 }), null);
+  // getMany: corrupt + absent keys are misses
+  llmCache.put('p1', 'brief', 'k2', { avoids: ['B'] }, 1000);
+  const many = llmCache.getMany('p1', 'brief', ['k1', 'k2', 'k3'], { now: 1010 });
+  assert.strictEqual(many.size, 1);
+  assert.deepStrictEqual(many.get('k2'), { avoids: ['B'] });
+  // prune drops the oldest row
+  llmCache.put('p1', 'brief', 'k4', { moods: ['C'] }, 100);
+  assert.strictEqual(llmCache.prune('p1', 'brief', 500, 1000), 1); // k4 at 100 < 500
+  assert.strictEqual(llmCache.get('p1', 'brief', 'k4', { now: 1000 }), null);
+  llmCache._clear();
+});
+
+ok('marquee ME-04: historyHash stable across calls, changes on a rating or watch change (spec §4.3)', () => {
+  const taste = require('../src/engines/marquee/taste');
+  const watchedStore = require('../src/watchedStore');
+  watchedStore.upsertMany('p-h', [
+    { simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'T1', year: 2010, watched_at: '2026-01-01T00:00:00Z' },
+    { simkl_id: 2, type: 'movie', imdb_id: 'tt2', tmdb_id: '2', title: 'T2', year: 2011, watched_at: '2026-02-01T00:00:00Z' },
+  ]);
+  const ratings = new Map([['1', 9], ['2', 3]]);
+  const h1 = taste.historyHash('p-h', { ratings });
+  assert.strictEqual(h1, taste.historyHash('p-h', { ratings })); // stable
+  // a rating change → different hash
+  assert.notStrictEqual(h1, taste.historyHash('p-h', { ratings: new Map([['1', 9], ['2', 5]]) }));
+  // an unrated title (no entry in the map) → '' in the hash → different hash
+  assert.notStrictEqual(h1, taste.historyHash('p-h', { ratings: new Map([['1', 9]]) }));
+  // a new watch → different hash
+  watchedStore.upsertMany('p-h', [{ simkl_id: 3, type: 'movie', imdb_id: 'tt3', tmdb_id: '3', title: 'T3', year: 2012, watched_at: '2026-03-01T00:00:00Z' }]);
+  assert.notStrictEqual(h1, taste.historyHash('p-h', { ratings }));
+  watchedStore.deleteForProfile('p-h');
+});
+
+ok('marquee ME-04: briefHash stable per JSON content (spec §4.3)', () => {
+  const taste = require('../src/engines/marquee/taste');
+  const a = { loves: ['A'], avoids: [], moods: [], eras: [], standout_titles: [] };
+  assert.strictEqual(taste.briefHash(a), taste.briefHash({ ...a }));
+  assert.notStrictEqual(taste.briefHash(a), taste.briefHash({ ...a, loves: ['B'] }));
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');

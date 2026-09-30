@@ -113,6 +113,67 @@ async function getActivities(profile) {
   return authedGet(profile, '/sync/activities');
 }
 
+// ---- Marquee ME-03 (spec §4.1): ratings + "users also liked" ----
+// Both are authed GETs on the same governed simkl_get lane (MI-4 etiquette:
+// every Simkl call via the governor, sequential, no retry loops).
+
+// GET /sync/ratings/{kind} — §12 L1: returns EVERY movie on the account, not
+// only rated ones; unrated entries carry user_rating null.
+async function getRatings(profile, kind = 'movies') {
+  const body = await authedGet(profile, `/sync/ratings/${kind}`);
+  return parseRatings(body);
+}
+
+// PURE (spec §4.1): parse a /sync/ratings/{kind} body into
+// [{ tmdb_id, imdb_id, simkl_id, rating, rated_at }]. §12 L1: ids sit at
+// entry.movie.ids (tmdb a string); keep only entries whose user_rating is an
+// integer 1–10; tolerate a bare array; drop entries with no id; never throws
+// (MI-3) — malformed entries just come back as fewer items.
+function parseRatings(body) {
+  let entries;
+  if (Array.isArray(body)) entries = body;
+  else if (body && typeof body === 'object') entries = body.movies || [];
+  else entries = [];
+  const out = [];
+  for (const e of entries) {
+    if (!e || typeof e !== 'object') continue;
+    const rating = e.user_rating;
+    if (!Number.isInteger(rating) || rating < 1 || rating > 10) continue; // unrated / out of range
+    const ids = (e.movie && e.movie.ids) || e.ids || {};
+    const tmdb = ids.tmdb != null ? String(ids.tmdb) : null;
+    const imdb = ids.imdb != null ? String(ids.imdb) : null;
+    const simkl = ids.simkl != null ? Number(ids.simkl) : null;
+    if (tmdb == null && imdb == null && simkl == null) continue; // no id — unusable
+    out.push({ tmdb_id: tmdb, imdb_id: imdb, simkl_id: simkl, rating, rated_at: e.user_rated_at || null });
+  }
+  return out;
+}
+
+// GET /movies/{simklId} — §12 L4: users_recommendations ("users also liked")
+// is present BY DEFAULT (no extra query params), so none are sent.
+async function getMovieSummary(profile, simklId) {
+  const body = await authedGet(profile, `/movies/${simklId}`);
+  return parseMovieSummary(body);
+}
+
+// PURE (spec §4.1): parse a /movies/{id} body → { users_recommendations:
+// [{ simkl_id, tmdb_id, imdb_id, title, year }] }. §12 L4: ids at item.ids,
+// tmdb a string; missing users_recommendations → [].
+function parseMovieSummary(body) {
+  const items = body && typeof body === 'object' && Array.isArray(body.users_recommendations) ? body.users_recommendations : [];
+  const out = [];
+  for (const it of items) {
+    if (!it || typeof it !== 'object') continue;
+    const ids = it.ids || {};
+    const tmdb = ids.tmdb != null ? String(ids.tmdb) : null;
+    const imdb = ids.imdb != null ? String(ids.imdb) : null;
+    const simkl = ids.simkl != null ? Number(ids.simkl) : null;
+    if (tmdb == null && imdb == null && simkl == null) continue; // no id — unusable
+    out.push({ simkl_id: simkl, tmdb_id: tmdb, imdb_id: imdb, title: it.title || null, year: it.year != null ? Number(it.year) : null });
+  }
+  return { users_recommendations: out };
+}
+
 // Full/delta watched read for one type ('movies' | 'shows' | 'anime'), status
 // 'completed'. Pass dateFrom (ISO) for Phase-2 delta syncs; omit for the
 // Phase-1 initial pull. Always sequential per type (Simkl asks not to hammer).
@@ -302,6 +363,10 @@ module.exports = {
   accountName,
   authedGet,
   getActivities,
+  getRatings,
+  parseRatings,
+  getMovieSummary,
+  parseMovieSummary,
   getAllItems,
   getRecentWatched,
   getPlanToWatch,

@@ -1205,6 +1205,388 @@ async function main() {
     }
   });
 
+  await it('marquee ME-03: syncRatings activities-gated sync (null gate, 24 h degraded gate, force, never throws) (B3)', async () => {
+    const simklCache = require('../src/engines/marquee/simklCache');
+    const simkl = require('../src/services/simkl');
+    const db = require('../src/db');
+    const profile = { id: 'p-simkl', name: 'Test', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    const body = { movies: [
+      { user_rating: 8, user_rated_at: '2026-01-01T00:00:00Z', movie: { title: 'T1', ids: { simkl: 1, imdb: 'tt1', tmdb: '1' } } },
+      { user_rating: null, user_rated_at: null, movie: { title: 'T2', ids: { simkl: 2, imdb: 'tt2', tmdb: '2' } } },
+    ] };
+    let ratingsCalls = 0;
+    // The fetchRatings seam returns PARSED ratings (the simkl.getRatings contract).
+    const fetchRatings = async () => { ratingsCalls += 1; return simkl.parseRatings(body); };
+    // First sync: no marquee_sync row → pull once; null rated_at stored as SQL NULL (§12 L2).
+    let res = await simklCache.syncRatings(profile, { fetchActivities: async () => ({ movies: { rated_at: null } }), fetchRatings, now: 1000, log: quiet });
+    assert.deepStrictEqual(res, { ok: true, synced: 1, unresolved: 0 });
+    assert.strictEqual(ratingsCalls, 1);
+    const row = db.get().prepare('SELECT ratings_activity, synced_at FROM marquee_sync WHERE profile_id = ?').get('p-simkl');
+    assert.strictEqual(row.ratings_activity, null);
+    // Unchanged (null === null) → skip, no ratings call.
+    res = await simklCache.syncRatings(profile, { fetchActivities: async () => ({ movies: { rated_at: null } }), fetchRatings, now: 2000, log: quiet });
+    assert.deepStrictEqual(res, { ok: true, skipped: 'unchanged' });
+    assert.strictEqual(ratingsCalls, 1);
+    // Value changes → pull again; then unchanged → skip.
+    res = await simklCache.syncRatings(profile, { fetchActivities: async () => ({ movies: { rated_at: '2026-02-01T00:00:00Z' } }), fetchRatings, now: 3000, log: quiet });
+    assert.strictEqual(ratingsCalls, 2);
+    res = await simklCache.syncRatings(profile, { fetchActivities: async () => ({ movies: { rated_at: '2026-02-01T00:00:00Z' } }), fetchRatings, now: 4000, log: quiet });
+    assert.deepStrictEqual(res, { ok: true, skipped: 'unchanged' });
+    // force → pull even when unchanged.
+    res = await simklCache.syncRatings(profile, { fetchActivities: async () => ({ movies: { rated_at: '2026-02-01T00:00:00Z' } }), fetchRatings, now: 5000, log: quiet, force: true });
+    assert.strictEqual(ratingsCalls, 3);
+    // Missing rated_at KEY (≠ null) → pull at most once per 24 h (§4.2(5)).
+    res = await simklCache.syncRatings(profile, { fetchActivities: async () => ({ movies: {} }), fetchRatings, now: 6000, log: quiet });
+    assert.strictEqual(ratingsCalls, 4); // first pull
+    res = await simklCache.syncRatings(profile, { fetchActivities: async () => ({ movies: {} }), fetchRatings, now: 6000 + 12 * 3600e3, log: quiet });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(ratingsCalls, 4); // within 24 h → skipped
+    res = await simklCache.syncRatings(profile, { fetchActivities: async () => ({ movies: {} }), fetchRatings, now: 6000 + 25 * 3600e3, log: quiet });
+    assert.strictEqual(ratingsCalls, 5); // past 24 h → pull again
+    // Never throws: an activities error keeps existing rows and returns ok:false (MI-3).
+    res = await simklCache.syncRatings(profile, { fetchActivities: async () => { throw new Error('down'); }, fetchRatings, now: 7000, log: quiet });
+    assert.strictEqual(res.ok, false);
+    assert.ok(res.error);
+    assert.deepStrictEqual([...simklCache.getRatingsMap('p-simkl').entries()], [['1', 8]]); // rows preserved
+    db.get().exec('DELETE FROM marquee_ratings; DELETE FROM marquee_sync');
+  });
+
+  await it('marquee ME-03: syncRatings replace semantics + zero rated + resolve cap 50 (B4)', async () => {
+    const simklCache = require('../src/engines/marquee/simklCache');
+    const simkl = require('../src/services/simkl');
+    const db = require('../src/db');
+    const profile = { id: 'p-replace', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    const activities = async () => ({ movies: { rated_at: null } });
+    // Seed another profile's row — must survive this profile's replace.
+    db.get().prepare('INSERT INTO marquee_ratings (profile_id, tmdb_id, rating) VALUES (?, ?, ?)').run('p-other', '99', 5);
+    // Zero rated entries → this profile's table empty (valid state, §12 L3).
+    let res = await simklCache.syncRatings(profile, { fetchActivities: activities, fetchRatings: async () => simkl.parseRatings({ movies: [{ user_rating: null, movie: { ids: { tmdb: '1' } } }] }), now: 1000, log: quiet });
+    assert.deepStrictEqual(res, { ok: true, synced: 0, unresolved: 0 });
+    assert.deepStrictEqual([...simklCache.getRatingsMap('p-replace').entries()], []);
+    assert.deepStrictEqual([...simklCache.getRatingsMap('p-other').entries()], [['99', 5]]);
+    // imdb-only entries resolved via resolveTmdb, capped at 50 lookups per sync.
+    const lookups = [];
+    const resolve = async (imdbId) => { lookups.push(imdbId); return 'tmdb-' + imdbId; };
+    const items = [];
+    for (let i = 1; i <= 55; i += 1) items.push({ user_rating: 7, movie: { ids: { imdb: 'tt' + i } } });
+    // force: true — the gate would otherwise skip (same rated_at), but this test
+    // exercises the replace semantics of each pull.
+    res = await simklCache.syncRatings(profile, { fetchActivities: activities, fetchRatings: async () => simkl.parseRatings({ movies: items }), resolveTmdb: resolve, now: 2000, log: quiet, force: true });
+    assert.strictEqual(res.unresolved, 5); // 55 − 50 capped
+    assert.strictEqual(lookups.length, 50);
+    const map = simklCache.getRatingsMap('p-replace');
+    assert.strictEqual(map.size, 50);
+    assert.strictEqual(map.get('tmdb-tt1'), 7);
+    // A failing resolve → skipped + counted, not fatal.
+    res = await simklCache.syncRatings(profile, { fetchActivities: activities, fetchRatings: async () => simkl.parseRatings({ movies: [{ user_rating: 6, movie: { ids: { imdb: 'ttX' } } }] }), resolveTmdb: async () => { throw new Error('nope'); }, now: 3000, log: quiet, force: true });
+    assert.deepStrictEqual(res, { ok: true, synced: 0, unresolved: 1 });
+    assert.deepStrictEqual([...simklCache.getRatingsMap('p-replace').entries()], []);
+    db.get().exec('DELETE FROM marquee_ratings; DELETE FROM marquee_sync');
+  });
+
+  await it('marquee ME-03: ensureRecs sequential fetch, cap, stale served, per-id error (B6)', async () => {
+    const simklCache = require('../src/engines/marquee/simklCache');
+    const db = require('../src/db');
+    const profile = { id: 'p-recs', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    const recs = (id) => [{ simkl_id: id + 100, tmdb_id: String(id + 100), imdb_id: null, title: 'R' + id, year: 2020 }];
+    // Seed: id 1 fresh (fetched at 1900), id 2 stale (fetched at 1000) under the
+    // short ttlMs=500 below.
+    db.get().prepare('INSERT INTO marquee_simkl_recs (simkl_id, recs, fetched_at) VALUES (?, ?, ?)').run(1, JSON.stringify(recs(1)), 1900);
+    db.get().prepare('INSERT INTO marquee_simkl_recs (simkl_id, recs, fetched_at) VALUES (?, ?, ?)').run(2, JSON.stringify([{ title: 'stale-2' }]), 1000);
+    const order = [];
+    const fetchSummary = async (_p, id) => { order.push(id); return { users_recommendations: recs(id) }; };
+    // now = 2000, ttlMs=500: id 1 (age 100) fresh (no fetch); id 2 (age 1000)
+    // stale → refetch; ids 3,4,5 uncached → fetch; cap 2 → only 2 fetches, ids
+    // beyond the cap: stale ones still served, uncached ones absent.
+    let out = await simklCache.ensureRecs(profile, [1, 2, 3, 4, 5], { fetchSummary, now: 2000, log: quiet, maxUncached: 2, ttlMs: 500 });
+    assert.deepStrictEqual(order, [2, 3]); // sequential, capped at 2
+    assert.deepStrictEqual(out.get(1), recs(1));
+    assert.deepStrictEqual(out.get(2), recs(2)); // refetched (fresh value)
+    assert.deepStrictEqual(out.get(3), recs(3));
+    assert.strictEqual(out.has(4), false);
+    assert.strictEqual(out.has(5), false);
+    // Second call: ids 4 and 5 now uncached; cap 2 → both fetched; id 1 still fresh.
+    out = await simklCache.ensureRecs(profile, [1, 4, 5], { fetchSummary, now: 2000, log: quiet, maxUncached: 2 });
+    assert.deepStrictEqual(order, [2, 3, 4, 5]);
+    assert.deepStrictEqual(out.get(4), recs(4));
+    // A per-id fetch error → log + skip (not cached), continue with the next id.
+    const flaky = async (_p, id) => { if (id === 7) throw new Error('Simkl GET failed (500)'); return { users_recommendations: recs(id) }; };
+    out = await simklCache.ensureRecs(profile, [7, 8], { fetchSummary: flaky, now: 2000, log: quiet });
+    assert.strictEqual(out.has(7), false); // error → not cached
+    assert.deepStrictEqual(out.get(8), recs(8)); // continued past the failure
+    // TTL: an env override shrinks the freshness window → id 1 (fetched at 1000) now stale.
+    process.env.MARQUEE_SIMKL_RECS_TTL_MS = '1000';
+    try {
+      out = await simklCache.ensureRecs(profile, [1], { fetchSummary, now: 3000, log: quiet });
+      assert.deepStrictEqual(out.get(1), recs(1)); // refetched (stale under the 1 s TTL)
+      assert.strictEqual(db.get().prepare('SELECT fetched_at FROM marquee_simkl_recs WHERE simkl_id = 1').get().fetched_at, 3000);
+    } finally {
+      delete process.env.MARQUEE_SIMKL_RECS_TTL_MS;
+    }
+    // Stale beyond the cap is served (stale better than nothing).
+    db.get().prepare('INSERT INTO marquee_simkl_recs (simkl_id, recs, fetched_at) VALUES (?, ?, ?)').run(9, JSON.stringify([{ title: 'stale-9' }]), 1000);
+    out = await simklCache.ensureRecs(profile, [9, 11, 12, 13], { fetchSummary: async () => { throw new Error('down'); }, now: 2000, log: quiet, maxUncached: 1, ttlMs: 500 });
+    assert.deepStrictEqual(out.get(9), [{ title: 'stale-9' }]); // stale served despite the cap
+    assert.strictEqual(out.has(11), false); // uncached beyond the cap → absent
+    db.get().exec('DELETE FROM marquee_simkl_recs');
+  });
+
+  await it('marquee ME-04: buildEvents re-weights watched by rating, rejections unchanged, rated-but-never-watched not added (B8)', async () => {
+    const taste = require('../src/engines/marquee/taste');
+    const cfg = require('../src/engines/marquee/config').resolveConfig({});
+    const watchedStore = require('../src/watchedStore');
+    const rs = require('../src/recommendationStore');
+    const profileId = 'p-events';
+    const nowMs = Date.parse('2026-06-01T00:00:00Z');
+    watchedStore.upsertMany(profileId, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'Rated9', year: 2020, watched_at: '2026-05-01T00:00:00Z' },
+      { simkl_id: 2, type: 'movie', imdb_id: 'tt2', tmdb_id: '2', title: 'Unrated', year: 2020, watched_at: '2026-05-01T00:00:00Z' },
+      { simkl_id: 3, type: 'movie', imdb_id: 'tt3', tmdb_id: '3', title: 'Rated3', year: 2020, watched_at: '2026-05-01T00:00:00Z' },
+    ]);
+    rs.addDontRecommend(profileId, 'movie', '4', 'user', nowMs);
+    const ratings = new Map([['1', 9], ['3', 3], ['5', 10]]); // '5' rated but never watched
+    const events = taste.buildEvents(profileId, cfg, { nowMs, ratings });
+    const byId = new Map(events.map((e) => [e.tmdb_id, e]));
+    // watched + rated → re-weighted, ev.rating set
+    assert.strictEqual(byId.get('1').weight, 2.0);
+    assert.strictEqual(byId.get('1').rating, 9);
+    assert.strictEqual(byId.get('3').weight, -1.2);
+    assert.strictEqual(byId.get('3').rating, 3);
+    // watched + unrated → keeps the watched base weight, no rating field
+    assert.strictEqual(byId.get('2').weight, 1.0);
+    assert.strictEqual(byId.get('2').rating, undefined);
+    // rejection events unchanged
+    assert.strictEqual(byId.get('4').weight, -1.5);
+    assert.strictEqual(byId.get('4').kind, 'rejected_user');
+    // rated but never watched → NOT added
+    assert.strictEqual(byId.has('5'), false);
+    assert.strictEqual(events.length, 4);
+    watchedStore.deleteForProfile(profileId);
+  });
+
+  await it('marquee ME-04: seedsFor excludes ≤4-rated, weight = rating × blended, sort + cap (B9)', async () => {
+    const taste = require('../src/engines/marquee/taste');
+    const cfg = require('../src/engines/marquee/config').resolveConfig({});
+    const watchedStore = require('../src/watchedStore');
+    const profileId = 'p-seeds';
+    const nowMs = Date.parse('2026-06-01T00:00:00Z');
+    const day = 24 * 3600e3;
+    watchedStore.upsertMany(profileId, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'RecentRated10', year: 2020, watched_at: '2026-05-20T00:00:00Z' },
+      { simkl_id: 2, type: 'movie', imdb_id: 'tt2', tmdb_id: '2', title: 'OldRated10', year: 2020, watched_at: '2024-06-01T00:00:00Z' },
+      { simkl_id: 3, type: 'movie', imdb_id: 'tt3', tmdb_id: '3', title: 'UnratedRecent', year: 2020, watched_at: '2026-05-20T00:00:00Z' },
+      { simkl_id: 4, type: 'movie', imdb_id: 'tt4', tmdb_id: '4', title: 'Rated3', year: 2020, watched_at: '2026-05-20T00:00:00Z' },
+      { simkl_id: 5, type: 'movie', imdb_id: 'tt5', tmdb_id: null, title: 'NoTmdb', year: 2020, watched_at: '2026-05-20T00:00:00Z' },
+    ]);
+    const ratings = new Map([['1', 10], ['2', 10], ['4', 3]]);
+    const seeds = taste.seedsFor(profileId, cfg, { nowMs, ratings });
+    // Rated ≤ 4 excluded; no-tmdb row excluded.
+    assert.ok(!seeds.some((s) => s.tmdb_id === '4'));
+    assert.ok(!seeds.some((s) => s.tmdb_id === null));
+    // weight = ratingWeight × blendedWeight(days): recent rated-10 > unrated recent > old rated-10
+    const byId = new Map(seeds.map((s) => [s.tmdb_id, s]));
+    const recentDays = (nowMs - Date.parse('2026-05-20T00:00:00Z')) / day;
+    const oldDays = (nowMs - Date.parse('2024-06-01T00:00:00Z')) / day;
+    const hl = cfg.half_life_days.movie;
+    const blend = cfg.horizon_blend;
+    const bw = (d) => blend.long * 0.5 ** (d / hl.long) + blend.medium * 0.5 ** (d / hl.medium) + blend.recent * 0.5 ** (d / hl.recent);
+    assert.ok(byId.get('1').weight > byId.get('3').weight, 'rated-10 recent beats unrated recent');
+    assert.ok(byId.get('3').weight > byId.get('2').weight, 'unrated recent beats old rated-10');
+    assert.ok(Math.abs(byId.get('1').weight - 2.0 * bw(recentDays)) < 1e-9);
+    assert.ok(Math.abs(byId.get('3').weight - 1.0 * bw(recentDays)) < 1e-9);
+    assert.ok(Math.abs(byId.get('2').weight - 2.0 * bw(oldDays)) < 1e-9);
+    // sort: weight desc
+    assert.deepStrictEqual(seeds.map((s) => s.tmdb_id), ['1', '3', '2']);
+    // rating carried through (null for unrated)
+    assert.strictEqual(byId.get('1').rating, 10);
+    assert.strictEqual(byId.get('3').rating, null);
+    // cap: seed_cap 40 → with a tiny library all 3 come back
+    assert.strictEqual(seeds.length, 3);
+    watchedStore.deleteForProfile(profileId);
+  });
+
+  await it('marquee ME-04: buildTaste rating-weighted + tasteBrief chain/cache/failure (B10)', async () => {
+    const taste = require('../src/engines/marquee/taste');
+    const cfg = require('../src/engines/marquee/config').resolveConfig({});
+    const watchedStore = require('../src/watchedStore');
+    const metaStore = require('../src/engines/glass/metaStore');
+    const llmCache = require('../src/engines/marquee/llmCache');
+    const profileId = 'p-brief';
+    const nowMs = Date.parse('2026-06-01T00:00:00Z');
+    watchedStore.upsertMany(profileId, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'SciFi One', year: 2010, watched_at: '2026-05-01T00:00:00Z' },
+      { simkl_id: 2, type: 'movie', imdb_id: 'tt2', tmdb_id: '2', title: 'Drama One', year: 2011, watched_at: '2026-05-01T00:00:00Z' },
+    ]);
+    // Enrichment normally comes from the TMDB fetch; here we set it directly so
+    // the Drama genre dim exists for the rating-layer assertion below.
+    watchedStore.updateEnrichment(profileId, 2, { genre: 'Drama', age: null });
+    metaStore.put('movie', '1', { genres: ['Sci-Fi', 'Thriller'], keywords: ['dream'], director: ['D1'], decade: 2010, imdb_id: 'tt1' });
+    const ratings = new Map([['1', 10]]);
+    // buildTaste: enrichment degrades (fetcher throws), taste model still built.
+    const tasteModel = await taste.buildTaste(profileId, 'key', cfg, {
+      nowMs, ratings,
+      enrichFetcher: async () => { throw new Error('TMDB down'); },
+      log: quiet,
+    });
+    assert.strictEqual(tasteModel.type, 'movie');
+    assert.ok(tasteModel.dims.genres['Sci-Fi'] > 0);
+    // A high-rated title's genre outweighs an unrated one's (rating layer works).
+    assert.ok(tasteModel.dims.genres['Sci-Fi'] > tasteModel.dims.genres['Drama']);
+    // tasteBrief: empty chain → null WITHOUT any network call.
+    let chatCalls = 0;
+    // Mimics llm.chat: the provider returns a JSON string and the validate
+    // function (parseBrief) coerces it to the brief object before it is returned.
+    const chat = async (chain, messages, opts) => {
+      chatCalls += 1;
+      return opts.validate(JSON.stringify({ loves: ['Sci-Fi'], avoids: ['Horror'], moods: ['tense'], eras: ['2010s'], standout_titles: ['SciFi One'] }));
+    };
+    let brief = await taste.tasteBrief(profileId, tasteModel, { chain: [], chat, cfg, ratings, log: quiet, now: nowMs });
+    assert.strictEqual(brief, null);
+    assert.strictEqual(chatCalls, 0);
+    // With a chain: one call, cached (hash key), second call is a cache hit.
+    brief = await taste.tasteBrief(profileId, tasteModel, { chain: [{ type: 'custom', uri: 'http://localhost:1' }], chat, cfg, ratings, log: quiet, now: nowMs });
+    assert.strictEqual(chatCalls, 1);
+    assert.deepStrictEqual(brief, { loves: ['Sci-Fi'], avoids: ['Horror'], moods: ['tense'], eras: ['2010s'], standout_titles: ['SciFi One'], hash: taste.historyHash(profileId, { ratings }) });
+    const cached = await taste.tasteBrief(profileId, tasteModel, { chain: [{ type: 'custom', uri: 'http://localhost:1' }], chat, cfg, ratings, log: quiet, now: nowMs });
+    assert.strictEqual(chatCalls, 1); // cache hit — no second call
+    assert.deepStrictEqual(cached, brief);
+    // A failing brief → null, NEVER cached (next build retries). Clear the
+    // cached brief from the successful call above so this is a cold failure.
+    const failing = async () => { throw new Error('all providers failed'); };
+    llmCache._clear();
+    brief = await taste.tasteBrief(profileId, tasteModel, { chain: [{ type: 'custom', uri: 'http://localhost:1' }], chat: failing, cfg, ratings, log: quiet, now: nowMs });
+    assert.strictEqual(brief, null);
+    assert.strictEqual(llmCache.get(profileId, 'brief', taste.historyHash(profileId, { ratings }), { now: nowMs }), null); // never cached
+    // The prompt must not mention age/classification/children.
+    const prompts = [];
+    const recordChat = async (chain, messages) => { prompts.push(messages[0].content); return JSON.stringify({ loves: ['A'], avoids: [], moods: [], eras: [], standout_titles: [] }); };
+    llmCache._clear();
+    await taste.tasteBrief(profileId, tasteModel, { chain: [{ type: 'custom', uri: 'http://localhost:1' }], chat: recordChat, cfg, ratings, log: quiet, now: nowMs });
+    assert.ok(!/age|classification|suitable|child|kid/i.test(prompts[0]), 'prompt must not mention age/classification/children');
+    watchedStore.deleteForProfile(profileId);
+    metaStore._clear();
+  });
+
+  await it('marquee ME-03: syncRatings never holds a transaction open across an await (F1)', async () => {
+    const simklCache = require('../src/engines/marquee/simklCache');
+    const simkl = require('../src/services/simkl');
+    const db = require('../src/db');
+    const profile = { id: 'p-txn', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    db.get().exec('CREATE TABLE IF NOT EXISTS test_scratch (note TEXT)');
+    db.get().exec('DELETE FROM test_scratch');
+    // The resolver stub plays a CONCURRENT writer: while the lookup is pending
+    // (an await), it opens its own transaction on the SAME shared connection —
+    // the exact hazard F1 describes. Before the fix syncRatings's transaction
+    // was already open here, so this BEGIN threw "cannot start a transaction
+    // within a transaction"; after the fix the lookups finish before BEGIN.
+    const resolveTmdb = async (imdbId) => {
+      await new Promise((r) => setTimeout(r, 0)); // yield while the lookup is "in flight"
+      const conn = db.get();
+      conn.exec('BEGIN');
+      conn.prepare('INSERT INTO test_scratch (note) VALUES (?)').run('concurrent-write');
+      conn.exec('COMMIT');
+      return 'tmdb-' + imdbId;
+    };
+    const res = await simklCache.syncRatings(profile, {
+      fetchActivities: async () => ({ movies: { rated_at: null } }),
+      fetchRatings: async () => simkl.parseRatings({ movies: [{ user_rating: 7, movie: { ids: { imdb: 'ttF1' } } }] }),
+      resolveTmdb,
+      now: 1000,
+      log: quiet,
+      force: true,
+    });
+    assert.deepStrictEqual(res, { ok: true, synced: 1, unresolved: 0 });
+    // Both writes persist: the profile's rating row AND the concurrent writer's row.
+    assert.deepStrictEqual([...simklCache.getRatingsMap('p-txn').entries()], [['tmdb-ttF1', 7]]);
+    assert.deepStrictEqual(db.get().prepare('SELECT note FROM test_scratch').all().map((r) => r.note), ['concurrent-write']);
+    db.get().exec('DELETE FROM marquee_ratings; DELETE FROM marquee_sync; DELETE FROM test_scratch');
+    db.get().exec('DROP TABLE IF EXISTS test_scratch');
+  });
+
+  await it('marquee ME-04: no ratings (the production case) — events identical to Glass, seeds by recency (T1)', async () => {
+    const taste = require('../src/engines/marquee/taste');
+    const glassEvents = require('../src/engines/glass/events');
+    const glassTasteModel = require('../src/engines/glass/tasteModel');
+    const cfg = require('../src/engines/marquee/config').resolveConfig({});
+    const profileId = 'p-noratings';
+    const nowMs = Date.parse('2026-06-01T00:00:00Z');
+    watchedStore.upsertMany(profileId, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'Recent', year: 2020, watched_at: '2026-05-25T00:00:00Z' },
+      { simkl_id: 2, type: 'movie', imdb_id: 'tt2', tmdb_id: '2', title: 'Mid', year: 2020, watched_at: '2026-03-01T00:00:00Z' },
+      { simkl_id: 3, type: 'movie', imdb_id: 'tt3', tmdb_id: '3', title: 'Old', year: 2020, watched_at: '2024-06-01T00:00:00Z' },
+    ]);
+    rs.addDontRecommend(profileId, 'movie', '4', 'user', nowMs);
+    const empty = new Map();
+    // No ratings → buildEvents is EXACTLY Glass's event list (nothing re-weighted).
+    assert.deepStrictEqual(taste.buildEvents(profileId, cfg, { nowMs, ratings: empty }), glassEvents.buildEventList(profileId, 'movie', cfg, { nowMs }));
+    // seedsFor orders purely by recency — the same order as sorting by blendedWeight alone.
+    const seeds = taste.seedsFor(profileId, cfg, { nowMs, ratings: empty });
+    const day = 24 * 3600e3;
+    const hl = cfg.half_life_days.movie;
+    const blend = cfg.horizon_blend;
+    const bw = (w) => { const d = Math.max(0, (nowMs - Date.parse(w.watched_at)) / day); return glassTasteModel.blendedWeight(d, hl, blend); };
+    const byBlended = watchedStore.getWatched(profileId, { type: 'movie' }).filter((w) => w.tmdb_id).sort((a, b) => bw(b) - bw(a)).map((w) => String(w.tmdb_id));
+    assert.deepStrictEqual(seeds.map((s) => s.tmdb_id), byBlended);
+    // All unrated → every seed weight = base × blendedWeight (no rating multiplier), rating null.
+    const watched = new Map(watchedStore.getWatched(profileId, { type: 'movie' }).map((w) => [String(w.tmdb_id), w]));
+    for (const s of seeds) {
+      assert.ok(Math.abs(s.weight - 1.0 * bw(watched.get(s.tmdb_id))) < 1e-9);
+      assert.strictEqual(s.rating, null);
+    }
+    watchedStore.deleteForProfile(profileId);
+  });
+
+  await it('marquee ME-04: negative rating → negative director affinity (T2)', async () => {
+    const taste = require('../src/engines/marquee/taste');
+    const cfg = require('../src/engines/marquee/config').resolveConfig({});
+    const metaStore = require('../src/engines/glass/metaStore');
+    const profileId = 'p-negdir';
+    const nowMs = Date.parse('2026-06-01T00:00:00Z');
+    watchedStore.upsertMany(profileId, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'Disliked', year: 2020, watched_at: '2026-05-01T00:00:00Z' },
+    ]);
+    // 'Director X' appears in NO other title — only this rated-2 movie.
+    metaStore.put('movie', '1', { genres: ['Drama'], director: ['Director X'], decade: 2020, imdb_id: 'tt1' });
+    const ratings = new Map([['1', 2]]);
+    const tasteModel = await taste.buildTaste(profileId, 'key', cfg, {
+      nowMs, ratings,
+      enrichFetcher: async () => { throw new Error('TMDB down'); },
+      log: quiet,
+    });
+    assert.ok(tasteModel.dims.directors['Director X'] < 0, 'rated-2 movie → negative director affinity');
+    watchedStore.deleteForProfile(profileId);
+    metaStore._clear();
+  });
+
+  await it('marquee ME-04: brief regenerated when history changes (cache miss, not just a hit) (T3)', async () => {
+    const taste = require('../src/engines/marquee/taste');
+    const cfg = require('../src/engines/marquee/config').resolveConfig({});
+    const profileId = 'p-brief-miss';
+    const nowMs = Date.parse('2026-06-01T00:00:00Z');
+    watchedStore.upsertMany(profileId, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'A', year: 2010, watched_at: '2026-05-01T00:00:00Z' },
+      { simkl_id: 2, type: 'movie', imdb_id: 'tt2', tmdb_id: '2', title: 'B', year: 2011, watched_at: '2026-05-01T00:00:00Z' },
+    ]);
+    let chatCalls = 0;
+    const chat = async (chain, messages, opts) => { chatCalls += 1; return opts.validate(JSON.stringify({ loves: ['X'], avoids: [], moods: [], eras: [], standout_titles: ['A'] })); };
+    const chain = [{ type: 'custom', uri: 'http://localhost:1' }];
+    const tasteModel = { type: 'movie', dims: { genres: {}, directors: {}, keywords: {}, decades: {} } };
+    const ratings1 = new Map([['1', 10]]);
+    // First call: cache miss → 1 chat call.
+    let brief = await taste.tasteBrief(profileId, tasteModel, { chain, chat, cfg, ratings: ratings1, log: quiet, now: nowMs });
+    assert.strictEqual(chatCalls, 1);
+    const hash1 = brief.hash;
+    // Same ratings again → cache hit, no new call.
+    await taste.tasteBrief(profileId, tasteModel, { chain, chat, cfg, ratings: ratings1, log: quiet, now: nowMs });
+    assert.strictEqual(chatCalls, 1);
+    // One more rating → history changes → cache MISS → 2nd call, different hash.
+    const ratings2 = new Map([['1', 10], ['2', 5]]);
+    const brief2 = await taste.tasteBrief(profileId, tasteModel, { chain, chat, cfg, ratings: ratings2, log: quiet, now: nowMs });
+    assert.strictEqual(chatCalls, 2);
+    assert.notStrictEqual(brief2.hash, hash1);
+    watchedStore.deleteForProfile(profileId);
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();
