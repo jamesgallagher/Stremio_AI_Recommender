@@ -3180,6 +3180,24 @@ async function httpTests() {
   const recView = await (await fetch(`${BASE}/api/profiles/${profile.id}/recommend`)).json();
   assert.strictEqual(recView.total, 0);
   assert.deepStrictEqual(recView.engines, { movie: 'genesis', series: 'genesis' }); // /recommend surfaces per-type engine
+  // The View panel shows what the catalogs SERVE: the profile's filters + list
+  // size (was: the raw pool's top 40, ignoring both).
+  {
+    const rsv = require('../src/recommendationStore');
+    const before = config.getProfile(profile.id).filters;
+    config.updateProfile(profile.id, { filters: { ...before, list_size: 5, min_rating: 7 } });
+    const rows = [];
+    for (let i = 0; i < 8; i++) rows.push({ type: 'movie', tmdb_id: 'vr' + i, imdb_id: 'ttvr' + i, title: 'Good ' + i, year: 2024, primary_genre: i % 2 ? 'Drama' : 'Comedy', genres: i % 2 ? 'Drama' : 'Comedy', vote_average: 8, vote_count: 5000, affinity: 10 - i, rec_count: 1, popularity: 1 });
+    for (let i = 0; i < 3; i++) rows.push({ type: 'movie', tmdb_id: 'vb' + i, imdb_id: 'ttvb' + i, title: 'Low ' + i, year: 2024, primary_genre: 'Action', genres: 'Action', vote_average: 5, vote_count: 5000, affinity: 100 - i, rec_count: 1, popularity: 1 });
+    rsv.upsertCandidates(profile.id, rows);
+    const v = await (await fetch(`${BASE}/api/profiles/${profile.id}/recommend`)).json();
+    assert.strictEqual(v.total, 11, 'pool size still reported');
+    assert.strictEqual(v.listSize, 5);
+    assert.strictEqual(v.movies.length, 5, 'list size honoured');
+    assert.ok(v.movies.every((r) => r.vote_average >= 7), 'rating floor honoured (the high-affinity 5.0 titles are hidden)');
+    config.updateProfile(profile.id, { filters: before });
+    rsv.deleteForProfile(profile.id);
+  }
   // Suppress endpoint validates its input and records a rejection
   const badSuppress = await fetch(`${BASE}/api/profiles/${profile.id}/recommend/suppress`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
   assert.strictEqual(badSuppress.status, 400);

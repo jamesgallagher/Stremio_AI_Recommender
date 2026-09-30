@@ -1204,7 +1204,7 @@ async function viewRecs(id, btn) {
           : ''}</span>
       <button class="ghost mini" title="Don't recommend" onclick="suppressRec('${id}','${r.type}','${r.tmdb_id}',this)">🚫</button></div>`;
     const section = (list, label) => `<div style="margin-top:8px"><b>${label} (${list.length})</b>${list.map(row).join('') || '<div class="muted">none</div>'}</div>`;
-    panel.innerHTML = `<div class="muted">${d.total} in the pool (top 40 of each shown)</div>${section(d.movies, 'Movies')}${section(d.series, 'Shows')}`;
+    panel.innerHTML = `<div class="muted">${d.total} in the pool · showing what each catalog serves (your filters, list size ${d.listSize})</div>${section(d.movies, 'Movies')}${section(d.series, 'Shows')}`;
   } catch (e) { panel.innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`; }
 }
 

@@ -487,12 +487,24 @@ router.post('/profiles/:id/recommend/reset', (req, res) => {
 router.get('/profiles/:id/recommend', (req, res) => {
   const profile = config.getProfile(req.params.id);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  // Show exactly what the AI catalogs SERVE — the profile's filters (rating
+  // floor, recency, excluded genres, age band) + its list size, genre-balanced —
+  // not the raw pool's top 40. The pool routinely holds titles the filters hide
+  // (the ME-10 backtest: ~70% of a Genesis pool), so the old raw view listed
+  // films the user would never be shown. Read-only: no impressions recorded.
+  const listSize = recommendationStore.listSizeFor(profile);
+  const served = (type) => recommendationStore.selectServe(
+    recommendationStore.getRecommended(profile.id, { type, limit: 100000 }),
+    profile.filters || {},
+    { limit: listSize },
+  );
   res.json({
     total: recommendationStore.countRecommended(profile.id),
+    listSize,
     // Which engine currently produces each catalog (SC-03) — for the Advanced tab.
     engines: { movie: engines.resolveFor(profile, 'movie').id, series: engines.resolveFor(profile, 'series').id },
-    movies: recommendationStore.getRecommended(profile.id, { type: 'movie', limit: 40 }),
-    series: recommendationStore.getRecommended(profile.id, { type: 'series', limit: 40 }),
+    movies: served('movie'),
+    series: served('series'),
   });
 });
 
