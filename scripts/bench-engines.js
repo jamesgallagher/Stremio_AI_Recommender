@@ -16,9 +16,19 @@
 // tokens/keys). All app modules are required only AFTER the snapshot, with
 // DATA_DIR pointed at the temp copy, so the live DB is never opened for write.
 //
-// It makes NO live API calls: the build runs against the snapshotted store, and
-// Marquee's Simkl ratings sync is skipped (ctx.marqueeSkipSync). Run it yourself
-// on real profiles — the assistant never runs it against live services.
+// Live calls: the build runs each engine's REAL generate() with the real keys,
+// so a bench run makes READ-ONLY live calls — TMDB (recommendations, similar,
+// discover, collections, trending refresh, deep meta for uncached candidates,
+// title search for LLM suggestions), MDBList (the pipeline's IMDb-rating step),
+// the local LLM (Glass's rerank; Marquee's brief, suggestions and fit), the
+// Simkl trending CDN (public), and authed Simkl GETs (Marquee's S2 recs, up to
+// 40 uncached summaries per Marquee run) — all paced through the governor. It
+// NEVER writes to Simkl or the live store, and it skips the Simkl RATINGS sync
+// (ctx.marqueeSkipSync). Everything fetched is cached in the throwaway copy
+// only — the store.db snapshot's cache tables (marquee_trending,
+// marquee_llm_cache, marquee_simkl_recs, glass_metadata, simkl_trending) and
+// the cache/ + meta/ files — so the live caches never warm up and the next
+// run starts equally cold.
 
 const path = require('path');
 const fs = require('fs');
@@ -26,7 +36,8 @@ const fs = require('fs');
 const REPO_ROOT = path.join(__dirname, '..');
 const USAGE =
   'Usage: node --experimental-sqlite scripts/bench-engines.js <profileName>\n'
-  + '  [--holdout 10] [--engines genesis,glass,marquee] [--no-cache] [--json] [--keep]';
+  + '  [--holdout 10] [--engines genesis,glass,marquee] [--no-cache] [--json] [--keep]\n'
+  + 'Expect several minutes per profile on a cold cache (Marquee\'s LLM fit dominates).';
 
 function parseArgs(argv) {
   const a = { profile: null, holdout: 10, engines: ['genesis', 'glass', 'marquee'], noCache: false, json: false, keep: false, help: false };
@@ -74,6 +85,7 @@ async function main() {
   }
 
   const quiet = { log() {}, warn() {}, error() {} };
+  console.log('Live read-only calls: TMDB, MDBList, local LLM, Simkl (trending CDN + ≤40 recs GETs). No writes to Simkl or the live store.');
   let results;
   try {
     results = await bench.runBench({
