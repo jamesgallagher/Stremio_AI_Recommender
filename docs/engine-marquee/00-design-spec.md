@@ -254,4 +254,29 @@ It ships **globally disabled** (SC-07), and series keep whatever engine the prof
 ---
 
 ## 12. Live findings (ME-00)
-_Pending — James runs `node --experimental-sqlite test/verify-marquee-live.js --profile="<name>"` and pastes its findings block here. P2 (ME-03) is blocked until this section is filled._
+Run by James on 2026-09-30 against the production container (v7.16.0-beta), one real
+profile. 5 Simkl calls, all checks PASS. Per-title Simkl ids from the account are
+replaced with "movie 1–3" (the repo is public).
+
+### Raw findings (script output)
+
+- **V1** (PASS): top-level object (keys: movies); 256 entries; entry keys: added_to_watchlist_at, last_watched_at, user_rated_at, user_rating, status, watched_episodes_count, total_episodes_count, not_aired_episodes_count, movie; movie keys: title, poster, year, ids; id path: movie.ids; ids: tmdb=present imdb=present simkl=present; rating field "user_rating"; rated-at "user_rated_at"
+- **V1b** (PASS): activities.movies keys: all, rated_at, playback, plantowatch, completed, dropped, removed_from_list; movies ratings timestamp path: movies.rated_at
+- **V2** (PASS): movie 1: present (default), length 12, first item tmdb id present; movie 2: present (default), length 12, first item tmdb id present; movie 3: present (default), length 11, first item tmdb id present
+- **V3** (PASS): 20 results; 0 of them have NO AU certification — certification.lte DROPS uncertified titles
+- **V4** (PASS): 20 results; 1 NOT_YET — cinema-only titles still present (1 NOT_YET)
+- **V5** (PASS): week p1–p5: 20 items each; day p1–p2: 20 items each; every page carries id/genre_ids/vote_average/vote_count/adult/release_date
+- **V6** (PASS): blocks in one request: credits, keywords, external_ids, release_dates; AU cert M, US cert R, availability AVAILABLE (tmdb 603)
+
+### What this means for the build (architect's reading)
+
+| # | Finding | Consequence |
+|---|---|---|
+| L1 | `GET /sync/ratings/movies` returns `{ movies: [...] }` with **every** movie on the account, not only rated ones. Unrated entries carry `user_rating: null` and `user_rated_at: null`. Ids are at `entry.movie.ids.{simkl, imdb, tmdb}`, and **`tmdb` is a string**. | ME-03 `parseRatings` must keep only entries whose `user_rating` is an integer 1–10. |
+| L2 | `activities.movies.rated_at` exists, and is **`null`** on an account that has never rated a movie. | ME-03's activities gate compares the stored and current value **including `null`**. No stored sync row means "never synced": pull once, then gate. The 24 h fallback is only for when the key itself is absent. |
+| L3 | The tested account has **no movie ratings** (`rated_at: null`). | The rating weights are a no-op until the viewer rates films on Simkl; every watched film keeps weight +1, exactly like Glass. This is the MI-3 degradation path, and it is the **normal** case today, not an edge case. |
+| L4 | `users_recommendations` is present on `GET /movies/{id}` **by default** (no `extended` param), with 11–12 items. Each item is `{ title, year, poster, fanart, type, ids: { simkl, slug, imdb, tmdb, … } }`, with ids at `item.ids` and `tmdb` a string. | ME-03 `getMovieSummary` sends no extra params. S2 (ME-05) maps recs through `item.ids.tmdb`. |
+| L5 | `certification.lte` with `certification_country=AU` returned no uncertified titles in 20. | Useful narrowing at source. The hard filter stays the kids guarantee (MD-3) regardless. |
+| L6 | `with_release_type=4\|5\|6` still let 1 of 20 `NOT_YET` titles through. | The discover param is a hint, not a guarantee. The hard filter's `availability === 'NOT_YET'` check (§3.3) is required. |
+| L7 | Trending pages are 20 items; week 5 pages = 100, day 2 pages = 40. | `weekN = 100`, `dayN = 40` for the trending formula (§7). |
+| L8 | The movie append call returns all four blocks in one request, with AU and US certs. | Confirms §2's cost model and ME-02's deep-meta change. |
