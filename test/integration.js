@@ -2576,12 +2576,14 @@ async function main() {
     settings.updateSettings({ engines: { marquee: true } });
     const reset = marqueeEngine._setTestSeams({ fetchers: mqSeam({ recs: () => [mqItem('mqiso1')] }), chain: [] });
     // Stub the live TMDB calls the (non-preResolved) Genesis series build + pipeline resolve make.
-    const origRecs = tmdb.getRecommendations, origGenreMap = tmdb.getGenreMap, origImdbFor = tmdb.imdbFor;
+    // SH-01: the resolve step now calls imdbAndCertFor (series delegates to imdbFor
+    // internally), so the stub moves to the new entry point.
+    const origRecs = tmdb.getRecommendations, origGenreMap = tmdb.getGenreMap, origImdbAndCertFor = tmdb.imdbAndCertFor;
     tmdb.getRecommendations = async (_k, type, _seedId) => (type === 'series'
       ? [{ type: 'series', tmdb_id: 'mqisoS1', title: 'Rec Series', year: 2024, genre_ids: [18], vote_average: 7, vote_count: 1000, popularity: 5, adult: false, poster: null }]
       : []);
     tmdb.getGenreMap = async () => ({ 18: 'Drama' });
-    tmdb.imdbFor = async (_k, _type, _id) => 'ttmqisoS1';
+    tmdb.imdbAndCertFor = async (_k, _type, _id) => ({ imdb_id: 'ttmqisoS1', certification: null });
     const p = config.addProfile('INT-MQISO');
     try {
       config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'marquee', engine_series: 'genesis' } });
@@ -2597,7 +2599,7 @@ async function main() {
       const seriesRows = rs.getRecommended(p.id, { type: 'series', limit: 100 });
       for (const row of seriesRows) assert.strictEqual(row.engine_id, 'genesis', 'series row stamped genesis');
     } finally {
-      tmdb.getRecommendations = origRecs; tmdb.getGenreMap = origGenreMap; tmdb.imdbFor = origImdbFor;
+      tmdb.getRecommendations = origRecs; tmdb.getGenreMap = origGenreMap; tmdb.imdbAndCertFor = origImdbAndCertFor;
       settings.updateSettings({ engines: { marquee: false } });
       config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id);
       reset();
@@ -2715,6 +2717,137 @@ async function main() {
     } finally {
       settings.updateSettings({ marquee: {} });
     }
+  });
+
+  // ── SH-01 (P5): the real AU/US movie classification reaches the shared age gate ──
+  await it('SH-01: the pipeline resolve fills certification — one TMDB request per candidate', async () => {
+    const pipeline = require('../src/engines/pipeline');
+    const certs = require('../src/certs');
+    offlineAnimeMap();
+    const p = config.addProfile('INT-SH01-RES');
+    // A non-preResolved fixture engine so the shared resolve path runs (the
+    // path every non-Marquee/Glass candidate takes — Genesis's own generate is
+    // not needed to prove the resolve contract).
+    const resolveEngine = {
+      id: 'sh01-resolve', name: 'SH-01 resolve fixture', supportedTypes: ['movie'],
+      capabilities: { providesRankScore: true, preResolved: false, serveOrder: 'affinity', unrestricted: false },
+      requirements: () => ({ ok: true, missing: [] }),
+      generate: async () => [
+        { type: 'movie', tmdb_id: '101', title: 'Film A', year: 2024, genre_ids: [28], poster: '/p1.jpg', rankScore: 2, vote_average: 7, vote_count: 5000, popularity: 10 },
+        { type: 'movie', tmdb_id: '202', title: 'Film B', year: 2023, genre_ids: [28], poster: '/p2.jpg', rankScore: 1, vote_average: 7, vote_count: 4000, popularity: 9 },
+      ],
+    };
+    const fetchLog = [];
+    const origFetch = global.fetch;
+    global.fetch = (url) => {
+      const u = String(url);
+      fetchLog.push(u);
+      if (u.includes('/genre/')) {
+        const genres = u.includes('/genre/movie') ? [{ id: 28, name: 'Action' }] : [];
+        return Promise.resolve({ ok: true, json: async () => ({ genres }) });
+      }
+      if (u.includes('/movie/') && u.includes('append_to_response')) {
+        const id = u.split('/movie/')[1].split('?')[0];
+        return Promise.resolve({ ok: true, json: async () => ({
+          external_ids: { imdb_id: 'ttSH01' + id },
+          release_dates: { results: [
+            { iso_3166_1: 'AU', release_dates: [{ certification: 'M' }] },
+            { iso_3166_1: 'US', release_dates: [{ certification: 'PG-13' }] },
+          ] },
+        }) });
+      }
+      return Promise.reject(new Error('unexpected fetch in SH-01 resolve test: ' + u));
+    };
+    try {
+      assert.strictEqual(certs.strictestCert('M', 'PG-13'), 'M'); // the fixture's expected strictest
+      const r = await pipeline.runEngineBuild(p, 'movie', resolveEngine,
+        { tmdbKey: 'itest-tmdb', mdblistKey: '', settings: settings.getSettings(), filters: {}, log: quiet });
+      assert.strictEqual(r.stored, 2, 'both candidates stored');
+      const appendCalls = fetchLog.filter((u) => u.includes('append_to_response'));
+      assert.strictEqual(appendCalls.length, 2, 'ONE details+append request per candidate');
+      assert.ok(!fetchLog.some((u) => u.includes('/external_ids')), 'no separate external_ids call');
+      for (const row of rs.getRecommended(p.id, { type: 'movie', limit: 100 })) {
+        assert.strictEqual(row.certification, 'M', `strictest(AU M, US PG-13) = M for ${row.tmdb_id}`);
+      }
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id); rs.deleteForProfile(p.id);
+    }
+  });
+
+  await it('SH-01: the shared age gate sends the real cert (MAL band is the fallback)', async () => {
+    const groq = require('../src/services/groq');
+    offlineAnimeMap();
+    const p = config.addProfile('INT-SH01-GATE');
+    config.updateProfile(p.id, { filters: { age_limit: 8 } }); // judged at 9
+    const captured = [];
+    const origAgeGate = groq.ageGate;
+    groq.ageGate = async (type, judgeAge, items) => { captured.push({ type, items }); return new Set(); };
+    try {
+      rs.upsertCandidates(p.id, [
+        { type: 'movie', tmdb_id: 'sh01a', imdb_id: 'ttsh01a', title: 'Film A', year: 2024, primary_genre: 'Action', genres: 'Action', vote_average: 7, vote_count: 1000, affinity: 1, rec_count: 1, popularity: 5, certification: 'M' },
+        { type: 'movie', tmdb_id: 'sh01b', imdb_id: 'ttsh01b', title: 'Anime B', year: 2024, primary_genre: 'Anime', genres: 'Anime', vote_average: 7, vote_count: 1000, affinity: 1, rec_count: 1, popularity: 5 },
+      ]);
+      rs.setAgeClassification(p.id, 'movie', 'sh01b', 'R+'); // MAL band, no real cert
+      await rs.ageGatePool(config.getProfile(p.id), quiet);
+      const movieItems = (captured.find((c) => c.type === 'movie') || {}).items || [];
+      const a = movieItems.find((i) => i.id === 'sh01a');
+      const b = movieItems.find((i) => i.id === 'sh01b');
+      assert.ok(a && b, 'both rows reached the LLM pass');
+      assert.strictEqual(a.certification, 'M', 'the real cert is sent');
+      assert.strictEqual(b.certification, 'R+', 'an anime row with no real cert still sends its MAL band');
+    } finally {
+      groq.ageGate = origAgeGate;
+      config.removeProfile(p.id); rs.deleteForProfile(p.id);
+    }
+  });
+
+  await it('SH-01: upsert COALESCE — a build without a cert never wipes a known one', async () => {
+    const p = config.addProfile('INT-SH01-COALESCE');
+    const base = { type: 'movie', tmdb_id: 'sh01c', imdb_id: 'ttsh01c', title: 'Film C', year: 2024, primary_genre: 'Action', genres: 'Action', vote_average: 7, vote_count: 1000, affinity: 1, rec_count: 1, popularity: 5 };
+    try {
+      rs.upsertCandidates(p.id, [{ ...base, certification: 'M' }]);
+      rs.upsertCandidates(p.id, [{ ...base }]); // a build that couldn't read a cert
+      let row = rs.getRecommended(p.id, { type: 'movie', limit: 100 })[0];
+      assert.strictEqual(row.certification, 'M', 'a null upsert keeps the known cert');
+      rs.upsertCandidates(p.id, [{ ...base, certification: 'PG' }]);
+      row = rs.getRecommended(p.id, { type: 'movie', limit: 100 })[0];
+      assert.strictEqual(row.certification, 'PG', 'a later known cert fills/overwrites');
+    } finally {
+      config.removeProfile(p.id); rs.deleteForProfile(p.id);
+    }
+  });
+
+  await it('SH-01: adult profiles are unchanged — served list identical with and without certs', async () => {
+    const db = require('../src/db');
+    const p = config.addProfile('INT-SH01-ADULT');
+    config.updateProfile(p.id, { filters: {} }); // adult: no age limit
+    const mk = (id, cert) => ({ type: 'movie', tmdb_id: id, imdb_id: 'tt' + id, title: 'T' + id, year: 2024, primary_genre: 'Action', genres: 'Action', vote_average: 7, vote_count: 1000, affinity: 2, rec_count: 1, popularity: 5, certification: cert });
+    try {
+      rs.upsertCandidates(p.id, [mk('ad1', 'M'), mk('ad2', 'R 18+'), mk('ad3', null)]);
+      const withCerts = rs.serveRecommendations(config.getProfile(p.id), 'movie').map((r) => r.id);
+      db.get().prepare('UPDATE recommended SET certification = NULL WHERE profile_id = ?').run(p.id);
+      const withoutCerts = rs.serveRecommendations(config.getProfile(p.id), 'movie').map((r) => r.id);
+      assert.deepStrictEqual(withoutCerts, withCerts, 'adult serve is cert-independent');
+      assert.strictEqual(withCerts.length, 3, 'all three rows served for an adult');
+    } finally {
+      config.removeProfile(p.id); rs.deleteForProfile(p.id);
+    }
+  });
+
+  await it('SH-01: Glass scoreCandidate carries the real cert from the enriched meta onto the candidate (movie only)', async () => {
+    const { scoreCandidate } = require('../src/engines/glass/scoring');
+    const certs = require('../src/certs');
+    const taste = { dims: { genres: { Action: 1 }, decades: {}, languages: {}, runtimeBands: {}, directors: {}, franchises: {}, cast: {}, keywords: {} }, genreMass: { Action: 1 } };
+    const cfg = { weights: { taste_match: 0.5, quality: 0.3 }, taste_dims: { genres: 1, decade: 0, language: 0, runtime: 0, director: 0, franchise: 0, cast: 0, keywords: 0 }, keyword_min_shared: 1 };
+    const mk = (type) => ({ type, tmdb_id: type + '1', title: 'Glass ' + type, sources: ['simkl'] });
+    const meta = (certAU, certUS) => ({ imdb_id: 'ttg1', title: 'Glass Film', year: 2024, genres: ['Action'], poster: null, vote_average: 7, vote_count: 1000, popularity: 10, certAU, certUS });
+    const movie = scoreCandidate(mk('movie'), meta('M', 'PG-13'), taste, cfg, { nowYear: 2026 });
+    assert.strictEqual(movie.certification, certs.strictestCert('M', 'PG-13'), 'movie carries the strictest cert');
+    const preP1 = scoreCandidate(mk('movie'), meta(null, null), taste, cfg, { nowYear: 2026 });
+    assert.strictEqual(preP1.certification, null, 'a cached meta predating P1 → null');
+    const series = scoreCandidate(mk('series'), meta('M', 'PG-13'), taste, cfg, { nowYear: 2026 });
+    assert.strictEqual(series.certification, undefined, 'series: SH-01 out of scope (no cert written)');
   });
 
   // Restore a clean-ish shared state for any process that runs after this one.

@@ -18,6 +18,7 @@
 // `dont_recommend` (user rejections + decay-outs, excluded from build/serve),
 // and `rec_state` (last build time, the rebuild trigger).
 const db = require('./db');
+const certs = require('./certs');
 const settings = require('./settings');
 const tmdb = require('./services/tmdb');
 const animeMap = require('./services/animeMap');
@@ -119,7 +120,9 @@ function init() {
   for (const [col, decl] of [['genres', 'TEXT'], ['vote_average', 'REAL'], ['imdb_rating', 'REAL'], ['imdb_rating_at', 'INTEGER'], ['vote_count', 'INTEGER'], ['because_title', 'TEXT'],
     ['streak_started_at', 'INTEGER'], ['times_shown_in_streak', 'INTEGER DEFAULT 0'], ['last_shown_at', 'INTEGER'],
     // GE-01: score-components store (engine-agnostic). Best-effort on older DBs.
-    ['score_components', 'TEXT'], ['algorithm_version', 'TEXT'], ['engine_id', 'TEXT']]) {
+    ['score_components', 'TEXT'], ['algorithm_version', 'TEXT'], ['engine_id', 'TEXT'],
+    // SH-01: real AU/US movie classification (strictest), engine- or pipeline-supplied.
+    ['certification', 'TEXT']]) {
     try { db.get().exec(`ALTER TABLE recommended ADD COLUMN ${col} ${decl}`); } catch { /* already present */ }
   }
   // MW-03: persist the imdb id alongside the tmdb-keyed suppression row so a
@@ -234,15 +237,16 @@ function upsertCandidates(profileId, candidates, { ratingCheckedAt = null } = {}
   init();
   const conn = db.get();
   const stmt = conn.prepare(`
-    INSERT INTO recommended (profile_id, type, tmdb_id, imdb_id, title, year, primary_genre, genres, vote_average, imdb_rating, imdb_rating_at, vote_count, affinity, rec_count, because_title, score_components, algorithm_version, engine_id, popularity, poster, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO recommended (profile_id, type, tmdb_id, imdb_id, title, year, primary_genre, genres, vote_average, imdb_rating, imdb_rating_at, vote_count, affinity, rec_count, because_title, score_components, algorithm_version, engine_id, popularity, poster, created_at, certification)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(profile_id, type, tmdb_id) DO UPDATE SET
       affinity = excluded.affinity, rec_count = excluded.rec_count, popularity = excluded.popularity,
       primary_genre = excluded.primary_genre, genres = excluded.genres, vote_average = excluded.vote_average,
       imdb_rating = COALESCE(excluded.imdb_rating, recommended.imdb_rating),
       imdb_rating_at = COALESCE(excluded.imdb_rating_at, recommended.imdb_rating_at), vote_count = excluded.vote_count,
       because_title = excluded.because_title, title = excluded.title, year = excluded.year, poster = excluded.poster,
-      score_components = excluded.score_components, algorithm_version = excluded.algorithm_version, engine_id = excluded.engine_id
+      score_components = excluded.score_components, algorithm_version = excluded.algorithm_version, engine_id = excluded.engine_id,
+      certification = COALESCE(excluded.certification, recommended.certification)
   `);
   conn.prepare('BEGIN').run();
   try {
@@ -252,7 +256,7 @@ function upsertCandidates(profileId, candidates, { ratingCheckedAt = null } = {}
       // string; null when the engine doesn't emit it (e.g. Genesis today).
       const comps = c.score_components == null ? null
         : (typeof c.score_components === 'string' ? c.score_components : JSON.stringify(c.score_components));
-      stmt.run(profileId, c.type, c.tmdb_id, c.imdb_id || null, c.title, c.year, c.primary_genre || null, c.genres || null, c.vote_average ?? null, c.imdb_rating ?? null, ratingCheckedAt, c.vote_count ?? null, c.affinity, c.rec_count, c.because_title || null, comps, c.algorithm_version || null, c.engine_id || null, c.popularity, c.poster || null, now);
+      stmt.run(profileId, c.type, c.tmdb_id, c.imdb_id || null, c.title, c.year, c.primary_genre || null, c.genres || null, c.vote_average ?? null, c.imdb_rating ?? null, ratingCheckedAt, c.vote_count ?? null, c.affinity, c.rec_count, c.because_title || null, comps, c.algorithm_version || null, c.engine_id || null, c.popularity, c.poster || null, now, c.certification || null);
     }
     conn.prepare('COMMIT').run();
   } catch (err) { conn.prepare('ROLLBACK').run(); throw err; }
@@ -372,8 +376,10 @@ async function ageGatePool(profile, log = console, onProgress = () => {}) {
     for (const type of ['movie', 'series']) {
       const survivors = getRecommended(profile.id, { type, limit: 100000 });
       if (!survivors.length) continue;
+      // SH-01: the real AU/US movie classification (when stored) informs the LLM
+      // judgement; the MAL band (age_classification) remains the fallback.
       const veto = await groq.ageGate(type, rebuild.judgementAge(profile.filters),
-        survivors.map((r) => ({ id: r.tmdb_id, title: r.title, year: r.year, genres: r.primary_genre ? [r.primary_genre] : [], certification: r.age_classification })), log);
+        survivors.map((r) => ({ id: r.tmdb_id, title: r.title, year: r.year, genres: r.primary_genre ? [r.primary_genre] : [], certification: r.certification || r.age_classification })), log);
       for (const r of survivors) if (veto.has(r.tmdb_id)) { hardDrop(profile.id, r.type, r.tmdb_id); vetoed++; }
     }
   }
@@ -563,9 +569,12 @@ function certMinAge(cert) {
 // (the pool is already LLM-vetted); this is the same lowered-limit safety net.
 function passesAgeBand(row, filters = {}) {
   const limit = filters.age_limit || 0;
-  if (limit <= 0) return true;
-  const m = certMinAge(row.age_classification);
-  return m === null || m <= limit + 1;
+  if (limit <= 0) return true;                       // adults: unchanged, always true
+  const mal  = certMinAge(row.age_classification);   // existing MAL-band table, unchanged
+  const real = certs.anyCertMinAge(row.certification);
+  const known = [mal, real].filter((m) => m !== null);
+  if (!known.length) return true;                    // unknown stays KEPT at serve (unchanged rule)
+  return Math.max(...known) <= limit + 1;            // SH-01: stricter-only — the stricter source wins
 }
 
 // Round-robin across primary_genre buckets: take the strongest remaining title

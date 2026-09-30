@@ -65,7 +65,9 @@ contradicts them is non-conformant.
       **and supplies `primary_genre` + `genres` itself** — the pipeline only derives
       those from `genre_ids` on the resolve path, so a `preResolved` row with no
       `primary_genre` lands in serve's "Other" genre bucket (no crash, but genre
-      balance degrades).
+      balance degrades). A `preResolved` engine **may** supply `certification`
+      (the strictest AU/US cert string, SH-01); the pipeline fills it on the
+      resolve path.
 - [ ] `capabilities.serveOrder` is `'affinity'` unless the serve path has been
       taught to honor `'preserve'` (out of scope until an engine needs it).
 - [ ] `capabilities.unrestricted` is set **honestly** (I7):
