@@ -1681,7 +1681,7 @@ ok('marquee envelope: MI-1 parity matrix (envelope never looser than selectServe
     28: 'Action', 12: 'Adventure', 16: 'Animation', 35: 'Comedy', 80: 'Crime',
     99: 'Documentary', 18: 'Drama', 10751: 'Family', 14: 'Fantasy', 36: 'History',
     27: 'Horror', 10402: 'Music', 9648: 'Mystery', 10749: 'Romance',
-    878: 'Science Fiction', 10770: 'TV Movie', 53: 'War', 10752: 'Western',
+    878: 'Science Fiction', 10770: 'TV Movie', 53: 'Thriller', 10752: 'War', 37: 'Western',
   };
   const configs = {
     adult:    { min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 0 },
@@ -1753,13 +1753,13 @@ ok('marquee envelope: MI-1 parity matrix (envelope never looser than selectServe
   let rejected = 0;
   for (const [name, cfg] of Object.entries(configs)) {
     const env = marquee.compileEnvelope(cfg, { nowYear: 2026, genreMap });
-    for (const row of rows) {
+    for (const [idx, row] of rows.entries()) {
       const res = env.hardFilter(row);
       if (res.ok) {
         kept += 1;
         const served = recommendationStore.selectServe([asPoolRow(row)], cfg, { nowYear: 2026 });
         assert.strictEqual(served.length, 1,
-          `MI-1 violated: ${name} kept row ${row.imdb_id} that selectServe dropped`);
+          `MI-1 violated: ${name} kept row ${idx + 1} that selectServe dropped`);
       } else {
         rejected += 1;
       }
@@ -1791,10 +1791,51 @@ ok('marquee envelope: kids cert filtering (MD-3)', () => {
   assert.deepStrictEqual(run(null, 'G'), { ok: true });
   // R 18+ (Infinity) → cert_over
   assert.deepStrictEqual(run('R 18+', null), { ok: false, reason: 'cert_over' });
+  // age_limit 14 (judgement 15): M and MA 15+ kept, R over (T1)
+  const kids14 = marquee.compileEnvelope({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 14 }, { nowYear: 2026, genreMap });
+  assert.strictEqual(kids14.judgementAge, 15);
+  assert.deepStrictEqual(kids14.hardFilter({ ...base, certAU: 'M', certUS: null }), { ok: true });
+  assert.deepStrictEqual(kids14.hardFilter({ ...base, certAU: 'MA 15+', certUS: null }), { ok: true });
+  assert.deepStrictEqual(kids14.hardFilter({ ...base, certAU: null, certUS: 'R' }), { ok: false, reason: 'cert_over' });
+  // strictestMinAge('M','PG') === 15 (the prompt's example)
+  assert.strictEqual(marquee.strictestMinAge('M', 'PG'), 15);
   // an adult envelope (age_limit 0) ignores certs entirely
   const adult = marquee.compileEnvelope({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 0 }, { nowYear: 2026, genreMap });
   assert.strictEqual(adult.kids, false);
   assert.deepStrictEqual(adult.hardFilter({ ...base, certAU: null, certUS: null }), { ok: true });
+});
+
+ok('marquee live-verify: describeRatings/seedIdsFrom nested + flat shapes (F1)', () => {
+  const live = require('./verify-marquee-live');
+  // Nested shape — the real Simkl shape, ids under movie.ids.
+  const nested = {
+    movies: [
+      { user_rating: 9, user_rated_at: '2026-01-01', movie: { title: 'Alpha One', year: 2020, ids: { simkl: 's1', imdb: 'tt1', tmdb: '100' } } },
+      { user_rating: 8, user_rated_at: '2026-01-02', movie: { title: 'Beta Two', year: 2021, ids: { simkl: 's2', imdb: 'tt2', tmdb: '200' } } },
+    ],
+  };
+  const d1 = live.describeRatings(nested);
+  assert.ok(d1.ok, 'nested describeRatings ok');
+  assert.ok(d1.detail.includes('id path: movie.ids'), `nested id path is movie.ids: ${d1.detail}`);
+  assert.ok(d1.detail.includes('tmdb=present'), `nested tmdb present: ${d1.detail}`);
+  assert.ok(d1.detail.includes('imdb=present'), `nested imdb present: ${d1.detail}`);
+  assert.ok(d1.detail.includes('simkl=present'), `nested simkl present: ${d1.detail}`);
+  assert.ok(d1.detail.includes('entry keys:'), `nested entry key list present: ${d1.detail}`);
+  assert.ok(d1.detail.includes('movie keys:'), `nested movie key list present: ${d1.detail}`);
+  assert.ok(d1.detail.includes('rating field "user_rating"'), `nested rating field name: ${d1.detail}`);
+  assert.ok(d1.detail.includes('rated-at "user_rated_at"'), `nested rated-at field name: ${d1.detail}`);
+  assert.deepStrictEqual(live.seedIdsFrom(d1.entries), ['s1', 's2'], 'nested seed ids from movie.ids.simkl');
+  // Flat shape — ids under top-level ids.
+  const flat = [
+    { rating: 7, rated_at: '2026-02-01', ids: { simkl: 'f1', imdb: 'tt3', tmdb: '300' } },
+    { rating: 6, rated_at: '2026-02-02', ids: { simkl: 'f2', imdb: 'tt4', tmdb: '400' } },
+  ];
+  const d2 = live.describeRatings(flat);
+  assert.ok(d2.ok, 'flat describeRatings ok');
+  assert.ok(d2.detail.includes('id path: ids'), `flat id path is ids: ${d2.detail}`);
+  assert.ok(!d2.detail.includes('movie.ids'), `flat id path is not movie.ids: ${d2.detail}`);
+  assert.ok(d2.detail.includes('tmdb=present'), `flat tmdb present: ${d2.detail}`);
+  assert.deepStrictEqual(live.seedIdsFrom(d2.entries), ['f1', 'f2'], 'flat seed ids from ids.simkl');
 });
 
 ok('marquee envelope: discoverParams (spec §3.1)', () => {
@@ -1803,7 +1844,7 @@ ok('marquee envelope: discoverParams (spec §3.1)', () => {
     28: 'Action', 12: 'Adventure', 16: 'Animation', 35: 'Comedy', 80: 'Crime',
     99: 'Documentary', 18: 'Drama', 10751: 'Family', 14: 'Fantasy', 36: 'History',
     27: 'Horror', 10402: 'Music', 9648: 'Mystery', 10749: 'Romance',
-    878: 'Science Fiction', 10770: 'TV Movie', 53: 'War', 10752: 'Western',
+    878: 'Science Fiction', 10770: 'TV Movie', 53: 'Thriller', 10752: 'War', 37: 'Western',
   };
   const compile = (filters) => marquee.compileEnvelope(filters, { nowYear: 2026, genreMap }).discoverParams();
   // adult default → exactly the three always-on params
