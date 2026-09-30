@@ -2163,6 +2163,152 @@ ok('marquee ME-04: briefHash stable per JSON content (spec §4.3)', () => {
   assert.notStrictEqual(taste.briefHash(a), taste.briefHash({ ...a, loves: ['B'] }));
 });
 
+// ---- Marquee ME-05/ME-06: pure features + S6 parsers (spec §4.2/§5) ----
+ok('marquee ME-06: rankScore01 — rank 1 → 1, rank N → small, null/≤0 → 0', () => {
+  const f = require('../src/engines/marquee/features');
+  assert.strictEqual(f.rankScore01(1, 100), 1);
+  assert.ok(f.rankScore01(100, 100) > 0 && f.rankScore01(100, 100) < 0.01, 'rank N is near 0');
+  assert.strictEqual(f.rankScore01(null, 100), 0);
+  assert.strictEqual(f.rankScore01(0, 100), 0);
+  assert.strictEqual(f.rankScore01(1, 0), 0);
+  assert.ok(f.rankScore01(10, 100) > f.rankScore01(50, 100), 'lower rank scores higher');
+});
+
+ok('marquee ME-06: trendingRaw — week/day/Simkl, rising bonus, max, clamp', () => {
+  const f = require('../src/engines/marquee/features');
+  // week-only: rank 5 of 100.
+  const weekOnly = f.trendingRaw({ tmdbWeekRank: 5, tmdbDayRank: null, simklWatched: 0, simklDrop: null }, { weekN: 100, dayN: 40 });
+  assert.ok(Math.abs(weekOnly - (1 - Math.log(5) / Math.log(101))) < 1e-9);
+  // day-only OUTSIDE the week top-50 gets the +0.1 rising bonus.
+  const dayOnly = f.trendingRaw({ tmdbWeekRank: null, tmdbDayRank: 10, simklWatched: 0, simklDrop: null }, { weekN: 100, dayN: 40 });
+  assert.ok(Math.abs(dayOnly - (1 - Math.log(10) / Math.log(41)) - 0.1) < 1e-9, 'rising bonus applied');
+  // day INSIDE the week top-50 gets NO bonus; the week rank wins the max.
+  const inTop = f.trendingRaw({ tmdbWeekRank: 5, tmdbDayRank: 10, simklWatched: 0, simklDrop: null }, { weekN: 100, dayN: 40 });
+  assert.ok(Math.abs(inTop - (1 - Math.log(5) / Math.log(101))) < 1e-9, 'no bonus inside top-50');
+  // Simkl momentum only.
+  const simklOnly = f.trendingRaw({ tmdbWeekRank: null, tmdbDayRank: null, simklWatched: 500, simklDrop: 0.3 }, { weekN: 100, dayN: 40 });
+  assert.ok(simklOnly > 0 && simklOnly < 1);
+  // the max of the three: a strong Simkl signal beats a weak week rank.
+  const maxCase = f.trendingRaw({ tmdbWeekRank: 90, tmdbDayRank: null, simklWatched: 500, simklDrop: 0.3 }, { weekN: 100, dayN: 40 });
+  assert.ok(Math.abs(maxCase - simklOnly) < 1e-9, 'Simkl momentum wins the max');
+  // clamped to 1.
+  assert.strictEqual(f.trendingRaw({ tmdbDayRank: 1, simklWatched: 2000, simklDrop: 0 }, { weekN: 100, dayN: 40 }), 1);
+});
+
+ok('marquee ME-06: trending gate (MD-2) — 0 → 0, half-gate → half, ≥ gate → full', () => {
+  const f = require('../src/engines/marquee/features');
+  assert.strictEqual(f.tasteGate(0, 0.35), 0);
+  assert.ok(Math.abs(f.tasteGate(0.175, 0.35) - 0.5) < 1e-9, 'half the gate → half');
+  assert.strictEqual(f.tasteGate(0.35, 0.35), 1);
+  assert.strictEqual(f.tasteGate(0.5, 0.35), 1, 'above the gate clamps to 1');
+  // trending_eff = trending_raw × gate: off-taste (taste_match 0) → 0.
+  assert.strictEqual(0.8 * f.tasteGate(0, 0.35), 0);
+});
+
+ok('marquee ME-06: quality — Bayesian prior, IMDb preferred, R=0 → 0', () => {
+  const f = require('../src/engines/marquee/features');
+  // R = 9, v = 10, m = 2000, C = 6.5 → (90 + 13000)/2010/10 ≈ 0.651.
+  const q1 = f.quality({ imdbRating: 9, voteAverage: 7, voteCount: 10 }, { m: 2000, C: 6.5 });
+  assert.ok(Math.abs(q1 - ((10 * 9 + 2000 * 6.5) / 2010 / 10)) < 1e-9);
+  assert.ok(Math.abs(q1 - 0.651) < 0.001, '≈ 0.651');
+  // many votes approach R/10.
+  const q2 = f.quality({ imdbRating: 8, voteCount: 100000 }, { m: 2000, C: 6.5 });
+  assert.ok(Math.abs(q2 - 0.8) < 0.01);
+  // IMDb preferred over TMDB when present.
+  const q3 = f.quality({ imdbRating: 4, voteAverage: 9, voteCount: 1000 }, { m: 2000, C: 6.5 });
+  assert.ok(Math.abs(q3 - ((1000 * 4 + 2000 * 6.5) / 3000 / 10)) < 1e-9);
+  // R = 0 → 0.
+  assert.strictEqual(f.quality({ imdbRating: 0, voteAverage: 0, voteCount: 100 }, { m: 2000, C: 6.5 }), 0);
+});
+
+ok('marquee ME-06: consensus — S1 tags one group, trending/exploration not counted, seeds add 0.5', () => {
+  const f = require('../src/engines/marquee/features');
+  // tmdb_recs + tmdb_similar = ONE group, one seed → ln(2)/ln(8).
+  assert.ok(Math.abs(f.consensus(new Set(['tmdb_recs', 'tmdb_similar']), new Set(['s1'])) - Math.log(2) / Math.log(8)) < 1e-9);
+  // all five counted groups + 3 seeds (extra 2 × 0.5) → ln(7)/ln(8).
+  assert.ok(Math.abs(f.consensus(new Set(['tmdb_recs', 'simkl_recs', 'discover', 'collection', 'llm']), new Set(['a', 'b', 'c'])) - Math.log(7) / Math.log(8)) < 1e-9);
+  // trending/exploration are NOT counted (MD-2: no double count).
+  assert.strictEqual(f.consensus(new Set(['trending', 'exploration']), new Set()), 0);
+  // clamped at 1.
+  assert.strictEqual(f.consensus(new Set(['tmdb_recs', 'simkl_recs', 'discover', 'collection', 'llm']), new Set(['1', '2', '3', '4', '5', '6', '7', '8'])), 1);
+});
+
+ok('marquee ME-06: freshness — max_age_years window, default 30, unknown/old → floor', () => {
+  const f = require('../src/engines/marquee/features');
+  // window from max_age_years.
+  assert.ok(Math.abs(f.freshness(2020, { nowYear: 2026, maxAgeYears: 10 }) - 0.4) < 1e-9);
+  assert.ok(Math.abs(f.freshness(2025, { nowYear: 2026, maxAgeYears: 10 }) - 0.9) < 1e-9);
+  assert.strictEqual(f.freshness(2026, { nowYear: 2026, maxAgeYears: 10 }), 1);
+  // very old → floor.
+  assert.strictEqual(f.freshness(2000, { nowYear: 2026, maxAgeYears: 10 }), 0.2);
+  // default 30-year window when unlimited.
+  assert.ok(Math.abs(f.freshness(2010, { nowYear: 2026, maxAgeYears: 0 }) - (2010 - 1996) / 30) < 1e-9);
+  // unknown year → floor.
+  assert.strictEqual(f.freshness(null, { nowYear: 2026 }), 0.2);
+  assert.strictEqual(f.freshness(0, { nowYear: 2026 }), 0.2);
+});
+
+ok('marquee ME-06: renormalize — sums to 1 without llm_fit / without trending_eff, ratios preserved', () => {
+  const f = require('../src/engines/marquee/features');
+  const weights = { taste_match: 0.28, llm_fit: 0.20, trending_eff: 0.20, quality: 0.14, consensus: 0.12, freshness: 0.06 };
+  // without llm_fit: sum to 1, ratios preserved.
+  const w1 = f.renormalize(weights, ['taste_match', 'trending_eff', 'quality', 'consensus', 'freshness']);
+  assert.ok(Math.abs(Object.values(w1).reduce((a, b) => a + b, 0) - 1) < 1e-9);
+  assert.ok(Math.abs(w1.taste_match - 0.28 / 0.8) < 1e-9);
+  assert.ok(Math.abs(w1.taste_match / w1.quality - 2) < 1e-9, 'taste_match:quality ratio preserved');
+  // without llm_fit AND trending_eff: sum to 1.
+  const w2 = f.renormalize(weights, ['taste_match', 'quality', 'consensus', 'freshness']);
+  assert.ok(Math.abs(Object.values(w2).reduce((a, b) => a + b, 0) - 1) < 1e-9);
+  assert.ok(Math.abs(w2.taste_match - 0.28 / 0.6) < 1e-9);
+  // all-zero → {}.
+  assert.deepStrictEqual(f.renormalize({ a: 0, b: 0 }, ['a', 'b']), {});
+});
+
+ok('marquee ME-06: preScore — the spec §5 formula on a fixed fixture', () => {
+  const f = require('../src/engines/marquee/features');
+  const taste = { dims: { genres: { Action: 0.8 } } };
+  const cand = {
+    genres: ['Action'],
+    sources: new Set(['tmdb_recs', 'simkl_recs']),
+    trending: { tmdbWeekRank: 5, tmdbDayRank: null, simklWatched: 0, simklDrop: null },
+    vote_average: 8,
+  };
+  const ga = 0.8;
+  const tr = 1 - Math.log(5) / Math.log(101);
+  const expected = 0.45 * ga + 0.20 * tr + 0.15 * 0.8 + 0.20 * Math.min(1, 2 / 3);
+  assert.ok(Math.abs(f.preScore(cand, taste, { weekN: 100, dayN: 40 }) - expected) < 1e-9);
+});
+
+ok('marquee ME-05: parseSuggestions — fenced JSON, invalid year/title dropped, dedupe, all-invalid throws', () => {
+  const sources = require('../src/engines/marquee/sources');
+  // fenced JSON + a valid item.
+  const ok1 = sources.parseSuggestions('```json\n[{"title": "Alpha", "year": 2010}, {"title": "Beta"}]\n```', { nowYear: 2026 });
+  assert.deepStrictEqual(ok1, [{ title: 'Alpha', year: 2010 }, { title: 'Beta', year: null }]);
+  // invalid year (out of range) dropped; non-string title dropped; dedupe by lowercased title+year.
+  const ok2 = sources.parseSuggestions('[{"title": "Alpha", "year": 2010}, {"title": "alpha", "year": 2010}, {"title": "BadYear", "year": 1899}, {"title": 42}, {"title": "LongTitleOverOneHundredTwentyCharactersLongTitleOverOneHundredTwentyCharactersLongTitleOverOneHundredTwentyCharactersLongTitleOverOneHundredTwentyCharacters", "year": 2010}]', { nowYear: 2026 });
+  assert.deepStrictEqual(ok2, [{ title: 'Alpha', year: 2010 }]);
+  // all-invalid throws.
+  assert.throws(() => sources.parseSuggestions('[{"title": "BadYear", "year": 1899}]', { nowYear: 2026 }));
+});
+
+ok('marquee ME-05: buildSuggestPrompt — filter rules in words, never age/suitability/classification (kids included)', () => {
+  const sources = require('../src/engines/marquee/sources');
+  const p = sources.buildSuggestPrompt({
+    brief: { loves: ['Sci-Fi'], avoids: ['Horror'], moods: ['tense'], eras: ['2010s'], standout_titles: ['A'] },
+    minYear: 2016, minRating: 6, excludedGenres: ['Anime', 'Kids'],
+    avoidRecent: [{ title: 'Recent One', year: 2025 }],
+    count: 60,
+  });
+  assert.ok(p.includes('released in or after 2016'));
+  assert.ok(p.includes('rated at least 6 on IMDb'));
+  assert.ok(p.includes('not these genres: Anime, Kids'));
+  assert.ok(p.includes('Recent One (2025)'));
+  // never age/suitability/classification/child wording — even for a kids-profile
+  // input. (Genre NAMES from the brief's avoids list, e.g. 'Kids', are data the
+  // viewer asked for, not classification wording.)
+  assert.ok(!/age|suitab|classif|child/i.test(p), 'no age wording: ' + p);
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');
