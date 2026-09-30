@@ -2342,6 +2342,45 @@ ok('marquee ME-07: buildFitPrompt — brief + item data, cert as context only, n
   assert.ok(!/suitab|appropriate|child|kid|age limit|for ages/i.test(p), 'no age/suitability wording: ' + p);
 });
 
+// ---- Marquee ME-08 (pure) ----
+ok('marquee ME-08: shapeOutput — franchise cap, store cap, exact shortfall line, _fit/_preScore stripped', () => {
+  const shape = require('../src/engines/marquee/shape');
+  const cfg = require('../src/engines/marquee/config').DEFAULTS;
+  const mk = (id, cid, score) => ({
+    type: 'movie', tmdb_id: id, rankScore: score, reason: null,
+    scoreComponents: { features: {}, weights: {}, penalty: 0, inputs: { collection_id: cid }, llm: { fit: 5, reason: null, cached: false } },
+    _fit: { overview: 'x' }, _preScore: 0.5,
+  });
+  const warn = [];
+  const log = { log() {}, warn(m) { warn.push(m); }, error() {} };
+
+  // 5 rows, one collection → at most 2 of it kept; no-collection rows uncapped.
+  const rows = [mk('a1', 1, 5), mk('a2', 1, 4), mk('a3', 1, 3), mk('b1', null, 2), mk('b2', null, 1)];
+  const out = shape.shapeOutput(rows, { cfg, listSize: 20, envelopeStats: {}, log });
+  assert.deepStrictEqual(out.map((r) => r.tmdb_id), ['a1', 'a2', 'b1', 'b2'], 'franchise cap 2 on the collection');
+  assert.ok(out.every((r) => !('_fit' in r) && !('_preScore' in r)), '_fit/_preScore stripped');
+
+  // Store cap.
+  const outCap = shape.shapeOutput(rows, { cfg: { ...cfg, store_cap: 3 }, listSize: 20, envelopeStats: {}, log });
+  assert.deepStrictEqual(outCap.map((r) => r.tmdb_id), ['a1', 'a2', 'b1'], 'store cap 3');
+
+  // Exact shortfall line — the 4 largest non-zero counters, descending.
+  warn.length = 0;
+  shape.shapeOutput(rows, { cfg, listSize: 20, envelopeStats: { cert_over: 10, votes: 7, genre: 3, adult: 2, rating: 1 }, log });
+  assert.deepStrictEqual(warn, ['[marquee] : shortfall 4/150 — blockers: cert_over 10, votes 7, genre 3, adult 2'], 'shortfall line, dominant blocker first');
+
+  // No non-zero counters → 'blockers: none recorded'.
+  warn.length = 0;
+  shape.shapeOutput(rows, { cfg, listSize: 20, envelopeStats: { no_imdb: 0, votes: 0 }, log });
+  assert.deepStrictEqual(warn, ['[marquee] : shortfall 4/150 — blockers: none recorded'], 'none recorded');
+
+  // No shortfall → no warn.
+  warn.length = 0;
+  const big = Array.from({ length: 150 }, (_, i) => mk('z' + i, null, 150 - i));
+  shape.shapeOutput(big, { cfg, listSize: 20, envelopeStats: {}, log });
+  assert.deepStrictEqual(warn, [], 'no warn at target');
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');

@@ -72,6 +72,12 @@ const DEFAULTS = {
   // The LOCAL LLM judges the top candidate_cap by the taste brief, in batches
   // of `batch`, sequential (single GPU). ttl_days bounds the fit cache.
   llm_fit: { enabled: true, candidate_cap: 250, batch: 20, ttl_days: 14, timeout_ms: 60000 },
+
+  // ── ME-08 (spec §8.3) — output shaping ──
+  franchise_cap: 2,    // at most N titles per collection in the final output
+  store_cap: 300,      // the stored slice is capped at this
+  min_supply: 150,     // shortfall target floor
+  supply_factor: 6,    // shortfall target = max(min_supply, listSize × supply_factor)
 };
 
 // Resolve the EFFECTIVE Marquee config for a build: Tier-1 defaults with a
