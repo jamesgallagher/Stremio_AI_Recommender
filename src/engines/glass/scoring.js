@@ -12,6 +12,7 @@
 // finalised IMDb rating (P4/I4 — the pipeline enriches that AFTER generate()).
 const metaStore = require('./metaStore');
 const animeMap = require('../../services/animeMap');
+const certs = require('../../certs');
 const { ALGORITHM_VERSION } = require('./config');
 
 const clamp01 = (x) => Math.max(0, Math.min(1, x));
@@ -176,6 +177,10 @@ function scoreCandidate(cand, meta, taste, cfg, { nowYear, animeLoaded = true } 
   cand.popularity = meta.popularity || cand.popularity || 0;
   cand.title = cand.title || meta.title;
   cand.year = cand.year || meta.year;
+
+  // SH-01: the real AU/US movie classification from the enriched meta (null
+  // when the cached meta predates P1 and has no certAU/certUS).
+  if (cand.type === 'movie') cand.certification = certs.strictestCert(meta.certAU, meta.certUS);
 
   cand.rankScore = rankScore;
   cand.algorithm_version = ALGORITHM_VERSION;

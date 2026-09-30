@@ -742,6 +742,50 @@ ok('recommendationStore: selectStrong gates on the supplied vote floor (NOT rati
   assert.ok(!rs.selectStrong(recs, 0).some((r) => r.tmdb_id === 'adult'));
 });
 
+ok('recommendationStore: SH-01 passesAgeBand — real cert + MAL band, stricter-only', () => {
+  const rs = require('../src/recommendationStore');
+  const row = (certification, age_classification = null) => ({ certification, age_classification });
+  // Age 10 (judged at 11):
+  assert.strictEqual(rs.passesAgeBand(row('MA 15+'), { age_limit: 10 }), false, 'MA 15+ (15) rejected at 10');
+  assert.strictEqual(rs.passesAgeBand(row('PG'), { age_limit: 10 }), true, 'PG (8) kept at 10');
+  assert.strictEqual(rs.passesAgeBand(row('M'), { age_limit: 10 }), false, 'M (15) rejected at 10');
+  assert.strictEqual(rs.passesAgeBand(row('PG-13'), { age_limit: 10 }), false, 'PG-13 (13) rejected at 10');
+  // Age 12 (judged at 13):
+  assert.strictEqual(rs.passesAgeBand(row('PG-13'), { age_limit: 12 }), true, 'PG-13 (13) kept at 12');
+  // R 18+ (Infinity) is rejected at EVERY age limit:
+  for (const age of [1, 10, 12, 17, 99]) assert.strictEqual(rs.passesAgeBand(row('R 18+'), { age_limit: age }), false);
+  // Unknown cert (null / 'NR') stays KEPT (unchanged rule):
+  assert.strictEqual(rs.passesAgeBand(row(null), { age_limit: 10 }), true);
+  assert.strictEqual(rs.passesAgeBand(row('NR'), { age_limit: 10 }), true);
+  // MAL band + real cert: the STRICTER source wins (MAL 'R+' = 17 beats 'PG' = 8):
+  assert.strictEqual(rs.passesAgeBand(row('PG', 'R+'), { age_limit: 10 }), false);
+  assert.strictEqual(rs.passesAgeBand(row('PG', 'R+'), { age_limit: 17 }), true);
+  // Adult profile (no age limit): always true, whatever the certs.
+  for (const c of [null, 'NR', 'M', 'MA 15+', 'R 18+']) assert.strictEqual(rs.passesAgeBand(row(c, 'R+'), { age_limit: 0 }), true);
+});
+
+ok('recommendationStore: SH-01 stricter-only matrix — new passesAgeBand never keeps what the old MAL-only logic rejected', () => {
+  const rs = require('../src/recommendationStore');
+  // The OLD logic, kept as a local copy: MAL band only.
+  const CERT_MIN_AGE = { G: 0, PG: 8, 'PG-13': 13, R: 17, 'R+': 17 };
+  const oldPasses = (row, filters) => {
+    const limit = filters.age_limit || 0;
+    if (limit <= 0) return true;
+    const m = row.age_classification && row.age_classification in CERT_MIN_AGE ? CERT_MIN_AGE[row.age_classification] : null;
+    return m === null || m <= limit + 1;
+  };
+  const malValues = [null, 'G', 'PG', 'PG-13', 'R', 'R+'];
+  const certValues = [null, 'NR', 'G', 'PG', 'M', 'MA 15+', 'PG-13', 'R', 'R 18+', 'X18+'];
+  for (const mal of malValues) for (const cert of certValues) for (const age of [0, 5, 10, 14, 17]) {
+    const row = { age_classification: mal, certification: cert };
+    const filters = { age_limit: age };
+    if (rs.passesAgeBand(row, filters)) assert.ok(oldPasses(row, filters), `new kept but old rejected: mal=${mal} cert=${cert} age=${age}`);
+  }
+  // Sanity: the new logic is actually STRICTER somewhere (a real cert adds a rejection the MAL-only logic missed).
+  assert.strictEqual(rs.passesAgeBand({ age_classification: null, certification: 'MA 15+' }, { age_limit: 10 }), false);
+  assert.strictEqual(oldPasses({ age_classification: null, certification: 'MA 15+' }, { age_limit: 10 }), true);
+});
+
 ok('engines: registry lists Genesis, resolveFor/availableFor honour age gating (I7) + global enablement (SC-07)', () => {
   const engines = require('../src/engines');
   const settings = require('../src/settings');

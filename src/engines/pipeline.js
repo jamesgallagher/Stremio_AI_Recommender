@@ -90,9 +90,12 @@ async function runEngineBuild(profile, type, engine, ctx, onProgress = () => {})
     for (let i = 0; i < filtered.length; i += 8) {
       const chunk = filtered.slice(i, i + 8);
       await Promise.all(chunk.map(async (c) => {
-        const imdb = await tmdb.imdbFor(tmdbKey, c.type, c.tmdb_id);
+        // SH-01: one request per candidate resolves the tt id AND the real
+        // AU/US movie classification (movies only; series → certification null).
+        const { imdb_id: imdb, certification } = await tmdb.imdbAndCertFor(tmdbKey, c.type, c.tmdb_id);
         if (imdb) {
           c.imdb_id = imdb;
+          c.certification = certification;
           c.poster = tmdb.posterUrl(c.poster); // bare path → full URL
           if (animeMap.isAnime(imdb, c.tmdb_id) && !c.genres.split(',').includes('Anime')) {
             c.genres = c.genres ? `Anime,${c.genres}` : 'Anime';

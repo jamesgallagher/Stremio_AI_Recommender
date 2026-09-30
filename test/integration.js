@@ -2576,12 +2576,14 @@ async function main() {
     settings.updateSettings({ engines: { marquee: true } });
     const reset = marqueeEngine._setTestSeams({ fetchers: mqSeam({ recs: () => [mqItem('mqiso1')] }), chain: [] });
     // Stub the live TMDB calls the (non-preResolved) Genesis series build + pipeline resolve make.
-    const origRecs = tmdb.getRecommendations, origGenreMap = tmdb.getGenreMap, origImdbFor = tmdb.imdbFor;
+    // SH-01: the resolve step now calls imdbAndCertFor (series delegates to imdbFor
+    // internally), so the stub moves to the new entry point.
+    const origRecs = tmdb.getRecommendations, origGenreMap = tmdb.getGenreMap, origImdbAndCertFor = tmdb.imdbAndCertFor;
     tmdb.getRecommendations = async (_k, type, _seedId) => (type === 'series'
       ? [{ type: 'series', tmdb_id: 'mqisoS1', title: 'Rec Series', year: 2024, genre_ids: [18], vote_average: 7, vote_count: 1000, popularity: 5, adult: false, poster: null }]
       : []);
     tmdb.getGenreMap = async () => ({ 18: 'Drama' });
-    tmdb.imdbFor = async (_k, _type, _id) => 'ttmqisoS1';
+    tmdb.imdbAndCertFor = async (_k, _type, _id) => ({ imdb_id: 'ttmqisoS1', certification: null });
     const p = config.addProfile('INT-MQISO');
     try {
       config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'marquee', engine_series: 'genesis' } });
@@ -2597,7 +2599,7 @@ async function main() {
       const seriesRows = rs.getRecommended(p.id, { type: 'series', limit: 100 });
       for (const row of seriesRows) assert.strictEqual(row.engine_id, 'genesis', 'series row stamped genesis');
     } finally {
-      tmdb.getRecommendations = origRecs; tmdb.getGenreMap = origGenreMap; tmdb.imdbFor = origImdbFor;
+      tmdb.getRecommendations = origRecs; tmdb.getGenreMap = origGenreMap; tmdb.imdbAndCertFor = origImdbAndCertFor;
       settings.updateSettings({ engines: { marquee: false } });
       config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id);
       reset();
@@ -2715,6 +2717,299 @@ async function main() {
     } finally {
       settings.updateSettings({ marquee: {} });
     }
+  });
+
+  // ── SH-01 (P5): the real AU/US movie classification reaches the shared age gate ──
+  await it('SH-01: the pipeline resolve fills certification — one TMDB request per candidate', async () => {
+    const pipeline = require('../src/engines/pipeline');
+    const certs = require('../src/certs');
+    offlineAnimeMap();
+    const p = config.addProfile('INT-SH01-RES');
+    // A non-preResolved fixture engine so the shared resolve path runs (the
+    // path every non-Marquee/Glass candidate takes — Genesis's own generate is
+    // not needed to prove the resolve contract).
+    const resolveEngine = {
+      id: 'sh01-resolve', name: 'SH-01 resolve fixture', supportedTypes: ['movie'],
+      capabilities: { providesRankScore: true, preResolved: false, serveOrder: 'affinity', unrestricted: false },
+      requirements: () => ({ ok: true, missing: [] }),
+      generate: async () => [
+        { type: 'movie', tmdb_id: '101', title: 'Film A', year: 2024, genre_ids: [28], poster: '/p1.jpg', rankScore: 2, vote_average: 7, vote_count: 5000, popularity: 10 },
+        { type: 'movie', tmdb_id: '202', title: 'Film B', year: 2023, genre_ids: [28], poster: '/p2.jpg', rankScore: 1, vote_average: 7, vote_count: 4000, popularity: 9 },
+      ],
+    };
+    const fetchLog = [];
+    const origFetch = global.fetch;
+    global.fetch = (url) => {
+      const u = String(url);
+      fetchLog.push(u);
+      if (u.includes('/genre/')) {
+        const genres = u.includes('/genre/movie') ? [{ id: 28, name: 'Action' }] : [];
+        return Promise.resolve({ ok: true, json: async () => ({ genres }) });
+      }
+      if (u.includes('/movie/') && u.includes('append_to_response')) {
+        const id = u.split('/movie/')[1].split('?')[0];
+        return Promise.resolve({ ok: true, json: async () => ({
+          external_ids: { imdb_id: 'ttSH01' + id },
+          release_dates: { results: [
+            { iso_3166_1: 'AU', release_dates: [{ certification: 'M' }] },
+            { iso_3166_1: 'US', release_dates: [{ certification: 'PG-13' }] },
+          ] },
+        }) });
+      }
+      return Promise.reject(new Error('unexpected fetch in SH-01 resolve test: ' + u));
+    };
+    try {
+      assert.strictEqual(certs.strictestCert('M', 'PG-13'), 'M'); // the fixture's expected strictest
+      const r = await pipeline.runEngineBuild(p, 'movie', resolveEngine,
+        { tmdbKey: 'itest-tmdb', mdblistKey: '', settings: settings.getSettings(), filters: {}, log: quiet });
+      assert.strictEqual(r.stored, 2, 'both candidates stored');
+      const appendCalls = fetchLog.filter((u) => u.includes('append_to_response'));
+      assert.strictEqual(appendCalls.length, 2, 'ONE details+append request per candidate');
+      assert.ok(!fetchLog.some((u) => u.includes('/external_ids')), 'no separate external_ids call');
+      for (const row of rs.getRecommended(p.id, { type: 'movie', limit: 100 })) {
+        assert.strictEqual(row.certification, 'M', `strictest(AU M, US PG-13) = M for ${row.tmdb_id}`);
+      }
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id); rs.deleteForProfile(p.id);
+    }
+  });
+
+  await it('SH-01: the shared age gate sends the real cert (MAL band is the fallback)', async () => {
+    const groq = require('../src/services/groq');
+    offlineAnimeMap();
+    const p = config.addProfile('INT-SH01-GATE');
+    config.updateProfile(p.id, { filters: { age_limit: 8 } }); // judged at 9
+    const captured = [];
+    const origAgeGate = groq.ageGate;
+    groq.ageGate = async (type, judgeAge, items) => { captured.push({ type, items }); return new Set(); };
+    try {
+      rs.upsertCandidates(p.id, [
+        { type: 'movie', tmdb_id: 'sh01a', imdb_id: 'ttsh01a', title: 'Film A', year: 2024, primary_genre: 'Action', genres: 'Action', vote_average: 7, vote_count: 1000, affinity: 1, rec_count: 1, popularity: 5, certification: 'M' },
+        { type: 'movie', tmdb_id: 'sh01b', imdb_id: 'ttsh01b', title: 'Anime B', year: 2024, primary_genre: 'Anime', genres: 'Anime', vote_average: 7, vote_count: 1000, affinity: 1, rec_count: 1, popularity: 5 },
+      ]);
+      rs.setAgeClassification(p.id, 'movie', 'sh01b', 'R+'); // MAL band, no real cert
+      await rs.ageGatePool(config.getProfile(p.id), quiet);
+      const movieItems = (captured.find((c) => c.type === 'movie') || {}).items || [];
+      const a = movieItems.find((i) => i.id === 'sh01a');
+      const b = movieItems.find((i) => i.id === 'sh01b');
+      assert.ok(a && b, 'both rows reached the LLM pass');
+      assert.strictEqual(a.certification, 'M', 'the real cert is sent');
+      assert.strictEqual(b.certification, 'R+', 'an anime row with no real cert still sends its MAL band');
+    } finally {
+      groq.ageGate = origAgeGate;
+      config.removeProfile(p.id); rs.deleteForProfile(p.id);
+    }
+  });
+
+  await it('SH-01: upsert COALESCE — a build without a cert never wipes a known one', async () => {
+    const p = config.addProfile('INT-SH01-COALESCE');
+    const base = { type: 'movie', tmdb_id: 'sh01c', imdb_id: 'ttsh01c', title: 'Film C', year: 2024, primary_genre: 'Action', genres: 'Action', vote_average: 7, vote_count: 1000, affinity: 1, rec_count: 1, popularity: 5 };
+    try {
+      rs.upsertCandidates(p.id, [{ ...base, certification: 'M' }]);
+      rs.upsertCandidates(p.id, [{ ...base }]); // a build that couldn't read a cert
+      let row = rs.getRecommended(p.id, { type: 'movie', limit: 100 })[0];
+      assert.strictEqual(row.certification, 'M', 'a null upsert keeps the known cert');
+      rs.upsertCandidates(p.id, [{ ...base, certification: 'PG' }]);
+      row = rs.getRecommended(p.id, { type: 'movie', limit: 100 })[0];
+      assert.strictEqual(row.certification, 'PG', 'a later known cert fills/overwrites');
+    } finally {
+      config.removeProfile(p.id); rs.deleteForProfile(p.id);
+    }
+  });
+
+  await it('SH-01: adult profiles are unchanged — served list identical with and without certs', async () => {
+    const db = require('../src/db');
+    const p = config.addProfile('INT-SH01-ADULT');
+    config.updateProfile(p.id, { filters: {} }); // adult: no age limit
+    const mk = (id, cert) => ({ type: 'movie', tmdb_id: id, imdb_id: 'tt' + id, title: 'T' + id, year: 2024, primary_genre: 'Action', genres: 'Action', vote_average: 7, vote_count: 1000, affinity: 2, rec_count: 1, popularity: 5, certification: cert });
+    try {
+      rs.upsertCandidates(p.id, [mk('ad1', 'M'), mk('ad2', 'R 18+'), mk('ad3', null)]);
+      const withCerts = rs.serveRecommendations(config.getProfile(p.id), 'movie').map((r) => r.id);
+      db.get().prepare('UPDATE recommended SET certification = NULL WHERE profile_id = ?').run(p.id);
+      const withoutCerts = rs.serveRecommendations(config.getProfile(p.id), 'movie').map((r) => r.id);
+      assert.deepStrictEqual(withoutCerts, withCerts, 'adult serve is cert-independent');
+      assert.strictEqual(withCerts.length, 3, 'all three rows served for an adult');
+    } finally {
+      config.removeProfile(p.id); rs.deleteForProfile(p.id);
+    }
+  });
+
+  await it('SH-01: Glass scoreCandidate carries the real cert from the enriched meta onto the candidate (movie only)', async () => {
+    const { scoreCandidate } = require('../src/engines/glass/scoring');
+    const certs = require('../src/certs');
+    const taste = { dims: { genres: { Action: 1 }, decades: {}, languages: {}, runtimeBands: {}, directors: {}, franchises: {}, cast: {}, keywords: {} }, genreMass: { Action: 1 } };
+    const cfg = { weights: { taste_match: 0.5, quality: 0.3 }, taste_dims: { genres: 1, decade: 0, language: 0, runtime: 0, director: 0, franchise: 0, cast: 0, keywords: 0 }, keyword_min_shared: 1 };
+    const mk = (type) => ({ type, tmdb_id: type + '1', title: 'Glass ' + type, sources: ['simkl'] });
+    const meta = (certAU, certUS) => ({ imdb_id: 'ttg1', title: 'Glass Film', year: 2024, genres: ['Action'], poster: null, vote_average: 7, vote_count: 1000, popularity: 10, certAU, certUS });
+    const movie = scoreCandidate(mk('movie'), meta('M', 'PG-13'), taste, cfg, { nowYear: 2026 });
+    assert.strictEqual(movie.certification, certs.strictestCert('M', 'PG-13'), 'movie carries the strictest cert');
+    const preP1 = scoreCandidate(mk('movie'), meta(null, null), taste, cfg, { nowYear: 2026 });
+    assert.strictEqual(preP1.certification, null, 'a cached meta predating P1 → null');
+    const series = scoreCandidate(mk('series'), meta('M', 'PG-13'), taste, cfg, { nowYear: 2026 });
+    assert.strictEqual(series.certification, undefined, 'series: SH-01 out of scope (no cert written)');
+  });
+
+  // ── ME-10 (P5): the offline engine backtest — pure functions + hermetic run ──
+  const bench = require('../src/bench/engineBench');
+  const db = require('../src/db');
+
+  await it('ME-10: pickTargets — the most recent N with a tmdb id; too little history throws', async () => {
+    const mk = (i, tmdb) => ({ tmdb_id: tmdb, watched_at: new Date(Date.parse('2026-06-01T00:00:00Z') + i * 3600e3).toISOString() });
+    // 30 rows (holdout 10 needs 10+20); row 5 has no tmdb_id and must be skipped.
+    const watched = Array.from({ length: 30 }, (_, i) => mk(i, i === 5 ? null : 'w' + i));
+    const targets = bench.pickTargets(watched, 10);
+    assert.deepStrictEqual(targets, ['w0', 'w1', 'w2', 'w3', 'w4', 'w6', 'w7', 'w8', 'w9', 'w10'], 'most recent 10 with a tmdb id (row 5 skipped)');
+    assert.throws(() => bench.pickTargets(watched.slice(0, 29), 10), /not enough history/, '29 rows < 10+20 → throws');
+  });
+
+  await it('ME-10: metrics — exact values over hand-made rows + targets', async () => {
+    const mkRow = (i, trending) => ({
+      tmdb_id: 'r' + String(i).padStart(3, '0'),
+      imdb_id: 'ttr' + String(i).padStart(3, '0'),
+      title: 'Row ' + i, year: 2024, primary_genre: 'Action', genres: 'Action',
+      vote_average: 7, vote_count: 5000, affinity: 120 - i,
+      score_components: JSON.stringify({ sources: [trending ? 'trending' : 'simkl'] }),
+    });
+    const rows = Array.from({ length: 120 }, (_, i) => mkRow(i, i < 10));
+    const targets = ['r005', 'r050', 'r110'];
+    const m = bench.metrics(rows, targets, {}, { selectServe: rs.selectServe, stored: 120, buildSeconds: 1.23 });
+    assert.strictEqual(m.hitAt20, 1, 'only r005 is in the top-20 served');
+    assert.strictEqual(m.hitAt20Fraction, 1 / 3);
+    assert.strictEqual(m.recallAt100, 2 / 3, 'r005 + r050 in the top 100');
+    assert.strictEqual(m.meanRankOfHits, (6 + 51 + 111) / 3, 'mean 1-based rank of the hit targets');
+    assert.strictEqual(m.filterPass, 1.0, 'no filters → every row passes');
+    assert.strictEqual(m.trendingShareAt20, 0.5, '10 of the top-20 served carry the trending source');
+    assert.strictEqual(m.stored, 120);
+    assert.strictEqual(m.buildSeconds, 1.23);
+  });
+
+  await it('ME-10: snapshotStore leaves the live store.db + WAL byte-identical', async () => {
+    const fs = require('fs');
+    const path = require('path');
+    const os = require('os');
+    const crypto = require('crypto');
+    const { DatabaseSync } = require('node:sqlite');
+    const liveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'me10-live-'));
+    let liveDb = null;
+    let benchDir = null;
+    try {
+      // Hold a connection open for the whole test (simulating the server that owns
+      // the live store) so the WAL file exists in the same state before and after
+      // the snapshot — opening a WAL-mode DB otherwise creates an empty -wal.
+      liveDb = new DatabaseSync(path.join(liveDir, 'store.db'));
+      liveDb.exec('PRAGMA journal_mode = WAL;');
+      liveDb.exec('CREATE TABLE watched (profile_id TEXT, tmdb_id TEXT, title TEXT);');
+      liveDb.prepare('INSERT INTO watched VALUES (?, ?, ?)').run('p1', 't1', 'Title 1');
+      liveDb.prepare('INSERT INTO watched VALUES (?, ?, ?)').run('p1', 't2', 'Title 2');
+      fs.writeFileSync(path.join(liveDir, 'profiles.json'), JSON.stringify({ profiles: [] }));
+      const hashFile = (f) => (fs.existsSync(f) ? crypto.createHash('sha256').update(fs.readFileSync(f)).digest('hex') : null);
+      const dbBefore = hashFile(path.join(liveDir, 'store.db'));
+      const walBefore = hashFile(path.join(liveDir, 'store.db-wal'));
+      const snap = bench.snapshotStore(liveDir);
+      benchDir = snap.benchDir;
+      assert.strictEqual(hashFile(path.join(liveDir, 'store.db')), dbBefore, 'live store.db bytes unchanged');
+      assert.strictEqual(hashFile(path.join(liveDir, 'store.db-wal')), walBefore, 'live store.db-wal bytes unchanged');
+      const benchDb = new DatabaseSync(path.join(benchDir, 'store.db'), { readOnly: true });
+      assert.strictEqual(benchDb.prepare('SELECT COUNT(*) AS n FROM watched').get().n, 2, 'snapshot has both rows');
+      benchDb.close();
+      assert.ok(['readOnly', 'default'].includes(snap.readOnlyPath), 'the open path is recorded');
+    } finally {
+      if (liveDb) { try { liveDb.close(); } catch { /* already closed */ } }
+      if (benchDir) fs.rmSync(benchDir, { recursive: true, force: true });
+      fs.rmSync(liveDir, { recursive: true, force: true });
+    }
+  });
+
+  await it('ME-10: no leakage — held-out targets are removed from watched + ratings before the build', async () => {
+    const simklCache = require('../src/engines/marquee/simklCache');
+    const p = config.addProfile('INT-ME10-LEAK');
+    let stubTargets = [];
+    const dispose = engines._register({
+      id: 'bench-stub', name: 'Bench stub', supportedTypes: ['movie'],
+      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+      requirements: () => ({ ok: true, missing: [] }),
+      generate: async () => [
+        ...stubTargets.map((t) => ({ type: 'movie', tmdb_id: t, imdb_id: 'ttstub' + t, title: 'Target ' + t, year: 2024, genres: 'Action', primary_genre: 'Action', vote_average: 8, vote_count: 5000, affinity: 10, rankScore: 10, popularity: 5, poster: null })),
+        ...Array.from({ length: 5 }, (_, i) => ({ type: 'movie', tmdb_id: 'filler' + i, imdb_id: 'ttfiller' + i, title: 'Filler ' + i, year: 2024, genres: 'Drama', primary_genre: 'Drama', vote_average: 7, vote_count: 3000, affinity: 5, rankScore: 5, popularity: 4, poster: null })),
+      ],
+    });
+    try {
+      config.updateProfile(p.id, { filters: {} });
+      const base = Date.parse('2026-06-01T00:00:00Z');
+      for (let i = 0; i < 40; i++) {
+        const tmdb = 'leak' + i;
+        watchedStore.upsertMany(p.id, [{ simkl_id: i + 1, type: 'movie', imdb_id: 'tt' + tmdb, tmdb_id: tmdb, title: 'Leak ' + i, year: 2024, watched_at: new Date(base + i * 3600e3).toISOString() }]);
+      }
+      const watched = watchedStore.getWatched(p.id, { type: 'movie' }); // sorted watched_at DESC
+      const expectedTargets = watched.slice(0, 10).map((r) => r.tmdb_id);
+      stubTargets = expectedTargets;
+      // Held-out ratings: a target's rating must NOT steer the build.
+      simklCache.init();
+      const conn = db.get();
+      const ins = conn.prepare('INSERT INTO marquee_ratings (profile_id, tmdb_id, imdb_id, simkl_id, rating, rated_at) VALUES (?, ?, ?, ?, ?, ?)');
+      for (const t of expectedTargets.slice(0, 5)) ins.run(p.id, t, 'tt' + t, null, 8, Date.now());
+      const results = await bench.runBench({
+        profile: config.getProfile(p.id), engineIds: ['bench-stub'], holdout: 10,
+        deps: { engines, pipeline, rs, watchedStore, db, settings, selectServe: rs.selectServe, log: quiet },
+      });
+      assert.strictEqual(results.engines['bench-stub'].metrics.hitAt20, 10, 'the stub returns every held-out target → all hit');
+      const sets = watchedStore.watchedIdSets(p.id);
+      for (const t of expectedTargets) assert.ok(!sets.tmdb.has(t), 'no target in the watched set: ' + t);
+      for (const t of expectedTargets) {
+        assert.ok(!conn.prepare('SELECT tmdb_id FROM marquee_ratings WHERE profile_id = ? AND tmdb_id = ?').get(p.id, t), 'no marquee_ratings row for target: ' + t);
+      }
+    } finally {
+      dispose();
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id);
+    }
+  });
+
+  await it('ME-10: marqueeSkipSync — the bench never calls Marquee syncRatings', async () => {
+    const marqueeEngine = require('../src/engines/marquee');
+    const p = config.addProfile('INT-ME10-SKIP');
+    let syncCalls = 0;
+    try {
+      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'marquee' } });
+      const base = Date.parse('2026-06-01T00:00:00Z');
+      for (let i = 0; i < 40; i++) {
+        const tmdb = 'skip' + i;
+        watchedStore.upsertMany(p.id, [{ simkl_id: i + 1, type: 'movie', imdb_id: 'tt' + tmdb, tmdb_id: tmdb, title: 'Skip ' + i, year: 2024, watched_at: new Date(base + i * 3600e3).toISOString() }]);
+      }
+      const results = await bench.runBench({
+        profile: config.getProfile(p.id), engineIds: ['marquee'], holdout: 10,
+        deps: {
+          engines, pipeline, rs, watchedStore, db, settings, selectServe: rs.selectServe, log: quiet,
+          ctxExtras: {
+            marqueeChain: [],
+            marqueeFetchers: { syncRatings: async () => { syncCalls += 1; return { ok: true }; }, ...mqSeam({}) },
+          },
+        },
+      });
+      assert.strictEqual(syncCalls, 0, 'syncRatings was NOT called (marqueeSkipSync)');
+      assert.ok(results.engines.marquee, 'the marquee engine ran');
+    } finally {
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id);
+    }
+  });
+
+  await it('ME-10: renderTable — stable output for a fixed results object', async () => {
+    const results = {
+      profile: 'TestProfile', holdout: 10,
+      targets: [{ tmdb_id: 't1', title: 'Title One' }, { tmdb_id: 't2', title: 'Title Two' }],
+      engines: {
+        genesis: { metrics: { hitAt20: 1, hitAt20Fraction: 0.1, recallAt100: 0.2, meanRankOfHits: 5, filterPass: 0.8, trendingShareAt20: null, stored: 100, buildSeconds: 1.5 }, hitTargets: ['t1'] },
+        marquee: { metrics: { hitAt20: 2, hitAt20Fraction: 0.2, recallAt100: 0.5, meanRankOfHits: 10, filterPass: 0.9, trendingShareAt20: 0.5, stored: 90, buildSeconds: 2.0 }, hitTargets: ['t1', 't2'] },
+      },
+    };
+    const out1 = bench.renderTable(results);
+    const out2 = bench.renderTable(results);
+    assert.strictEqual(out1, out2, 'stable output for a fixed results object');
+    assert.ok(out1.includes('TestProfile'), 'profile name');
+    assert.ok(out1.includes('genesis'), 'genesis row');
+    assert.ok(out1.includes('marquee'), 'marquee row');
+    assert.ok(out1.includes('Title One'), 'target title');
+    assert.ok(out1.includes('Title Two'), 'second target title');
   });
 
   // Restore a clean-ish shared state for any process that runs after this one.

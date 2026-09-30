@@ -1,6 +1,7 @@
 // TMDB: meta enrichment for id-based sources (posters, logos, descriptions),
 // the portal's genre vocabulary, and (v6) the per-title recommendation source.
 const governor = require('./governor');
+const certs = require('../certs');
 const API = 'https://api.themoviedb.org/3';
 
 // Portal genre vocabulary (checkbox names). Values are legacy TMDB alias
@@ -481,6 +482,30 @@ async function imdbFor(apiKey, type, tmdbId, log = console) {
   }
 }
 
+// SH-01: the pipeline's resolve step, upgraded to also carry the real AU/US
+// movie classification. MOVIE = ONE request (details with
+// append_to_response=external_ids,release_dates — not external_ids +
+// release_dates, which would be two); the stored certification is the strictest
+// of the two countries' certs (certs.strictestCert). SERIES delegates to
+// imdbFor and gets certification null — series are out of scope for SH-01.
+// On error: { imdb_id: null, certification: null } + a warning, like imdbFor.
+async function imdbAndCertFor(apiKey, type, tmdbId, log = console) {
+  if (type !== 'movie') {
+    return { imdb_id: await imdbFor(apiKey, type, tmdbId, log), certification: null };
+  }
+  try {
+    const data = await get(apiKey, `movie/${tmdbId}`, { append_to_response: 'external_ids,release_dates' });
+    const rd = data.release_dates?.results;
+    return {
+      imdb_id: data.external_ids?.imdb_id || null,
+      certification: certs.strictestCert(certForCountry(rd, 'AU'), certForCountry(rd, 'US')),
+    };
+  } catch (err) {
+    log.warn(`[tmdb] details ${type}/${tmdbId} failed: ${err.message}`);
+    return { imdb_id: null, certification: null };
+  }
+}
+
 // Full poster URL from a bare TMDB poster_path (what getRecommendations stores).
 function posterUrl(posterPath) {
   return posterPath ? `${IMG}/w500${posterPath}` : null;
@@ -559,6 +584,7 @@ module.exports = {
   deepMeta,
   normalizeDeepMeta,
   imdbFor,
+  imdbAndCertFor,
   posterUrl,
   getGenreMap,
   toMeta,
