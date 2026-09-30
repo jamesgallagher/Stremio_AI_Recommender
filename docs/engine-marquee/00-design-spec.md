@@ -317,6 +317,28 @@ enabled for the family only if it beats Genesis on hit@20 for most profiles (Jam
 - One profile × 10 titles is a small sample: a 1–2 hit difference is mostly noise.
 - trending@20 is inflated as a measure: Simkl's list had 500 movies, so most popular titles carry the tag.
 
+### Run 2 — 2026-09-30, one profile, holdout 30, algorithm `marquee-m2` (v7.16.5-beta)
+
+| engine | hit@20 | hit@20r | recall@100 | meanRank | filterPass | trending@20 | stored | build (s) |
+|---|---|---|---|---|---|---|---|---|
+| genesis | 1/30 | 1/13 | 6.7% | 162.8 | 29.3% | n/a | 300 | 33.6 |
+| glass | 1/30 | 1/13 | 23.3% | 52.3 | 39.3% | 80.0% | 211 | 43.6 |
+| **marquee (m2)** | **3/30** | **3/13** | **33.3%** | 68.3 | **100.0%** | 40.0% | 236 | 165.2 |
+
+**Reading:**
+- m2 fixed candidate recall: 10 of the 13 reachable targets reached Marquee's pool (m1: 1 of 10).
+  Its served hits were ranked #4, #8 and #42; five more reachable targets sat at #25–#91.
+- **17 of 30 targets were unreachable under the profile's OWN filters**: 10 by the recency window,
+  3 by the rating floor, 3 by the vote floor, 1 by an excluded genre. No engine can serve those.
+  The profile's filters, not the engine, are now the biggest limit (a settings decision for James).
+- trending@20 fell from 95% to 40%: the capped, taste-gated intake worked.
+- Still one profile: run the bench on the other family profiles before enabling Marquee for them.
+
+**V7 (Nuvio progress, 2026-09-30):** 1,000 progress rows returned (movies + episodes; probably the
+backend's 1,000-row cap), 14 of them movies, all ≥ 90%, aged 3–55 days. Nuvio keeps rows for
+finished films, and no abandoned film was in the window. Marquee pulls every 6 h and keeps what it
+sees, so the abandoned signal builds up going forward.
+
 ## 15. m2 tuning (2026-09-30, after run 1)
 
 `ALGORITHM_VERSION` `marquee-m1` → **`marquee-m2`**. What Genesis did better: it seeds from 150
