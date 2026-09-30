@@ -1603,6 +1603,348 @@ ok('config: Simkl fields present + simkl_auth token sealed at rest (v6)', () => 
   config.removeProfile(p.id);
 });
 
+// ---- Marquee ME-01: shared cert table + FilterEnvelope (pure) ----
+ok('marquee certs: normalizeCert trims/uppercases/whitespace-free, unrated → null', () => {
+  const certs = require('../src/certs');
+  assert.strictEqual(certs.normalizeCert('MA 15+'), 'MA15+');
+  assert.strictEqual(certs.normalizeCert('ma 15+'), 'MA15+');
+  assert.strictEqual(certs.normalizeCert('pg-13'), 'PG-13');
+  assert.strictEqual(certs.normalizeCert(' G '), 'G');
+  assert.strictEqual(certs.normalizeCert('R 18+'), 'R18+');
+  assert.strictEqual(certs.normalizeCert(null), null);
+  assert.strictEqual(certs.normalizeCert(undefined), null);
+  assert.strictEqual(certs.normalizeCert(''), null);
+  assert.strictEqual(certs.normalizeCert('NR'), null);
+  assert.strictEqual(certs.normalizeCert('unrated'), null);
+  assert.strictEqual(certs.normalizeCert('notrated'), null);
+});
+
+ok('marquee certs: min-age table (spec §3.4) + strictest/any/auCeiling', () => {
+  const certs = require('../src/certs');
+  // AU (ACB)
+  assert.strictEqual(certs.certMinAge('AU', 'E'), 0);
+  assert.strictEqual(certs.certMinAge('AU', 'G'), 0);
+  assert.strictEqual(certs.certMinAge('AU', 'PG'), 8);
+  assert.strictEqual(certs.certMinAge('AU', 'M'), 15);
+  assert.strictEqual(certs.certMinAge('AU', 'MA 15+'), 15);
+  assert.strictEqual(certs.certMinAge('AU', 'R 18+'), Infinity);
+  assert.strictEqual(certs.certMinAge('AU', 'X 18+'), Infinity);
+  assert.strictEqual(certs.certMinAge('AU', 'RC'), Infinity);
+  // US (MPA)
+  assert.strictEqual(certs.certMinAge('US', 'G'), 0);
+  assert.strictEqual(certs.certMinAge('US', 'PG'), 8);
+  assert.strictEqual(certs.certMinAge('US', 'PG-13'), 13);
+  assert.strictEqual(certs.certMinAge('US', 'R'), 17);
+  assert.strictEqual(certs.certMinAge('US', 'NC-17'), Infinity);
+  // Unknown → null
+  assert.strictEqual(certs.certMinAge('AU', '12'), null);
+  assert.strictEqual(certs.certMinAge('US', '15'), null);
+  assert.strictEqual(certs.certMinAge('AU', 'NR'), null);
+
+  // strictestMinAge: larger known min age; null only if BOTH unknown
+  assert.strictEqual(certs.strictestMinAge('M', 'PG-13'), 15);
+  assert.strictEqual(certs.strictestMinAge('PG', 'R'), 17);
+  assert.strictEqual(certs.strictestMinAge(null, 'PG-13'), 13);
+  assert.strictEqual(certs.strictestMinAge('R 18+', null), Infinity);
+  assert.strictEqual(certs.strictestMinAge(null, null), null);
+  assert.strictEqual(certs.strictestMinAge('G', 'R'), 17);
+
+  // strictestCert: cert string whose min age is strictest, AU wins a tie
+  assert.strictEqual(certs.strictestCert('M', 'PG-13'), 'M');
+  assert.strictEqual(certs.strictestCert('PG', 'R'), 'R');
+  assert.strictEqual(certs.strictestCert(null, 'PG-13'), 'PG-13');
+  assert.strictEqual(certs.strictestCert('R 18+', null), 'R18+');
+  assert.strictEqual(certs.strictestCert(null, null), null);
+  assert.strictEqual(certs.strictestCert('PG', 'PG'), 'PG'); // tie → AU wins
+
+  // anyCertMinAge: stored cert has no country → AU then US
+  assert.strictEqual(certs.anyCertMinAge('M'), 15);
+  assert.strictEqual(certs.anyCertMinAge('PG-13'), 13);
+  assert.strictEqual(certs.anyCertMinAge('G'), 0);
+  assert.strictEqual(certs.anyCertMinAge('12'), null);
+  assert.strictEqual(certs.anyCertMinAge('NR'), null);
+
+  // auCeilingFor: highest AU cert with minAge <= judgementAge (TMDB spelling)
+  assert.strictEqual(certs.auCeilingFor(0), 'G');
+  assert.strictEqual(certs.auCeilingFor(8), 'PG');
+  assert.strictEqual(certs.auCeilingFor(11), 'PG');
+  assert.strictEqual(certs.auCeilingFor(14), 'PG');
+  assert.strictEqual(certs.auCeilingFor(15), 'MA 15+');
+  assert.strictEqual(certs.auCeilingFor(30), 'MA 15+');
+  assert.strictEqual(certs.auCeilingFor(-1), null);
+});
+
+ok('marquee envelope: MI-1 parity matrix (envelope never looser than selectServe)', () => {
+  const marquee = require('../src/engines/marquee/filters');
+  const recommendationStore = require('../src/recommendationStore');
+  const genreMap = {
+    28: 'Action', 12: 'Adventure', 16: 'Animation', 35: 'Comedy', 80: 'Crime',
+    99: 'Documentary', 18: 'Drama', 10751: 'Family', 14: 'Fantasy', 36: 'History',
+    27: 'Horror', 10402: 'Music', 9648: 'Mystery', 10749: 'Romance',
+    878: 'Science Fiction', 10770: 'TV Movie', 53: 'War', 10752: 'Western',
+  };
+  const configs = {
+    adult:    { min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 0 },
+    minRating:{ min_rating: 7, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 0 },
+    recency:  { min_rating: 0, vote_count_floor: 1000, max_age_years: 10, excluded_genres: [], age_limit: 0 },
+    genres:   { min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: ['Horror', 'Anime'], age_limit: 0 },
+    kids:     { min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 10 },
+    combined: { min_rating: 7, vote_count_floor: 1000, max_age_years: 10, excluded_genres: ['Horror', 'Anime'], age_limit: 0 },
+  };
+  // 40 fixture rows covering every edge of the hard filter.
+  const R = (over) => ({
+    imdb_id: 'tt', imdb_rating: 8.0, vote_average: 8.0, vote_count: 5000,
+    year: 2020, genres: ['Drama'], availability: 'AVAILABLE', certAU: 'PG', certUS: 'PG', ...over,
+  });
+  const rows = [
+    R({}),                                                        // 1  clean base
+    R({ imdb_rating: 7.0, vote_average: 7.0 }),                  // 2  rating exactly at floor
+    R({ imdb_rating: 6.9, vote_average: 6.9 }),                  // 3  rating just below floor
+    R({ imdb_rating: 6.99, vote_average: 6.99 }),                // 4  rating below floor
+    R({ imdb_rating: 0, vote_average: 8.0 }),                   // 5  no imdb, vote 8
+    R({ imdb_rating: 0, vote_average: 6.5 }),                   // 6  no imdb, vote 6.5
+    R({ imdb_rating: 0, vote_average: 0 }),                     // 7  both ratings 0 (unknown)
+    R({ vote_count: 1000 }),                                    // 8  vote_count exactly at floor
+    R({ vote_count: 999 }),                                     // 9  vote_count below floor
+    R({ vote_count: 0 }),                                       // 10 vote_count 0
+    R({ year: null }),                                          // 11 year unknown
+    R({ year: 2016 }),                                          // 12 recency boundary (kept)
+    R({ year: 2015 }),                                          // 13 recency (rejected)
+    R({ year: 2000 }),                                          // 14 recency (rejected)
+    R({ genres: ['Horror'] }),                                  // 15 excluded genre
+    R({ genres: ['Anime'] }),                                   // 16 excluded pseudo-genre
+    R({ availability: 'NOT_YET' }),                             // 17 not streamable
+    R({ availability: 'UNKNOWN' }),                             // 18 unknown availability (kept)
+    R({ availability: null }),                                  // 19 null availability (kept)
+    R({ imdb_id: null }),                                       // 20 not servable
+    R({ certAU: null, certUS: null }),                          // 21 kids: unknown cert
+    R({ certAU: 'PG', certUS: 'PG' }),                          // 22 kids: PG (kept)
+    R({ certAU: 'M', certUS: null }),                           // 23 kids: M (rejected)
+    R({ certAU: 'MA 15+', certUS: null }),                      // 24 kids: MA 15+ (rejected)
+    R({ certAU: null, certUS: 'PG-13' }),                       // 25 kids: PG-13 (rejected)
+    R({ certAU: 'PG', certUS: 'R' }),                           // 26 kids: PG+R strictest 17 (rejected)
+    R({ certAU: 'R 18+', certUS: null }),                       // 27 kids: R 18+ (rejected)
+    R({ certAU: null, certUS: 'G' }),                           // 28 kids: US-only G (kept)
+    R({ certAU: 'M', certUS: 'PG' }),                           // 29 kids: M+PG strictest 15 (rejected)
+    R({ imdb_rating: 0, vote_average: 0, year: 2016 }),         // 30 recency kept + unknown rating
+    R({ genres: ['Horror'], availability: 'NOT_YET' }),         // 31 genre + unavailable
+    R({ vote_count: 0 }),                                       // 32 vote floor rejected
+    R({ year: 2015 }),                                          // 33 recency rejected
+    R({ certAU: 'G', certUS: null }),                           // 34 kids: AU G (kept)
+    R({ certAU: null, certUS: 'PG' }),                          // 35 kids: US PG (kept)
+    R({ certAU: 'M', certUS: 'PG-13' }),                        // 36 kids: M+PG-13 strictest 15 (rejected)
+    R({ year: 2025 }),                                          // 37 recent (kept)
+    R({ imdb_rating: 0, vote_average: 8.5 }),                  // 38 no imdb, vote 8.5
+    R({ certAU: 'RC', certUS: null }),                          // 39 kids: RC (rejected)
+    R({ genres: ['Drama', 'Horror'] }),                         // 40 mixed genres incl. excluded
+  ];
+  const asPoolRow = (row) => ({
+    type: 'movie',
+    imdb_id: row.imdb_id,
+    imdb_rating: row.imdb_rating,
+    vote_average: row.vote_average,
+    vote_count: row.vote_count,
+    year: row.year,
+    genres: (row.genres || []).join(','),
+    primary_genre: (row.genres || [])[0] || null,
+    age_classification: null, // serve's age band is a MAL-band safety net; null → kept
+  });
+  let kept = 0;
+  let rejected = 0;
+  for (const [name, cfg] of Object.entries(configs)) {
+    const env = marquee.compileEnvelope(cfg, { nowYear: 2026, genreMap });
+    for (const row of rows) {
+      const res = env.hardFilter(row);
+      if (res.ok) {
+        kept += 1;
+        const served = recommendationStore.selectServe([asPoolRow(row)], cfg, { nowYear: 2026 });
+        assert.strictEqual(served.length, 1,
+          `MI-1 violated: ${name} kept row ${row.imdb_id} that selectServe dropped`);
+      } else {
+        rejected += 1;
+      }
+    }
+  }
+  assert.ok(kept > 0, 'matrix kept some rows');
+  assert.ok(rejected > 0, 'matrix rejected some rows');
+});
+
+ok('marquee envelope: kids cert filtering (MD-3)', () => {
+  const marquee = require('../src/engines/marquee/filters');
+  const genreMap = { 18: 'Drama', 27: 'Horror' };
+  const base = { imdb_id: 'tt', imdb_rating: 8, vote_average: 8, vote_count: 5000, year: 2020, genres: ['Drama'], availability: 'AVAILABLE' };
+  const kids = marquee.compileEnvelope({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 10 }, { nowYear: 2026, genreMap });
+  assert.strictEqual(kids.kids, true);
+  assert.strictEqual(kids.judgementAge, 11); // age_limit + 1
+  const run = (certAU, certUS) => kids.hardFilter({ ...base, certAU, certUS });
+  // unknown cert → cert_unknown
+  assert.deepStrictEqual(run(null, null), { ok: false, reason: 'cert_unknown' });
+  // PG (8 <= 11) → kept
+  assert.deepStrictEqual(run('PG', 'PG'), { ok: true });
+  // M (15 > 11) → cert_over
+  assert.deepStrictEqual(run('M', null), { ok: false, reason: 'cert_over' });
+  // PG-13 (13 > 11) → cert_over
+  assert.deepStrictEqual(run(null, 'PG-13'), { ok: false, reason: 'cert_over' });
+  // PG + R (strictest 17 > 11) → cert_over
+  assert.deepStrictEqual(run('PG', 'R'), { ok: false, reason: 'cert_over' });
+  // US-only G (0 <= 11) → kept
+  assert.deepStrictEqual(run(null, 'G'), { ok: true });
+  // R 18+ (Infinity) → cert_over
+  assert.deepStrictEqual(run('R 18+', null), { ok: false, reason: 'cert_over' });
+  // an adult envelope (age_limit 0) ignores certs entirely
+  const adult = marquee.compileEnvelope({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 0 }, { nowYear: 2026, genreMap });
+  assert.strictEqual(adult.kids, false);
+  assert.deepStrictEqual(adult.hardFilter({ ...base, certAU: null, certUS: null }), { ok: true });
+});
+
+ok('marquee envelope: discoverParams (spec §3.1)', () => {
+  const marquee = require('../src/engines/marquee/filters');
+  const genreMap = {
+    28: 'Action', 12: 'Adventure', 16: 'Animation', 35: 'Comedy', 80: 'Crime',
+    99: 'Documentary', 18: 'Drama', 10751: 'Family', 14: 'Fantasy', 36: 'History',
+    27: 'Horror', 10402: 'Music', 9648: 'Mystery', 10749: 'Romance',
+    878: 'Science Fiction', 10770: 'TV Movie', 53: 'War', 10752: 'Western',
+  };
+  const compile = (filters) => marquee.compileEnvelope(filters, { nowYear: 2026, genreMap }).discoverParams();
+  // adult default → exactly the three always-on params
+  assert.deepStrictEqual(
+    compile({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 0 }),
+    { include_adult: 'false', with_release_type: '4|5|6', 'vote_count.gte': '1000' });
+  // kids 10 → certification_country AU + certification.lte PG (judgementAge 11 → ceiling PG)
+  assert.deepStrictEqual(
+    compile({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 10 }),
+    { include_adult: 'false', with_release_type: '4|5|6', 'vote_count.gte': '1000', certification_country: 'AU', 'certification.lte': 'PG' });
+  // recency 10 → primary_release_date.gte 2016-01-01
+  assert.deepStrictEqual(
+    compile({ min_rating: 0, vote_count_floor: 1000, max_age_years: 10, excluded_genres: [], age_limit: 0 }),
+    { include_adult: 'false', with_release_type: '4|5|6', 'vote_count.gte': '1000', 'primary_release_date.gte': '2016-01-01' });
+  // excluded genres → without_genres (movie ids only; Anime/Kids have no movie id)
+  assert.deepStrictEqual(
+    compile({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: ['Horror', 'Anime', 'Kids'], age_limit: 0 }),
+    { include_adult: 'false', with_release_type: '4|5|6', 'vote_count.gte': '1000', without_genres: '27' });
+  // min_rating 7 → vote_average.gte 6.5
+  assert.deepStrictEqual(
+    compile({ min_rating: 7, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 0 }),
+    { include_adult: 'false', with_release_type: '4|5|6', 'vote_count.gte': '1000', 'vote_average.gte': '6.5' });
+});
+
+ok('marquee envelope: prefilter reasons in order (spec §3.2)', () => {
+  const marquee = require('../src/engines/marquee/filters');
+  const genreMap = { 18: 'Drama', 27: 'Horror' };
+  const env = marquee.compileEnvelope(
+    { min_rating: 7, vote_count_floor: 1000, max_age_years: 10, excluded_genres: ['Horror'], age_limit: 0 },
+    { nowYear: 2026, genreMap });
+  // each reason, in order
+  assert.deepStrictEqual(env.prefilter({ adult: true, vote_count: 5000, year: 2020, genre_ids: [18] }), { ok: false, reason: 'adult' });
+  assert.deepStrictEqual(env.prefilter({ adult: false, vote_count: 999, year: 2020, genre_ids: [18] }), { ok: false, reason: 'votes' });
+  assert.deepStrictEqual(env.prefilter({ adult: false, vote_count: 5000, year: 2015, genre_ids: [18] }), { ok: false, reason: 'recency' });
+  assert.deepStrictEqual(env.prefilter({ adult: false, vote_count: 5000, year: 2020, genre_ids: [27] }), { ok: false, reason: 'genre' });
+  // rating margin: vote_average 6.1 passes (>= min_rating - 1.0), 5.9 fails
+  assert.deepStrictEqual(env.prefilter({ adult: false, vote_count: 5000, year: 2020, genre_ids: [18], vote_average: 6.1 }), { ok: true });
+  assert.deepStrictEqual(env.prefilter({ adult: false, vote_count: 5000, year: 2020, genre_ids: [18], vote_average: 5.9 }), { ok: false, reason: 'rating' });
+  // order: adult beats votes
+  assert.deepStrictEqual(env.prefilter({ adult: true, vote_count: 0, year: 2010, genre_ids: [27], vote_average: 1 }), { ok: false, reason: 'adult' });
+  // order: votes beats recency
+  assert.deepStrictEqual(env.prefilter({ adult: false, vote_count: 999, year: 2010, genre_ids: [27], vote_average: 1 }), { ok: false, reason: 'votes' });
+});
+
+ok('marquee envelope: stats counters (both stages + copy semantics)', () => {
+  const marquee = require('../src/engines/marquee/filters');
+  const genreMap = { 18: 'Drama', 27: 'Horror' };
+  const env = marquee.compileEnvelope(
+    { min_rating: 7, vote_count_floor: 1000, max_age_years: 10, excluded_genres: ['Horror'], age_limit: 10 },
+    { nowYear: 2026, genreMap });
+  // prefilter rejections (one per reason)
+  env.prefilter({ adult: true });                                  // adult
+  env.prefilter({ vote_count: 999, year: 2020, genre_ids: [18] }); // votes
+  env.prefilter({ vote_count: 5000, year: 2015, genre_ids: [18] }); // recency
+  env.prefilter({ vote_count: 5000, year: 2020, genre_ids: [27] }); // genre
+  env.prefilter({ vote_count: 5000, year: 2020, genre_ids: [18], vote_average: 5.9 }); // rating
+  // hardFilter rejections (one per reason)
+  const H = (over) => ({ imdb_id: 'tt', imdb_rating: 8, vote_average: 8, vote_count: 5000, year: 2020, genres: ['Drama'], availability: 'AVAILABLE', certAU: 'PG', certUS: 'PG', ...over });
+  env.hardFilter(H({ imdb_id: null }));                              // no_imdb
+  env.hardFilter(H({ imdb_rating: 0, vote_average: 6.9 }));          // rating
+  env.hardFilter(H({ year: 2015 }));                                 // recency
+  env.hardFilter(H({ genres: ['Horror'] }));                         // genre
+  env.hardFilter(H({ vote_count: 999 }));                            // votes
+  env.hardFilter(H({ availability: 'NOT_YET' }));                    // unavailable
+  env.hardFilter(H({ certAU: null, certUS: null }));                 // cert_unknown
+  env.hardFilter(H({ certAU: 'M', certUS: null }));                  // cert_over
+  const s = env.stats();
+  assert.deepStrictEqual(s, {
+    adult: 1, votes: 2, recency: 2, genre: 2, rating: 2,
+    no_imdb: 1, unavailable: 1, cert_unknown: 1, cert_over: 1,
+  });
+  // copy semantics: mutating the returned object doesn't affect the envelope
+  s.adult = 999;
+  assert.strictEqual(env.stats().adult, 1);
+});
+
+ok('tmdb: normalizeDeepMeta movie cert/availability + series has no keys (ME-02)', () => {
+  const tmdb = require('../src/services/tmdb');
+  // movie with AU + US certs and a past home release → AVAILABLE
+  const movie = {
+    id: 603, title: 'Inception', release_date: '2010-07-16',
+    genres: [{ id: 18, name: 'Drama' }],
+    keywords: { keywords: [{ name: 'dream' }] },
+    credits: { crew: [{ name: 'N', job: 'Director' }], cast: [{ name: 'A' }, { name: 'B' }] },
+    external_ids: { imdb_id: 'tt1375666' },
+    poster_path: '/p.jpg', vote_average: 8.8, vote_count: 15000, popularity: 5,
+    original_language: 'en', runtime: 148,
+    belongs_to_collection: { id: 123, name: 'C' },
+    overview: 'o',
+    release_dates: { results: [
+      { iso_3166_1: 'AU', release_dates: [{ certification: 'M', release_date: '2010-09-01', type: 3 }, { certification: 'M', release_date: '2010-09-15', type: 4 }] },
+      { iso_3166_1: 'US', release_dates: [{ certification: 'PG-13', release_date: '2010-07-16', type: 3 }] },
+    ] },
+  };
+  const m = tmdb.normalizeDeepMeta(movie, 'movie', 603);
+  assert.strictEqual(m.certAU, 'M');
+  assert.strictEqual(m.certUS, 'PG-13');
+  assert.strictEqual(m.availability, 'AVAILABLE');
+  // theatrical-only → NOT_YET
+  const theatrical = { ...movie, release_dates: { results: [{ iso_3166_1: 'US', release_dates: [{ certification: 'R', release_date: '2010-07-16', type: 3 }] }] } };
+  const t = tmdb.normalizeDeepMeta(theatrical, 'movie', 603);
+  assert.strictEqual(t.availability, 'NOT_YET');
+  assert.strictEqual(t.certUS, 'R');
+  // no release_dates → UNKNOWN + null certs
+  const noRel = { ...movie }; delete noRel.release_dates;
+  const n = tmdb.normalizeDeepMeta(noRel, 'movie', 603);
+  assert.strictEqual(n.availability, 'UNKNOWN');
+  assert.strictEqual(n.certAU, null);
+  assert.strictEqual(n.certUS, null);
+  // series → NO cert/availability keys
+  const series = {
+    id: 1234, name: 'Show', first_air_date: '2020-01-01',
+    genres: [{ id: 18, name: 'Drama' }],
+    keywords: { results: [{ name: 'k' }] },
+    created_by: [{ name: 'C' }],
+    external_ids: { imdb_id: 'tt1' },
+    poster_path: '/s.jpg', vote_average: 8, vote_count: 1000, popularity: 2,
+    original_language: 'en', episode_run_time: [30],
+    networks: [{ name: 'Net' }],
+  };
+  const s = tmdb.normalizeDeepMeta(series, 'series', 1234);
+  assert.ok(!('certAU' in s), 'series has no certAU');
+  assert.ok(!('certUS' in s), 'series has no certUS');
+  assert.ok(!('availability' in s), 'series has no availability');
+});
+
+ok('tmdb: pickCertification unchanged (ME-02 refactor)', () => {
+  const tmdb = require('../src/services/tmdb');
+  // AU + US → AU first
+  assert.strictEqual(tmdb.pickCertification([
+    { iso_3166_1: 'AU', release_dates: [{ certification: 'M' }] },
+    { iso_3166_1: 'US', release_dates: [{ certification: 'PG-13' }] },
+  ], 'movie'), 'M');
+  // US only → US
+  assert.strictEqual(tmdb.pickCertification([{ iso_3166_1: 'US', release_dates: [{ certification: 'PG-13' }] }], 'movie'), 'PG-13');
+  // other only (GB '12') → '12'
+  assert.strictEqual(tmdb.pickCertification([{ iso_3166_1: 'GB', release_dates: [{ certification: '12' }] }], 'movie'), '12');
+  // empty certifications → null
+  assert.strictEqual(tmdb.pickCertification([{ iso_3166_1: 'US', release_dates: [{ certification: '' }] }], 'movie'), null);
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');

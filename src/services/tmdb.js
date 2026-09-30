@@ -310,13 +310,12 @@ async function fullMeta(apiKey, type, imdbId, log = console) {
   };
 }
 
-// TMDB per-title "recommendations" — the v6 candidate source (collaborative,
-// current, no hallucination). Returns lightly-normalised items. type is the
-// SOURCE title's type; recommendations are same-type.
-async function getRecommendations(apiKey, type, tmdbId, { page = 1 } = {}) {
+// Shared item mapping for the TMDB list endpoints (recommendations, similar,
+// discover, trending, collection parts) — ME-02 factors it out of
+// getRecommendations, whose output stays byte-identical.
+function mapListItem(r, type) {
   const isMovie = type === 'movie';
-  const data = await get(apiKey, `${isMovie ? 'movie' : 'tv'}/${tmdbId}/recommendations`, { language: 'en-US', page });
-  return (data.results || []).map((r) => ({
+  return {
     type,
     tmdb_id: String(r.id),
     title: isMovie ? r.title : r.name,
@@ -327,7 +326,57 @@ async function getRecommendations(apiKey, type, tmdbId, { page = 1 } = {}) {
     popularity: r.popularity || 0,
     adult: !!r.adult,                // TMDB's own porn flag
     poster: r.poster_path || null,
-  }));
+  };
+}
+
+// TMDB per-title "recommendations" — the v6 candidate source (collaborative,
+// current, no hallucination). Returns lightly-normalised items. type is the
+// SOURCE title's type; recommendations are same-type.
+async function getRecommendations(apiKey, type, tmdbId, { page = 1 } = {}) {
+  const isMovie = type === 'movie';
+  const data = await get(apiKey, `${isMovie ? 'movie' : 'tv'}/${tmdbId}/recommendations`, { language: 'en-US', page });
+  return (data.results || []).map((r) => mapListItem(r, type));
+}
+
+// ---- Marquee ME-02 (spec §2): the remaining TMDB list endpoints ----
+// All via the existing governed get; same item shape as getRecommendations.
+async function getSimilar(apiKey, tmdbId, { page = 1 } = {}) {
+  const data = await get(apiKey, `movie/${tmdbId}/similar`, { language: 'en-US', page });
+  return (data.results || []).map((r) => mapListItem(r, 'movie'));
+}
+
+// discover/movie with the caller's params (the FilterEnvelope's discoverParams,
+// spec §3.1) passed through untouched.
+async function discoverMovies(apiKey, params, { page = 1 } = {}) {
+  const data = await get(apiKey, 'discover/movie', { language: 'en-US', ...params, page });
+  return (data.results || []).map((r) => mapListItem(r, 'movie'));
+}
+
+// trending/movie/{day|week}, pages 1..pages fetched SEQUENTIALLY. rank is
+// 1-based and continuous across pages (page 2's first item is
+// rank = page1.length + 1) — P3's 1 − ln(rank)/ln(N+1) assumes it. A failed
+// page ends the loop and returns what was gathered so far.
+async function trendingMovies(apiKey, window, pages) {
+  if (window !== 'day' && window !== 'week') {
+    throw new Error(`trendingMovies: unknown window "${window}" (expected 'day' or 'week')`);
+  }
+  const out = [];
+  for (let page = 1; page <= pages; page += 1) {
+    let data;
+    try {
+      data = await get(apiKey, `trending/movie/${window}`, { language: 'en-US', page });
+    } catch { break; } // a failed page ends the loop; return what was gathered
+    const results = data.results || [];
+    for (const r of results) out.push({ ...mapListItem(r, 'movie'), rank: out.length + 1 });
+    if (!results.length) break; // a short page: nothing more to gather
+  }
+  return out;
+}
+
+// collection/{id} parts in the list item shape, plus the raw release_date.
+async function collectionParts(apiKey, collectionId) {
+  const data = await get(apiKey, `collection/${collectionId}`);
+  return (data.parts || []).map((p) => ({ ...mapListItem(p, 'movie'), release_date: p.release_date || null }));
 }
 
 // ---- Glass deep metadata (GE-03) ----
@@ -383,6 +432,15 @@ function normalizeDeepMeta(data, type, tmdbId) {
     collection: isMovie && data.belongs_to_collection
       ? { id: data.belongs_to_collection.id, name: data.belongs_to_collection.name } : null,
     networks: isMovie ? [] : peopleNames(data.networks, 5),
+    // ME-02 (spec §4.5): AU/US certification + home availability from the
+    // release_dates block — MOVIES ONLY. Series deliberately get NO keys: P3
+    // uses "the key is missing" to spot a pre-ME-02 cached movie row, so a
+    // series row must not look fresh or stale by accident.
+    ...(isMovie ? {
+      certAU: certForCountry(data.release_dates?.results, 'AU'),
+      certUS: certForCountry(data.release_dates?.results, 'US'),
+      availability: movieAvailability(data.release_dates?.results), // no block -> 'UNKNOWN'
+    } : {}),
   };
 }
 
@@ -392,9 +450,14 @@ function normalizeDeepMeta(data, type, tmdbId) {
 async function deepMeta(apiKey, type, tmdbId, log = console) {
   try {
     const base = type === 'series' ? `tv/${tmdbId}` : `movie/${tmdbId}`;
+    // ME-02 (spec §4.5): movies append release_dates so certAU/certUS +
+    // availability come from the SAME single request. Series stay unchanged.
+    const append = type === 'movie'
+      ? 'credits,keywords,external_ids,release_dates'
+      : 'credits,keywords,external_ids';
     const data = await get(apiKey, base, {
       language: 'en-US',
-      append_to_response: 'credits,keywords,external_ids',
+      append_to_response: append,
     });
     return normalizeDeepMeta(data, type, tmdbId);
   } catch (err) {
@@ -440,6 +503,16 @@ async function getGenreMap(apiKey) {
   return map;
 }
 
+// First non-empty certification in ONE country's release_dates entry. ME-02
+// factors this out of pickCertification's movie certOf; pickCertification
+// reuses it so its behaviour stays identical.
+function certForCountry(results, cc) {
+  if (!Array.isArray(results)) return null;
+  const entry = results.find((r) => r.iso_3166_1 === cc);
+  const cert = (entry?.release_dates || []).map((d) => d.certification).find((c) => c);
+  return cert || null;
+}
+
 // Pick a certification for the watched-store age column. Australia first (our
 // standard), then US, then any non-empty value.
 function pickCertification(results, kind) {
@@ -447,10 +520,7 @@ function pickCertification(results, kind) {
   const byCountry = (cc) => results.find((r) => r.iso_3166_1 === cc);
   const certOf = (entry) => {
     if (!entry) return null;
-    if (kind === 'movie') {
-      const rd = (entry.release_dates || []).map((d) => d.certification).find((c) => c);
-      return rd || null;
-    }
+    if (kind === 'movie') return certForCountry(results, entry.iso_3166_1);
     return entry.rating || null;
   };
   return certOf(byCountry('AU')) || certOf(byCountry('US')) || (results.map(certOf).find((c) => c) || null);
@@ -480,7 +550,12 @@ module.exports = {
   voteFloor,
   genreAndCert,
   pickCertification,
+  certForCountry,
   getRecommendations,
+  getSimilar,
+  discoverMovies,
+  trendingMovies,
+  collectionParts,
   deepMeta,
   normalizeDeepMeta,
   imdbFor,
