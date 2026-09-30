@@ -1797,6 +1797,39 @@ ok('marquee envelope: kids cert filtering (MD-3)', () => {
   assert.deepStrictEqual(adult.hardFilter({ ...base, certAU: null, certUS: null }), { ok: true });
 });
 
+ok('marquee live-verify: describeRatings/seedIdsFrom nested + flat shapes (F1)', () => {
+  const live = require('./verify-marquee-live');
+  // Nested shape — the real Simkl shape, ids under movie.ids.
+  const nested = {
+    movies: [
+      { user_rating: 9, user_rated_at: '2026-01-01', movie: { title: 'Alpha One', year: 2020, ids: { simkl: 's1', imdb: 'tt1', tmdb: '100' } } },
+      { user_rating: 8, user_rated_at: '2026-01-02', movie: { title: 'Beta Two', year: 2021, ids: { simkl: 's2', imdb: 'tt2', tmdb: '200' } } },
+    ],
+  };
+  const d1 = live.describeRatings(nested);
+  assert.ok(d1.ok, 'nested describeRatings ok');
+  assert.ok(d1.detail.includes('id path: movie.ids'), `nested id path is movie.ids: ${d1.detail}`);
+  assert.ok(d1.detail.includes('tmdb=present'), `nested tmdb present: ${d1.detail}`);
+  assert.ok(d1.detail.includes('imdb=present'), `nested imdb present: ${d1.detail}`);
+  assert.ok(d1.detail.includes('simkl=present'), `nested simkl present: ${d1.detail}`);
+  assert.ok(d1.detail.includes('entry keys:'), `nested entry key list present: ${d1.detail}`);
+  assert.ok(d1.detail.includes('movie keys:'), `nested movie key list present: ${d1.detail}`);
+  assert.ok(d1.detail.includes('rating field "user_rating"'), `nested rating field name: ${d1.detail}`);
+  assert.ok(d1.detail.includes('rated-at "user_rated_at"'), `nested rated-at field name: ${d1.detail}`);
+  assert.deepStrictEqual(live.seedIdsFrom(d1.entries), ['s1', 's2'], 'nested seed ids from movie.ids.simkl');
+  // Flat shape — ids under top-level ids.
+  const flat = [
+    { rating: 7, rated_at: '2026-02-01', ids: { simkl: 'f1', imdb: 'tt3', tmdb: '300' } },
+    { rating: 6, rated_at: '2026-02-02', ids: { simkl: 'f2', imdb: 'tt4', tmdb: '400' } },
+  ];
+  const d2 = live.describeRatings(flat);
+  assert.ok(d2.ok, 'flat describeRatings ok');
+  assert.ok(d2.detail.includes('id path: ids'), `flat id path is ids: ${d2.detail}`);
+  assert.ok(!d2.detail.includes('movie.ids'), `flat id path is not movie.ids: ${d2.detail}`);
+  assert.ok(d2.detail.includes('tmdb=present'), `flat tmdb present: ${d2.detail}`);
+  assert.deepStrictEqual(live.seedIdsFrom(d2.entries), ['f1', 'f2'], 'flat seed ids from ids.simkl');
+});
+
 ok('marquee envelope: discoverParams (spec §3.1)', () => {
   const marquee = require('../src/engines/marquee/filters');
   const genreMap = {
