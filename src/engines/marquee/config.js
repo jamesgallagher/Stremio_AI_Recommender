@@ -45,6 +45,10 @@ const DEFAULTS = {
     recs_max_uncached: 40,
     recs_ttl_days: 30,
     ratings_resolve_cap: 50,
+    // F1 (review round 1): S2-only candidates carry no list payload (pre-score
+    // ~0.067), so pure pre-score truncation starves the collaborative signal.
+    // A reserved slice (10% of lookup_cap) keeps the best of them.
+    collab_reserve: 40,
   },
 
   // ── ME-05/ME-06 (spec §4.4/§4.5/§5/§7/§8) ──

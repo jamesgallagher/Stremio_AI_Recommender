@@ -1908,6 +1908,58 @@ async function main() {
     assert.strictEqual(ctx.stats.kept, candidates.length, 'kept = returned length');
   });
 
+  await it('marquee ME-05: Simkl collaborative reserve (F1) — 960 S1 + 60 S2-only → exactly 40 S2-only survive, multi-seed first', async () => {
+    glassMeta._clear();
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const seeds = Array.from({ length: 40 }, (_, i) => mqSeed('s' + i, { simkl_id: 5000 + i }));
+    // Per-seed S2 lists: 10 multi-seed titles q0..q9 (each in exactly 2 seeds)
+    // + 50 single-seed titles q10..q59 → 60 S2-only candidates total.
+    const s2List = (i) => {
+      const out = [];
+      if (i < 10) out.push({ tmdb_id: 'q' + i, title: 'Q' + i, year: 2020 });
+      if (i > 0 && i <= 10) out.push({ tmdb_id: 'q' + (i - 1), title: 'Q' + (i - 1), year: 2020 });
+      out.push({ tmdb_id: 'q' + (10 + i), title: 'Q' + (10 + i), year: 2020 });
+      if (i < 10) out.push({ tmdb_id: 'q' + (40 + i), title: 'Q' + (40 + i), year: 2020 });
+      return out;
+    };
+    const { f } = mqFetchers({
+      recs: (id) => Array.from({ length: 12 }, (_, j) => mqItem('r' + id + '-' + j)),
+      similar: (id) => Array.from({ length: 12 }, (_, j) => mqItem('s' + id + '-' + j)),
+      simklRecs: (ids) => { const m = new Map(); for (const sid of ids) m.set(sid, s2List(sid - 5000)); return m; },
+    });
+    const ctx = mqCtx(filters);
+    const { candidates } = await mqSources.gatherCandidates({ id: 'p-mq-f1a', name: 'MQF1a', filters }, ctx, {
+      taste: mqTaste, brief: null, briefHash: 'h', seeds, envelope: env, cfg: mqCfgResolved, genreMap: mqGenreMap, fetchers: f, chain: [], log: quiet,
+    });
+    assert.ok(candidates.length <= mqCfgResolved.lookup_cap, '≤ lookup_cap');
+    const s2Only = candidates.filter((c) => c.sources.has('simkl_recs') && !c.sources.has('tmdb_recs') && !c.sources.has('tmdb_similar'));
+    assert.strictEqual(s2Only.length, 40, 'exactly collab_reserve S2-only titles survive');
+    for (let i = 0; i < 10; i += 1) {
+      assert.ok(s2Only.some((c) => c.tmdb_id === 'q' + i), 'multi-seed title q' + i + ' is in the reserve');
+    }
+    assert.strictEqual(ctx.stats.sources.S2_reserved, 40, 'S2_reserved counted');
+  });
+
+  await it('marquee ME-05: Simkl collaborative reserve (F1) — cached meta hydrates genres/votes, pre-score > 0.2 on-taste', async () => {
+    glassMeta._clear();
+    const nowMs = Date.parse('2026-06-01T00:00:00Z');
+    glassMeta.put('movie', 'h1', mqFullMeta('h1', { genres: ['Drama'] }), nowMs);
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const seeds = [mqSeed('s1', { simkl_id: 6000 })];
+    const { f } = mqFetchers({ simklRecs: (ids) => { const m = new Map(); for (const sid of ids) m.set(sid, [{ tmdb_id: 'h1', title: 'H1', year: 2020 }]); return m; } });
+    const ctx = mqCtx(filters);
+    const { candidates } = await mqSources.gatherCandidates({ id: 'p-mq-f1b', name: 'MQF1b', filters }, ctx, {
+      taste: mqTaste, brief: null, briefHash: 'h', seeds, envelope: env, cfg: mqCfgResolved, genreMap: mqGenreMap, fetchers: f, chain: [], log: quiet,
+    });
+    const h1 = candidates.find((c) => c.tmdb_id === 'h1');
+    assert.ok(h1, 'hydrated candidate present');
+    assert.deepStrictEqual(h1.genres, ['Drama'], 'genres hydrated from cached meta');
+    assert.strictEqual(h1.vote_count, 1000, 'vote_count hydrated');
+    assert.ok(h1._preScore > 0.2, 'hydrated pre-score > 0.2 for an on-taste genre');
+  });
+
   await it('marquee ME-05/06: call budget (40 seeds → 40 recs + 40 similar; discover ≤ 16; collection ≤ 10; simklRecs once; deepMeta ≤ 400)', async () => {
     glassMeta._clear();
     const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };

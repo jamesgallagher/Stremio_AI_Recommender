@@ -20,6 +20,7 @@ const simklTrending = require('../../services/simklTrending');
 const llmCache = require('./llmCache');
 const glassCandidates = require('../glass/candidates');
 const glassTasteModel = require('../glass/tasteModel');
+const metaStore = require('../glass/metaStore');
 const features = require('./features');
 
 // The fixed TMDB movie-genre id set (spec §3.1): getGenreMap merges the tv
@@ -285,7 +286,7 @@ async function gatherCandidates(profile, ctx, {
   const watchedTmdb = ctx.watchedIds?.tmdb || new Set();
   const dont = ctx.dont || new Set();
   const pool = [];
-  const srcCounts = { S1: 0, S2: 0, S3: 0, S4: 0, S5: 0, S6: 0, S7: 0 };
+  const srcCounts = { S1: 0, S2: 0, S3: 0, S4: 0, S5: 0, S6: 0, S7: 0, S2_reserved: 0 };
 
   // S1 — TMDB /recommendations + /similar per seed, chunks of 5 (like Glass).
   try {
@@ -448,6 +449,26 @@ async function gatherCandidates(profile, ctx, {
   // vote_count = Infinity and vote_average = 0.
   let merged = dedupePool(pool);
   const raw = srcCounts.S1 + srcCounts.S2 + srcCounts.S3 + srcCounts.S4 + srcCounts.S5 + srcCounts.S6;
+
+  // F1 (review round 1): hydrate S2/LLM-only candidates from the meta cache —
+  // free, no network. They arrive with no list payload (genres: [], votes 0);
+  // where a cached deep meta exists, fill genres/votes so the title pre-scores
+  // normally (and takes the normal prefilter, not the vote+rating exception).
+  {
+    const need = merged.filter((c) => [...c.sources].every((s) => s === 'simkl_recs' || s === 'llm') && !c.genres.length);
+    if (need.length) {
+      const metas = metaStore.getMany('movie', need.map((c) => c.tmdb_id));
+      for (const c of need) {
+        const m = metas.get(c.tmdb_id);
+        if (m) {
+          if (!c.genres.length) c.genres = (m.genres || []).slice();
+          if (!c.vote_average) c.vote_average = m.vote_average || 0;
+          if (!c.vote_count) c.vote_count = m.vote_count || 0;
+        }
+      }
+    }
+  }
+
   merged = merged
     .filter((c) => !watchedTmdb.has(c.tmdb_id))
     .filter((c) => !dont.has(`movie:${c.tmdb_id}`))
@@ -475,8 +496,28 @@ async function gatherCandidates(profile, ctx, {
   for (const c of merged) c._preScore = features.preScore(c, taste, { weekN, dayN });
   const nonExplore = merged.filter((c) => !c.sources.has('exploration'));
   nonExplore.sort((a, b) => (b._preScore - a._preScore) || (a.tmdb_id < b.tmdb_id ? -1 : 1));
-  const mainSlice = nonExplore.slice(0, Math.max(0, cfg.lookup_cap - explore.length));
-  const candidates = [...mainSlice, ...explore];
+
+  // F1 (review round 1): the Simkl collaborative reserve. S2-only candidates
+  // pre-score ~0.067 (no list payload), so a pure pre-score truncation would
+  // starve the collaborative signal (spec §2 pillar). Take up to
+  // cfg.simkl.collab_reserve candidates whose sources include simkl_recs and
+  // that do NOT already rank inside the main slice, ranked by distinct-seed
+  // count, then max seed weight, then tmdb_id. The 'collab_reserve' tag is
+  // deliberately NOT counted by features.countedGroups (no consensus change).
+  const mainCap = Math.max(0, cfg.lookup_cap - explore.length);
+  const maxSeedWeight = (c) => { let m = null; for (const [, w] of c._seedWeights) if (m == null || w > m) m = w; return m; };
+  const collab = nonExplore
+    .slice(mainCap)
+    .filter((c) => c.sources.has('simkl_recs'))
+    .sort((a, b) => (b.seeds.size - a.seeds.size) || ((maxSeedWeight(b) || 0) - (maxSeedWeight(a) || 0)) || (a.tmdb_id < b.tmdb_id ? -1 : 1))
+    .slice(0, cfg.simkl.collab_reserve);
+  for (const c of collab) c.sources.add('collab_reserve');
+  srcCounts.S2_reserved = collab.length;
+
+  // Main slice = the top (lookup_cap − explore − collab) by pre-score; total
+  // stays ≤ lookup_cap (MI-5 unchanged).
+  const mainSlice = nonExplore.slice(0, Math.max(0, cfg.lookup_cap - explore.length - collab.length));
+  const candidates = [...mainSlice, ...collab, ...explore];
   const kept = candidates.length;
 
   if (ctx.stats) {
