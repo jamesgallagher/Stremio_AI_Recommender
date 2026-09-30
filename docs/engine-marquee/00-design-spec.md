@@ -294,3 +294,6 @@ replaced with "movie 1–3" (the repo is public).
 - **API-only Tier-2.** `settings.marquee` is wired through the settings/portal write path
   (replace-whole, like Glass) but there is NO UI surface yet — the admin edits it via
   `PUT /settings`.
+
+## 14. Backtest results (ME-10)
+_Pending — James runs `node --experimental-sqlite scripts/bench-engines.js "<profile>" --json` for each real profile and pastes the tables here. Marquee is enabled for the family only if it beats Genesis on hit@20 for most profiles (James decides)._
