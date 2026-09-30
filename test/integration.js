@@ -2398,6 +2398,325 @@ async function main() {
     assert.strictEqual(envelopeStats.no_imdb, 1, 'no_imdb included in the returned envelopeStats');
   });
 
+  // ── Marquee ME-09 (P4): descriptor + registry + Tier-2 admin config ──
+  const marqueeEngine = require('../src/engines/marquee');
+  const jobsMod = require('../src/jobs');
+  const portalMod = require('../src/portal');
+
+  // Hermetic seam for generate(): every fetcher injectable, no network. The
+  // genreMap seam keeps generate() off the live tmdb.getGenreMap.
+  const mqSeam = (over = {}) => ({
+    recs: async (id) => (over.recs ? over.recs(id) : []),
+    similar: async (id) => (over.similar ? over.similar(id) : []),
+    discover: async (params, page) => (over.discover ? over.discover(params, page) : []),
+    collection: async (id) => (over.collection ? over.collection(id) : []),
+    trendingWeek: async () => (over.trendingWeek || []),
+    trendingDay: async () => (over.trendingDay || []),
+    simklTrending: async () => (over.simklTrending || []),
+    simklRecs: async (ids) => (over.simklRecs ? over.simklRecs(ids) : new Map()),
+    chat: async (chain, messages, opts) => (over.chat ? over.chat(chain, messages, opts) : '[]'),
+    resolve: async (title, year) => (over.resolve ? over.resolve(title, year) : null),
+    deepMeta: async (_apiKey, _type, id) => (over.deepMeta ? over.deepMeta(id) : mqFullMeta(id)),
+    imdbRatings: async (ids) => new Map(),
+    genreMap: async () => mqGenreMap,
+  });
+
+  // Drive the portal's PUT /settings handler directly (no HTTP).
+  const portalPutSettings = (body) => {
+    const isPut = (m) => (Array.isArray(m) ? m.includes('put') : !!m.put);
+    const layer = portalMod.router.stack.find(
+      (l) => l.route && l.route.path === '/settings' && isPut(l.route.methods),
+    );
+    const res = fakeRes();
+    layer.handle({ body, method: 'PUT' }, res);
+    return res.body;
+  };
+
+  // Wait for a rebuild job (ensureBuilt → jobs.enqueue → buildPool) to settle.
+  async function waitRebuildJob(pid, timeoutMs = 10000) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeoutMs) {
+      const s = jobsMod.snapshot(pid);
+      if (s && (s.state === 'done' || s.state === 'error')) return s;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    throw new Error('rebuild job did not settle in time');
+  }
+
+  await it('ME-09: empty — no watched history → empty output; series type → empty', async () => {
+    const profile = { id: 'p-mqempty', name: 'MQEMPTY', filters: {} };
+    const ctx = {
+      tmdbKey: 'k', mdblistKey: '', settings: {},
+      filters: { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 },
+      log: quiet, watchedIds: { tmdb: new Set(), imdb: new Set() }, dont: new Set(), stats: {},
+      marqueeSkipSync: true, marqueeFetchers: mqSeam(), marqueeChain: [],
+    };
+    assert.deepStrictEqual(await marqueeEngine.generate(profile, 'movie', ctx, () => {}), [], 'no seeds → no candidates → empty');
+    assert.deepStrictEqual(await marqueeEngine.generate(profile, 'series', ctx, () => {}), [], 'series type → empty (movie-only)');
+  });
+
+  await it('ME-09: requirements — Simkl missing → movie skipped, existing rows kept', async () => {
+    const p = config.addProfile('INT-MQREQ');
+    try {
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', engine_series: 'genesis' } });
+      const profile = config.getProfile(p.id);
+      // No simkl_auth → the requirement is unmet (TMDB key is global, present).
+      assert.deepStrictEqual(marqueeEngine.requirements(profile), { ok: false, missing: ['Simkl connection'] });
+      // One existing movie row that a skip must NOT wipe.
+      rs.upsertCandidates(p.id, [{ type: 'movie', tmdb_id: 'mqreq1', imdb_id: 'ttmqreq1', title: 'Existing', year: 2020, vote_average: 7, vote_count: 1000, affinity: 0.5, rec_count: 1, popularity: 5, engine_id: 'marquee' }]);
+      assert.strictEqual(rs.countRecommended(p.id), 1, 'one pre-seeded movie row');
+      settings.updateSettings({ engines: { marquee: true } });
+      const r = await rs.buildRecommendations(config.getProfile(p.id), quiet);
+      assert.strictEqual(r.movie.skipped, true, 'movie skipped (requirements unmet)');
+      assert.strictEqual(r.movie.engine, 'marquee', 'the skipped engine is marquee');
+      assert.deepStrictEqual(r.movie.missing, ['Simkl connection'], 'reports the missing requirement');
+      assert.strictEqual(rs.countRecommended(p.id), 1, 'a skip never wipes the existing slice');
+    } finally {
+      settings.updateSettings({ engines: { marquee: false } });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id);
+    }
+  });
+
+  await it('ME-09 CONFORMANCE SC-07: registered + disabled by default; enable → resolve', async () => {
+    assert.ok(engines.has('marquee'), 'marquee is registered');
+    const p = config.addProfile('INT-MQSC07');
+    try {
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', engine_series: 'marquee' } });
+      const profile = config.getProfile(p.id);
+      // Disabled (default): not offered, movie + series floor to genesis.
+      assert.ok(!engines.availableFor(profile, 'movie').some((e) => e.id === 'marquee'), 'disabled → not offered');
+      assert.strictEqual(engines.resolveFor(profile, 'movie').id, 'genesis', 'disabled → movie floors to genesis');
+      assert.strictEqual(engines.resolveFor(profile, 'series').id, 'genesis', 'series → genesis (type unsupported)');
+      // Enabled: movie resolves to marquee; series still genesis (type unsupported).
+      settings.updateSettings({ engines: { marquee: true } });
+      assert.strictEqual(engines.resolveFor(profile, 'movie').id, 'marquee', 'enabled → movie resolves to marquee');
+      assert.strictEqual(engines.resolveFor(profile, 'series').id, 'genesis', 'enabled → series still genesis');
+      assert.ok(engines.availableFor(profile, 'movie').some((e) => e.id === 'marquee'), 'enabled → offered');
+    } finally {
+      settings.updateSettings({ engines: { marquee: false } });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id);
+    }
+  });
+
+  await it('ME-09 CONFORMANCE I7: age-gated (unrestricted:false); offered to kids when enabled', async () => {
+    assert.strictEqual(marqueeEngine.capabilities.unrestricted, false, 'Marquee is age-gated (I7)');
+    const p = config.addProfile('INT-MQI7');
+    try {
+      config.updateProfile(p.id, { filters: { age_limit: 12, engine_movie: 'marquee' } });
+      const profile = config.getProfile(p.id);
+      // Disabled: not offered (SC-07), even though it is age-gated.
+      assert.ok(!engines.availableFor(profile, 'movie').some((e) => e.id === 'marquee'), 'disabled → not offered to kids');
+      // Enabled: offered — it is age-gated, so a kids profile may choose it.
+      settings.updateSettings({ engines: { marquee: true } });
+      assert.ok(engines.availableFor(profile, 'movie').some((e) => e.id === 'marquee'), 'enabled → offered to kids (age-gated)');
+    } finally {
+      settings.updateSettings({ engines: { marquee: false } });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id);
+    }
+  });
+
+  await it('ME-09 CONFORMANCE I1: the shared age gate (not the engine) vetoes an over-band title (kids)', async () => {
+    offlineAnimeMap();
+    const p = config.addProfile('INT-MQI1');
+    const reset = marqueeEngine._setTestSeams({
+      fetchers: mqSeam({
+        recs: () => [mqItem('mqi1a'), mqItem('mqi1b'), mqItem('mqi1c')],
+        deepMeta: (id) => mqFullMeta(id, { certAU: 'G', certUS: 'PG' }),
+      }),
+      chain: [],
+    });
+    const prev = store.loadAgeVerdicts();
+    try {
+      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { age_limit: 8, engine_movie: 'marquee', engine_series: 'genesis' } });
+      watchedStore.upsertMany(p.id, [
+        { simkl_id: 1, type: 'movie', imdb_id: 'ttmqi1w', tmdb_id: 'mqi1w', title: 'Watched', year: 2024, watched_at: '2026-05-01T00:00:00Z' },
+      ]);
+      // Verdict cache (judgementAge = 8 + 1 = 9): veto mqi1b, keep the other two.
+      store.saveAgeVerdicts({
+        [verdictKey('movie', 9, 'mqi1a')]: true,
+        [verdictKey('movie', 9, 'mqi1b')]: false,
+        [verdictKey('movie', 9, 'mqi1c')]: true,
+      });
+      settings.updateSettings({ engines: { marquee: true } });
+      await rs.buildPool(config.getProfile(p.id), quiet);
+      const pool = rs.getRecommended(p.id, { type: 'movie', limit: 100 }).map((x) => x.tmdb_id);
+      assert.ok(!pool.includes('mqi1b'), 'the over-band title is removed from the pool by the shared gate');
+      assert.ok(pool.includes('mqi1a') && pool.includes('mqi1c'), 'the in-band titles remain');
+      const served = rs.serveRecommendations(config.getProfile(p.id), 'movie').map((m) => m.id);
+      assert.ok(!served.includes('ttmqi1b'), 'and never served to the kid');
+    } finally {
+      store.saveAgeVerdicts(prev);
+      settings.updateSettings({ engines: { marquee: false } });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id);
+      reset();
+    }
+  });
+
+  await it('ME-09 CONFORMANCE I4: the engine never writes imdb_rating (pipeline owns the column)', async () => {
+    const p = config.addProfile('INT-MQI4');
+    try {
+      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'marquee', engine_series: 'genesis' } });
+      watchedStore.upsertMany(p.id, [
+        { simkl_id: 1, type: 'movie', imdb_id: 'ttmqi4w', tmdb_id: 'mqi4w', title: 'Watched', year: 2024, watched_at: '2026-05-01T00:00:00Z' },
+      ]);
+      const ctx = {
+        tmdbKey: 'k', mdblistKey: '', settings: {}, filters: config.getProfile(p.id).filters, log: quiet,
+        marqueeSkipSync: true, marqueeFetchers: mqSeam({ recs: () => [mqItem('mqi4a'), mqItem('mqi4b')] }), marqueeChain: [],
+      };
+      const r = await pipeline.runEngineBuild(config.getProfile(p.id), 'movie', marqueeEngine, ctx, () => {});
+      assert.ok(r.stored >= 2, 'two candidates stored');
+      const rows = rs.getRecommended(p.id, { type: 'movie', limit: 100 });
+      for (const row of rows) assert.strictEqual(row.imdb_rating, null, 'imdb_rating is never written by the engine');
+    } finally {
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id);
+    }
+  });
+
+  await it('ME-09: per-type isolation — movie via Marquee, series via Genesis', async () => {
+    settings.updateSettings({ engines: { marquee: true } });
+    const reset = marqueeEngine._setTestSeams({ fetchers: mqSeam({ recs: () => [mqItem('mqiso1')] }), chain: [] });
+    // Stub the live TMDB calls the (non-preResolved) Genesis series build + pipeline resolve make.
+    const origRecs = tmdb.getRecommendations, origGenreMap = tmdb.getGenreMap, origImdbFor = tmdb.imdbFor;
+    tmdb.getRecommendations = async (_k, type, _seedId) => (type === 'series'
+      ? [{ type: 'series', tmdb_id: 'mqisoS1', title: 'Rec Series', year: 2024, genre_ids: [18], vote_average: 7, vote_count: 1000, popularity: 5, adult: false, poster: null }]
+      : []);
+    tmdb.getGenreMap = async () => ({ 18: 'Drama' });
+    tmdb.imdbFor = async (_k, _type, _id) => 'ttmqisoS1';
+    const p = config.addProfile('INT-MQISO');
+    try {
+      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'marquee', engine_series: 'genesis' } });
+      watchedStore.upsertMany(p.id, [
+        { simkl_id: 1, type: 'movie', imdb_id: 'ttmqisowm', tmdb_id: 'mqisowm', title: 'Watched Movie', year: 2024, watched_at: '2026-05-01T00:00:00Z' },
+        { simkl_id: 2, type: 'series', imdb_id: 'ttmqisows', tmdb_id: 'mqisows', title: 'Watched Series', year: 2024, watched_at: '2026-05-01T00:00:00Z' },
+      ]);
+      const r = await rs.buildPool(config.getProfile(p.id), quiet);
+      assert.deepStrictEqual(r.engines, { movie: 'marquee', series: 'genesis' }, 'per-type engine dispatch');
+      const movieRows = rs.getRecommended(p.id, { type: 'movie', limit: 100 });
+      assert.ok(movieRows.length >= 1, 'a movie row was produced');
+      for (const row of movieRows) assert.strictEqual(row.engine_id, 'marquee', 'movie row stamped marquee');
+      const seriesRows = rs.getRecommended(p.id, { type: 'series', limit: 100 });
+      for (const row of seriesRows) assert.strictEqual(row.engine_id, 'genesis', 'series row stamped genesis');
+    } finally {
+      tmdb.getRecommendations = origRecs; tmdb.getGenreMap = origGenreMap; tmdb.imdbFor = origImdbFor;
+      settings.updateSettings({ engines: { marquee: false } });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id);
+      reset();
+    }
+  });
+
+  await it('ME-09: end-to-end filter guarantee — exactly list_size passers reach the served list', async () => {
+    offlineAnimeMap();
+    const filters = { min_rating: 7, max_age_years: 10, age_limit: 10, excluded_genres: ['Horror'], list_size: 20 };
+    const deepMeta = (id) => {
+      const n = Number(id.slice(4));
+      switch (n) {
+        case 1: return mqFullMeta(id, { genres: ['Action'], primary_genre: 'Action', certAU: 'G', certUS: 'PG' });
+        case 2: return mqFullMeta(id, { genres: ['Drama'], primary_genre: 'Drama', certAU: 'PG', certUS: 'PG' });
+        case 3: return mqFullMeta(id, { genres: ['Science Fiction'], primary_genre: 'Science Fiction', certAU: 'PG', certUS: 'PG' });
+        case 4: return mqFullMeta(id, { genres: ['Animation'], primary_genre: 'Animation', certAU: 'G', certUS: 'PG' });
+        case 5: return mqFullMeta(id, { vote_average: 6.5, certAU: 'G', certUS: 'PG' });
+        case 6: return mqFullMeta(id, { year: 2010, certAU: 'G', certUS: 'PG' });
+        case 7: return mqFullMeta(id, { genres: ['Horror'], primary_genre: 'Horror', certAU: 'M', certUS: 'R' });
+        case 8: return mqFullMeta(id, { vote_count: 100, certAU: 'G', certUS: 'PG' });
+        case 9: return mqFullMeta(id, { availability: 'NOT_YET', certAU: 'G', certUS: 'PG' });
+        case 10: return mqFullMeta(id, { certAU: null, certUS: null });
+        case 11: return mqFullMeta(id, { certAU: 'R18+', certUS: 'R' });
+        default: return mqFullMeta(id, { certAU: 'G', certUS: 'PG' });
+      }
+    };
+    const recs = (seedId) => [
+      mqItem(seedId + '1'), mqItem(seedId + '2', { genre_ids: [18] }), mqItem(seedId + '3', { genre_ids: [878] }),
+      mqItem(seedId + '4', { genre_ids: [16] }), mqItem(seedId + '5'), mqItem(seedId + '6', { year: 2010 }),
+      mqItem(seedId + '7', { genre_ids: [27] }), mqItem(seedId + '8', { vote_count: 100 }),
+      mqItem(seedId + '9'), mqItem(seedId + '10'), mqItem(seedId + '11'), mqItem(seedId + '12', { adult: true }),
+    ];
+    const p = config.addProfile('INT-MQE2E');
+    const reset = marqueeEngine._setTestSeams({ fetchers: mqSeam({ recs, deepMeta }), chain: [] });
+    const prev = store.loadAgeVerdicts();
+    try {
+      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { ...filters, engine_movie: 'marquee', engine_series: 'genesis' } });
+      const seeds = ['mqe1', 'mqe2', 'mqe3', 'mqe4', 'mqe5'];
+      watchedStore.upsertMany(p.id, seeds.map((s, i) => ({ simkl_id: i + 1, type: 'movie', imdb_id: 'tt' + s, tmdb_id: s, title: 'Seed ' + s, year: 2024, watched_at: '2026-05-01T00:00:00Z' })));
+      // The 20 passers (n1–n4 per seed): verdict true for each (judgementAge = 10 + 1 = 11).
+      const passers = [];
+      for (const s of seeds) for (const n of ['1', '2', '3', '4']) passers.push(s + n);
+      const verdicts = {};
+      for (const id of passers) verdicts[verdictKey('movie', 11, id)] = true;
+      store.saveAgeVerdicts(verdicts);
+      settings.updateSettings({ engines: { marquee: true } });
+      await rs.buildPool(config.getProfile(p.id), quiet);
+      const pool = rs.getRecommended(p.id, { type: 'movie', limit: 100 }).map((x) => x.tmdb_id);
+      assert.deepStrictEqual(pool.sort(), [...passers].sort(), 'the pool is exactly the 20 passers');
+      const served = rs.serveRecommendations(config.getProfile(p.id), 'movie');
+      assert.strictEqual(served.length, 20, 'served exactly list_size');
+      for (const m of served) assert.ok(passers.includes(m.id.slice(2)), 'every served id is a passer');
+    } finally {
+      store.saveAgeVerdicts(prev);
+      settings.updateSettings({ engines: { marquee: false } });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id);
+      reset();
+    }
+  });
+
+  await it('ME-09: Tier-2 admin config change rebuilds only the Marquee movie slice (parallel to Glass)', async () => {
+    settings.updateSettings({ engines: { marquee: true, glass: true }, marquee: {} });
+    const reset = marqueeEngine._setTestSeams({ fetchers: mqSeam({ recs: () => [mqItem('mqt2a'), mqItem('mqt2b')] }), chain: [] });
+    const pMq = config.addProfile('INT-MQT2-MQ');
+    const pGl = config.addProfile('INT-MQT2-GL');
+    try {
+      config.updateProfile(pMq.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'marquee', engine_series: 'genesis' } });
+      config.updateProfile(pGl.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'glass', engine_series: 'genesis' } });
+      watchedStore.upsertMany(pMq.id, [
+        { simkl_id: 1, type: 'movie', imdb_id: 'ttmqt2w', tmdb_id: 'mqt2w', title: 'Watched', year: 2024, watched_at: '2026-05-01T00:00:00Z' },
+      ]);
+      // A pre-existing Glass movie row + built_at that the Marquee rebuild must NOT touch.
+      rs.upsertCandidates(pGl.id, [{ type: 'movie', tmdb_id: 'mqt2g1', imdb_id: 'ttmqt2g1', title: 'Glass Row', year: 2024, vote_average: 8, vote_count: 1000, affinity: 0.9, rec_count: 2, popularity: 5, engine_id: 'glass' }]);
+      rs.setBuiltAt(pGl.id);
+      const glassBuiltAtBefore = rs.getBuiltAt(pGl.id);
+      // A real Tier-2 change ({} → { franchise_cap: 1 }) fans out a Marquee rebuild only.
+      portalPutSettings({ marquee: { franchise_cap: 1 } });
+      const snap = await waitRebuildJob(pMq.id);
+      assert.strictEqual(snap.state, 'done', 'the Marquee rebuild job settled');
+      assert.deepStrictEqual(settings.getSettings().marquee, { franchise_cap: 1 }, 'the Tier-2 config is persisted');
+      const mqRows = rs.getRecommended(pMq.id, { type: 'movie', limit: 100 });
+      assert.ok(mqRows.length >= 1, 'the Marquee movie slice was rebuilt');
+      for (const row of mqRows) assert.strictEqual(row.engine_id, 'marquee');
+      // The Glass profile is untouched: its row + built_at survive.
+      const glRows = rs.getRecommended(pGl.id, { type: 'movie', limit: 100 });
+      assert.ok(glRows.some((r) => r.tmdb_id === 'mqt2g1'), 'the Glass row is intact');
+      assert.strictEqual(rs.getBuiltAt(pGl.id), glassBuiltAtBefore, 'the Glass built_at is untouched');
+      // A second identical save is a no-op: no rebuild, rows + built_at unchanged.
+      const mqBefore = rs.getRecommended(pMq.id, { type: 'movie', limit: 100 }).map((x) => `${x.tmdb_id}:${x.affinity.toFixed(4)}`);
+      const mqBuiltAtBefore = rs.getBuiltAt(pMq.id);
+      portalPutSettings({ marquee: { franchise_cap: 1 } });
+      await new Promise((r) => setTimeout(r, 200));
+      const mqAfter = rs.getRecommended(pMq.id, { type: 'movie', limit: 100 }).map((x) => `${x.tmdb_id}:${x.affinity.toFixed(4)}`);
+      assert.deepStrictEqual(mqAfter, mqBefore, 'no rebuild on an identical save');
+      assert.strictEqual(rs.getBuiltAt(pMq.id), mqBuiltAtBefore, 'built_at unchanged on an identical save');
+    } finally {
+      settings.updateSettings({ engines: { marquee: false, glass: false }, marquee: {} });
+      config.removeProfile(pMq.id); rs.deleteForProfile(pMq.id); watchedStore.deleteForProfile(pMq.id);
+      config.removeProfile(pGl.id); rs.deleteForProfile(pGl.id);
+      reset();
+    }
+  });
+
+  await it('ME-09: Tier-2 settings persistence — settings.marquee round-trips; missing blob → {}', async () => {
+    const fs = require('fs');
+    const path = require('path');
+    try {
+      settings.updateSettings({ marquee: { franchise_cap: 1, llm_fit: { batch: 30 } } });
+      assert.deepStrictEqual(settings.getSettings().marquee, { franchise_cap: 1, llm_fit: { batch: 30 } }, 'round-trips');
+      // Delete the blob from disk; a reload must yield {} (never throw).
+      const raw = JSON.parse(fs.readFileSync(path.join(process.env.DATA_DIR, 'settings.json'), 'utf8'));
+      delete raw.marquee;
+      fs.writeFileSync(path.join(process.env.DATA_DIR, 'settings.json'), JSON.stringify(raw));
+      assert.deepStrictEqual(settings.getSettings().marquee, {}, 'missing blob → {}');
+    } finally {
+      settings.updateSettings({ marquee: {} });
+    }
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();

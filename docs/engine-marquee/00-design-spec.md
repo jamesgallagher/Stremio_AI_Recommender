@@ -1,6 +1,6 @@
 # Marquee Engine — Technical Design Spec
 
-**Version:** 0.1 · **Status:** DESIGN ONLY (no code, not registered)
+**Version:** 0.2 · **Status:** BUILT (MVP) — registered, globally disabled
 **Kind:** a *candidate-producer* engine, `supportedTypes: ['movie']`
 **Depends on:** [`../engine-abstraction/00-overview.md`](../engine-abstraction/00-overview.md)
 (the seam), [`../engine-abstraction/CONFORMANCE.md`](../engine-abstraction/CONFORMANCE.md)
@@ -280,3 +280,17 @@ replaced with "movie 1–3" (the repo is public).
 | L6 | `with_release_type=4\|5\|6` still let 1 of 20 `NOT_YET` titles through. | The discover param is a hint, not a guarantee. The hard filter's `availability === 'NOT_YET'` check (§3.3) is required. |
 | L7 | Trending pages are 20 items; week 5 pages = 100, day 2 pages = 40. | `weekN = 100`, `dayN = 40` for the trending formula (§7). |
 | L8 | The movie append call returns all four blocks in one request, with AU and US certs. | Confirms §2's cost model and ME-02's deep-meta change. |
+
+---
+
+## 13. Build notes (P4 MVP)
+- **Neutral fit below the cap.** Rows outside the top `llm_fit.candidate_cap` (250) get a
+  neutral `llm_fit = 0.5` (fit 5) — never a penalty, so the feature set is uniform and the
+  renormalized weights stay meaningful.
+- **Fixed shortfall log format.** `shapeOutput` logs exactly
+  `[marquee] <profile>: shortfall <n>/<target> — blockers: <k1> <v1>, <k2> <v2>, <k3> <v3>, <k4> <v4>`
+  (the 4 largest non-zero envelope counters, descending; `blockers: none recorded` when none),
+  so an operator can read the dominant blocker at a glance.
+- **API-only Tier-2.** `settings.marquee` is wired through the settings/portal write path
+  (replace-whole, like Glass) but there is NO UI surface yet — the admin edits it via
+  `PUT /settings`.

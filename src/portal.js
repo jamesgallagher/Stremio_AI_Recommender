@@ -746,6 +746,19 @@ function rebuildGlassProfiles() {
   }
 }
 
+// ME-09: a Tier-2 Marquee config change (settings.marquee) is BUILD-AFFECTING —
+// the same GD-6 pattern as Glass, but MOVIE ONLY (Marquee is a movie engine).
+// Deliberately a parallel function, not a refactor of Glass's: the two engines'
+// rebuild paths stay independent (no shared factor to drift).
+function rebuildMarqueeProfiles() {
+  for (const p of config.listProfiles()) {
+    if (require('./engines').resolveFor(p, 'movie').id !== 'marquee') continue;
+    recommendationStore.clearType(p.id, 'movie');
+    recommendationStore.ensureBuilt(p)
+      .catch((err) => console.warn(`[marquee] ${p.name}: Tier-2 config rebuild failed — ${err.message}`));
+  }
+}
+
 router.put('/settings', (req, res) => {
   try {
     const patch = {};
@@ -783,6 +796,14 @@ router.put('/settings', (req, res) => {
       patch.glass = req.body.glass;                    // replace-whole (settings.js)
       glassChanged = JSON.stringify(req.body.glass) !== before;
     }
+    // ME-09: Marquee Tier-2 admin config — exactly Glass's pattern (stored as-is,
+    // real change detected by JSON compare so an unrelated save doesn't rebuild).
+    let marqueeChanged = false;
+    if (req.body.marquee && typeof req.body.marquee === 'object') {
+      const before = JSON.stringify(settings.getSettings()?.marquee || {});
+      patch.marquee = req.body.marquee;                // replace-whole (settings.js)
+      marqueeChanged = JSON.stringify(req.body.marquee) !== before;
+    }
     const updated = settings.updateSettings(patch);
     // Fan out AFTER the write is persisted, so isEnabled already reports the new
     // (disabled) state while the revert runs. resolveFor's disabled→Genesis
@@ -790,6 +811,8 @@ router.put('/settings', (req, res) => {
     if (disabledIds.length) revertDisabledEngines(disabledIds);
     // Build-affecting Tier-2 change → clear + rebuild every Glass slice (GD-6).
     if (glassChanged) rebuildGlassProfiles();
+    // ME-09: build-affecting Tier-2 change → clear + rebuild every Marquee movie slice.
+    if (marqueeChanged) rebuildMarqueeProfiles();
     res.json({ settings: updated, complete: settings.isComplete(updated) });
   } catch (err) {
     res.status(423).json({ error: err.message });

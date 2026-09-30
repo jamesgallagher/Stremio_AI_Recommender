@@ -745,9 +745,10 @@ ok('recommendationStore: selectStrong gates on the supplied vote floor (NOT rati
 ok('engines: registry lists Genesis, resolveFor/availableFor honour age gating (I7) + global enablement (SC-07)', () => {
   const engines = require('../src/engines');
   const settings = require('../src/settings');
-  // The registry lists Genesis + Glass for both types (Glass is registered but
-  // ships globally DISABLED, so it's in listForType yet absent from availableFor).
-  assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['genesis', 'glass']);
+  // The registry lists Genesis + Glass for both types, and Marquee (movie-only)
+  // for movie. All ship globally DISABLED, so each is in listForType yet absent
+  // from availableFor until an admin enables it (SC-07).
+  assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['genesis', 'glass', 'marquee']);
   assert.deepStrictEqual(engines.listForType('series').map((e) => e.id), ['genesis', 'glass']);
   // Genesis is the permanent default + safe floor — always enabled (SC-07).
   assert.strictEqual(engines.isEnabled('genesis'), true);
@@ -786,7 +787,7 @@ ok('engines: registry lists Genesis, resolveFor/availableFor honour age gating (
     assert.strictEqual(engines.resolveFor(kid, 'movie').id, 'genesis');
   } finally { dispose(); settings.updateSettings({ engines: { 'open-stub': false } }); }
   // Registry restored to the built-in engines after the stub is disposed.
-  assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['genesis', 'glass']);
+  assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['genesis', 'glass', 'marquee']);
 
   // GE-07 conformance: Glass ships DISABLED (absent from dropdowns), and once
   // enabled it is a GATED engine (unrestricted:false) — offered to an age-limited
@@ -2381,6 +2382,44 @@ ok('marquee ME-08: shapeOutput — franchise cap, store cap, exact shortfall lin
   assert.deepStrictEqual(warn, [], 'no warn at target');
 });
 
+// ---- Marquee ME-09 (pure) ----
+ok('marquee ME-09: resolveConfig — Tier-2 merge semantics (spec §4.5)', () => {
+  const mc = require('../src/engines/marquee/config');
+
+  // A nested override changes only that leaf; siblings keep defaults.
+  const r1 = mc.resolveConfig({ marquee: { weights: { quality: 0.5 } } });
+  assert.strictEqual(r1.weights.quality, 0.5, 'weights.quality overridden');
+  assert.strictEqual(r1.weights.taste_match, 0.28, 'sibling weight untouched');
+  assert.strictEqual(r1.franchise_cap, 2, 'unrelated section untouched');
+
+  // Top-level scalar override.
+  const r2 = mc.resolveConfig({ marquee: { franchise_cap: 1, store_cap: 50 } });
+  assert.strictEqual(r2.franchise_cap, 1, 'franchise_cap overridden');
+  assert.strictEqual(r2.store_cap, 50, 'store_cap overridden');
+  assert.strictEqual(r2.min_supply, 150, 'min_supply untouched');
+
+  // Unknown sections are ignored (no throw, no leak into cfg).
+  const r3 = mc.resolveConfig({ marquee: { bogus: { x: 1 }, other: 42 } });
+  assert.ok(!('bogus' in r3) && !('other' in r3), 'unknown sections ignored');
+  assert.deepStrictEqual(r3, mc.resolveConfig({}), 'unknown-only blob → pure defaults');
+
+  // Malformed blob: non-object marquee → defaults, never throws.
+  assert.deepStrictEqual(mc.resolveConfig({ marquee: 'x' }), mc.resolveConfig({}), "marquee: 'x' → defaults");
+  assert.deepStrictEqual(mc.resolveConfig({ marquee: null }), mc.resolveConfig({}), 'marquee: null → defaults');
+  assert.deepStrictEqual(mc.resolveConfig({}), mc.resolveConfig(null), 'no settings → defaults');
+
+  // A glass blob never touches Marquee's config (independent blobs, spec §4.5).
+  const r4 = mc.resolveConfig({ glass: { weights: { quality: 0.99 } }, marquee: {} });
+  assert.strictEqual(r4.weights.quality, 0.14, 'glass blob does not leak into Marquee');
+
+  // The result is a fresh clone — mutating it never touches DEFAULTS.
+  const r5 = mc.resolveConfig({ marquee: { franchise_cap: 7 } });
+  r5.franchise_cap = 999;
+  r5.weights.quality = 999;
+  assert.strictEqual(mc.DEFAULTS.franchise_cap, 2, 'DEFAULTS untouched');
+  assert.strictEqual(mc.DEFAULTS.weights.quality, 0.14, 'DEFAULTS untouched');
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');
@@ -2934,15 +2973,16 @@ async function httpTests() {
   console.log('  ✓ /api/genres');
 
   // /api/engines — the static registry for the portal's per-type dropdowns (SC-02).
-  // It advertises Genesis + Glass (Glass registered but globally disabled), both types.
+  // It advertises Genesis + Glass (both types) + Marquee (movie-only), Glass and
+  // Marquee registered but globally disabled.
   const eng = await (await fetch(`${BASE}/api/engines`)).json();
   assert.strictEqual(eng.default, 'genesis');
-  assert.deepStrictEqual(eng.engines.map((e) => e.id), ['genesis', 'glass']);
+  assert.deepStrictEqual(eng.engines.map((e) => e.id), ['genesis', 'glass', 'marquee']);
   assert.deepStrictEqual(eng.engines[0].supported_types, ['movie', 'series']);
   assert.ok(eng.engines[0].description && eng.engines[0].capabilities.unrestricted === false);
   const glassAd = eng.engines.find((e) => e.id === 'glass');
   assert.ok(glassAd && glassAd.enabled === false && glassAd.capabilities.unrestricted === false);
-  console.log('  ✓ /api/engines advertises the registry (Genesis + Glass, both types)');
+  console.log('  ✓ /api/engines advertises the registry (Genesis + Glass both types, Marquee movie-only)');
 
   // Create a profile through the API
   let res = await fetch(`${BASE}/api/profiles`, {

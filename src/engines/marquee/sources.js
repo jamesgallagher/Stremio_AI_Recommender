@@ -548,6 +548,7 @@ async function gatherCandidates(profile, ctx, {
 
 module.exports = {
   gatherCandidates,
+  defaultFetchers,
   parseSuggestions,
   buildSuggestPrompt,
   buildDiscoverQueries,
