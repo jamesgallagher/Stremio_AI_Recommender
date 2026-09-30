@@ -16,6 +16,7 @@ const mdblist = require('../../services/mdblist');
 const animeMap = require('../../services/animeMap');
 const recommendationStore = require('../../recommendationStore');
 const { strictestCert } = require('../../certs');
+const { ALGORITHM_VERSION } = require('./config');
 
 const DAY_MS = 24 * 3600e3;
 
@@ -57,6 +58,11 @@ async function scoreCandidates(profile, ctx, candidates, {
   await animeMap.ensureLoaded(log).catch(() => {});
 
   const decayedCount = decayedCollectionCounts(profile.id);
+  // m2: seed agreement, normalised to the strongest candidate in this build.
+  let maxSeedAff = 0;
+  for (const c of candidates) maxSeedAff = Math.max(maxSeedAff, features.seedAffinityRaw(c));
+  // m2 diagnostics (see sources.js): record where a looked-up title is lost.
+  const trace = ctx.marqueeTrace || null;
 
   // 1. Lookup in chunks of cfg.lookup_chunk (MI-5). Refetch (spec §4.5.1):
   // no cached row; a pre-ME-02 row (no availability key); or a NOT_YET row
@@ -80,7 +86,7 @@ async function scoreCandidates(profile, ctx, candidates, {
         if (fresh) { metaStore.put(type, cand.tmdb_id, fresh); meta = fresh; }
         // null refetch: keep the cached meta if there is one.
       }
-      if (!meta) { noImdb += 1; return; }
+      if (!meta) { noImdb += 1; if (trace?.dropped) trace.dropped.set(cand.tmdb_id, 'lookup_failed'); return; }
       looked.push({ cand, meta });
     }));
     onProgress(Math.round((Math.min(i + cfg.lookup_chunk, candidates.length) / (candidates.length || 1)) * 100), `Looked up ${Math.min(i + cfg.lookup_chunk, candidates.length)}/${candidates.length} candidate(s)`);
@@ -110,7 +116,10 @@ async function scoreCandidates(profile, ctx, candidates, {
       year: meta.year, genres, availability: meta.availability,
       certAU: meta.certAU, certUS: meta.certUS,
     });
-    if (!verdict.ok) continue; // MI-1: never return a row the envelope rejects
+    if (!verdict.ok) { // MI-1: never return a row the envelope rejects
+      if (trace?.dropped) trace.dropped.set(cand.tmdb_id, `hard_filter:${verdict.reason}`);
+      continue;
+    }
 
     const tm = glassScoring.tasteMatch(meta, taste, cfg);
     const trendingRaw = features.trendingRaw(cand.trending, { ...gatherMeta, risingTop: cfg.trending.rising_top, risingBonus: cfg.trending.rising_bonus });
@@ -122,6 +131,8 @@ async function scoreCandidates(profile, ctx, candidates, {
       trending_eff: trendingRaw * features.tasteGate(tm.score, cfg.trending_gate),
       quality: features.quality({ imdbRating, voteAverage: meta.vote_average, voteCount: meta.vote_count }, cfg.quality_prior),
       consensus: features.consensus(cand.sources, cand.seeds),
+      // m2: Genesis's recency-weighted seed agreement, normalised per build.
+      seed_affinity: maxSeedAff > 0 ? Math.min(1, features.seedAffinityRaw(cand) / maxSeedAff) : 0,
       freshness: features.freshness(meta.year, { nowYear, maxAgeYears: filters.max_age_years || 0, defaultWindow: cfg.freshness_default_window, floor: cfg.freshness_floor }),
     };
     // llm_fit is always absent here (P4 adds it); trending_eff is absent when
@@ -158,7 +169,9 @@ async function scoreCandidates(profile, ctx, candidates, {
       rankScore,
       reason: null, // P4 fills it
       recCount: cand.sources.size,
-      algorithmVersion: cfg.ALGORITHM_VERSION || 'marquee-m1',
+      // The version constant, not cfg: resolveConfig never carries it, so the
+      // old `cfg.ALGORITHM_VERSION || 'marquee-m1'` stamped m1 on every row forever.
+      algorithmVersion: ALGORITHM_VERSION,
       scoreComponents: {
         features: feat, weights: w, penalty, matched: tm.matched,
         sources: [...cand.sources], seeds: [...cand.seeds],

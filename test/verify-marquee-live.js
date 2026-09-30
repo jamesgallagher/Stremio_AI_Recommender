@@ -268,6 +268,23 @@ async function checkV5() {
 // V6: movie/603 with append_to_response=credits,keywords,external_ids,
 // release_dates — one request returns all four blocks; print the AU/US
 // certifications and movieAvailability.
+// V7 (m2 engagement): the watch provider's progress rows — the "finished vs
+// abandoned" signal. Nuvio only. Prints COUNTS only (no titles): movie rows by
+// progress bucket, how old they are, and whether finished films keep a row.
+// Answers: does Nuvio retain "continue watching" rows for abandoned films?
+async function checkV7(profile) {
+  const cfg = profile.scrobble;
+  if (!cfg?.enabled || cfg.provider !== 'nuvio') { record('V7', null, 'skipped — this profile has no Nuvio scrobble configured'); return; }
+  const rows = await require('../src/services/scrobble').pullProviderProgress(cfg);
+  const movies = (rows || []).filter((r) => r.type === 'movie' && r.percent != null);
+  const b = { lt50: 0, mid: 0, ge90: 0 };
+  for (const r of movies) { if (r.percent < 50) b.lt50 += 1; else if (r.percent < 90) b.mid += 1; else b.ge90 += 1; }
+  const ages = movies.map((r) => r.updatedAtMs).filter(Boolean).map((t) => Math.round((Date.now() - t) / 86400e3)).sort((x, y) => x - y);
+  record('V7', movies.length > 0,
+    `${(rows || []).length} progress rows, ${movies.length} movies: <50% ${b.lt50}, 50–90% ${b.mid}, ≥90% ${b.ge90}; `
+    + `age in days min ${ages[0] ?? '—'} / median ${ages[Math.floor(ages.length / 2)] ?? '—'} / max ${ages[ages.length - 1] ?? '—'}`);
+}
+
 async function checkV6() {
   const data = await tmdbGet('movie/603', { append_to_response: 'credits,keywords,external_ids,release_dates' });
   const blocks = ['credits', 'keywords', 'external_ids', 'release_dates'].filter((b) => data[b] != null);
@@ -324,6 +341,7 @@ async function main() {
   await run('V4', checkV4);
   await run('V5', checkV5);
   await run('V6', checkV6);
+  await run('V7', () => checkV7(profile));
 
   if (stopped) {
     console.error(`\n✗ ${stopped}`);

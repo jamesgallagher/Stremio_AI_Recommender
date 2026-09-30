@@ -307,7 +307,8 @@ async function gatherCandidates(profile, ctx, {
         } catch (err) { log.warn(`[marquee] S1 recs for ${seed.title} failed: ${err.message}`); }
         try {
           const sim = await f.similar(seed.tmdb_id);
-          for (const s of sim.slice(0, cfg.recs_per_seed)) {
+          // m2: /similar is genre/keyword-based and noisier — fewer per seed.
+          for (const s of sim.slice(0, cfg.similar_per_seed ?? cfg.recs_per_seed)) {
             const c = makeCand(s, genreMap);
             c.sources.add('tmdb_similar');
             c.seeds.add(seed.tmdb_id);
@@ -402,6 +403,16 @@ async function gatherCandidates(profile, ctx, {
   try { week = (await f.trendingWeek()) || []; } catch (err) { log.warn(`[marquee] S5 trendingWeek failed: ${err.message}`); }
   try { day = (await f.trendingDay()) || []; } catch (err) { log.warn(`[marquee] S5 trendingDay failed: ${err.message}`); }
   try { simkl = (await f.simklTrending()) || []; } catch (err) { log.warn(`[marquee] S5 simklTrending failed: ${err.message}`); }
+  // m2: take only the top cfg.trending.simkl_take of Simkl's week_500 list (by
+  // its own rank; unranked last). The full list flooded the lookup budget with
+  // generic popular titles — the first backtest's top 20 was 95% trending-tagged.
+  {
+    const take = cfg.trending?.simkl_take;
+    if (Number.isFinite(take) && take >= 0 && simkl.length > take) {
+      const rankOf = (it) => (Number.isFinite(it?.rank) ? it.rank : Infinity);
+      simkl = simkl.slice().sort((a, b) => rankOf(a) - rankOf(b)).slice(0, take);
+    }
+  }
   weekN = week.length;
   dayN = day.length;
   hadTrending = weekN > 0 || dayN > 0 || simkl.length > 0;
@@ -473,15 +484,29 @@ async function gatherCandidates(profile, ctx, {
     }
   }
 
-  merged = merged
-    .filter((c) => !watchedTmdb.has(c.tmdb_id))
-    .filter((c) => !dont.has(`movie:${c.tmdb_id}`))
-    .filter((c) => !c.adult)
-    .filter((c) => {
-      const onlyS2orLLM = [...c.sources].every((s) => s === 'simkl_recs' || s === 'llm');
-      const item = (onlyS2orLLM && c.vote_count === 0) ? { ...c, vote_count: Infinity, vote_average: 0 } : c;
-      return envelope.prefilter(item).ok;
-    });
+  // m2 diagnostics: when the caller passes ctx.marqueeTrace (the backtest
+  // does), record every generated title and the stage that dropped it, so a
+  // miss can be explained instead of guessed at. Zero cost when absent.
+  const trace = ctx.marqueeTrace || null;
+  if (trace) {
+    trace.generated = trace.generated || new Map();
+    trace.dropped = trace.dropped || new Map();
+    for (const c of merged) trace.generated.set(c.tmdb_id, [...c.sources]);
+  }
+  const drop = (c, why) => { if (trace) trace.dropped.set(c.tmdb_id, why); return false; };
+
+  merged = merged.filter((c) => {
+    if (watchedTmdb.has(c.tmdb_id)) return drop(c, 'watched');
+    if (dont.has(`movie:${c.tmdb_id}`)) return drop(c, 'dont_recommend');
+    // m2 engagement: a film this profile started and abandoned before halfway
+    // is never recommended back by Marquee (Marquee-only by design).
+    if (ctx.marqueeAbandoned && ctx.marqueeAbandoned.has(c.tmdb_id)) return drop(c, 'abandoned');
+    if (c.adult) return drop(c, 'adult');
+    const onlyS2orLLM = [...c.sources].every((s) => s === 'simkl_recs' || s === 'llm');
+    const item = (onlyS2orLLM && c.vote_count === 0) ? { ...c, vote_count: Infinity, vote_average: 0 } : c;
+    const v = envelope.prefilter(item);
+    return v.ok ? true : drop(c, `prefilter:${v.reason}`);
+  });
   const strong = merged.length;
 
   // S7 — exploration reserve: high-quality trending OUTSIDE the top-6 genres.
@@ -497,7 +522,10 @@ async function gatherCandidates(profile, ctx, {
   srcCounts.S7 = explore.length;
 
   // Pre-score + truncate to the MI-5 resolve budget.
-  for (const c of merged) c._preScore = features.preScore(c, taste, { weekN, dayN });
+  // m2: seed agreement is normalised to this build's strongest title.
+  let maxSeedAff = 0;
+  for (const c of merged) maxSeedAff = Math.max(maxSeedAff, features.seedAffinityRaw(c));
+  for (const c of merged) c._preScore = features.preScore(c, taste, { weekN, dayN, maxSeedAff, weights: cfg.prescore });
   const nonExplore = merged.filter((c) => !c.sources.has('exploration'));
   nonExplore.sort((a, b) => (b._preScore - a._preScore) || (a.tmdb_id < b.tmdb_id ? -1 : 1));
 
@@ -534,6 +562,10 @@ async function gatherCandidates(profile, ctx, {
     .slice(0, Math.max(0, mainCap - collab.length));
   const candidates = [...mainSlice, ...collab, ...explore];
   const kept = candidates.length;
+  if (trace) {
+    const keptSet = new Set(candidates.map((c) => c.tmdb_id));
+    nonExplore.forEach((c, i) => { if (!keptSet.has(c.tmdb_id)) drop(c, `truncated (pre-score rank ${i + 1}/${nonExplore.length})`); });
+  }
 
   if (ctx.stats) {
     ctx.stats.seeds = seeds.length;

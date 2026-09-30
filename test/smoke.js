@@ -2145,19 +2145,19 @@ ok('marquee ME-04: config copies Glass values independently + resolveConfig deep
   assert.deepStrictEqual(marqueeCfg.DEFAULTS.keyword_min_shared, glassCfg.DEFAULTS.keyword_min_shared);
   // Marquee-specific knobs
   assert.deepStrictEqual(marqueeCfg.DEFAULTS.rating_weights, { r9_10: 2.0, r7_8: 1.2, r5_6: 0.4, r1_4: -1.2 });
-  assert.strictEqual(marqueeCfg.DEFAULTS.seed_cap, 40);
+  assert.strictEqual(marqueeCfg.DEFAULTS.seed_cap, 100); // m2: 40 → 100
   assert.strictEqual(marqueeCfg.DEFAULTS.enrich_cap, 60);
   assert.strictEqual(marqueeCfg.DEFAULTS.llm_timeout_ms, 60000);
   assert.deepStrictEqual(marqueeCfg.DEFAULTS.brief, { input_cap: 60 });
   // collab_reserve added in review round 1 (F1): the S2 collaborative reserve.
   assert.deepStrictEqual(marqueeCfg.DEFAULTS.simkl, { recs_max_uncached: 40, recs_ttl_days: 30, ratings_resolve_cap: 50, collab_reserve: 40 });
-  assert.strictEqual(marqueeCfg.ALGORITHM_VERSION, 'marquee-m1');
+  assert.strictEqual(marqueeCfg.ALGORITHM_VERSION, 'marquee-m2');
   // resolveConfig: deep clone — mutating the result must not touch DEFAULTS
   const resolved = marqueeCfg.resolveConfig({});
   resolved.half_life_days.movie.recent = 999;
   resolved.seed_cap = 1;
   assert.strictEqual(marqueeCfg.DEFAULTS.half_life_days.movie.recent, 21);
-  assert.strictEqual(marqueeCfg.DEFAULTS.seed_cap, 40);
+  assert.strictEqual(marqueeCfg.DEFAULTS.seed_cap, 100); // m2: 40 → 100
 });
 
 ok('marquee ME-04: llmCache put/get/getMany/prune + expired/corrupt = miss (spec §4.4)', () => {
@@ -2310,19 +2310,57 @@ ok('marquee ME-06: renormalize — sums to 1 without llm_fit / without trending_
   assert.deepStrictEqual(f.renormalize({ a: 0, b: 0 }, ['a', 'b']), {});
 });
 
-ok('marquee ME-06: preScore — the spec §5 formula on a fixed fixture', () => {
+ok('nuvio: normalizeProgressRow — Nuvio unit rules, percent, movie vs series (m2 engagement)', () => {
+  const nuvio = require('../src/services/nuvio');
+  // Explicit *_ms pair.
+  let r = nuvio.normalizeProgressRow({ content_id: 'tt1', content_type: 'movie', position_ms: 1800000, duration_ms: 7200000, updated_at: '2026-05-01T00:00:00Z' });
+  assert.strictEqual(r.type, 'movie'); assert.strictEqual(r.percent, 25); assert.strictEqual(r.updatedAtMs, Date.parse('2026-05-01T00:00:00Z'));
+  // Legacy unitless pair in SECONDS (duration ≤ 8 h) → ms.
+  r = nuvio.normalizeProgressRow({ content_id: 'tt2', position: 3600, duration: 7200 });
+  assert.strictEqual(r.positionMs, 3600000); assert.strictEqual(r.durationMs, 7200000); assert.strictEqual(r.percent, 50);
+  // Legacy unitless pair already in MILLISECONDS (duration > 8 h as seconds) → kept.
+  r = nuvio.normalizeProgressRow({ content_id: 'tt3', position: 720000, duration: 7200000 });
+  assert.strictEqual(r.durationMs, 7200000); assert.strictEqual(r.percent, 10);
+  // The row's own progress_percent wins; trakt_history counts as finished.
+  assert.strictEqual(nuvio.normalizeProgressRow({ content_id: 'tt4', progress_percent: 42, position_ms: 1, duration_ms: 100 }).percent, 42);
+  assert.strictEqual(nuvio.normalizeProgressRow({ content_id: 'tt5', progress_percent: 60, source: 'trakt_history' }).percent, 100);
+  // Episodes are series; non-tt ids are dropped; epoch-seconds timestamps convert.
+  assert.strictEqual(nuvio.normalizeProgressRow({ content_id: 'tt6', content_type: 'series', season: 1, episode: 2, position_ms: 1, duration_ms: 2 }).type, 'series');
+  assert.strictEqual(nuvio.normalizeProgressRow({ content_id: 'kitsu:1', position_ms: 1, duration_ms: 2 }), null);
+  assert.strictEqual(nuvio.normalizeProgressRow({ content_id: 'tt7', position_ms: 1, duration_ms: 2, updated_at: 1780000000 }).updatedAtMs, 1780000000000);
+});
+
+ok('marquee m2: preScore — seed agreement leads; trending counts only in proportion to genre fit', () => {
   const f = require('../src/engines/marquee/features');
   const taste = { dims: { genres: { Action: 0.8 } } };
   const cand = {
     genres: ['Action'],
     sources: new Set(['tmdb_recs', 'simkl_recs']),
+    _seedWeights: new Map([['s1', 0.6], ['s2', 0.2]]),
     trending: { tmdbWeekRank: 5, tmdbDayRank: null, simklWatched: 0, simklDrop: null },
     vote_average: 8,
   };
+  const w = f.PRESCORE_DEFAULTS;
   const ga = 0.8;
-  const tr = 1 - Math.log(5) / Math.log(101);
-  const expected = 0.45 * ga + 0.20 * tr + 0.15 * 0.8 + 0.20 * Math.min(1, 2 / 3);
-  assert.ok(Math.abs(f.preScore(cand, taste, { weekN: 100, dayN: 40 }) - expected) < 1e-9);
+  const sa = 0.8 / 1.6;                                   // seedAffinityRaw 0.8 over a build max of 1.6
+  const tr = (1 - Math.log(5) / Math.log(101)) * Math.min(1, ga / w.trending_genre_gate);
+  const expected = w.seed_affinity * sa + w.genre * ga + w.trending * tr + w.quality * 0.8 + w.sources * Math.min(1, 2 / 3);
+  assert.ok(Math.abs(f.preScore(cand, taste, { weekN: 100, dayN: 40, maxSeedAff: 1.6 }) - expected) < 1e-9);
+  assert.strictEqual(f.seedAffinityRaw(cand), 0.8);
+
+  // Seed agreement beats a better genre match: a title four recent watches point
+  // at outranks a single-seed title with a perfect genre fit.
+  const agreed = { genres: ['Drama'], sources: new Set(['tmdb_recs']), _seedWeights: new Map([['a', 1], ['b', 1], ['c', 1], ['d', 1]]), trending: {}, vote_average: 7 };
+  const lone = { genres: ['Action'], sources: new Set(['tmdb_recs']), _seedWeights: new Map([['a', 1]]), trending: {}, vote_average: 7 };
+  const t2 = { dims: { genres: { Action: 1, Drama: 0.3 } } };
+  assert.ok(f.preScore(agreed, t2, { maxSeedAff: 4 }) > f.preScore(lone, t2, { maxSeedAff: 4 }), 'seed agreement wins');
+
+  // An off-taste trending blockbuster gets no trending credit at all.
+  const offTaste = { genres: ['Horror'], sources: new Set(['trending']), trending: { tmdbWeekRank: 1 }, vote_average: 7 };
+  const onTaste = { genres: ['Action'], sources: new Set(['trending']), trending: { tmdbWeekRank: 1 }, vote_average: 7 };
+  const base = { genres: ['Horror'], sources: new Set(['trending']), trending: {}, vote_average: 7 };
+  assert.strictEqual(f.preScore(offTaste, taste, { weekN: 100 }), f.preScore(base, taste, { weekN: 100 }), 'off-taste trending adds nothing');
+  assert.ok(f.preScore(onTaste, taste, { weekN: 100 }) > f.preScore({ ...onTaste, trending: {} }, taste, { weekN: 100 }), 'on-taste trending adds');
 });
 
 ok('marquee ME-05: parseSuggestions — fenced JSON, invalid year/title dropped, dedupe, all-invalid throws', () => {
@@ -2433,7 +2471,7 @@ ok('marquee ME-09: resolveConfig — Tier-2 merge semantics (spec §4.5)', () =>
   // A nested override changes only that leaf; siblings keep defaults.
   const r1 = mc.resolveConfig({ marquee: { weights: { quality: 0.5 } } });
   assert.strictEqual(r1.weights.quality, 0.5, 'weights.quality overridden');
-  assert.strictEqual(r1.weights.taste_match, 0.28, 'sibling weight untouched');
+  assert.strictEqual(r1.weights.taste_match, 0.24, 'sibling weight untouched');
   assert.strictEqual(r1.franchise_cap, 2, 'unrelated section untouched');
 
   // Top-level scalar override.
@@ -2454,14 +2492,14 @@ ok('marquee ME-09: resolveConfig — Tier-2 merge semantics (spec §4.5)', () =>
 
   // A glass blob never touches Marquee's config (independent blobs, spec §4.5).
   const r4 = mc.resolveConfig({ glass: { weights: { quality: 0.99 } }, marquee: {} });
-  assert.strictEqual(r4.weights.quality, 0.14, 'glass blob does not leak into Marquee');
+  assert.strictEqual(r4.weights.quality, 0.10, 'glass blob does not leak into Marquee');
 
   // The result is a fresh clone — mutating it never touches DEFAULTS.
   const r5 = mc.resolveConfig({ marquee: { franchise_cap: 7 } });
   r5.franchise_cap = 999;
   r5.weights.quality = 999;
   assert.strictEqual(mc.DEFAULTS.franchise_cap, 2, 'DEFAULTS untouched');
-  assert.strictEqual(mc.DEFAULTS.weights.quality, 0.14, 'DEFAULTS untouched');
+  assert.strictEqual(mc.DEFAULTS.weights.quality, 0.10, 'DEFAULTS untouched');
 });
 
 // ---- HTTP surface ----

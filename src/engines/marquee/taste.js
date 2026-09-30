@@ -40,7 +40,12 @@ function ratingWeight(rating, cfg) {
 // events unchanged; a title rated but never watched is NOT added (only existing
 // watched events are re-weighted). `ratings` is a Map<tmdb_id, rating>
 // (defaults to simklCache.getRatingsMap).
-function buildEvents(profileId, cfg, { nowMs = Date.now(), ratings } = {}) {
+// m2 engagement: `abandoned` (Map<tmdb_id, { percent, ts }>, from
+// engagement.abandonedFor) adds one NEGATIVE event per film the profile started
+// but left before halfway — kind 'abandoned', weight cfg.engagement.weight,
+// recency-decayed from when it was last touched like every other event. Empty
+// (the default) leaves the list exactly Glass's + the rating re-weighting.
+function buildEvents(profileId, cfg, { nowMs = Date.now(), ratings, abandoned } = {}) {
   const ratingsMap = ratings || simklCache.getRatingsMap(profileId);
   const events = glassEvents.buildEventList(profileId, 'movie', cfg, { nowMs });
   for (const ev of events) {
@@ -49,6 +54,10 @@ function buildEvents(profileId, cfg, { nowMs = Date.now(), ratings } = {}) {
     if (r == null) continue;
     const w = ratingWeight(r, cfg);
     if (w != null) { ev.weight = w; ev.rating = r; }
+  }
+  const weight = cfg.engagement?.weight ?? -1.0;
+  for (const [tmdbId, a] of abandoned || new Map()) {
+    events.push({ type: 'movie', tmdb_id: String(tmdbId), weight, ts: a.ts || NaN, kind: 'abandoned', fallback_genre: null });
   }
   return events;
 }
@@ -94,15 +103,23 @@ function seedsFor(profileId, cfg, { nowMs, ratings } = {}) {
 // The rating-weighted taste model (spec §4.3): top up watched enrichment first
 // (degrades, never throws — MI-3), then build Glass's taste model from the
 // rating-weighted events. Returns the taste model unchanged.
-async function buildTaste(profileId, apiKey, cfg, { nowMs = Date.now(), ratings, enrichFetcher, log = console } = {}) {
+async function buildTaste(profileId, apiKey, cfg, { nowMs = Date.now(), ratings, abandoned, enrichFetcher, log = console } = {}) {
   try {
     await watchedEnrichment.enrichWatchedBatch(profileId, 'movie', apiKey, { cap: cfg.enrich_cap, fetcher: enrichFetcher, log });
   } catch (err) {
     log.warn(`[marquee] watched enrichment failed: ${err.message} — building taste without it`);
   }
+  // m2 engagement: an abandoned film only steers taste once its deep meta
+  // (director/genres/keywords…) is known — enrich a bounded batch, cached forever.
+  if (abandoned && abandoned.size) {
+    const missing = [...abandoned.keys()].filter((id) => !metaStore.has('movie', id)).slice(0, cfg.engagement?.enrich_cap ?? 30);
+    for (let i = 0; i < missing.length; i += 8) {
+      await Promise.all(missing.slice(i, i + 8).map((id) => metaStore.enrich(apiKey, 'movie', id, log, enrichFetcher ? { fetcher: enrichFetcher } : {}).catch(() => null)));
+    }
+  }
   return glassTasteModel.buildTasteModel(profileId, 'movie', cfg, {
     nowMs,
-    events: buildEvents(profileId, cfg, { nowMs, ratings }),
+    events: buildEvents(profileId, cfg, { nowMs, ratings, abandoned }),
   });
 }
 

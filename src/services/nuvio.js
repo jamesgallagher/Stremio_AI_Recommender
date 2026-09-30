@@ -94,4 +94,73 @@ async function pullWatched({ email, password, profileIndex }) {
   return out;
 }
 
-module.exports = { login, listProfiles, pullWatched };
+// ---- watch progress (Marquee engagement signal) ----
+// Nuvio's "continue watching" state: how far into each title a profile got.
+// RPC name, params and row shape are taken from Nuvio's own open-source client
+// (NuvioMedia/NuvioTVSmart js/core/profile/watchProgressSyncService.js,
+// PULL_RPC = "sync_pull_watch_progress", params { p_profile_id }). Read-only.
+
+// Nuvio's unit rules (same constants as its client): legacy rows store
+// position/duration WITHOUT a unit — a duration above 8 h in "seconds" can only
+// be milliseconds; a *_ms pair larger than 24 h but ≤ 24 h once divided by 1000
+// was double-scaled and is corrected.
+const MAX_AMBIGUOUS_SECONDS = 8 * 60 * 60;
+const MAX_REASONABLE_DURATION_MS = 24 * 60 * 60 * 1000;
+
+// PURE: one sync_pull_watch_progress row → { type, imdbId, season, episode,
+// positionMs, durationMs, percent (0–100|null), updatedAtMs, source } or null.
+// A port of Nuvio's mapProgressRow; `percent` prefers the row's own
+// progress_percent, else position/duration.
+function normalizeProgressRow(row) {
+  if (!row || typeof row !== 'object') return null;
+  const imdbId = String(row.content_id || row.contentId || '');
+  if (!imdbId.startsWith('tt')) return null;
+  const hasMs = row.position_ms != null || row.positionMs != null || row.duration_ms != null || row.durationMs != null;
+  const rawPos = Number(row.position_ms ?? row.positionMs ?? row.position ?? 0) || 0;
+  const rawDur = Number(row.duration_ms ?? row.durationMs ?? row.duration ?? 0) || 0;
+  let positionMs; let durationMs;
+  if (hasMs) {
+    positionMs = Math.max(0, Math.trunc(rawPos));
+    durationMs = Math.max(0, Math.trunc(rawDur));
+  } else {
+    const legacyMs = rawDur > MAX_AMBIGUOUS_SECONDS;
+    const conv = (n) => (n > 0 ? Math.trunc(legacyMs || n > MAX_AMBIGUOUS_SECONDS ? n : n * 1000) : 0);
+    positionMs = conv(rawPos);
+    durationMs = conv(rawDur);
+  }
+  if (durationMs > MAX_REASONABLE_DURATION_MS && durationMs / 1000 <= MAX_REASONABLE_DURATION_MS) {
+    positionMs = Math.trunc(positionMs / 1000);
+    durationMs = Math.trunc(durationMs / 1000);
+  }
+  const pctRaw = Number(row.progress_percent ?? row.progressPercent);
+  let percent = Number.isFinite(pctRaw) && (row.progress_percent != null || row.progressPercent != null)
+    ? Math.max(0, Math.min(100, pctRaw))
+    : (durationMs > 0 ? Math.max(0, Math.min(100, (positionMs / durationMs) * 100)) : null);
+  const source = String(row.source || '').trim() || 'local';
+  if (source === 'trakt_history' && percent != null) percent = 100; // Nuvio treats imported history as complete
+  const upd = row.updated_at ?? row.last_watched ?? row.lastWatched ?? null;
+  let updatedAtMs = null;
+  if (upd != null) {
+    const n = Number(upd);
+    updatedAtMs = Number.isFinite(n) ? (n > 1e12 ? n : Math.trunc(n * 1000)) : (Date.parse(upd) || null);
+  }
+  const season = row.season ?? row.season_number ?? null;
+  const episode = row.episode ?? row.episode_number ?? null;
+  const type = String(row.content_type || row.contentType || 'movie') === 'movie' && season == null && episode == null ? 'movie' : 'series';
+  return { type, imdbId, season, episode, positionMs, durationMs, percent, updatedAtMs, source };
+}
+
+// Normalized progress rows for one Nuvio profile (movies AND series; callers
+// filter). One login + one RPC call.
+async function pullWatchProgress({ email, password, profileIndex }) {
+  if (profileIndex === null || profileIndex === undefined) throw new Error('No Nuvio profile selected');
+  const token = await login(email, password);
+  const rows = await rpc(token, 'sync_pull_watch_progress', { p_profile_id: profileIndex });
+  if (!Array.isArray(rows)) throw new Error('Nuvio watch progress returned an invalid snapshot');
+  return rows
+    .filter((r) => r?.profile_id == null || String(r.profile_id) === String(profileIndex))
+    .map(normalizeProgressRow)
+    .filter(Boolean);
+}
+
+module.exports = { login, listProfiles, pullWatched, pullWatchProgress, normalizeProgressRow };

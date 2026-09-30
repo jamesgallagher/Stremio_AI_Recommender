@@ -141,4 +141,17 @@ async function testCredentials({ provider, email, password, passwordEnc }) {
   throw new Error(`Unknown provider "${provider}"`);
 }
 
-module.exports = { computeDelta, syncProfile, ensureSynced, testCredentials, pullProviderWatched };
+// Marquee engagement: the provider's watch-PROGRESS rows (how far into each
+// title the profile got), or null when the provider has no progress source.
+// Nuvio only for now (Stremio's library carries state.timeOffset/duration and
+// can be added the same way). Throws on provider/credential errors; the caller
+// degrades.
+async function pullProviderProgress(cfg) {
+  if (!cfg?.enabled || !cfg.password_enc) return null;
+  const provider = providerFor(cfg.provider);
+  if (typeof provider.pullWatchProgress !== 'function') return null;
+  const { email, password } = decodeCreds(cfg);
+  return provider.pullWatchProgress({ email, password, profileIndex: cfg.nuvio_profile_index });
+}
+
+module.exports = { computeDelta, syncProfile, ensureSynced, testCredentials, pullProviderWatched, pullProviderProgress };

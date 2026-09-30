@@ -45,7 +45,7 @@ function parseComps(sc) {
 // against the holdout targets. `selectServe` is injected so the definition of
 // "served" stays the SAME serve-time selection the addon uses (nothing here
 // touches the network).
-const metrics = (rows, targets, filters, { selectServe, stored, buildSeconds }) => {
+const metrics = (rows, targets, filters, { selectServe, stored, buildSeconds, reachable = null }) => {
   const targetSet = new Set(targets);
   const served20 = selectServe(rows, filters, { limit: 20 });
   const served20Ids = new Set(served20.map((r) => r.tmdb_id));
@@ -86,8 +86,20 @@ const metrics = (rows, targets, filters, { selectServe, stored, buildSeconds }) 
     trending = hasComps ? n / served20.length : null;
   }
 
+  // m2: hit@20 counted only against targets the profile's own filters allow —
+  // a trailer, a 1992 film under a 10-year window or a cinema-only release can
+  // never be served by ANY filter-respecting engine, so it only adds noise.
+  let hitReach = null;
+  let reachN = null;
+  if (reachable) {
+    reachN = targets.filter((t) => reachable.has(t)).length;
+    hitReach = targets.filter((t) => reachable.has(t) && served20Ids.has(t)).length;
+  }
+
   return {
     hitAt20: hit20,
+    hitAt20Reachable: hitReach,
+    reachableTargets: reachN,
     hitAt20Fraction: targets.length ? hit20 / targets.length : 0,
     recallAt100: targets.length ? recall100 / targets.length : 0,
     meanRankOfHits: meanRank,
@@ -113,6 +125,12 @@ function removeHoldout(profileId, targetIds, { db, noCache = false }) {
   conn.prepare('DELETE FROM recommended WHERE profile_id = ?').run(profileId);
   if (tableExists(conn, 'marquee_ratings')) {
     conn.prepare('DELETE FROM marquee_ratings WHERE profile_id = ? AND tmdb_id IN (' + inList + ')').run(profileId, ...targetIds);
+  }
+  // m2 engagement: a held-out film the profile FINISHED may still carry an old
+  // mid-watch progress row. With the film removed from `watched`, that row would
+  // read as "abandoned" and Marquee would exclude it — an unfair miss. Clear it.
+  if (tableExists(conn, 'marquee_engagement')) {
+    conn.prepare('DELETE FROM marquee_engagement WHERE profile_id = ? AND tmdb_id IN (' + inList + ')').run(profileId, ...targetIds);
   }
   if (noCache && tableExists(conn, 'marquee_llm_cache')) {
     conn.prepare("DELETE FROM marquee_llm_cache WHERE profile_id = ? AND kind IN ('brief','fit','suggest')").run(profileId);
@@ -165,6 +183,33 @@ function snapshotStore(liveDir) {
   return { benchDir, readOnlyPath };
 }
 
+// m2: can a held-out film be recommended AT ALL under this profile's filters?
+// Runs Marquee's hard filter (the serve rules + vote floor + home availability
+// + kids cert) on the film's own metadata. Seams: `metaFor(tmdbId)` → the
+// normalized deep meta or null; `imdbRatingFor(imdbId)` → number|null;
+// `isAnime(imdbId, tmdbId)` → bool. Returns Map<tmdbId, { reachable, reason }>.
+// A film whose metadata can't be read is reported as reachable (unknown) so it
+// never silently shrinks the denominator.
+async function assessReachability(targetIds, filters, { metaFor, imdbRatingFor = async () => null, isAnime = () => false, nowYear = new Date().getFullYear(), compileEnvelope }) {
+  const env = compileEnvelope(filters || {}, { nowYear, genreMap: {} });
+  const out = new Map();
+  for (const id of targetIds) {
+    let meta = null;
+    try { meta = await metaFor(id); } catch { meta = null; }
+    if (!meta) { out.set(id, { reachable: true, reason: 'no metadata (assumed reachable)' }); continue; }
+    let genres = (meta.genres || []).slice();
+    if (isAnime(meta.imdb_id, id) && !genres.includes('Anime')) genres = ['Anime', ...genres];
+    let imdbRating = null;
+    try { imdbRating = meta.imdb_id ? await imdbRatingFor(meta.imdb_id) : null; } catch { imdbRating = null; }
+    const v = env.hardFilter({
+      imdb_id: meta.imdb_id, imdb_rating: imdbRating, vote_average: meta.vote_average, vote_count: meta.vote_count,
+      year: meta.year, genres, availability: meta.availability, certAU: meta.certAU, certUS: meta.certUS,
+    });
+    out.set(id, v.ok ? { reachable: true, reason: null } : { reachable: false, reason: v.reason });
+  }
+  return out;
+}
+
 // Orchestrator (spec §5.4/§5.5): for each requested engine, clear the movie
 // slice, run the shared pipeline build (age gate deliberately NOT run — the bench
 // measures RANKING quality, not age safety), time the build, and compute the
@@ -173,7 +218,7 @@ function snapshotStore(liveDir) {
 async function runBench({ profile, engineIds, holdout, deps }) {
   const {
     engines, pipeline, rs, watchedStore, db, settings, selectServe,
-    log = console, now = Date.now, noCache = false, ctxExtras = {},
+    log = console, now = Date.now, noCache = false, ctxExtras = {}, reachability = null,
   } = deps;
 
   const watched = watchedStore.getWatched(profile.id, { type: 'movie' });
@@ -191,6 +236,14 @@ async function runBench({ profile, engineIds, holdout, deps }) {
   for (const t of targetIds) {
     if (sets.tmdb.has(t)) throw new Error('leakage: target still in watched set: ' + t);
   }
+
+  // m2: which targets could be served at all (null when no seam is given).
+  let reach = null;
+  if (typeof reachability === 'function') {
+    try { reach = await reachability(targetIds, profile.filters || {}); } catch (err) { log.warn(`[bench] reachability failed: ${err.message}`); }
+  }
+  if (reach) for (const t of targets) { const r = reach.get(t.tmdb_id); if (r) { t.reachable = r.reachable; t.unreachableReason = r.reason; } }
+  const reachableSet = reach ? new Set([...reach].filter(([, r]) => r.reachable).map(([id]) => id)) : null;
 
   const results = { profile: profile.name, holdout, targets, engines: {} };
   for (const id of engineIds) {
@@ -213,6 +266,8 @@ async function runBench({ profile, engineIds, holdout, deps }) {
       filters: profile.filters || {},
       log,
       marqueeSkipSync: true, // ME-10: never pull live Simkl ratings in the bench
+      // m2: Marquee records where every title is lost; other engines ignore it.
+      marqueeTrace: { generated: new Map(), dropped: new Map() },
       ...ctxExtras,
     };
     const t0 = now();
@@ -220,12 +275,26 @@ async function runBench({ profile, engineIds, holdout, deps }) {
     const buildSeconds = (now() - t0) / 1000;
 
     const rows = rs.getRecommended(profile.id, { type: 'movie', limit: 100000 });
-    const m = metrics(rows, targetIds, profile.filters || {}, { selectServe, stored: rows.length, buildSeconds });
+    const m = metrics(rows, targetIds, profile.filters || {}, { selectServe, stored: rows.length, buildSeconds, reachable: reachableSet });
     // Which targets did this engine actually hit in the top-20 served?
     const served20 = selectServe(rows, profile.filters || {}, { limit: 20 });
     const served20Ids = new Set(served20.map((r) => r.tmdb_id));
     const hitTargets = targetIds.filter((t) => served20Ids.has(t));
-    results.engines[id] = { metrics: m, hitTargets };
+    // m2: per-target position in this engine's pool (1-based, affinity order)
+    // and, for Marquee, the stage that lost it when it never reached the pool.
+    const rankOf = new Map(rows.map((r, i) => [r.tmdb_id, i + 1]));
+    const positions = {};
+    for (const t of targetIds) {
+      const rank = rankOf.get(t) || null;
+      let fate = null;
+      if (!rank && ctx.marqueeTrace && ctx.marqueeTrace.generated.size) {
+        if (ctx.marqueeTrace.dropped.has(t)) fate = ctx.marqueeTrace.dropped.get(t);
+        else if (!ctx.marqueeTrace.generated.has(t)) fate = 'not generated';
+        else fate = 'dropped after scoring';
+      }
+      positions[t] = { rank, served: served20Ids.has(t), fate, sources: ctx.marqueeTrace?.generated.get(t) || null };
+    }
+    results.engines[id] = { metrics: m, hitTargets, positions };
   }
   return results;
 }
@@ -236,7 +305,7 @@ function renderTable(results) {
   const pad = (s, n) => String(s).padEnd(n);
   const pct = (x) => (x == null ? 'n/a' : (x * 100).toFixed(1) + '%');
   const head = [
-    pad('engine', 10), pad('hit@20', 8), pad('recall@100', 12), pad('meanRank', 10),
+    pad('engine', 10), pad('hit@20', 8), pad('hit@20r', 9), pad('recall@100', 12), pad('meanRank', 10),
     pad('filterPass', 12), pad('trending@20', 13), pad('stored', 8), 'build(s)',
   ].join(' ');
   const lines = [
@@ -249,6 +318,7 @@ function renderTable(results) {
     lines.push([
       pad(id, 10),
       pad(`${m.hitAt20}/${results.holdout}`, 8),
+      pad(m.hitAt20Reachable == null ? 'n/a' : `${m.hitAt20Reachable}/${m.reachableTargets}`, 9),
       pad(pct(m.recallAt100), 12),
       pad(m.meanRankOfHits == null ? '—' : m.meanRankOfHits.toFixed(1), 10),
       pad(pct(m.filterPass), 12),
@@ -263,9 +333,20 @@ function renderTable(results) {
     const hitters = Object.entries(results.engines)
       .filter(([, e]) => e.hitTargets.includes(t.tmdb_id))
       .map(([id]) => id);
-    lines.push(`  ${t.title} (${t.tmdb_id}) — ${hitters.length ? hitters.join(', ') : 'none'}`);
+    const reach = t.reachable === false ? `  [unreachable: ${t.unreachableReason}]` : '';
+    lines.push(`  ${t.title} (${t.tmdb_id}) — ${hitters.length ? hitters.join(', ') : 'none'}${reach}`);
+    // m2: where each engine placed it — "#7 served", "#57", or why it was lost.
+    const per = Object.entries(results.engines).map(([id, e]) => {
+      const p = e.positions && e.positions[t.tmdb_id];
+      if (!p) return null;
+      if (p.rank) return `${id} #${p.rank}${p.served ? ' served' : ''}`;
+      return `${id} ${p.fate || 'not in pool'}`;
+    }).filter(Boolean);
+    if (per.length) lines.push(`      ${per.join(' · ')}`);
   }
+  lines.push('');
+  lines.push("hit@20r = hits among the targets this profile's filters allow at all (n/a when not assessed).");
   return lines.join('\n');
 }
 
-module.exports = { pickTargets, metrics, renderTable, runBench, removeHoldout, snapshotStore, parseComps };
+module.exports = { pickTargets, metrics, renderTable, runBench, removeHoldout, snapshotStore, parseComps, assessReachability };
