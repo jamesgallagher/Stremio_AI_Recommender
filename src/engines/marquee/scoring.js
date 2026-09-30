@@ -183,7 +183,10 @@ async function scoreCandidates(profile, ctx, candidates, {
   // rankScore desc, ties broken by tmdb_id (spec §4.5.8).
   scored.sort((a, b) => (b.rankScore - a.rankScore) || (a.tmdb_id < b.tmdb_id ? -1 : 1));
   onProgress(100, `Scored ${scored.length} candidate(s)`);
-  return { scored, envelopeStats: envelope.stats() };
+  // Review round 1 (S2): candidates whose lookup returns nothing are counted
+  // in no_imdb, not just in ctx.stats — P4's shortfall log reads envelopeStats.
+  const stats = envelope.stats();
+  return { scored, envelopeStats: { ...stats, no_imdb: stats.no_imdb + noImdb } };
 }
 
 module.exports = { scoreCandidates, defaultFetchers, decayedCollectionCounts };

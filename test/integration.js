@@ -2215,6 +2215,19 @@ async function main() {
     glassMeta._clear();
   });
 
+  await it('marquee ME-06: no_imdb in envelopeStats (S2) — a lookup-null candidate is counted there', async () => {
+    glassMeta._clear();
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const env = mqEnvelope(filters);
+    const ctx = mqCtx(filters);
+    // No cached meta row; the deepMeta stub returns null → the candidate is dropped at lookup.
+    const { scored, envelopeStats } = await mqScoring.scoreCandidates({ id: 'p-mq21', name: 'MQ21', filters }, ctx, [mqCand('n1')], {
+      taste: mqTaste, envelope: env, cfg: mqCfgResolved, gatherMeta: { weekN: 0, dayN: 0, hadTrending: false }, fetchers: mqScoreFetchers({ deepMeta: () => null }).f, nowYear: 2026, nowMs: Date.parse('2026-06-01T00:00:00Z'), log: quiet,
+    });
+    assert.strictEqual(scored.length, 0, 'lookup-null candidate dropped');
+    assert.strictEqual(envelopeStats.no_imdb, 1, 'no_imdb included in the returned envelopeStats');
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();
