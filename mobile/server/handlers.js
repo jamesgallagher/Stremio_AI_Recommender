@@ -434,6 +434,18 @@ async function trainerFinishedHandler(req, res) {
   }
 }
 
+// POST /api/trainer/unwatched  { type, tmdb_id?, imdb_id?, simkl_id? }
+// Mark a film unwatched — removes it from Simkl history (R3: Simkl first).
+async function trainerUnwatchedHandler(req, res) {
+  const { type, tmdb_id, imdb_id, simkl_id } = req.body || {};
+  try {
+    const r = await trainer.markUnwatched(req.profile, { type, tmdb_id, imdb_id, simkl_id });
+    res.status(trainer.httpStatus(r)).json(r.ok ? r : { error: r.reason });
+  } catch (err) {
+    res.status(502).json({ error: `Simkl write failed — ${err.message}` });
+  }
+}
+
 // POST /api/trainer/rebuild — trigger a recommendation rebuild (T2 will wire the
 // taste-feedback trigger; T1 exposes the same job the portal's rebuild uses).
 function trainerRebuildHandler(req, res) {
@@ -448,6 +460,6 @@ module.exports = {
   toRecDTO, recommendationsHandler, suppressHandler, unsuppressHandler, watchedHandler,
   toCompanionFilters, companionCatalogs, companionSettings, settingsGetHandler, settingsPostHandler,
   catalogPreviewHandler,
-  trainerHandler, trainerRateHandler, trainerIgnoreHandler, trainerFinishedHandler, trainerRebuildHandler,
+  trainerHandler, trainerRateHandler, trainerIgnoreHandler, trainerFinishedHandler, trainerUnwatchedHandler, trainerRebuildHandler,
   TYPES, COMPANION_FILTERS, SEARCH_LIMIT, SEARCH_LIMIT_MAX,
 };

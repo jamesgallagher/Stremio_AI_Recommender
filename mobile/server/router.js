@@ -128,6 +128,7 @@ router.get('/api/trainer', requireSession, handlers.trainerHandler);            
 router.post('/api/trainer/rate', requireSession, handlers.trainerRateHandler);        // Trainer T1: rate 1–10 (or clear)
 router.post('/api/trainer/ignore', requireSession, handlers.trainerIgnoreHandler);    // Trainer T1: ignore / un-ignore
 router.post('/api/trainer/finished', requireSession, handlers.trainerFinishedHandler);// Trainer T1: mark unfinished film finished
+router.post('/api/trainer/unwatched', requireSession, handlers.trainerUnwatchedHandler); // Trainer T3.1: mark unwatched
 router.post('/api/trainer/rebuild', requireSession, handlers.trainerRebuildHandler);  // Trainer T1: trigger a rebuild
 router.get('/api/settings', requireSession, handlers.settingsGetHandler);              // Step 5: editable filters + view pref
 router.post('/api/settings', requireSession, handlers.settingsPostHandler);            // Step 5: save filters + view pref

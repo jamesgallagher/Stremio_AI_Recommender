@@ -408,12 +408,58 @@ async function markFinished(profile, ref, deps = {}) {
   return { ok: true };
 }
 
+// markUnwatched — remove a film from the profile's Simkl watch history (a film
+// marked watched by mistake). Simkl is the authority (R3): the history removal
+// happens FIRST; the local rows are removed only on success (a throw propagates
+// and changes nothing local). A rated film also gets its rating removed —
+// best-effort AFTER the history removal (a failure there is logged, ids only,
+// and does not fail the action). An unwatch block stops the Nuvio/Stremio
+// scrobble re-adding the film (R5). The film becomes recommendable again (R6).
+async function markUnwatched(profile, ref, deps = {}) {
+  const D = mergeDeps(deps);
+  const t = resolveType(ref && ref.type);
+  if (!t.ok) return { ok: false, reason: t.reason };
+  const type = t.type;
+  if (!hasSimkl(profile)) return { ok: false, reason: 'no-simkl' };
+  const row = resolveWatchedRow(profile.id, type, ref, D.watchedStore);
+  if (!row) return { ok: false, reason: 'not-in-history' };
+  // R3: Simkl first — if the history removal throws, nothing local changes.
+  await D.simkl.removeFromHistory(profile, [{ type, simkl_id: row.simkl_id, imdb_id: row.imdb_id, tmdb_id: row.tmdb_id }]);
+  const now = D.now();
+  // A rated film also gets its rating removed — best-effort AFTER the history
+  // removal; a failure there is logged (ids only) and does not fail the action.
+  if (D.tasteFeedback.getRating(profile.id, type, row.tmdb_id) != null) {
+    try {
+      await D.simkl.removeRatings(profile, [{ type, simkl_id: row.simkl_id, imdb_id: row.imdb_id, tmdb_id: row.tmdb_id }]);
+    } catch (e) {
+      D.log.warn(`[trainer] ${profile.name}: rating removal failed: ${e.message}`);
+    }
+  }
+  // Build the item BEFORE the local deletions (buildItem reads the local
+  // rating/ignore state), then override it for the unwatched response.
+  const item = buildItem(D, profile, type, row);
+  // R4: local state matches Simkl immediately — the film's watched rows, its
+  // pending-watched rows, its ignore row, and its rating row are all removed.
+  const removed = D.watchedStore.removeWatched(profile.id, type, { tmdbId: row.tmdb_id, imdbId: row.imdb_id });
+  D.tasteFeedback.deleteRating(profile.id, type, row.tmdb_id);
+  D.tasteFeedback.setIgnored(profile.id, { type, tmdb_id: row.tmdb_id }, false, now);
+  D.watchedStore.addUnwatchedBlock(profile.id, type, { imdbId: row.imdb_id, tmdbId: row.tmdb_id }, now);
+  D.tasteFeedback.recordChange(profile.id, now);
+  item.status = 'unwatched';
+  item.rating = null;
+  item.loved = false;
+  item.ignored = false;
+  D.log.log(`[trainer] ${profile.name}: marked unwatched ${type} tmdb:${row.tmdb_id} imdb:${row.imdb_id || '—'}`);
+  return { ok: true, removed, item };
+}
+
 module.exports = {
   VIEWS,
   listHistory,
   rate,
   setIgnored,
   markFinished,
+  markUnwatched,
   isUnfinishedRow,
   httpStatus,
   resolveType,

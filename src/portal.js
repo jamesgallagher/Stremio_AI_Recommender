@@ -639,6 +639,19 @@ router.post('/profiles/:id/trainer/finished', async (req, res) => {
   }
 });
 
+router.post('/profiles/:id/trainer/unwatched', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  const { type, tmdb_id, imdb_id, simkl_id } = req.body || {};
+  const ref = { type, tmdb_id, imdb_id, simkl_id };
+  try {
+    const r = await trainer.markUnwatched(profile, ref);
+    res.status(trainer.httpStatus(r)).json(r.ok ? r : { error: r.reason });
+  } catch (err) {
+    res.status(502).json({ error: `Simkl write failed — ${err.message}` });
+  }
+});
+
 // MW-04 — remove a title from the profile's Simkl plan-to-watch list (the ✕ on a
 // Watch Later preview cell). Plain list management, NOT a suppression: it writes
 // nothing to dont_recommend, so the title stays eligible for AI recs and other

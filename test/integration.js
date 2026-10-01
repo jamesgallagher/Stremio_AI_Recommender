@@ -4392,6 +4392,301 @@ async function main() {
     assert.strictEqual(db.get().prepare('SELECT COUNT(*) AS n FROM taste_changes WHERE profile_id = ?').get(profileId).n, 0, 'no row created');
   });
 
+  // ── Trainer T3.1: unwatch backend + scrobble guard ────────────────────────
+  await it('Trainer T3.1 B1: simkl.removeFromHistory — /sync/history/remove body via buildRatingsBody, simkl_post lane; empty body throws with zero fetches', async () => {
+    const simkl = require('../src/services/simkl');
+    const profile = { id: 'p-b1', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    const origFetch = global.fetch;
+    const calls = [];
+    global.fetch = async (url, opts) => {
+      calls.push({ url: String(url), opts });
+      return { ok: true, status: 200, json: async () => ({}) };
+    };
+    try {
+      const res = await simkl.removeFromHistory(profile, [{ type: 'movie', simkl_id: 1, imdb_id: 'tt1', tmdb_id: '1' }]);
+      assert.deepStrictEqual(res, {});
+      assert.strictEqual(calls.length, 1);
+      assert.ok(calls[0].url.includes('/sync/history/remove'), 'the right path');
+      assert.ok(calls[0].url.includes('client_id=c'), 'client_id query param');
+      assert.strictEqual(calls[0].opts.method, 'POST');
+      const body = JSON.parse(calls[0].opts.body);
+      assert.deepStrictEqual(body, { movies: [{ ids: { simkl: 1, imdb: 'tt1', tmdb: '1' } }], shows: [] }, 'buildRatingsBody with withRating:false');
+    } finally { global.fetch = origFetch; }
+    // empty body → throws with zero fetches.
+    calls.length = 0;
+    await assert.rejects(() => simkl.removeFromHistory(profile, []), /nothing to remove/);
+    assert.strictEqual(calls.length, 0, 'no fetch on an empty body');
+    // no Simkl → throws.
+    await assert.rejects(() => simkl.removeFromHistory({ id: 'x', name: 'X', keys: {} }, [{ type: 'movie', tmdb_id: '1' }]), /not connected/);
+  });
+
+  await it('Trainer T3.1 B2: watchedStore.removeWatched — deletes watched rows by tmdb OR imdb (duplicates included) + pending rows; other profiles untouched; returns count', () => {
+    const watchedStore = require('../src/watchedStore');
+    const db = require('../src/db');
+    const A = 'p-b2-a';
+    const B = 'p-b2-b';
+    watchedStore.upsertMany(A, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'A1', year: 2020, watched_at: '2026-01-01T00:00:00Z' },
+      { simkl_id: 2, type: 'movie', imdb_id: 'tt1b', tmdb_id: '1', title: 'A2 (dup tmdb)', year: 2020, watched_at: '2026-01-02T00:00:00Z' },
+      { simkl_id: 3, type: 'movie', imdb_id: 'tt1', tmdb_id: null, title: 'A3 (imdb only)', year: 2020, watched_at: '2026-01-03T00:00:00Z' },
+      { simkl_id: 4, type: 'movie', imdb_id: 'tt4', tmdb_id: '4', title: 'A4 (untouched)', year: 2020, watched_at: '2026-01-04T00:00:00Z' },
+    ]);
+    watchedStore.addPendingWatched(A, { type: 'movie', imdbId: 'tt1' });
+    watchedStore.addPendingWatched(A, { type: 'movie', tmdbId: '4' });
+    // B: its own row sharing the tmdb id — must be untouched.
+    watchedStore.upsertMany(B, [{ simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'B1', year: 2020, watched_at: '2026-01-01T00:00:00Z' }]);
+    const removed = watchedStore.removeWatched(A, 'movie', { tmdbId: '1', imdbId: 'tt1' });
+    assert.strictEqual(removed, 3, 'two dup tmdb rows + one imdb-only row');
+    assert.strictEqual(watchedStore.getWatched(A, { type: 'movie' }).length, 1, 'only the untouched row remains');
+    assert.strictEqual(watchedStore.getWatched(A, { type: 'movie' })[0].tmdb_id, '4');
+    // pending: the tt1 row is gone, the tmdb-4 row remains.
+    const pend = db.get().prepare('SELECT id FROM pending_watched WHERE profile_id = ?').all(A).map((r) => r.id);
+    assert.deepStrictEqual(pend, ['4'], 'the matching pending row removed, the other kept');
+    // B untouched.
+    assert.strictEqual(watchedStore.getWatched(B, { type: 'movie' }).length, 1);
+    watchedStore.deleteForProfile(A);
+    watchedStore.deleteForProfile(B);
+  });
+
+  await it('Trainer T3.1 B3: unwatched block — add/get/clear; missing imdb is a no-op; deleteForProfile clears it', () => {
+    const watchedStore = require('../src/watchedStore');
+    const A = 'p-b3';
+    assert.strictEqual(watchedStore.addUnwatchedBlock(A, 'movie', { imdbId: 'tt1', tmdbId: '1' }, 1000), true);
+    let blocks = watchedStore.unwatchedBlocks(A, 'movie');
+    assert.deepStrictEqual([...blocks.entries()], [['tt1', 1000]]);
+    // upsert: a newer block for the same imdb replaces the at.
+    watchedStore.addUnwatchedBlock(A, 'movie', { imdbId: 'tt1', tmdbId: '1' }, 2000);
+    assert.deepStrictEqual([...watchedStore.unwatchedBlocks(A, 'movie').entries()], [['tt1', 2000]]);
+    // missing imdb → no-op.
+    assert.strictEqual(watchedStore.addUnwatchedBlock(A, 'movie', { tmdbId: '2' }, 1000), false);
+    assert.strictEqual(watchedStore.unwatchedBlocks(A, 'movie').size, 1, 'no row added without an imdb id');
+    // clear.
+    watchedStore.clearUnwatchedBlock(A, 'movie', 'tt1');
+    assert.strictEqual(watchedStore.unwatchedBlocks(A, 'movie').size, 0);
+    // deleteForProfile clears it.
+    watchedStore.addUnwatchedBlock(A, 'movie', { imdbId: 'tt5' });
+    watchedStore.deleteForProfile(A);
+    assert.strictEqual(watchedStore.unwatchedBlocks(A, 'movie').size, 0);
+  });
+
+  await it('Trainer T3.1 B4: scrobble guard — a blocked movie is skipped unless the provider watch is newer (R5)', async () => {
+    const scrobble = require('../src/services/scrobble');
+    const watchedStore = require('../src/watchedStore');
+    const nuvio = require('../src/services/nuvio');
+    const simkl = require('../src/services/simkl');
+    const crypto = require('../src/services/crypto');
+    const profile = { id: 'p-b4', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' }, scrobble: { enabled: true, provider: 'nuvio', email: 'a@b.c', password_enc: crypto.encrypt('pw') } };
+    const origPull = nuvio.pullWatched;
+    const origAdd = simkl.addToHistory;
+    let pushed = null;
+    simkl.addToHistory = async (_p, body) => { pushed = body; return {}; };
+    try {
+      watchedStore.addUnwatchedBlock(profile.id, 'movie', { imdbId: 'tt1', tmdbId: '1' }, 1000);
+      // (a) blocked movie, watchedAtMs ≤ block → not pushed; the other movie is.
+      nuvio.pullWatched = async () => [
+        { type: 'movie', imdbId: 'tt1', watchedAtMs: 1000 },
+        { type: 'movie', imdbId: 'tt2', watchedAtMs: 2000 },
+      ];
+      await scrobble.syncProfile(profile, quiet);
+      assert.deepStrictEqual(pushed.movies.map((m) => m.ids.imdb), ['tt2'], 'only the non-blocked movie pushed');
+      // (b) blocked movie with no watchedAtMs → not pushed.
+      pushed = null;
+      nuvio.pullWatched = async () => [{ type: 'movie', imdbId: 'tt1' }];
+      await scrobble.syncProfile(profile, quiet);
+      assert.strictEqual(pushed, null, 'nothing to push → no addToHistory call');
+      // (c) newer than the block → pushed and the block is cleared.
+      pushed = null;
+      nuvio.pullWatched = async () => [{ type: 'movie', imdbId: 'tt1', watchedAtMs: 2000 }];
+      await scrobble.syncProfile(profile, quiet);
+      assert.deepStrictEqual(pushed.movies.map((m) => m.ids.imdb), ['tt1']);
+      assert.strictEqual(watchedStore.unwatchedBlocks(profile.id, 'movie').size, 0, 'block cleared on a genuine rewatch');
+      // (d) full:true still skips the old one.
+      watchedStore.addUnwatchedBlock(profile.id, 'movie', { imdbId: 'tt1', tmdbId: '1' }, 1000);
+      pushed = null;
+      nuvio.pullWatched = async () => [{ type: 'movie', imdbId: 'tt1', watchedAtMs: 500 }];
+      await scrobble.syncProfile(profile, quiet, { full: true });
+      assert.strictEqual(pushed, null, 'full rebuild still skips a blocked movie older than the block');
+      // (e) episodes are unaffected.
+      pushed = null;
+      nuvio.pullWatched = async () => [
+        { type: 'movie', imdbId: 'tt1', watchedAtMs: 500 },
+        { type: 'series', imdbId: 'tt1', season: 1, episode: 1, watchedAtMs: 500 },
+      ];
+      await scrobble.syncProfile(profile, quiet);
+      assert.strictEqual(pushed.movies.length, 0, 'the blocked movie is skipped');
+      assert.strictEqual(pushed.shows.length, 1, 'the episode is unaffected');
+    } finally {
+      nuvio.pullWatched = origPull;
+      simkl.addToHistory = origAdd;
+      watchedStore.deleteForProfile(profile.id);
+    }
+  });
+
+  await it('Trainer T3.1 B5: markUnwatched — Simkl history removal first, local cleanup, block added, change recorded', async () => {
+    const trainer = require('../src/trainer');
+    const watchedStore = require('../src/watchedStore');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const db = require('../src/db');
+    const profile = { id: 'p-b5', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    watchedStore.upsertMany(profile.id, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'A', year: 2020, watched_at: '2026-01-01T00:00:00Z' },
+    ]);
+    watchedStore.addPendingWatched(profile.id, { type: 'movie', imdbId: 'tt1' });
+    tasteFeedback.upsertRating(profile.id, { type: 'movie', tmdb_id: '1', imdb_id: 'tt1', simkl_id: 1, rating: 7 });
+    tasteFeedback.setIgnored(profile.id, { type: 'movie', tmdb_id: '1', simkl_id: 1, imdb_id: 'tt1' }, true, 500);
+    const simklCalls = [];
+    const deps = {
+      simkl: {
+        removeFromHistory: async (_p, items) => { simklCalls.push(['history', items]); },
+        removeRatings: async (_p, items) => { simklCalls.push(['ratings', items]); },
+      },
+      now: () => 1000,
+      log: quiet,
+    };
+    const res = await trainer.markUnwatched(profile, { type: 'movie', tmdb_id: '1' }, deps);
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.removed, 1, 'the watched row removed');
+    assert.deepStrictEqual(simklCalls, [
+      ['history', [{ type: 'movie', simkl_id: 1, imdb_id: 'tt1', tmdb_id: '1' }]],
+      ['ratings', [{ type: 'movie', simkl_id: 1, imdb_id: 'tt1', tmdb_id: '1' }]],
+    ], 'history removal first, then the rating removal (a rated film)');
+    // local rows gone.
+    assert.strictEqual(watchedStore.getWatched(profile.id, { type: 'movie' }).length, 0);
+    assert.strictEqual(db.get().prepare('SELECT COUNT(*) AS n FROM pending_watched WHERE profile_id = ?').get(profile.id).n, 0, 'pending row gone');
+    assert.strictEqual(tasteFeedback.getRating(profile.id, 'movie', '1'), null, 'rating row gone');
+    assert.strictEqual(tasteFeedback.ignoredSet(profile.id, 'movie').size, 0, 'ignore row gone');
+    // block added.
+    assert.deepStrictEqual([...watchedStore.unwatchedBlocks(profile.id, 'movie').entries()], [['tt1', 1000]]);
+    // change recorded.
+    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 1000, changes_since_build: 1, built_changed_at: null });
+    // the returned item is the unwatched DTO.
+    assert.strictEqual(res.item.status, 'unwatched');
+    assert.strictEqual(res.item.rating, null);
+    assert.strictEqual(res.item.loved, false);
+    assert.strictEqual(res.item.ignored, false);
+    assert.strictEqual(res.item.key, '1');
+    assert.strictEqual(res.item.title, 'A');
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ignore; DELETE FROM taste_changes');
+    watchedStore.deleteForProfile(profile.id);
+  });
+
+  await it('Trainer T3.1 B6: markUnwatched — a thrown history removal rejects; every local row is still present, no block, no change', async () => {
+    const trainer = require('../src/trainer');
+    const watchedStore = require('../src/watchedStore');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const db = require('../src/db');
+    const profile = { id: 'p-b6', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    watchedStore.upsertMany(profile.id, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'A', year: 2020, watched_at: '2026-01-01T00:00:00Z' },
+    ]);
+    tasteFeedback.upsertRating(profile.id, { type: 'movie', tmdb_id: '1', imdb_id: 'tt1', simkl_id: 1, rating: 7 });
+    tasteFeedback.setIgnored(profile.id, { type: 'movie', tmdb_id: '1', simkl_id: 1, imdb_id: 'tt1' }, true, 500);
+    const deps = {
+      simkl: {
+        removeFromHistory: async () => { throw new Error('Simkl POST /sync/history/remove failed (500)'); },
+        removeRatings: async () => { throw new Error('should not be called'); },
+      },
+      now: () => 1000,
+      log: quiet,
+    };
+    await assert.rejects(() => trainer.markUnwatched(profile, { type: 'movie', tmdb_id: '1' }, deps), /history/);
+    // every local row still present.
+    assert.strictEqual(watchedStore.getWatched(profile.id, { type: 'movie' }).length, 1, 'watched row untouched');
+    assert.strictEqual(tasteFeedback.getRating(profile.id, 'movie', '1'), 7, 'rating row untouched');
+    assert.ok(tasteFeedback.ignoredSet(profile.id, 'movie').has('1'), 'ignore row untouched');
+    // no block, no change.
+    assert.strictEqual(watchedStore.unwatchedBlocks(profile.id, 'movie').size, 0, 'no block');
+    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: null, changes_since_build: 0, built_changed_at: null }, 'no change recorded');
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ignore');
+    watchedStore.deleteForProfile(profile.id);
+  });
+
+  await it('Trainer T3.1 B7: markUnwatched — a thrown rating removal still succeeds; local cleanup done', async () => {
+    const trainer = require('../src/trainer');
+    const watchedStore = require('../src/watchedStore');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const db = require('../src/db');
+    const profile = { id: 'p-b7', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    watchedStore.upsertMany(profile.id, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'A', year: 2020, watched_at: '2026-01-01T00:00:00Z' },
+    ]);
+    tasteFeedback.upsertRating(profile.id, { type: 'movie', tmdb_id: '1', imdb_id: 'tt1', simkl_id: 1, rating: 7 });
+    const deps = {
+      simkl: {
+        removeFromHistory: async () => {},
+        removeRatings: async () => { throw new Error('Simkl POST /sync/ratings/remove failed (500)'); },
+      },
+      now: () => 1000,
+      log: quiet,
+    };
+    const res = await trainer.markUnwatched(profile, { type: 'movie', tmdb_id: '1' }, deps);
+    assert.strictEqual(res.ok, true, 'still ok');
+    // local cleanup done: the rating row is deleted (deleteRating is local, independent of the Simkl removeRatings failure).
+    assert.strictEqual(tasteFeedback.getRating(profile.id, 'movie', '1'), null, 'rating row deleted');
+    assert.strictEqual(watchedStore.getWatched(profile.id, { type: 'movie' }).length, 0, 'watched row removed');
+    assert.ok(watchedStore.unwatchedBlocks(profile.id, 'movie').has('tt1'), 'block added');
+    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 1000, changes_since_build: 1, built_changed_at: null }, 'change recorded');
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_changes');
+    watchedStore.deleteForProfile(profile.id);
+  });
+
+  await it('Trainer T3.1 B8: portal route — 200/400 no-simkl/404 not-in-history/502 on throw', async () => {
+    const express = require('express');
+    const portal = require('../src/portal');
+    const simkl = require('../src/services/simkl');
+    const config = require('../src/config');
+    const watchedStore = require('../src/watchedStore');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const db = require('../src/db');
+    const port = 7314;
+    const app = express();
+    app.use('/api', portal.router);
+    const server = app.listen(port);
+    await new Promise((resolve, reject) => { server.on('listening', resolve); server.on('error', reject); });
+    const base = `http://localhost:${port}`;
+    const origRemoveHist = simkl.removeFromHistory;
+    const origRemoveRatings = simkl.removeRatings;
+    let p, p2;
+    try {
+      // A Simkl-connected profile with one watched movie.
+      p = config.addProfile('T31-Portal');
+      config.updateProfile(p.id, { keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't', connected_at: 0 } });
+      watchedStore.upsertMany(p.id, [{ simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'A', year: 2020, watched_at: '2026-01-01T00:00:00Z' }]);
+      tasteFeedback.upsertRating(p.id, { type: 'movie', tmdb_id: '1', imdb_id: 'tt1', simkl_id: 1, rating: 7 });
+      // 200 on success (Simkl writes stubbed).
+      simkl.removeFromHistory = async () => ({});
+      simkl.removeRatings = async () => ({});
+      let res = await fetch(`${base}/api/profiles/${p.id}/trainer/unwatched`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'movie', tmdb_id: '1' }) });
+      assert.strictEqual(res.status, 200);
+      const body = await res.json();
+      assert.strictEqual(body.item.status, 'unwatched');
+      assert.strictEqual(body.item.rating, null);
+      assert.ok(body.removed >= 1);
+      assert.strictEqual(watchedStore.getWatched(p.id, { type: 'movie' }).length, 0, 'local watched row gone');
+      assert.strictEqual(tasteFeedback.getRating(p.id, 'movie', '1'), null, 'local rating row gone');
+      // re-seed for the remaining cases.
+      watchedStore.upsertMany(p.id, [{ simkl_id: 2, type: 'movie', imdb_id: 'tt2', tmdb_id: '2', title: 'B', year: 2020, watched_at: '2026-01-02T00:00:00Z' }]);
+      // 400 no-simkl (a profile without Simkl).
+      p2 = config.addProfile('T31-NoSimkl');
+      res = await fetch(`${base}/api/profiles/${p2.id}/trainer/unwatched`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'movie', tmdb_id: '2' }) });
+      assert.strictEqual(res.status, 400);
+      // 404 not-in-history (Simkl-connected profile, no matching watched row).
+      res = await fetch(`${base}/api/profiles/${p.id}/trainer/unwatched`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'movie', tmdb_id: '999' }) });
+      assert.strictEqual(res.status, 404);
+      // 502 on a thrown Simkl write.
+      simkl.removeFromHistory = async () => { throw new Error('Simkl POST /sync/history/remove failed (500)'); };
+      res = await fetch(`${base}/api/profiles/${p.id}/trainer/unwatched`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'movie', tmdb_id: '2' }) });
+      assert.strictEqual(res.status, 502);
+    } finally {
+      simkl.removeFromHistory = origRemoveHist;
+      simkl.removeRatings = origRemoveRatings;
+      server.close();
+      if (p) { config.removeProfile(p.id); watchedStore.deleteForProfile(p.id); tasteFeedback.deleteForProfile(p.id); }
+      if (p2) { config.removeProfile(p2.id); }
+      db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ignore; DELETE FROM taste_changes');
+    }
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();
