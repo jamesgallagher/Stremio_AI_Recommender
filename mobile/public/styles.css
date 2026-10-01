@@ -5,11 +5,15 @@
   --text: #e6e8ee; --muted: #8b91a3; --accent: #8b5cf6; --accent2: #6d3fe0;
   --ok: #34d399; --warn: #fbbf24; --err: #f87171;
   --topbar-h: 52px; --tabbar-h: 60px;
+  /* Trainer star tokens (T4) — dark. Empty stars keep >=3:1 against --card2. */
+  --star: #ffd34d; --star-empty: #6b7184; --love: #f472b6;
 }
 @media (prefers-color-scheme: light) {
   :root {
     --bg: #f6f7fb; --card: #ffffff; --card2: #eef0f6; --border: #d9dce6;
     --text: #1a1d26; --muted: #5c6274; --accent: #6d3fe0; --accent2: #572fc4;
+    /* Light override — empty stars still >=3:1 against the light --card2. */
+    --star: #e0a100; --star-empty: #7a8094; --love: #db2777;
   }
 }
 
@@ -277,3 +281,114 @@ select:focus { border-color: var(--accent); }
 @media (min-width: 768px) { .snackbar { bottom: 24px; } }
 .link { background: transparent; border: 0; color: var(--accent); font-weight: 700; min-height: auto; padding: 4px 6px; }
 .link:hover { background: transparent; color: var(--accent2); }
+
+/* ---- Trainer (T4) ---- */
+/* Mode switch (Quick / List) — full-width segmented control. */
+.trainer-tabs { display: flex; width: 100%; margin: 4px 0 8px; }
+.trainer-tabs .seg { flex: 1; }
+
+/* Filter chips + search (List mode). */
+.tr-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 8px; }
+.tr-chip { background: var(--card2); border: 1px solid var(--border); border-radius: 999px;
+  color: var(--muted); padding: 6px 12px; font-size: 12px; min-height: 44px; }
+.tr-chip:hover { color: var(--text); }
+.tr-chip[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+.tr-count { color: var(--muted); font-size: 11px; }
+.tr-search-row { margin: 8px 0; }
+
+/* History rows — the portal's stacked (<=640px) layout, as the only layout.
+   Stars are 40x40; the row's buttons are transparent with a border. */
+.tr-table { display: grid; gap: 8px; }
+.tr-row { display: block; background: var(--card2); border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; }
+.tr-row.tr-dim { opacity: .45; }
+.tr-title { display: flex; align-items: center; gap: 8px; min-width: 0; margin-bottom: 4px; }
+.tr-tt { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.tr-thumb { width: 34px; height: 51px; border-radius: 6px; background: var(--card2);
+  border: 1px solid var(--border); object-fit: cover; flex: 0 0 auto; }
+/* genre · when are inline cells (the portal's stacked rule). */
+.tr-row > .tr-cell:nth-child(2), .tr-row > .tr-cell:nth-child(3) { display: inline; }
+.tr-row > .tr-cell:nth-child(3)::before { content: ' · '; }
+.tr-rating { margin: 6px 0; }
+.tr-acts { margin-top: 6px; flex-wrap: wrap; }
+
+/* Star group — the shared scrub visuals (glyph + fill + two transparent hit
+   areas per star). touch-action: pan-y so a vertical drag scrolls the page. */
+.tr-stars { display: inline-flex; gap: 2px; align-items: center; touch-action: pan-y; cursor: pointer; }
+.tr-stars.tr-previewing .tr-fill { color: var(--star); opacity: .85; }
+.tr-star-wrap { position: relative; display: inline-block; width: 40px; height: 40px; }
+.tr-glyph { position: absolute; top: 0; left: 0; width: 100%; height: 100%; font-size: 38px; line-height: 38px; color: var(--star-empty); pointer-events: none; }
+.tr-fill { position: absolute; top: 0; left: 0; height: 100%; overflow: hidden; white-space: nowrap; font-size: 38px; line-height: 38px; color: var(--star); pointer-events: none; }
+.tr-star { position: absolute; top: 0; height: 100%; width: 50%; min-height: 0; padding: 0; border: 0; background: transparent; cursor: pointer; }
+.tr-star[data-half="left"] { left: 0; }
+.tr-star[data-half="right"] { left: 50%; }
+.tr-star:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.tr-row .tr-star-wrap button.tr-star { border: 0; background: transparent; }
+/* Every other row button: transparent with a border (P10 keeps them >=44px via
+   the global button rule). */
+.tr-row button { background: transparent; border: 1px solid var(--border); color: var(--muted); }
+.tr-row button:hover { background: transparent; color: var(--text); border-color: var(--muted); }
+.tr-heart[aria-pressed="true"] { color: var(--love); border-color: var(--love); }
+
+/* Banner + notice. */
+.tr-banner { background: var(--card2); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+  border-radius: 8px; padding: 8px 12px; font-size: 13px; margin: 8px 0; }
+.tr-notice { color: var(--muted); font-size: 12px; margin: 8px 0; }
+.tr-pager { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+
+/* Quick card (Quick mode) — one screen, no scroll (K2). The trainer section is
+   a flex column filling the space between the top bar and the tab bar; the card
+   fills the remaining space, and the poster is the only flexible item. */
+#view-trainer {
+  display: flex; flex-direction: column;
+  height: calc(100dvh - var(--topbar-h) - var(--tabbar-h) - env(safe-area-inset-bottom) - 8px);
+}
+.trainer-tabs { flex: 0 0 auto; }
+#trainer-notice { flex: 0 0 auto; }
+#trainer-banner { flex: 0 0 auto; }
+#trainer-quick { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+/* List mode scrolls within the fixed-height flex column (K2). */
+#trainer-list { flex: 1; min-height: 0; overflow-y: auto; }
+.tq-left { flex: 0 0 auto; text-align: center; color: var(--muted); font-size: 13px; margin: 8px 0; }
+.tq-card {
+  position: relative; width: 100%; max-width: 420px; margin: 0 auto;
+  background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+  padding: 14px; touch-action: none; /* the card owns the swipe gesture */
+  display: flex; flex-direction: column; min-height: 0; flex: 1;
+}
+/* But the star group keeps pan-y so it never fights the card swipe (P5). */
+.tq-card .tr-stars { touch-action: pan-y; flex: 0 0 auto; }
+/* The poster is the only flexible item — it shrinks to fit the card. */
+.tq-poster { flex: 1 1 auto; min-height: 0; width: auto; max-width: 100%;
+  aspect-ratio: 2/3; object-fit: cover; align-self: center;
+  border-radius: 10px; background: var(--card2); }
+.tq-noposter { display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 12px; }
+.tq-meta { flex: 0 0 auto; margin: 10px 0 6px; }
+/* The quick card's star row is bigger: 48x48 per star. */
+.tq-card .tr-star-wrap { width: 48px; height: 48px; }
+.tq-card .tr-glyph, .tq-card .tr-fill { font-size: 46px; line-height: 46px; }
+.tq-rating-text { flex: 0 0 auto; margin: 4px 0 8px; color: var(--text); font-size: 14px; }
+.tq-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.tq-btn { flex: 1; min-height: 48px; font-size: 16px; }
+.tq-love { background: var(--love); color: #fff; }
+.tq-love:hover { background: var(--love); }
+.tq-ignore, .tq-skip { background: transparent; border: 1px solid var(--border); color: var(--muted); }
+.tq-ignore:hover, .tq-skip:hover { color: var(--text); border-color: var(--muted); }
+.tq-unwatch { background: transparent; border: 0; color: var(--muted); font-size: 13px; min-height: 44px; padding: 4px 8px; }
+.tq-unwatch:hover { color: var(--text); }
+.tq-hint { text-align: center; color: var(--muted); font-size: 12px; margin-top: 10px; }
+/* Swipe overlay: the label, opacity = progress; green Skip, red Ignore, pink Love. */
+.tq-overlay {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  font-size: 28px; font-weight: 700; opacity: 0; pointer-events: none; color: var(--muted);
+}
+.tq-overlay.tq-skip { color: var(--ok); }
+.tq-overlay.tq-ignore { color: var(--err); }
+.tq-overlay.tq-love { color: var(--love); }
+.tq-empty { text-align: center; color: var(--muted); padding: 32px 16px; }
+/* K2.3: in Quick mode the P8 notice and the banner are one line each. */
+.tr-notice-quick { display: flex; align-items: center; gap: 8px; }
+.tr-banner-quick { display: flex; align-items: center; gap: 8px; }
+/* K2.4: hide the hint line on short viewports. */
+@media (max-height: 700px) {
+  .tq-hint { display: none; }
+}

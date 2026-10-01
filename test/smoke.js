@@ -3022,6 +3022,88 @@ ok('trainer T3.1 U9: bindStarScrub — hover, touch scrub, scroll cancel, disabl
   }
 });
 
+// ---- Trainer T4: the new pure helpers in public/trainer-ui.js ----
+
+ok('trainer T4 M1: ratingText — null, 1, 2, 7, 9, 10 exactly as specified', () => {
+  assert.strictEqual(TrainerUI.ratingText(null), 'Not rated');
+  assert.strictEqual(TrainerUI.ratingText(1), '½★ · 1/10');
+  assert.strictEqual(TrainerUI.ratingText(2), '1★ · 2/10');
+  assert.strictEqual(TrainerUI.ratingText(7), '3½★ · 7/10');
+  assert.strictEqual(TrainerUI.ratingText(9), '4½★ · 9/10');
+  assert.strictEqual(TrainerUI.ratingText(10), '5★ · 10/10 · Loved');
+});
+
+ok('trainer T4 M2: cardSwipeOutcome — none, ignore, skip, love, live feedback', () => {
+  const w = 360, h = 640;
+  // (0,0) → none, no label, progress 0.
+  assert.deepStrictEqual(TrainerUI.cardSwipeOutcome(0, 0, w, h), { action: 'none', label: '', progress: 0 });
+  // (-0.30w, 0) → ignore (past the 28% threshold).
+  assert.deepStrictEqual(TrainerUI.cardSwipeOutcome(-0.30 * w, 0, w, h), { action: 'ignore', label: 'Ignore', progress: 1 });
+  // (-0.1w, 0) → below threshold: action none, but label 'Ignore', progress ≈ 0.357.
+  {
+    const o = TrainerUI.cardSwipeOutcome(-0.1 * w, 0, w, h);
+    assert.strictEqual(o.action, 'none');
+    assert.strictEqual(o.label, 'Ignore');
+    assert.ok(Math.abs(o.progress - 0.357) < 0.01, 'progress ≈ 0.357, got ' + o.progress);
+  }
+  // (0.3w, 0) → skip (past the 28% threshold).
+  assert.deepStrictEqual(TrainerUI.cardSwipeOutcome(0.3 * w, 0, w, h), { action: 'skip', label: 'Skip', progress: 1 });
+  // (10, -0.25h) → love (up dominates, past the 22% threshold).
+  assert.deepStrictEqual(TrainerUI.cardSwipeOutcome(10, -0.25 * h, w, h), { action: 'love', label: 'Love ♥', progress: 1 });
+  // (-0.3w, -0.1h) → ignore (horizontal dominates).
+  assert.deepStrictEqual(TrainerUI.cardSwipeOutcome(-0.3 * w, -0.1 * h, w, h), { action: 'ignore', label: 'Ignore', progress: 1 });
+  // (5, -0.1h) → up but below threshold: action none, progress < 1.
+  {
+    const o = TrainerUI.cardSwipeOutcome(5, -0.1 * h, w, h);
+    assert.strictEqual(o.action, 'none');
+    assert.strictEqual(o.label, 'Love ♥');
+    assert.ok(o.progress < 1, 'progress < 1, got ' + o.progress);
+  }
+});
+
+ok('trainer T4 M3: pickQuickBatch — excludes rated/ignored/unfinished/handled, preserves order', () => {
+  const items = [
+    { key: 'a', status: 'watched', ignored: false, rating: null },
+    { key: 'b', status: 'watched', ignored: true, rating: null },        // ignored → excluded
+    { key: 'c', status: 'watched', ignored: false, rating: 5 },          // rated → excluded
+    { key: 'd', status: 'unfinished', ignored: false, rating: null },    // unfinished → excluded
+    { key: 'e', status: 'watched', ignored: false, rating: null },
+    { key: 'f', status: 'watched', ignored: false, rating: 0 },          // rating 0 is non-null → excluded
+  ];
+  const handled = new Set(['e']);
+  const batch = TrainerUI.pickQuickBatch(items, handled);
+  assert.deepStrictEqual(batch.map(i => i.key), ['a'], 'only watched, unignored, unrated, unhandled remain, in order');
+});
+
+ok('trainer T4 M4: QUICK_ACTIONS is exactly the list', () => {
+  assert.deepStrictEqual(TrainerUI.QUICK_ACTIONS, ['love', 'ignore', 'skip', 'unwatch', 'undo']);
+});
+
+ok('trainer T4 K1a: jsonRequest — object body → JSON string; string/no body unchanged; input never mutated', () => {
+  // Object body → a JSON string (the fix for the "[object Object]" 400).
+  const obj = { method: 'POST', body: { type: 'movie', tmdb_id: '1', ignored: true } };
+  const r1 = TrainerUI.jsonRequest(obj);
+  assert.strictEqual(r1.body, JSON.stringify(obj.body));
+  assert.strictEqual(r1.method, 'POST'); // other opts preserved
+  // The result is a fresh copy, not the input.
+  assert.notStrictEqual(r1, obj);
+  // String body → unchanged (same reference).
+  const str = { method: 'POST', body: '{"a":1}' };
+  assert.strictEqual(TrainerUI.jsonRequest(str), str);
+  // No body → unchanged (same reference).
+  const nob = { method: 'POST' };
+  assert.strictEqual(TrainerUI.jsonRequest(nob), nob);
+  // The input is never mutated.
+  assert.deepStrictEqual(obj, { method: 'POST', body: { type: 'movie', tmdb_id: '1', ignored: true } });
+  r1.body = 'mutated';
+  assert.deepStrictEqual(obj.body, { type: 'movie', tmdb_id: '1', ignored: true });
+});
+
+ok('trainer T4 K3a: shouldAdvance — only advance if the current card is still the key', () => {
+  assert.strictEqual(TrainerUI.shouldAdvance('a', 'a'), true);
+  assert.strictEqual(TrainerUI.shouldAdvance('b', 'a'), false);
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');

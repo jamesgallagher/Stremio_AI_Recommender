@@ -144,6 +144,12 @@ router.get('/api/config', (req, res) => {
 // Public assets (index.html, app.js, styles.css, ui.js, manifest) — like
 // /configure. The DATA under /api/* above is what requires a session; the shell
 // itself is public. Registered AFTER the API routes so it can never shadow them.
+// Trainer T4: the portal's pure Trainer helpers, served to the companion as the
+// SAME file (no fork). Public like the rest of the SPA shell — it holds no data.
+router.get('/trainer-ui.js', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.type('application/javascript').sendFile(path.join(__dirname, '..', '..', 'public', 'trainer-ui.js'));
+});
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 router.use(express.static(PUBLIC_DIR, {
   etag: false,

@@ -301,6 +301,14 @@ async function unitTests() {
     assert.strictEqual(clientUi.viewForState({ authed: true }), clientUi.DEFAULT_VIEW);
   });
 
+  // ---- Trainer T4 M7: the companion route is recognised by the pure UI helpers ----
+  await ok('ui: trainer route parses and renders for an authed user', () => {
+    assert.strictEqual(clientUi.parseRoute('#/trainer').view, 'trainer');
+    assert.strictEqual(clientUi.viewForState({ authed: true, route: 'trainer' }), 'trainer');
+    // Not authed -> login, even for the trainer route.
+    assert.strictEqual(clientUi.viewForState({ authed: false, route: 'trainer' }), 'login');
+  });
+
   // ---- Step 3: Simkl plan-to-watch write ----
   await ok('simkl: buildAddToListBody routes by kind, sets plantowatch, id preference, skips id-less', () => {
     const body = simkl.buildAddToListBody([
@@ -1188,6 +1196,32 @@ async function httpTests() {
     console.log('  ✓ shell: styles.css responsive contract + [hidden] enforced');
   }
 
+  // Trainer T4 M6: the portal's pure Trainer helpers, served to the companion as
+  // the SAME file — public (no session needed), application/javascript, and it
+  // carries the shared star-scrub helper (proof it is the portal's file, not a fork).
+  {
+    const res = await fetch(`${BASE}/mobile/trainer-ui.js`);
+    assert.strictEqual(res.status, 200);
+    assert.ok((res.headers.get('content-type') || '').includes('application/javascript'), 'served as JS');
+    const js = await res.text();
+    assert.ok(js.includes('bindStarScrub'), 'contains the shared scrub helper');
+    console.log('  ✓ shell: GET /mobile/trainer-ui.js serves the shared pure module (public, JS, no session)');
+  }
+
+  // Trainer T4 M8: the shell carries the Trainer tab + section + both script
+  // tags, and the companion's own controller is served.
+  await ok('shell: GET /mobile/ has the Trainer tab/section/scripts; trainer.js is served', async () => {
+    const res = await fetch(`${BASE}/mobile/`);
+    assert.strictEqual(res.status, 200);
+    const html = await res.text();
+    assert.ok(html.includes('data-route="trainer"'), 'has the Trainer tabbar button');
+    assert.ok(html.includes('id="view-trainer"'), 'has the Trainer section');
+    assert.ok(html.includes('trainer-ui.js'), 'references the shared pure module');
+    assert.ok(html.includes('trainer.js'), 'references the companion controller');
+    const jsRes = await fetch(`${BASE}/mobile/trainer.js`);
+    assert.strictEqual(jsRes.status, 200, 'trainer.js is served');
+  });
+
   // Config endpoint (public) returns app name + version.
   {
     const cfg = await (await fetch(`${BASE}/mobile/api/config`)).json();
@@ -1417,6 +1451,32 @@ async function httpTests() {
     config.removeProfile(p1.id);
     config.removeProfile(p2.id);
     console.log('  ✓ trainer companion: unauthenticated 401 + query profile_id ignored (F11.6)');
+  }
+
+  // ---- Trainer T4 K1b: the companion's POST body is real JSON, not "[object Object]" ----
+  // POST /mobile/api/trainer/ignore with a real JSON body + session → 200 (or
+  // 404 not-in-history for an unknown film) — never 400.
+  {
+    const watchedStore = require('../../src/watchedStore');
+    const emailK = uniqEmail(); const pK = seedProfile('TrainerK1', emailK);
+    watchedStore.upsertMany(pK.id, [{ simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'Mine', year: 2020, watched_at: '2026-01-01T00:00:00Z' }]);
+    const cookie = await sessionCookieFor(emailK);
+    // Known film → 200.
+    const known = await fetch(`${BASE}/mobile/api/trainer/ignore`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ type: 'movie', tmdb_id: '1', ignored: true }),
+    });
+    assert.strictEqual(known.status, 200, 'known film → 200, got ' + known.status);
+    // Unknown film → 404 not-in-history (not 400).
+    const unknown = await fetch(`${BASE}/mobile/api/trainer/ignore`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ type: 'movie', tmdb_id: '999999', ignored: true }),
+    });
+    assert.strictEqual(unknown.status, 404, 'unknown film → 404, got ' + unknown.status);
+    assert.match((await unknown.json()).error, /not-in-history/);
+    watchedStore.deleteForProfile(pK.id);
+    config.removeProfile(pK.id);
+    console.log('  ✓ trainer K1b: POST /mobile/api/trainer/ignore with a real JSON body → 200/404, never 400');
   }
 
   console.log(`\nAll mobile checks passed (${passed} unit + http).`);

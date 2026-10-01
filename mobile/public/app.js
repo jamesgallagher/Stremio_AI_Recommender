@@ -30,6 +30,9 @@
       clearTimeout(timer);
     }
   }
+  // Trainer T4: the companion exposes its fetch + snackbar to the Trainer controller
+  // (trainer.js), so it can drive the same session-scoped API and snackbars.
+  window.companion = { apiFetch, showSnack, hideSnack };
   const setMsg = (text, kind) => { els.msg.textContent = text || ''; els.msg.className = 'msg' + (kind ? ' ' + kind : ''); };
 
   // ---- render ----
@@ -44,6 +47,7 @@
     document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.route === view));
     if (view === 'recs') loadRecs();
     if (view === 'settings') loadSettings();
+    if (view === 'trainer' && window.trainerView) window.trainerView.open();
   }
 
   // ---- login flow ----

@@ -63,6 +63,7 @@
     <nav class="tabbar" role="tablist">
       <button class="tab" data-route="recs" role="tab">Recommendations</button>
       <button class="tab" data-route="search" role="tab">Search</button>
+      <button class="tab" data-route="trainer" role="tab">Trainer</button>
     </nav>
 
     <main id="content" class="container">
@@ -210,6 +211,17 @@
           <button id="catalogs-save" class="block" type="button" style="margin-top:14px">Save catalogs</button>
         </div>
       </section>
+
+      <section id="view-trainer" class="view" hidden>
+        <div class="segmented trainer-tabs" role="tablist" aria-label="Trainer mode">
+          <button class="seg active" data-tmode="quick" role="tab">Quick</button>
+          <button class="seg" data-tmode="list" role="tab">List</button>
+        </div>
+        <div id="trainer-notice" class="trainer-notice"></div>
+        <div id="trainer-banner"></div>
+        <div id="trainer-quick"></div>
+        <div id="trainer-list"></div>
+      </section>
     </main>
   </div>
 
@@ -255,5 +267,7 @@
 <script src="ui.js"></script>
 <script src="swipe.js"></script>
 <script src="app.js"></script>
+<script src="trainer-ui.js"></script>
+<script src="trainer.js"></script>
 </body>
 </html>
