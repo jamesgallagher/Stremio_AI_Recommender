@@ -24,12 +24,18 @@
   };
 
   const queue = T.createRateQueue({
-    send: (key, rating) => postRate(key, rating),
+    send: (key, rating, o) => postRate(key, rating, o),
     delayMs: 800,
     setTimer: (fn, ms) => setTimeout(fn, ms),
     clearTimer: (t) => clearTimeout(t),
   });
   st.queue = queue;
+
+  // F1: flush pending ratings when the page is hidden or closing, so a rating
+  // made just before leaving the app isn't lost (the 800 ms debounce timer
+  // would otherwise never fire).
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') queue.flush(); });
+  window.addEventListener('pagehide', () => queue.flush());
 
   const $ = (id) => document.getElementById(id);
   const els = {
@@ -49,8 +55,10 @@
     if (!res.ok) throw new Error((body && body.error) || ('HTTP ' + res.status));
     return body;
   }
-  async function postRate(key, rating) {
-    return api('/trainer/rate', { method: 'POST', body: { type: 'movie', tmdb_id: key, rating } });
+  async function postRate(key, rating, o) {
+    // F1: pass keepalive through to fetch (apiFetch spreads opts into fetch), so
+    // a flush on page-hide can send the rating even as the page closes.
+    return api('/trainer/rate', { method: 'POST', body: { type: 'movie', tmdb_id: key, rating }, keepalive: !!(o && o.keepalive) });
   }
 
   // ---- open() ----
