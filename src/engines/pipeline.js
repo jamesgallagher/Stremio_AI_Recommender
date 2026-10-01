@@ -136,6 +136,15 @@ async function runEngineBuild(profile, type, engine, ctx, onProgress = () => {})
   // 6. Purge any already-stored row now under the vote-count floor (I3) — old
   //    fixed gate, or a raised floor. New sub-floor titles were gated at build.
   const purged = store.purgeBelowVoteFloor(profile.id, filters);
+  // 7. Drop this engine's rows from an OLDER algorithm version (the pool is
+  //    cumulative, so a scoring change would otherwise leave stale-scored rows
+  //    behind). Only when this build stored rows AND they agree on one version —
+  //    an empty or mixed build never prunes, so a failed run can't wipe a slice.
+  const versions = new Set(servable.map((c) => c.algorithm_version).filter(Boolean));
+  if (servable.length && versions.size === 1) {
+    const superseded = store.pruneSupersededVersions(profile.id, type, engine.id, [...versions][0]);
+    if (superseded) log.log(`[rec] ${profile.name}: removed ${superseded} ${type} row(s) from an older ${engine.id} version`);
+  }
   onProgress(100, `Stored ${servable.length} ${type} recommendation(s)`);
 
   const st = ctx.stats || {};

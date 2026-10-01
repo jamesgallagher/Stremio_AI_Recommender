@@ -4522,6 +4522,98 @@ async function main() {
     }
   });
 
+  await it('Tidy-up: pruneSupersededVersions drops ONLY this engine\'s older-version rows', () => {
+    const db = require('../src/db');
+    rs.init();
+    const ins = db.get().prepare('INSERT INTO recommended (profile_id, type, tmdb_id, title, engine_id, algorithm_version, affinity, rec_count) VALUES (?, ?, ?, ?, ?, ?, 1, 1)');
+    ins.run('p-prune', 'movie', 'm2a', 'old', 'marquee', 'marquee-m2');
+    ins.run('p-prune', 'movie', 'm2b', 'old', 'marquee', 'marquee-m2');
+    ins.run('p-prune', 'movie', 'm3a', 'new', 'marquee', 'marquee-m3');
+    ins.run('p-prune', 'movie', 'gen', 'genesis', 'genesis', null);
+    ins.run('p-prune', 'movie', 'leg', 'legacy', null, null);
+    ins.run('p-prune', 'series', 'sm2', 'other type', 'marquee', 'marquee-m2');
+    ins.run('p-other', 'movie', 'om2', 'other profile', 'marquee', 'marquee-m2');
+    try {
+      assert.strictEqual(rs.pruneSupersededVersions('p-prune', 'movie', 'marquee', null), 0, 'no version → no-op');
+      assert.strictEqual(rs.pruneSupersededVersions('p-prune', 'movie', 'marquee', 'marquee-m3'), 2);
+      const left = db.get().prepare("SELECT tmdb_id FROM recommended WHERE profile_id = 'p-prune' ORDER BY tmdb_id").all().map((r) => r.tmdb_id);
+      assert.deepStrictEqual(left, ['gen', 'leg', 'm3a', 'sm2'], 'genesis, legacy, current and other-type rows survive');
+      assert.strictEqual(db.get().prepare("SELECT COUNT(*) n FROM recommended WHERE profile_id = 'p-other'").get().n, 1, 'other profile untouched');
+    } finally {
+      db.get().prepare("DELETE FROM recommended WHERE profile_id IN ('p-prune','p-other')").run();
+    }
+  });
+
+  await it('Tidy-up: a build prunes its engine\'s superseded rows; an empty build prunes nothing', async () => {
+    const pipeline = require('../src/engines/pipeline');
+    const db = require('../src/db');
+    let emit = [];
+    const stub = {
+      id: 'vstub', name: 'V', description: 't', supportedTypes: ['movie'],
+      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+      requirements: () => ({ ok: true, missing: [] }),
+      generate: async () => emit,
+    };
+    const p = config.addProfile('INT-PRUNE');
+    rs.init();
+    const ins = db.get().prepare('INSERT INTO recommended (profile_id, type, tmdb_id, title, engine_id, algorithm_version, affinity, rec_count) VALUES (?, ?, ?, ?, ?, ?, 1, 1)');
+    ins.run(p.id, 'movie', 'old1', 'old', 'vstub', 'v1');
+    ins.run(p.id, 'movie', 'gen1', 'g', 'genesis', null);
+    const row = (id) => ({ type: 'movie', tmdb_id: id, rankScore: 1, imdb_id: 'tt' + id, title: id, year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, popularity: 1, algorithmVersion: 'v2' });
+    const ctx = { tmdbKey: 'itest-tmdb', mdblistKey: '', settings: settings.getSettings(), filters: {}, log: quiet };
+    try {
+      emit = [];
+      await pipeline.runEngineBuild(config.getProfile(p.id), 'movie', stub, ctx, () => {});
+      assert.ok(db.get().prepare('SELECT 1 FROM recommended WHERE profile_id = ? AND tmdb_id = ?').get(p.id, 'old1'), 'an empty build prunes nothing');
+      emit = [row('new1'), row('new2')];
+      await pipeline.runEngineBuild(config.getProfile(p.id), 'movie', stub, ctx, () => {});
+      const ids = db.get().prepare('SELECT tmdb_id FROM recommended WHERE profile_id = ? ORDER BY tmdb_id').all(p.id).map((r) => r.tmdb_id);
+      assert.deepStrictEqual(ids, ['gen1', 'new1', 'new2'], 'v1 row pruned; genesis row kept');
+    } finally {
+      config.removeProfile(p.id); rs.deleteForProfile(p.id);
+    }
+  });
+
+  await it('Tidy-up: the scrobble episode ledger — episodes are pushed once, new ones only, full re-pushes all', async () => {
+    const scrobble = require('../src/services/scrobble');
+    const watchedStore = require('../src/watchedStore');
+    const nuvio = require('../src/services/nuvio');
+    const simkl = require('../src/services/simkl');
+    const crypto = require('../src/services/crypto');
+    const profile = { id: 'p-ledger', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' }, scrobble: { enabled: true, provider: 'nuvio', email: 'a@b.c', password_enc: crypto.encrypt('pw') } };
+    const origPull = nuvio.pullWatched; const origAdd = simkl.addToHistory;
+    const eps = (n) => Array.from({ length: n }, (_, i) => ({ type: 'series', imdbId: 'ttS', season: 1, episode: i + 1, watchedAtMs: 1000 }));
+    const count = (b) => (b ? b.shows.reduce((n, s) => n + s.seasons.reduce((m, se) => m + se.episodes.length, 0), 0) : 0);
+    let pushed = null; let fail = false;
+    simkl.addToHistory = async (_p, body) => { if (fail) throw new Error('Simkl down'); pushed = body; return {}; };
+    try {
+      nuvio.pullWatched = async () => eps(3);
+      await scrobble.syncProfile(profile, quiet);
+      assert.strictEqual(count(pushed), 3, 'first run pushes all 3');
+      pushed = null;
+      await scrobble.syncProfile(profile, quiet);
+      assert.strictEqual(pushed, null, 'second run pushes nothing (all in the ledger)');
+      nuvio.pullWatched = async () => eps(4);
+      await scrobble.syncProfile(profile, quiet);
+      assert.deepStrictEqual(pushed.shows[0].seasons[0].episodes.map((e) => e.number), [4], 'only the new episode');
+      // A failed write records nothing: episode 5 is retried next run.
+      nuvio.pullWatched = async () => eps(5);
+      fail = true; pushed = null;
+      await assert.rejects(() => scrobble.syncProfile(profile, quiet));
+      fail = false;
+      await scrobble.syncProfile(profile, quiet);
+      assert.deepStrictEqual(pushed.shows[0].seasons[0].episodes.map((e) => e.number), [5], 'failed episode retried');
+      pushed = null;
+      await scrobble.syncProfile(profile, quiet, { full: true });
+      assert.strictEqual(count(pushed), 5, 'full re-push ignores the ledger');
+      watchedStore.deleteForProfile(profile.id);
+      assert.strictEqual(watchedStore.pushedEpisodeKeys(profile.id).size, 0, 'profile delete clears the ledger');
+    } finally {
+      nuvio.pullWatched = origPull; simkl.addToHistory = origAdd;
+      watchedStore.deleteForProfile(profile.id);
+    }
+  });
+
   await it('Trainer T3.1 B5: markUnwatched — Simkl history removal first, local cleanup, block added, change recorded', async () => {
     const trainer = require('../src/trainer');
     const watchedStore = require('../src/watchedStore');

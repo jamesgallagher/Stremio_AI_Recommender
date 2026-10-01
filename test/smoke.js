@@ -4534,6 +4534,7 @@ async function httpTests() {
     assert.ok(body.includes('data-tab="trainer"'));
     assert.ok(body.includes('trainer-ui.js'));
     assert.ok(body.includes('--love'));
+    assert.ok(body.includes('color: var(--star-empty)') && body.includes('--star-empty: #6b7184'), 'empty stars use the --star-empty token (contrast tidy-up)');
     console.log('  ✓ trainer portal UI: trainer-ui.js served + tab wiring in index.html');
   }
 

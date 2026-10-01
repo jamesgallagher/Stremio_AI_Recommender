@@ -111,15 +111,20 @@ async function syncProfile(profile, log = console, { full = false } = {}) {
   }
 
   // Normal sync excludes movies already known-watched on Simkl (from the local
-  // watched store). Per-episode state isn't tracked locally, so episodes are
-  // always pushed — Simkl de-dupes re-marks. full=true pushes everything.
+  // watched store) and episodes this app already pushed (the scrobble ledger —
+  // without it every hourly run re-sent the whole episode history). full=true
+  // ignores both and pushes everything (Simkl de-dupes re-marks).
   const watchedMovieIds = full ? new Set() : watchedStore.watchedIdSets(profile.id).imdb;
-  const body = computeDelta(items, watchedMovieIds, new Set());
+  const pushedEpisodes = full ? new Set() : watchedStore.pushedEpisodeKeys(profile.id);
+  const body = computeDelta(items, watchedMovieIds, pushedEpisodes);
   if (!body) {
     log.log(`[scrobble] ${profile.name}: nothing to scrobble (all ${items.length} watched items already on Simkl)`);
     return { pulled: items.length, pulledBreakdown: pulled, added: { movies: 0, episodes: 0 } };
   }
   await simkl.addToHistory(profile, body);
+  // Only after Simkl accepted the write: remember the episodes so the next run
+  // doesn't re-send them. A failed write throws above and records nothing.
+  watchedStore.recordPushedEpisodes(profile.id, body);
   const added = {
     movies: body.movies.length,
     episodes: body.shows.reduce((n, s) => n + s.seasons.reduce((m, se) => m + se.episodes.length, 0), 0),

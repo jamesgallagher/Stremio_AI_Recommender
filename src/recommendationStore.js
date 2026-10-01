@@ -290,6 +290,24 @@ function purgeBelowVoteFloor(profileId, filters = {}) {
   return Number(r.changes || 0);
 }
 
+// Drop one type's rows produced by an OLDER algorithm version of the SAME engine.
+// The pool is cumulative (a build upserts what it produced and leaves the rest),
+// so after a scoring change (e.g. marquee-m2 → m3) the old version's rows would
+// otherwise linger forever with scores that predate the change — including ones
+// a Trainer ignore/rating should now steer away from. Only rows that carry BOTH
+// this engine's id AND a version are touched: other engines' rows, and legacy
+// rows with no engine/version stamp, are left alone. Returns rows removed.
+function pruneSupersededVersions(profileId, type, engineId, currentVersion) {
+  init();
+  if (!engineId || !currentVersion) return 0;
+  const r = db.get().prepare(`
+    DELETE FROM recommended
+    WHERE profile_id = ? AND type = ? AND engine_id = ?
+      AND algorithm_version IS NOT NULL AND algorithm_version != ?
+  `).run(profileId, String(type), String(engineId), String(currentVersion));
+  return Number(r.changes || 0);
+}
+
 // Re-resolve IMDb ratings for stored pool rows that are DUE (see the RATING_*
 // constants): NULL ratings (unrated when first built) chased frequently, known
 // ratings refreshed occasionally. This is the ONLY thing that heals an orphan
@@ -840,6 +858,7 @@ module.exports = {
   upsertCandidates,
   setAgeClassification,
   purgeBelowVoteFloor,
+  pruneSupersededVersions,
   refreshStaleRatings,
   getRecommended,
   countRecommended,

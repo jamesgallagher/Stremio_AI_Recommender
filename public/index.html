@@ -10,7 +10,7 @@
   :root {
     --bg: #0f1117; --card: #171a23; --card2: #1e222e; --border: #2a2f3d;
     --text: #e6e8ee; --muted: #8b91a3; --accent: #8b5cf6; --accent2: #6d3fe0;
-    --ok: #34d399; --warn: #fbbf24; --err: #f87171; --love: #f472b6; --star: #ffd34d;
+    --ok: #34d399; --warn: #fbbf24; --err: #f87171; --love: #f472b6; --star: #ffd34d; --star-empty: #6b7184;
   }
   * { box-sizing: border-box; }
   body { margin: 0; font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); }
@@ -158,7 +158,7 @@
   .tr-stars { display: inline-flex; gap: 2px; align-items: center; touch-action: pan-y; cursor: pointer; }
   .tr-stars.tr-previewing .tr-fill { color: var(--star); opacity: .85; }
   .tr-star-wrap { position: relative; display: inline-block; width: 22px; height: 22px; }
-  .tr-glyph { position: absolute; top: 0; left: 0; width: 100%; height: 100%; font-size: 20px; line-height: 20px; color: var(--border); pointer-events: none; }
+  .tr-glyph { position: absolute; top: 0; left: 0; width: 100%; height: 100%; font-size: 20px; line-height: 20px; color: var(--star-empty); pointer-events: none; }
   .tr-fill { position: absolute; top: 0; left: 0; height: 100%; overflow: hidden; white-space: nowrap; font-size: 20px; line-height: 20px; color: var(--star); pointer-events: none; }
   .tr-star { position: absolute; top: 0; height: 100%; width: 50%; padding: 0; border: 0; background: transparent; cursor: pointer; }
   .tr-star[data-half="left"] { left: 0; }
