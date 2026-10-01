@@ -4195,7 +4195,22 @@ async function httpTests() {
     console.log('  ✓ trainer portal routes over HTTP: 200/400/404/502 (F11.5)');
   }
 
-  console.log(`\nAll checks passed (${passed} unit + 56 async/http).`);
+  // T3: the portal serves the Trainer UI helper and the tab wiring.
+  {
+    let res = await fetch(`${BASE}/configure/trainer-ui.js`);
+    assert.strictEqual(res.status, 200);
+    let body = await res.text();
+    assert.ok(body.includes('TrainerUI'));
+    res = await fetch(`${BASE}/configure/`);
+    assert.strictEqual(res.status, 200);
+    body = await res.text();
+    assert.ok(body.includes('data-tab="trainer"'));
+    assert.ok(body.includes('trainer-ui.js'));
+    assert.ok(body.includes('--love'));
+    console.log('  ✓ trainer portal UI: trainer-ui.js served + tab wiring in index.html');
+  }
+
+  console.log(`\nAll checks passed (${passed} unit + 58 async/http).`);
   process.exit(0);
 }
 
