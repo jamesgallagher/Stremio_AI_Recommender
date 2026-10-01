@@ -154,8 +154,8 @@ function isUnfinishedRow(row, watchedIds) {
 }
 
 // The profile's unfinished rows: read marquee_engagement directly (no
-// abandonedFor, no settings-as-config), keep the rows that areUnfinishedRow.
-// Injectable for tests (deps.unfinishedRows).
+// abandoned-query helper, no settings-as-config), keep the rows that
+// areUnfinishedRow. Injectable for tests (deps.unfinishedRows).
 function unfinishedRows(profileId, D) {
   D.engagement.init();
   const rows = D.db.get().prepare('SELECT imdb_id, tmdb_id, percent, updated_at FROM marquee_engagement WHERE profile_id = ?').all(profileId);
@@ -321,7 +321,9 @@ async function rate(profile, ref, rating, deps = {}) {
   const t = resolveType(ref && ref.type);
   if (!t.ok) return { ok: false, reason: t.reason };
   const type = t.type;
-  if (rating != null && (!Number.isInteger(rating) || rating < 1 || rating > 10)) {
+  // `null` clears the rating; an omitted rating (undefined) is a bad value,
+  // not a clear — clearing must be explicit.
+  if (rating === undefined || (rating != null && (!Number.isInteger(rating) || rating < 1 || rating > 10))) {
     return { ok: false, reason: 'bad-rating' };
   }
   if (!hasSimkl(profile)) return { ok: false, reason: 'no-simkl' };

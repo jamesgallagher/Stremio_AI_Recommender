@@ -1356,6 +1356,30 @@ async function httpTests() {
     console.log('  ✓ preview: session-scoped, age-gated 404, no age leak over HTTP (CP-02)');
   }
 
+  // ---- Trainer T1 companion: session-scoped (F11.6) ----
+  {
+    const watchedStore = require('../../src/watchedStore');
+    // Unauthenticated -> 401 (requireSession guard).
+    assert.strictEqual((await fetch(`${BASE}/mobile/api/trainer`)).status, 401);
+
+    const email1 = uniqEmail(); const p1 = seedProfile('TrainerSess', email1);
+    const email2 = uniqEmail(); const p2 = seedProfile('TrainerOther', email2);
+    watchedStore.upsertMany(p1.id, [{ simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'Mine', year: 2020, watched_at: '2026-01-01T00:00:00Z' }]);
+    watchedStore.upsertMany(p2.id, [{ simkl_id: 2, type: 'movie', imdb_id: 'tt2', tmdb_id: '2', title: 'Other', year: 2020, watched_at: '2026-01-01T00:00:00Z' }]);
+    const cookie = await sessionCookieFor(email1);
+    // A client-supplied profile_id is ignored: the session profile is used.
+    const res = await fetch(`${BASE}/mobile/api/trainer?profile_id=${p2.id}`, { headers: { Cookie: cookie } });
+    assert.strictEqual(res.status, 200);
+    const body = await res.json();
+    assert.ok(body.items.some((i) => i.tmdb_id === '1'), 'the session profile row is listed');
+    assert.ok(!body.items.some((i) => i.tmdb_id === '2'), 'the other profile row is absent');
+    watchedStore.deleteForProfile(p1.id);
+    watchedStore.deleteForProfile(p2.id);
+    config.removeProfile(p1.id);
+    config.removeProfile(p2.id);
+    console.log('  ✓ trainer companion: unauthenticated 401 + query profile_id ignored (F11.6)');
+  }
+
   console.log(`\nAll mobile checks passed (${passed} unit + http).`);
   process.exit(0);
 }

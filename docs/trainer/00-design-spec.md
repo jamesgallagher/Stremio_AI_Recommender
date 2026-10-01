@@ -111,7 +111,7 @@ Every function takes a resolved `profile` and returns plain data (no req/res).
     to 25, max 100. `q` is a case-insensitive title match.
   - Item:
     `{ key, type, simkl_id, tmdb_id, imdb_id, title, year, genre, poster, watched_at, rating, loved, ignored, status, percent }`.
-    - `key` is the stable id for actions.
+    - `key` is the tmdb id (unique after dedupe; the stable id for actions).
     - `status` is `'watched' | 'unfinished'`.
     - `loved` is `rating === 10`.
     - `genre` is `watched.primary_genre`, else the first genre from the meta cache, else null.
