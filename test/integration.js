@@ -1426,11 +1426,11 @@ async function main() {
     assert.deepStrictEqual([...tasteFeedback.getRatingsMap(A, 'movie').entries()], []);
     assert.strictEqual(db.get().prepare('SELECT COUNT(*) AS n FROM taste_ratings_sync WHERE profile_id = ?').get(A).n, 0);
     assert.deepStrictEqual([...tasteFeedback.ignoredSet(A, 'movie')], []);
-    assert.deepStrictEqual(tasteFeedback.getTraining(A), { changed_at: null, changes_since_build: 0 });
+    assert.deepStrictEqual(tasteFeedback.getTraining(A), { changed_at: null, changes_since_build: 0, built_changed_at: null });
     // B: untouched.
     assert.deepStrictEqual([...tasteFeedback.getRatingsMap(B, 'movie').entries()], [['3', 9]]);
     assert.deepStrictEqual([...tasteFeedback.ignoredSet(B, 'movie')], ['4']);
-    assert.deepStrictEqual(tasteFeedback.getTraining(B), { changed_at: 1000, changes_since_build: 1 });
+    assert.deepStrictEqual(tasteFeedback.getTraining(B), { changed_at: 1000, changes_since_build: 1, built_changed_at: null });
     tasteFeedback.deleteForProfile(B);
   });
 
@@ -1458,7 +1458,7 @@ async function main() {
     assert.deepStrictEqual(res, { ok: true, item: { key: '1', type: 'movie', simkl_id: 1, tmdb_id: '1', imdb_id: 'tt1', title: 'A', year: 2020, genre: null, poster: null, watched_at: '2026-01-01T00:00:00Z', rating: 8, loved: false, ignored: false, status: 'watched', percent: null }, unchanged: false });
     assert.deepStrictEqual(simklCalls, [['set', [{ type: 'movie', simkl_id: 1, imdb_id: 'tt1', tmdb_id: '1', rating: 8 }]]]);
     assert.strictEqual(tasteFeedback.getRating(profile.id, 'movie', '1'), 8);
-    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 1000, changes_since_build: 1 });
+    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 1000, changes_since_build: 1, built_changed_at: null });
     // rate 10 → loved computed (M3).
     res = await trainer.rate(profile, { type: 'movie', tmdb_id: '1' }, 10, deps);
     assert.strictEqual(res.item.loved, true);
@@ -1547,8 +1547,10 @@ async function main() {
       { simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'A', year: 2020, watched_at: '2026-01-01T00:00:00Z' },
     ]);
     // An abandoned (unfinished) row: started 30%, untouched for >7 days.
+    // The grace period runs on the action clock (deps.now = 1000), so the
+    // row's timestamps are relative to that same clock.
     engagement.init();
-    const abandonedAt = Date.now() - 8 * 24 * 3600e3;
+    const abandonedAt = 1000 - 8 * 24 * 3600e3;
     db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at) VALUES (?, ?, ?, ?, ?, ?)').run(profile.id, 'tt2', '2', 30, abandonedAt, abandonedAt);
     const markWatchedCalls = [];
     const deps = {
@@ -1560,7 +1562,7 @@ async function main() {
     let res = await trainer.markFinished(profile, { type: 'movie', tmdb_id: '2' }, deps);
     assert.deepStrictEqual(res, { ok: true });
     assert.deepStrictEqual(markWatchedCalls, [{ type: 'movie', imdbId: 'tt2', tmdbId: '2', title: null }]);
-    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 1000, changes_since_build: 1 });
+    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 1000, changes_since_build: 1, built_changed_at: null });
     // markFinished on a WATCHED row → not-in-history (unfinished only).
     res = await trainer.markFinished(profile, { type: 'movie', tmdb_id: '1' }, deps);
     assert.deepStrictEqual(res, { ok: false, reason: 'not-in-history' });
@@ -1667,13 +1669,13 @@ async function main() {
     };
     // same value twice → second is a no-op: zero Simkl calls, unchanged:true, changes_since_build unchanged.
     await trainer.rate(profile, { type: 'movie', tmdb_id: '1' }, 5, deps);
-    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 1000, changes_since_build: 1 });
+    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 1000, changes_since_build: 1, built_changed_at: null });
     simklCalls.length = 0;
     let res = await trainer.rate(profile, { type: 'movie', tmdb_id: '1' }, 5, deps);
     assert.strictEqual(res.ok, true);
     assert.strictEqual(res.unchanged, true);
     assert.strictEqual(simklCalls.length, 0); // zero Simkl calls on the no-op
-    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 1000, changes_since_build: 1 }); // unchanged
+    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 1000, changes_since_build: 1, built_changed_at: null }); // unchanged
     // '8' (string) and undefined → bad-rating.
     res = await trainer.rate(profile, { type: 'movie', tmdb_id: '1' }, '8', deps);
     assert.deepStrictEqual(res, { ok: false, reason: 'bad-rating' });
@@ -1743,13 +1745,14 @@ async function main() {
     // true twice → second is a no-op: unchanged:true, no change recorded.
     let res = await trainer.setIgnored(profile, { type: 'movie', tmdb_id: '1' }, true, deps);
     assert.strictEqual(res.unchanged, false);
-    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 1000, changes_since_build: 1 });
+    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 1000, changes_since_build: 1, built_changed_at: null });
     res = await trainer.setIgnored(profile, { type: 'movie', tmdb_id: '1' }, true, deps);
     assert.strictEqual(res.unchanged, true);
-    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 1000, changes_since_build: 1 }); // unchanged
-    // ignoring an unfinished row works.
+    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 1000, changes_since_build: 1, built_changed_at: null }); // unchanged
+    // ignoring an unfinished row works. The grace period runs on the action
+    // clock (deps.now = 1000), so the row's timestamps are relative to it.
     engagement.init();
-    const at = Date.now() - 8 * 24 * 3600e3;
+    const at = 1000 - 8 * 24 * 3600e3;
     db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at) VALUES (?, ?, ?, ?, ?, ?)').run(profile.id, 'tt2', '2', 30, at, at);
     res = await trainer.setIgnored(profile, { type: 'movie', tmdb_id: '2' }, true, deps);
     assert.strictEqual(res.ok, true);
@@ -1792,10 +1795,13 @@ async function main() {
     db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at) VALUES (?, ?, ?, ?, ?, ?)').run(profile.id, 'tt10', '10', 30, Date.parse('2026-01-06T00:00:00Z'), Date.parse('2026-01-06T00:00:00Z'));
     db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at) VALUES (?, ?, ?, ?, ?, ?)').run(profile.id, 'tt4', '4', 30, Date.parse('2026-01-06T00:00:00Z'), Date.parse('2026-01-06T00:00:00Z')); // rewatch of Delta (tmdb 4 watched)
     db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at) VALUES (?, ?, ?, ?, ?, ?)').run(profile.id, 'tt12', '12', 30, Date.parse('2026-01-05T00:00:00Z'), Date.parse('2026-01-05T00:00:00Z'));
+    // The engagement rows below are seeded against the real clock (Jan 2026,
+    // >7 days old), so the action clock must be the real one for the grace
+    // period to see them as abandoned.
     const deps = {
       enrich: async () => { throw new Error('enrich must not run without a TMDB key'); },
       settings: { keyFor: () => '' },
-      now: () => 1000,
+      now: () => Date.now(),
       log: quiet,
     };
     // all view: watched minus ignored, newest first (dedupe keeps Eta for tmdb 6).
@@ -1891,9 +1897,13 @@ async function main() {
     watchedStore.deleteForProfile(profile.id);
   });
 
-  await it('Trainer T1: isUnfinishedRow — pure rule (F11.4)', () => {
+  await it('Trainer T2: isUnfinishedRow — the shared abandoned rule (N7, F11.4)', () => {
     const trainer = require('../src/trainer');
+    const engagement = require('../src/engines/marquee/engagement');
+    const mqCfg = require('../src/engines/marquee/config');
     const watchedIds = { imdb: new Set(['tt2']), tmdb: new Set(['2']) };
+    const now = Date.parse('2026-06-01T00:00:00Z');
+    const day = 24 * 3600e3;
     // 30% not watched → true.
     assert.strictEqual(trainer.isUnfinishedRow({ tmdb_id: '1', imdb_id: 'tt1', percent: 30 }, watchedIds), true);
     // 30% watched by tmdb → false.
@@ -1904,6 +1914,25 @@ async function main() {
     assert.strictEqual(trainer.isUnfinishedRow({ tmdb_id: '4', imdb_id: 'tt4', percent: 50 }, watchedIds), false);
     // no tmdb_id → false.
     assert.strictEqual(trainer.isUnfinishedRow({ tmdb_id: null, imdb_id: 'tt5', percent: 30 }, watchedIds), false);
+    // grace period (T2): touched within grace_days → not yet a verdict.
+    assert.strictEqual(trainer.isUnfinishedRow({ tmdb_id: '6', imdb_id: 'tt6', percent: 30, updated_at: now - 1 * day }, watchedIds, { now }), false);
+    // ... but untouched for > grace_days → true.
+    assert.strictEqual(trainer.isUnfinishedRow({ tmdb_id: '6', imdb_id: 'tt6', percent: 30, updated_at: now - 8 * day }, watchedIds, { now }), true);
+    // credits guard (N6): ≤ credits_min remaining → never abandoned.
+    assert.strictEqual(trainer.isUnfinishedRow({ tmdb_id: '7', imdb_id: 'tt7', percent: 40, duration_ms: 30 * 60000, updated_at: now - 8 * day }, watchedIds, { now }), false);
+    // finish_pct (N6): ≥ 90% → finished, never abandoned.
+    assert.strictEqual(trainer.isUnfinishedRow({ tmdb_id: '8', imdb_id: 'tt8', percent: 95, updated_at: now - 8 * day }, watchedIds, { now }), false);
+    // N7: identical to the engine's rule (one rule, two consumers).
+    const eng = mqCfg.resolveConfig({}).engagement;
+    for (const row of [
+      { tmdb_id: '1', imdb_id: 'tt1', percent: 30 },
+      { tmdb_id: '2', imdb_id: 'tt2', percent: 30 },
+      { tmdb_id: '6', imdb_id: 'tt6', percent: 30, updated_at: now - 1 * day },
+      { tmdb_id: '7', imdb_id: 'tt7', percent: 40, duration_ms: 30 * 60000, updated_at: now - 8 * day },
+      { tmdb_id: '8', imdb_id: 'tt8', percent: 95, updated_at: now - 8 * day },
+    ]) {
+      assert.strictEqual(trainer.isUnfinishedRow(row, watchedIds, { now }), engagement.isAbandoned(row, eng, { now, watchedIds }), 'trainer rule == engine rule');
+    }
   });
 
   await it('marquee ME-03: ensureRecs sequential fetch, cap, stale served, per-id error (B6)', async () => {
@@ -2005,20 +2034,24 @@ async function main() {
     // Rated ≤ 4 excluded; no-tmdb row excluded.
     assert.ok(!seeds.some((s) => s.tmdb_id === '4'));
     assert.ok(!seeds.some((s) => s.tmdb_id === null));
-    // weight = ratingWeight × blendedWeight(days): recent rated-10 > unrated recent > old rated-10
+    // Trainer T2 (N3/N4): weight = ratingWeight × max(blendedWeight(days), loved decay floor).
+    // recent rated-10 (3.0 × bw) > old rated-10 (floored at 3.0 × 0.5) > unrated recent (1.0 × bw).
     const byId = new Map(seeds.map((s) => [s.tmdb_id, s]));
     const recentDays = (nowMs - Date.parse('2026-05-20T00:00:00Z')) / day;
     const oldDays = (nowMs - Date.parse('2024-06-01T00:00:00Z')) / day;
     const hl = cfg.half_life_days.movie;
     const blend = cfg.horizon_blend;
     const bw = (d) => blend.long * 0.5 ** (d / hl.long) + blend.medium * 0.5 ** (d / hl.medium) + blend.recent * 0.5 ** (d / hl.recent);
-    assert.ok(byId.get('1').weight > byId.get('3').weight, 'rated-10 recent beats unrated recent');
-    assert.ok(byId.get('3').weight > byId.get('2').weight, 'unrated recent beats old rated-10');
-    assert.ok(Math.abs(byId.get('1').weight - 2.0 * bw(recentDays)) < 1e-9);
+    assert.ok(byId.get('1').weight > byId.get('2').weight, 'rated-10 recent beats old rated-10');
+    assert.ok(byId.get('2').weight > byId.get('3').weight, 'old rated-10 (floored) beats unrated recent');
+    // recent rated-10: bw(recentDays) > floor → weight = r10 × bw.
+    assert.ok(Math.abs(byId.get('1').weight - 3.0 * bw(recentDays)) < 1e-9);
+    // unrated recent: base weight × bw.
     assert.ok(Math.abs(byId.get('3').weight - 1.0 * bw(recentDays)) < 1e-9);
-    assert.ok(Math.abs(byId.get('2').weight - 2.0 * bw(oldDays)) < 1e-9);
-    // sort: weight desc
-    assert.deepStrictEqual(seeds.map((s) => s.tmdb_id), ['1', '3', '2']);
+    // old rated-10: bw(oldDays) < floor → decay floored at cfg.loved.decay_floor.
+    assert.ok(Math.abs(byId.get('2').weight - 3.0 * cfg.loved.decay_floor) < 1e-9);
+    // sort: weight desc (Loved films pinned at the front)
+    assert.deepStrictEqual(seeds.map((s) => s.tmdb_id), ['1', '2', '3']);
     // rating carried through (null for unrated)
     assert.strictEqual(byId.get('1').rating, 10);
     assert.strictEqual(byId.get('3').rating, null);
@@ -2976,7 +3009,7 @@ async function main() {
     const stored = rs.getRecommended('p-mq19', { type: 'movie', limit: 10 })[0];
     assert.strictEqual(stored.affinity, row.rankScore, 'affinity = rankScore');
     assert.strictEqual(stored.rec_count, row.recCount, 'rec_count = recCount');
-    assert.strictEqual(stored.algorithm_version, 'marquee-m2', 'algorithm_version = marquee-m2');
+    assert.strictEqual(stored.algorithm_version, 'marquee-m3', 'algorithm_version = marquee-m3');
     const comps = JSON.parse(stored.score_components);
     assert.ok(comps.features && comps.weights, 'score_components JSON parses');
     rs.deleteForProfile('p-mq19');
@@ -3718,7 +3751,7 @@ async function main() {
     assert.strictEqual(by.get('sa3').scoreComponents.features.seed_affinity, 0);
     assert.ok('seed_affinity' in by.get('sa1').scoreComponents.weights, 'seed_affinity is a weighted feature');
     assert.ok(by.get('sa1').rankScore > by.get('sa2').rankScore && by.get('sa2').rankScore > by.get('sa3').rankScore, 'more agreement ranks higher, all else equal');
-    assert.strictEqual(by.get('sa1').algorithmVersion, 'marquee-m2');
+    assert.strictEqual(by.get('sa1').algorithmVersion, 'marquee-m3');
   });
 
   await it('bench m2: reachability + hit@20r + per-target positions and Marquee fate', async () => {
@@ -3813,24 +3846,22 @@ async function main() {
     mqEngagement._clear();
   });
 
-  await it('marquee m2 engagement: an abandoned film is a negative taste event (its director turns negative)', async () => {
+  await it('marquee m3 engagement: an abandoned film is NEUTRAL (no taste event of any kind)', async () => {
     const taste = require('../src/engines/marquee/taste');
     const profileId = 'p-eng3';
     glassMeta._clear();
     watchedStore.upsertMany(profileId, [{ simkl_id: 1, type: 'movie', imdb_id: 'ttw1', tmdb_id: 'w1', title: 'Liked', year: 2020, watched_at: '2026-05-01T00:00:00Z' }]);
     glassMeta.put('movie', 'w1', { genres: ['Drama'], director: ['Director Liked'], imdb_id: 'ttw1' });
+    // N5: the m2 `abandoned` option is removed — even if a caller passes it, no
+    // abandoned event of any kind is produced (abandoned films are NEUTRAL).
     const abandoned = new Map([['ab1', { percent: 25, ts: engNow - 20 * DAYMS }]]);
     const events = taste.buildEvents(profileId, mqCfgResolved, { nowMs: engNow, ratings: new Map(), abandoned });
-    const ev = events.find((e) => e.tmdb_id === 'ab1');
-    assert.strictEqual(ev.kind, 'abandoned');
-    assert.strictEqual(ev.weight, -1.0);
-    // The abandoned film's meta is enriched (bounded), then its director goes negative.
-    const tm = await taste.buildTaste(profileId, 'k', mqCfgResolved, {
-      nowMs: engNow, ratings: new Map(), abandoned, log: quiet,
-      enrichFetcher: async (_k, _t, id) => (id === 'ab1' ? { tmdb_id: 'ab1', imdb_id: 'ttab1', genres: ['Horror'], director: ['Director Disliked'] } : null),
-    });
-    assert.ok(tm.dims.directors['Director Disliked'] < 0, 'abandoned film pushes its director negative');
+    assert.ok(!events.some((e) => e.kind === 'abandoned'), 'no abandoned event of any kind');
+    assert.ok(!events.some((e) => e.tmdb_id === 'ab1'), 'the abandoned film is absent from the event list');
+    // The taste model carries no negative director from a (would-be) abandoned film.
+    const tm = await taste.buildTaste(profileId, 'k', mqCfgResolved, { nowMs: engNow, ratings: new Map(), log: quiet });
     assert.ok(tm.dims.directors['Director Liked'] > 0, 'finished film stays positive');
+    assert.ok(!('Director Disliked' in tm.dims.directors), 'no negative director from an abandoned film');
     watchedStore.deleteForProfile(profileId);
     glassMeta._clear();
   });
@@ -3861,6 +3892,504 @@ async function main() {
       config.removeProfile(p.id); watchedStore.deleteForProfile(p.id); rs.deleteForProfile(p.id);
       mqEngagement._clear(); glassMeta._clear();
     }
+  });
+
+  // ── Marquee m3 engagement: the abandoned rule — credits, finish, rewatch (N6) ──
+  await it('marquee m3 engagement: migration adds duration_ms to the old schema without losing rows', async () => {
+    const db = require('../src/db');
+    // Simulate an OLD db: drop the table, recreate it WITHOUT duration_ms.
+    db.get().exec('DROP TABLE IF EXISTS marquee_engagement');
+    db.get().exec(`
+      CREATE TABLE marquee_engagement (
+        profile_id  TEXT NOT NULL,
+        imdb_id     TEXT NOT NULL,
+        tmdb_id     TEXT,
+        percent     REAL,
+        updated_at  INTEGER,
+        seen_at     INTEGER,
+        PRIMARY KEY (profile_id, imdb_id)
+      );
+    `);
+    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at) VALUES (?, ?, ?, ?, ?, ?)').run('p-mig', 'ttM', 'tmM', 30, 1000, 1000);
+    // Run the migration exactly as init() does (PRAGMA-guarded ADD COLUMN).
+    {
+      const cols = db.get().prepare('PRAGMA table_info(marquee_engagement)').all();
+      assert.ok(!cols.some((c) => c.name === 'duration_ms'), 'old schema has no duration_ms');
+      if (!cols.some((c) => c.name === 'duration_ms')) db.get().exec('ALTER TABLE marquee_engagement ADD COLUMN duration_ms INTEGER');
+    }
+    const colsAfter = db.get().prepare('PRAGMA table_info(marquee_engagement)').all();
+    assert.ok(colsAfter.some((c) => c.name === 'duration_ms'), 'duration_ms added');
+    const oldRow = db.get().prepare('SELECT tmdb_id, percent, duration_ms FROM marquee_engagement WHERE profile_id = ?').get('p-mig');
+    assert.strictEqual(oldRow.tmdb_id, 'tmM', 'row preserved');
+    assert.strictEqual(oldRow.percent, 30);
+    assert.strictEqual(oldRow.duration_ms, null, 'old row has null duration');
+    // syncEngagement stores durationMs; a later row without a duration keeps the stored one.
+    mqEngagement._clear();
+    const profile = { id: 'p-mig', name: 'MIG' };
+    await mqEngagement.syncEngagement(profile, mqCfgResolved, {
+      pull: async () => [
+        { type: 'movie', imdbId: 'ttM', percent: 30, updatedAtMs: 1000, durationMs: 7200000 },
+        { type: 'movie', imdbId: 'ttM2', percent: 40, updatedAtMs: 1000 },
+      ],
+      resolveTmdb: async (id) => id.replace('tt', 'tm'), now: 2000, log: quiet,
+    });
+    const rM = db.get().prepare('SELECT duration_ms FROM marquee_engagement WHERE profile_id = ? AND imdb_id = ?').get('p-mig', 'ttM');
+    assert.strictEqual(rM.duration_ms, 7200000, 'duration stored');
+    const rM2 = db.get().prepare('SELECT duration_ms FROM marquee_engagement WHERE profile_id = ? AND imdb_id = ?').get('p-mig', 'ttM2');
+    assert.strictEqual(rM2.duration_ms, null, 'no duration → null');
+    // A later row without a duration keeps the stored one (COALESCE on conflict).
+    await mqEngagement.syncEngagement(profile, mqCfgResolved, {
+      pull: async () => [{ type: 'movie', imdbId: 'ttM', percent: 45, updatedAtMs: 3000 }],
+      resolveTmdb: async (id) => id.replace('tt', 'tm'), now: 4000, log: quiet, force: true,
+    });
+    const rM3 = db.get().prepare('SELECT duration_ms, percent FROM marquee_engagement WHERE profile_id = ? AND imdb_id = ?').get('p-mig', 'ttM');
+    assert.strictEqual(rM3.duration_ms, 7200000, 'stored duration kept when a later row has none');
+    assert.strictEqual(rM3.percent, 45, 'percent updated');
+    mqEngagement._clear();
+  });
+
+  await it('marquee m3 engagement: isAbandoned — credits, finish, rewatch, grace, watched guards', async () => {
+    const eng = mqCfgResolved.engagement;
+    const now = Date.parse('2026-06-01T00:00:00Z');
+    const day = 24 * 3600e3;
+    const watchedEmpty = { tmdb: new Set(), imdb: new Set() };
+    // 30% of a 120-min film, 8 days old, not watched → true.
+    assert.strictEqual(mqEngagement.isAbandoned({ tmdb_id: 'g1', imdb_id: 'ttg1', percent: 30, updated_at: now - 8 * day, duration_ms: 7200000 }, eng, { now, watchedIds: watchedEmpty }), true);
+    // 45% of a 30-min film (16.5 min left) → false (credits).
+    assert.strictEqual(mqEngagement.isAbandoned({ tmdb_id: 'g2', imdb_id: 'ttg2', percent: 45, updated_at: now - 8 * day, duration_ms: 1800000 }, eng, { now, watchedIds: watchedEmpty }), false);
+    // 92% → false (finish_pct); 49% with no duration → true.
+    assert.strictEqual(mqEngagement.isAbandoned({ tmdb_id: 'g3', imdb_id: 'ttg3', percent: 92, updated_at: now - 8 * day, duration_ms: 7200000 }, eng, { now, watchedIds: watchedEmpty }), false);
+    assert.strictEqual(mqEngagement.isAbandoned({ tmdb_id: 'g4', imdb_id: 'ttg4', percent: 49, updated_at: now - 8 * day, duration_ms: null }, eng, { now, watchedIds: watchedEmpty }), true);
+    // The Goonies case: a watched row from 2024 plus a 30% engagement row from 2026, same tmdb → false.
+    const gooniesWatched = { tmdb: new Set(['goonies']), imdb: new Set() };
+    assert.strictEqual(mqEngagement.isAbandoned({ tmdb_id: 'goonies', imdb_id: 'ttgoonies', percent: 30, updated_at: now - 1 * day, duration_ms: 7200000 }, eng, { now, watchedIds: gooniesWatched }), false);
+    // The same case matched by imdb only → false.
+    const gooniesImdb = { tmdb: new Set(), imdb: new Set(['ttgoonies']) };
+    assert.strictEqual(mqEngagement.isAbandoned({ tmdb_id: 'goonies2', imdb_id: 'ttgoonies', percent: 30, updated_at: now - 1 * day, duration_ms: 7200000 }, eng, { now, watchedIds: gooniesImdb }), false);
+    // A pending-watched shim → false (watchedIdSets includes it).
+    const shimWatched = { tmdb: new Set(['shim']), imdb: new Set() };
+    assert.strictEqual(mqEngagement.isAbandoned({ tmdb_id: 'shim', imdb_id: 'ttshim', percent: 30, updated_at: now - 8 * day, duration_ms: 7200000 }, eng, { now, watchedIds: shimWatched }), false);
+    // 3 days old → false (grace).
+    assert.strictEqual(mqEngagement.isAbandoned({ tmdb_id: 'g5', imdb_id: 'ttg5', percent: 30, updated_at: now - 3 * day, duration_ms: 7200000 }, eng, { now, watchedIds: watchedEmpty }), false);
+    // tmdb_id null → false.
+    assert.strictEqual(mqEngagement.isAbandoned({ tmdb_id: null, imdb_id: 'ttg6', percent: 30, updated_at: now - 8 * day, duration_ms: 7200000 }, eng, { now, watchedIds: watchedEmpty }), false);
+    // enabled:false → false.
+    assert.strictEqual(mqEngagement.isAbandoned({ tmdb_id: 'g7', imdb_id: 'ttg7', percent: 30, updated_at: now - 8 * day, duration_ms: 7200000 }, { ...eng, enabled: false }, { now, watchedIds: watchedEmpty }), false);
+  });
+
+  await it('marquee m3 engagement: abandonedRows returns full rows (incl. duration_ms); abandonedFor unchanged', async () => {
+    const db = require('../src/db');
+    mqEngagement._clear();
+    const profileId = 'p-rows';
+    const now = Date.parse('2026-06-01T00:00:00Z');
+    const day = 24 * 3600e3;
+    // Direct insert: one abandoned (30%, 8 days, 120-min) + one not (95%).
+    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)').run(profileId, 'ttA', 'tmA', 30, now - 8 * day, now - 8 * day, 7200000);
+    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)').run(profileId, 'ttB', 'tmB', 95, now - 8 * day, now - 8 * day, 7200000);
+    const rows = mqEngagement.abandonedRows(profileId, mqCfgResolved, { now });
+    assert.strictEqual(rows.length, 1, 'only the abandoned row');
+    assert.strictEqual(rows[0].tmdb_id, 'tmA');
+    assert.strictEqual(rows[0].imdb_id, 'ttA');
+    assert.strictEqual(rows[0].percent, 30);
+    assert.strictEqual(rows[0].duration_ms, 7200000, 'duration_ms included');
+    assert.strictEqual(rows[0].updated_at, now - 8 * day);
+    // abandonedFor unchanged shape: Map<tmdb_id, { percent, ts }>.
+    const ab = mqEngagement.abandonedFor(profileId, mqCfgResolved, { now });
+    assert.deepStrictEqual(ab.get('tmA'), { percent: 30, ts: now - 8 * day });
+    assert.strictEqual(ab.has('tmB'), false, '95% not abandoned');
+    db.get().prepare('DELETE FROM marquee_engagement WHERE profile_id = ?').run(profileId);
+  });
+
+  // ── Marquee m3 taste: rating bands, ignore, Loved tier (Trainer T2, §4.3) ──
+  await it('marquee m3: ratingWeight bands (N4)', async () => {
+    const taste = require('../src/engines/marquee/taste');
+    const cfg = mqCfgResolved;
+    assert.strictEqual(taste.ratingWeight(10, cfg), 3.0, '10 → r10');
+    assert.strictEqual(taste.ratingWeight(9, cfg), 2.0, '9 → r9');
+    assert.strictEqual(taste.ratingWeight(8, cfg), 1.2, '8 → r7_8');
+    assert.strictEqual(taste.ratingWeight(7, cfg), 1.2, '7 → r7_8');
+    assert.strictEqual(taste.ratingWeight(6, cfg), 0.4, '6 → r5_6');
+    assert.strictEqual(taste.ratingWeight(5, cfg), 0.4, '5 → r5_6');
+    assert.strictEqual(taste.ratingWeight(4, cfg), -1.2, '4 → r1_4');
+    assert.strictEqual(taste.ratingWeight(3, cfg), -1.2, '3 → r1_4');
+    assert.strictEqual(taste.ratingWeight(1, cfg), -1.2, '1 → r1_4');
+    assert.strictEqual(taste.ratingWeight(0, cfg), null, '0 → null');
+    assert.strictEqual(taste.ratingWeight(null, cfg), null, 'null → null');
+    assert.strictEqual(taste.ratingWeight('7', cfg), 1.2, 'string rating coerced');
+  });
+
+  await it('marquee m3: an ignored film never steers taste and is never a seed (N2)', async () => {
+    const taste = require('../src/engines/marquee/taste');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const profileId = 'p-ign1';
+    glassMeta._clear();
+    // Two watched films: one ignored (rated 10 — the strongest possible), one not.
+    watchedStore.upsertMany(profileId, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'ttig1', tmdb_id: 'ig1', title: 'Ignored', year: 2020, watched_at: '2026-05-01T00:00:00Z' },
+      { simkl_id: 2, type: 'movie', imdb_id: 'ttig2', tmdb_id: 'ig2', title: 'Kept', year: 2020, watched_at: '2026-05-01T00:00:00Z' },
+    ]);
+    glassMeta.put('movie', 'ig1', { genres: ['Drama'], director: ['Dir Ignored'], imdb_id: 'ttig1' });
+    glassMeta.put('movie', 'ig2', { genres: ['Action'], director: ['Dir Kept'], imdb_id: 'ttig2' });
+    const ratings = new Map([['ig1', 10], ['ig2', 7]]);
+    // Ignore ig1 (even though it is rated 10 — ignore beats any rating).
+    tasteFeedback.setIgnored(profileId, { type: 'movie', tmdb_id: 'ig1' }, true, engNow);
+    const ignored = tasteFeedback.ignoredSet(profileId, 'movie');
+    assert.ok(ignored.has('ig1'), 'ig1 is in the ignored set');
+    // buildEvents: the ignored film is absent (no taste event of any kind).
+    const events = taste.buildEvents(profileId, mqCfgResolved, { nowMs: engNow, ratings });
+    assert.ok(!events.some((e) => e.tmdb_id === 'ig1'), 'ignored film absent from the event list');
+    assert.ok(events.some((e) => e.tmdb_id === 'ig2'), 'non-ignored film present');
+    // seedOrder: the ignored film is never a seed (even at rating 10).
+    const seeds = taste.seedOrder(profileId, mqCfgResolved, { nowMs: engNow, ratings });
+    assert.ok(!seeds.some((s) => s.tmdb_id === 'ig1'), 'ignored film never a seed');
+    assert.ok(seeds.some((s) => s.tmdb_id === 'ig2'), 'non-ignored film is a seed');
+    // The ignored film stays in watchedIdSets (N2: ignore is local only).
+    const sets = watchedStore.watchedIdSets(profileId);
+    assert.ok(sets.tmdb.has('ig1'), 'ignored film stays in watchedIdSets');
+    tasteFeedback.deleteForProfile(profileId);
+    watchedStore.deleteForProfile(profileId);
+    glassMeta._clear();
+  });
+
+  await it('marquee m3: Loved decay is floored at cfg.loved.decay_floor (N3)', async () => {
+    const taste = require('../src/engines/marquee/taste');
+    const glassTasteModel = require('../src/engines/glass/tasteModel');
+    const glassConfig = require('../src/engines/glass/config');
+    const cfg = mqCfgResolved;
+    const floor = cfg.loved.decay_floor; // 0.5
+    const hl = glassConfig.halfLivesFor(cfg, 'movie');
+    // A recent Loved film: blendedWeight ≈ 1 (≥ floor) → no boost.
+    assert.strictEqual(taste.lovedFactor(0, cfg), 1, 'recent: no boost');
+    // An old Loved film: blendedWeight < floor → boosted so the effective decay = floor.
+    const days = 15000; // ~41 years → blendedWeight ≈ 1e-9
+    const b = glassTasteModel.blendedWeight(days, hl, cfg.horizon_blend);
+    assert.ok(b < floor, 'old film: blendedWeight below the floor');
+    const factor = taste.lovedFactor(days, cfg);
+    assert.ok(factor > 1, 'old film: boosted above 1');
+    const effective = b * factor;
+    assert.ok(Math.abs(effective - floor) < 1e-9, 'effective decay floored at the floor (to 1e-9)');
+  });
+
+  await it('marquee m3: Loved films are pinned at the front of the seeds (N3)', async () => {
+    const taste = require('../src/engines/marquee/taste');
+    const profileId = 'p-loved1';
+    glassMeta._clear();
+    // An old Loved film (weight floored at r10 × 0.5 = 1.5) + a recent rated-9
+    // film (weight ≈ 2.0 × 0.77 ≈ 1.54). Without pinning, the rated-9 film would
+    // sort first (1.54 > 1.5). Pinning puts the Loved film at the front.
+    watchedStore.upsertMany(profileId, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'ttlv1', tmdb_id: 'lv1', title: 'Loved (old)', year: 2020, watched_at: '2020-01-01T00:00:00Z' },
+      { simkl_id: 2, type: 'movie', imdb_id: 'ttlv2', tmdb_id: 'lv2', title: 'Rated 9 (recent)', year: 2024, watched_at: '2026-05-01T00:00:00Z' },
+    ]);
+    const ratings = new Map([['lv1', 10], ['lv2', 9]]);
+    const seeds = taste.seedsFor(profileId, mqCfgResolved, { nowMs: engNow, ratings });
+    assert.strictEqual(seeds[0].tmdb_id, 'lv1', 'Loved film pinned at the front (despite lower weight)');
+    assert.ok(seeds[0].loved, 'the front seed is Loved');
+    assert.strictEqual(seeds[0].rating, 10);
+    assert.strictEqual(seeds[1].tmdb_id, 'lv2', 'the rated-9 film is second');
+    watchedStore.deleteForProfile(profileId);
+    glassMeta._clear();
+  });
+
+  await it('marquee m3: historyHash changes when a film is ignored (N2)', async () => {
+    const taste = require('../src/engines/marquee/taste');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const profileId = 'p-hash1';
+    glassMeta._clear();
+    watchedStore.upsertMany(profileId, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'th1', tmdb_id: 'h1', title: 'Film 1', year: 2020, watched_at: '2026-05-01T00:00:00Z' },
+      { simkl_id: 2, type: 'movie', imdb_id: 'th2', tmdb_id: 'h2', title: 'Film 2', year: 2020, watched_at: '2026-05-02T00:00:00Z' },
+    ]);
+    const ratings = new Map([['h1', 7], ['h2', 8]]);
+    const hashBefore = taste.historyHash(profileId, { ratings });
+    // Ignore h1 → the hash changes.
+    tasteFeedback.setIgnored(profileId, { type: 'movie', tmdb_id: 'h1' }, true, engNow);
+    const hashIgnored = taste.historyHash(profileId, { ratings });
+    assert.notStrictEqual(hashIgnored, hashBefore, 'ignoring changes the hash');
+    // Un-ignore h1 → the hash returns to the original.
+    tasteFeedback.setIgnored(profileId, { type: 'movie', tmdb_id: 'h1' }, false, engNow);
+    const hashUnignored = taste.historyHash(profileId, { ratings });
+    assert.strictEqual(hashUnignored, hashBefore, 'un-ignoring restores the hash');
+    tasteFeedback.deleteForProfile(profileId);
+    watchedStore.deleteForProfile(profileId);
+    glassMeta._clear();
+  });
+
+  await it('marquee m3: a no-feedback profile is unchanged (N9 identity)', async () => {
+    const taste = require('../src/engines/marquee/taste');
+    const glassTasteModel = require('../src/engines/glass/tasteModel');
+    const profileId = 'p-n9';
+    glassMeta._clear();
+    // A no-feedback profile: watched films, NO ratings, NO ignores.
+    watchedStore.upsertMany(profileId, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'tn1', tmdb_id: 'n1', title: 'Film 1', year: 2020, watched_at: '2026-05-01T00:00:00Z' },
+      { simkl_id: 2, type: 'movie', imdb_id: 'tn2', tmdb_id: 'n2', title: 'Film 2', year: 2020, watched_at: '2026-05-02T00:00:00Z' },
+    ]);
+    glassMeta.put('movie', 'n1', { genres: ['Drama'], director: ['Dir 1'], imdb_id: 'tn1' });
+    glassMeta.put('movie', 'n2', { genres: ['Action'], director: ['Dir 2'], imdb_id: 'tn2' });
+    // The m3 taste model for a no-feedback profile == the pure Glass taste model
+    // (no rating re-weighting, no ignores, no abandoned events).
+    const m3 = await taste.buildTaste(profileId, 'k', mqCfgResolved, { nowMs: engNow, ratings: new Map(), log: quiet });
+    const glass = glassTasteModel.buildTasteModel(profileId, 'movie', mqCfgResolved, { nowMs: engNow });
+    assert.deepStrictEqual(m3.dims, glass.dims, 'm3 no-feedback dims == Glass dims');
+    assert.strictEqual(m3.totalWeight, glass.totalWeight, 'm3 no-feedback totalWeight == Glass');
+    assert.strictEqual(m3.seedCount, glass.seedCount, 'm3 no-feedback seedCount == Glass');
+    watchedStore.deleteForProfile(profileId);
+    glassMeta._clear();
+  });
+
+  await it('marquee m3: bench holdout clears taste_ignore rows (N2, §4.6)', async () => {
+    const bench = require('../src/bench/engineBench');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const profileId = 'p-bench-ign';
+    // A profile with two ignored films.
+    tasteFeedback.setIgnored(profileId, { type: 'movie', tmdb_id: 'bi1' }, true, engNow);
+    tasteFeedback.setIgnored(profileId, { type: 'movie', tmdb_id: 'bi2' }, true, engNow);
+    assert.strictEqual(tasteFeedback.ignoredSet(profileId, 'movie').size, 2, 'two ignored films before');
+    // removeHoldout deletes the holdout's taste_ignore rows (alongside taste_ratings).
+    bench.removeHoldout(profileId, ['bi1'], { db: require('../src/db') });
+    const after = tasteFeedback.ignoredSet(profileId, 'movie');
+    assert.ok(!after.has('bi1'), 'the holdout film is cleared from taste_ignore');
+    assert.ok(after.has('bi2'), 'the non-holdout film is kept');
+    tasteFeedback.deleteForProfile(profileId);
+  });
+
+  await it('Trainer T2: trainingDue — the 10-min quiet period + the build stamp (N8, test 11)', () => {
+    const tasteFeedback = require('../src/tasteFeedback');
+    const db = require('../src/db');
+    const profileId = 'p-t11';
+    const T0 = 1_000_000;
+    const min = 60e3;
+    // no feedback → never due.
+    assert.strictEqual(tasteFeedback.trainingDue(profileId, T0 + 10 * min), false);
+    // a change: due only after the 10-minute quiet period.
+    tasteFeedback.recordChange(profileId, T0);
+    assert.strictEqual(tasteFeedback.trainingDue(profileId, T0 + 9 * min), false, 'inside the quiet period');
+    assert.strictEqual(tasteFeedback.trainingDue(profileId, T0 + 10 * min), true, 'at the quiet-period boundary');
+    // a build that included the change (stamp = the cursor it saw) → no longer due.
+    tasteFeedback.markTrainingBuilt(profileId, T0);
+    assert.strictEqual(tasteFeedback.trainingDue(profileId, T0 + 11 * min), false, 'the last build covered the change');
+    // a change NEWER than the stamp → due again after its own quiet period.
+    tasteFeedback.recordChange(profileId, T0 + 20 * min);
+    assert.strictEqual(tasteFeedback.trainingDue(profileId, T0 + 29 * min), false, 'inside the new quiet period');
+    assert.strictEqual(tasteFeedback.trainingDue(profileId, T0 + 30 * min), true, 'newer than the stamp + quiet period elapsed');
+    // a change landing DURING a build: the stamp is the cursor seen at the
+    // build's START, so the newer change stays due (test 12 covers this via needsBuild).
+    tasteFeedback.markTrainingBuilt(profileId, T0); // the build's start snapshot
+    assert.strictEqual(tasteFeedback.trainingDue(profileId, T0 + 30 * min), true, 'change during the build stays newer than the stamp');
+    // a stamp equal to the cursor (not older) → not newer → not due.
+    tasteFeedback.markTrainingBuilt(profileId, T0 + 20 * min);
+    assert.strictEqual(tasteFeedback.trainingDue(profileId, T0 + 40 * min), false, 'stamp == cursor → not newer');
+    db.get().prepare('DELETE FROM taste_changes WHERE profile_id = ?').run(profileId);
+  });
+
+  await it('Trainer T2: needsBuild — Marquee gate, quiet period, change during a build (N8, test 12)', () => {
+    const rs = require('../src/recommendationStore');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const settings = require('../src/settings');
+    const db = require('../src/db');
+    const profileId = 'p-t12';
+    const T0 = 1_000_000;
+    const min = 60e3;
+    // A pool row so the "empty pool" clause is not the trigger.
+    rs.upsertCandidates(profileId, [{ type: 'movie', tmdb_id: 't12', imdb_id: 'ttt12', title: 'T', year: 2020, vote_average: 7, vote_count: 1000, affinity: 0.5, rec_count: 1, popularity: 5 }]);
+    rs.setBuiltAt(profileId, T0);
+    const marqueeProfile = { id: profileId, name: 'T12', filters: { engine_movie: 'marquee' } };
+    const genesisProfile = { id: profileId, name: 'T12', filters: { engine_movie: 'genesis' } };
+    settings.updateSettings({ engines: { marquee: true } });
+    try {
+      // fresh (no taste change) → no build needed.
+      assert.strictEqual(rs.needsBuild(profileId, { profile: marqueeProfile, now: T0 }), false);
+      // a Trainer edit: due only after the 10-minute quiet period.
+      tasteFeedback.recordChange(profileId, T0 + 5 * min);
+      assert.strictEqual(rs.needsBuild(profileId, { profile: marqueeProfile, now: T0 + 9 * min }), false, 'inside the quiet period');
+      assert.strictEqual(rs.needsBuild(profileId, { profile: marqueeProfile, now: T0 + 15 * min }), true, 'quiet period elapsed');
+      // a build that included the change → fresh again.
+      tasteFeedback.markTrainingBuilt(profileId, T0 + 5 * min);
+      assert.strictEqual(rs.needsBuild(profileId, { profile: marqueeProfile, now: T0 + 15 * min }), false, 'the build covered the change');
+      // a change landing DURING a build (the stamp is the start snapshot) →
+      // the NEXT build is triggered.
+      tasteFeedback.recordChange(profileId, T0 + 20 * min);
+      tasteFeedback.markTrainingBuilt(profileId, T0 + 5 * min);
+      assert.strictEqual(rs.needsBuild(profileId, { profile: marqueeProfile, now: T0 + 29 * min }), false, 'inside the new quiet period');
+      assert.strictEqual(rs.needsBuild(profileId, { profile: marqueeProfile, now: T0 + 30 * min }), true, 'change during the build triggers the next build');
+      // the gate: a non-Marquee movie engine never triggers a taste rebuild.
+      tasteFeedback.recordChange(profileId, T0 + 40 * min);
+      assert.strictEqual(rs.needsBuild(profileId, { profile: genesisProfile, now: T0 + 50 * min }), false, 'non-Marquee profile: no taste rebuild');
+      // a disabled Marquee floors to Genesis → gated out.
+      settings.updateSettings({ engines: { marquee: false } });
+      assert.strictEqual(rs.needsBuild(profileId, { profile: marqueeProfile, now: T0 + 50 * min }), false, 'disabled Marquee → gated out');
+    } finally {
+      settings.updateSettings({ engines: { marquee: false } });
+      db.get().prepare('DELETE FROM taste_changes WHERE profile_id = ?').run(profileId);
+      rs.deleteForProfile(profileId);
+    }
+  });
+
+  await it('Trainer T2: a successful build stamps the change cursor and resets the counter (N8, test 13)', async () => {
+    const rs = require('../src/recommendationStore');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const config = require('../src/config');
+    const settings = require('../src/settings');
+    const watchedStore = require('../src/watchedStore');
+    const p = config.addProfile('INT-T13');
+    const reset = marqueeEngine._setTestSeams({ fetchers: mqSeam({ recs: () => [mqItem('t13a')] }), chain: [] });
+    const prev = store.loadAgeVerdicts();
+    try {
+      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'marquee', engine_series: 'genesis' } });
+      watchedStore.upsertMany(p.id, [
+        { simkl_id: 1, type: 'movie', imdb_id: 'ttt13w', tmdb_id: 't13w', title: 'Watched', year: 2024, watched_at: '2026-05-01T00:00:00Z' },
+      ]);
+      // A Trainer edit BEFORE the build (the cursor the build sees at its start).
+      const T0 = 1_000_000;
+      tasteFeedback.recordChange(p.id, T0);
+      tasteFeedback.recordChange(p.id, T0 + 1); // two changes → the counter is 2
+      settings.updateSettings({ engines: { marquee: true } });
+      await rs.buildPool(config.getProfile(p.id), quiet);
+      const training = tasteFeedback.getTraining(p.id);
+      assert.strictEqual(training.built_changed_at, T0 + 1, 'the stamp is the cursor seen at the build start');
+      assert.strictEqual(training.changes_since_build, 0, 'a successful build resets the counter');
+      // a change landing during the build (newer than the stamp) → the next build is triggered.
+      tasteFeedback.recordChange(p.id, T0 + 2);
+      assert.strictEqual(rs.needsBuild(p.id, { profile: config.getProfile(p.id), now: T0 + 2 + 10 * 60e3 }), true, 'the during-build change triggers the next build');
+    } finally {
+      store.saveAgeVerdicts(prev);
+      settings.updateSettings({ engines: { marquee: false } });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id);
+      tasteFeedback.deleteForProfile(p.id);
+      reset();
+    }
+  });
+
+  await it('Trainer T2: the Trainer unfinished list comes from the shared engagement rule (N7, test 14)', async () => {
+    const trainer = require('../src/trainer');
+    const engagement = require('../src/engines/marquee/engagement');
+    const mqCfg = require('../src/engines/marquee/config');
+    const watchedStore = require('../src/watchedStore');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const db = require('../src/db');
+    const profileId = 'p-t14';
+    const profile = { id: profileId, name: 'T14', keys: {} };
+    const now = Date.parse('2026-06-01T00:00:00Z'); // the action clock (deps.now)
+    const day = 24 * 3600e3;
+    engagement.init();
+    // Five engagement rows: one abandoned (30%, untouched 8 days), one in the
+    // grace period (30%, touched 1 day ago), one credits (40% of 30 min → 18 min
+    // left), one finished (95%), one watched (30% but completed in the watched
+    // store — the rewatch rule). The grace period runs on the action clock
+    // (deps.now), so the row timestamps are relative to that same clock.
+    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)').run(profileId, 'ttt14a', 't14a', 30, now - 8 * day, now - 8 * day, null);
+    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)').run(profileId, 'ttt14b', 't14b', 30, now - 1 * day, now - 1 * day, null);
+    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)').run(profileId, 'ttt14c', 't14c', 40, now - 8 * day, now - 8 * day, 30 * 60000);
+    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)').run(profileId, 'ttt14d', 't14d', 95, now - 8 * day, now - 8 * day, null);
+    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)').run(profileId, 'ttt14e', 't14e', 30, now - 8 * day, now - 8 * day, null);
+    watchedStore.upsertMany(profileId, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'ttt14e', tmdb_id: 't14e', title: 'E', year: 2020, watched_at: '2026-05-01T00:00:00Z' },
+    ]);
+    const deps = { now: () => now, log: quiet, settings: { keyFor: () => '' } };
+    // The Trainer's unfinished list: only the one abandoned row.
+    const res = await trainer.listHistory(profile, { type: 'movie', view: 'unfinished' }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['t14a'], 'only the abandoned row is unfinished');
+    assert.strictEqual(res.counts.unfinished, 1);
+    // N7: the Trainer's list == the engine's abandoned set (one rule, two consumers).
+    // Both run on the action clock (deps.now).
+    assert.deepStrictEqual([...engagement.abandonedFor(profileId, mqCfg.resolveConfig({}), { now }).keys()], ['t14a'], 'the engine agrees');
+    // The training DTO surfaces the rebuild due time (change + the quiet period).
+    tasteFeedback.recordChange(profileId, now - 2 * 60e3);
+    const res2 = await trainer.listHistory(profile, { type: 'movie' }, deps);
+    assert.deepStrictEqual(res2.training, { changes_since_build: 1, changed_at: now - 2 * 60e3, rebuild_due_at: now + 8 * 60e3, built_changed_at: null });
+    // a build that included the change → no due time.
+    tasteFeedback.markTrainingBuilt(profileId, now - 2 * 60e3);
+    const res3 = await trainer.listHistory(profile, { type: 'movie' }, deps);
+    assert.strictEqual(res3.training.rebuild_due_at, null, 'the build covered the change');
+    assert.strictEqual(res3.training.built_changed_at, now - 2 * 60e3, 'the build stamp is surfaced');
+    db.get().prepare('DELETE FROM marquee_engagement WHERE profile_id = ?').run(profileId);
+    watchedStore.deleteForProfile(profileId);
+    tasteFeedback.deleteForProfile(profileId);
+  });
+
+  await it('Trainer T2 r1: G3a — the brief marks 10/10 as LOVED, 9 and unrated (§6 test 10)', () => {
+    const taste = require('../src/engines/marquee/taste');
+    const prompt = taste.buildBriefPrompt({
+      watch_history: [
+        { title: 'A', year: 2020, rating: 10, genres: ['Sci-Fi'] },
+        { title: 'B', year: 2019, rating: 9, genres: [] },
+        { title: 'C', year: 2018, rating: null, genres: [] },
+      ],
+      tastes: [],
+    });
+    assert.ok(prompt.includes('rated 10/10 (LOVED)'), 'a 10/10 is marked LOVED');
+    assert.ok(prompt.includes('rated 9/10'), 'a 9 is rated 9/10');
+    assert.ok(prompt.includes('unrated'), 'a null rating is unrated');
+  });
+
+  await it('Trainer T2 r1: G3b — a rating change (7 → 8) changes historyHash (§6 test 8)', () => {
+    const taste = require('../src/engines/marquee/taste');
+    const watchedStore = require('../src/watchedStore');
+    const profileId = 'p-g3b';
+    watchedStore.upsertMany(profileId, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'ttg3b', tmdb_id: 'g3b', title: 'G', year: 2020, watched_at: '2026-01-01T00:00:00Z' },
+    ]);
+    const h7 = taste.historyHash(profileId, { ratings: new Map([['g3b', 7]]), ignored: new Set() });
+    const h8 = taste.historyHash(profileId, { ratings: new Map([['g3b', 8]]), ignored: new Set() });
+    assert.notStrictEqual(h7, h8, 'changing the rating changes the brief cache key');
+    watchedStore.deleteForProfile(profileId);
+  });
+
+  await it('Trainer T2 r1: G3c — a mid-build edit keeps its change count (§6 test 11)', () => {
+    const tasteFeedback = require('../src/tasteFeedback');
+    const db = require('../src/db');
+    const profileId = 'p-g3c';
+    const T0 = Date.parse('2026-06-01T00:00:00Z');
+    tasteFeedback.recordChange(profileId, T0);
+    // The build-start snapshot: the cursor the build sees at its START.
+    const snap = tasteFeedback.getTraining(profileId);
+    assert.strictEqual(snap.changed_at, T0);
+    // A mid-build edit (newer than the snapshot).
+    tasteFeedback.recordChange(profileId, T0 + 60e3);
+    assert.strictEqual(tasteFeedback.getTraining(profileId).changes_since_build, 2);
+    // The build finishes and stamps the snapshot: the mid-build edit keeps its count.
+    tasteFeedback.markTrainingBuilt(profileId, T0);
+    let t = tasteFeedback.getTraining(profileId);
+    assert.strictEqual(t.changes_since_build, 2, 'the mid-build edit is NOT zeroed');
+    assert.strictEqual(t.built_changed_at, T0);
+    // The change is newer than the stamp and the quiet period has passed → due.
+    assert.strictEqual(tasteFeedback.trainingDue(profileId, T0 + 12 * 60e3), true);
+    // The next build (snapshot = the mid-build change) resets the count.
+    tasteFeedback.markTrainingBuilt(profileId, T0 + 60e3);
+    t = tasteFeedback.getTraining(profileId);
+    assert.strictEqual(t.changes_since_build, 0, 'the second build resets the count');
+    db.get().prepare('DELETE FROM taste_changes WHERE profile_id = ?').run(profileId);
+  });
+
+  await it('Trainer T2 r1: G3d — a skipped build leaves the change count alone (§6 test 13)', async () => {
+    const rs = require('../src/recommendationStore');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const settings = require('../src/settings');
+    const db = require('../src/db');
+    const profileId = 'p-g3d';
+    const T0 = Date.parse('2026-06-01T00:00:00Z');
+    tasteFeedback.recordChange(profileId, T0);
+    const before = tasteFeedback.getTraining(profileId);
+    const prevKeys = settings.getSettings().keys;
+    settings.updateSettings({ keys: { tmdb_api_key: '' } });
+    try {
+      const res = await rs.buildRecommendations({ id: profileId, name: 'G3D', filters: {} }, quiet);
+      assert.ok(res.skipped && res.reason.includes('TMDB key'), 'no TMDB key → skipped');
+      assert.deepStrictEqual(tasteFeedback.getTraining(profileId), before, 'the skipped build left the change count alone');
+    } finally {
+      settings.updateSettings({ keys: prevKeys });
+    }
+    db.get().prepare('DELETE FROM taste_changes WHERE profile_id = ?').run(profileId);
+  });
+
+  await it('Trainer T2 r1: G3e — markTrainingBuilt creates no row when none exists', () => {
+    const tasteFeedback = require('../src/tasteFeedback');
+    const db = require('../src/db');
+    const profileId = 'p-g3e';
+    tasteFeedback.markTrainingBuilt(profileId, Date.parse('2026-06-01T00:00:00Z'));
+    assert.deepStrictEqual(tasteFeedback.getTraining(profileId), { changed_at: null, changes_since_build: 0, built_changed_at: null });
+    assert.strictEqual(db.get().prepare('SELECT COUNT(*) AS n FROM taste_changes WHERE profile_id = ?').get(profileId).n, 0, 'no row created');
   });
 
   // Restore a clean-ish shared state for any process that runs after this one.

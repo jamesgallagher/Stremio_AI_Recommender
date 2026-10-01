@@ -91,7 +91,10 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
   // 5–20: the rating-weighted taste model + seeds + the cached local-LLM brief
   // (ME-04). Enrichment rides the deepMeta seam (hermetic under a stub).
   onProgress(5, 'Marquee: building taste model…');
-  const tasteModel = await taste.buildTaste(profile.id, ctx.tmdbKey, cfg, { nowMs, abandoned, enrichFetcher: f.deepMeta, log });
+  // Trainer T2 (N5): abandoned films are NEUTRAL — no taste event of any kind —
+  // so buildTaste no longer takes the abandoned set. It is still used to drop
+  // the films as candidates (ctx.marqueeAbandoned) and in the build log.
+  const tasteModel = await taste.buildTaste(profile.id, ctx.tmdbKey, cfg, { nowMs, enrichFetcher: f.deepMeta, log });
   const seeds = taste.seedsFor(profile.id, cfg, { nowMs });
   onProgress(12, 'Marquee: building taste brief…');
   const brief = await taste.tasteBrief(profile.id, tasteModel, { chain, chat, cfg, log, now: nowMs });

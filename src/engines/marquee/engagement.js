@@ -39,6 +39,12 @@ function init() {
       synced_at  INTEGER
     );
   `);
+  // Trainer T2 (§4.2): additive migration — old DBs predate the duration_ms
+  // column (the credits guard reads it). ADD COLUMN guarded by PRAGMA table_info
+  // (N11: no DROP, no data copy).
+  if (!db.get().prepare('PRAGMA table_info(marquee_engagement)').all().some((c) => c.name === 'duration_ms')) {
+    db.get().exec('ALTER TABLE marquee_engagement ADD COLUMN duration_ms INTEGER');
+  }
   ready = true;
 }
 
@@ -76,14 +82,15 @@ async function syncEngagement(profile, cfg, { pull, resolveTmdb, now = Date.now(
     conn.exec('BEGIN');
     try {
       const up = conn.prepare(`
-        INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at) VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(profile_id, imdb_id) DO UPDATE SET
           tmdb_id = COALESCE(excluded.tmdb_id, marquee_engagement.tmdb_id),
           percent = MAX(excluded.percent, COALESCE(marquee_engagement.percent, 0)),
           updated_at = MAX(COALESCE(excluded.updated_at, 0), COALESCE(marquee_engagement.updated_at, 0)),
-          seen_at = excluded.seen_at
+          seen_at = excluded.seen_at,
+          duration_ms = COALESCE(excluded.duration_ms, marquee_engagement.duration_ms)
       `);
-      for (const r of ready2) up.run(profile.id, r.imdbId, r.tmdbId, r.percent, r.updatedAtMs, now);
+      for (const r of ready2) up.run(profile.id, r.imdbId, r.tmdbId, r.percent, r.updatedAtMs, now, (Number.isFinite(r.durationMs) && r.durationMs > 0) ? r.durationMs : null);
       conn.prepare(`
         INSERT INTO marquee_engagement_sync (profile_id, synced_at) VALUES (?, ?)
         ON CONFLICT(profile_id) DO UPDATE SET synced_at = excluded.synced_at
@@ -101,22 +108,46 @@ async function syncEngagement(profile, cfg, { pull, resolveTmdb, now = Date.now(
   }
 }
 
-// The films this profile ABANDONED: furthest progress below
-// cfg.engagement.abandon_below (%), untouched for at least grace_days (a film
-// paused last night is not a verdict), with a resolved tmdb id, and NOT in the
-// watched store (a completed watch always wins). Map<tmdb_id, { percent, ts }>.
-function abandonedFor(profileId, cfg, { now = Date.now() } = {}) {
+// PURE (Trainer T2, N6/N7): is one marquee_engagement row an ABANDONED film?
+// True iff ALL of these hold: engagement enabled; a resolved tmdb id; furthest
+// progress below abandon_below AND below finish_pct; when a duration is known,
+// more than credits_min minutes remain (credits/rewatch = never abandoned);
+// untouched for at least grace_days (a film paused last night is not a
+// verdict); and NOT in the watched store under either id (a completed watch —
+// or a rewatch — always wins). `watchedIds` is watchedStore.watchedIdSets
+// (it already includes the pending shim — never re-query pending_watched).
+function isAbandoned(row, eng, { now, watchedIds }) {
+  if (eng.enabled === false) return false;
+  if (row.tmdb_id == null) return false;
+  if (row.percent == null) return false;
+  const p = Number(row.percent);
+  if (!(p < (eng.abandon_below ?? 50))) return false;
+  if (!(p < (eng.finish_pct ?? 90))) return false;
+  const dur = Number(row.duration_ms);
+  if (dur > 0 && !((dur * (1 - p / 100)) / 60000 > (eng.credits_min ?? 20))) return false; // credits → never abandoned
+  if (row.updated_at && now - row.updated_at < (eng.grace_days ?? 7) * DAY_MS) return false;
+  if (watchedIds.tmdb.has(String(row.tmdb_id))) return false;
+  if (watchedIds.imdb.has(row.imdb_id)) return false;
+  return true;
+}
+
+// The profile's ABANDONED rows (Trainer T2, N7): the full marquee_engagement
+// rows that isAbandoned flags, including duration_ms. The Trainer's "Unfinished"
+// list and Marquee's abandoned set BOTH come from here, so they can never
+// disagree (one rule, two consumers).
+function abandonedRows(profileId, cfg, { now = Date.now() } = {}) {
   init();
   const eng = cfg.engagement || {};
-  if (eng.enabled === false) return new Map();
-  const below = eng.abandon_below ?? 50;
-  const graceMs = (eng.grace_days ?? 7) * DAY_MS;
-  const watched = watchedStore.watchedIdSets(profileId);
+  const watchedIds = watchedStore.watchedIdSets(profileId);
+  const rows = db.get().prepare('SELECT imdb_id, tmdb_id, percent, updated_at, duration_ms FROM marquee_engagement WHERE profile_id = ?').all(profileId);
+  return rows.filter((row) => isAbandoned(row, eng, { now, watchedIds }));
+}
+
+// The films this profile ABANDONED, keyed by tmdb id: Map<tmdb_id, { percent, ts }>.
+// Built from abandonedRows (Trainer T2) — same rule, same rows, same shape as m2.
+function abandonedFor(profileId, cfg, { now = Date.now() } = {}) {
   const out = new Map();
-  const rows = db.get().prepare('SELECT imdb_id, tmdb_id, percent, updated_at FROM marquee_engagement WHERE profile_id = ? AND tmdb_id IS NOT NULL AND percent < ?').all(profileId, below);
-  for (const r of rows) {
-    if (watched.tmdb.has(r.tmdb_id) || watched.imdb.has(r.imdb_id)) continue; // finished later → not abandoned
-    if (r.updated_at && now - r.updated_at < graceMs) continue;                 // still possibly in progress
+  for (const r of abandonedRows(profileId, cfg, { now })) {
     out.set(String(r.tmdb_id), { percent: r.percent, ts: r.updated_at || null });
   }
   return out;
@@ -128,4 +159,4 @@ function _clear() {
   db.get().exec('DELETE FROM marquee_engagement; DELETE FROM marquee_engagement_sync');
 }
 
-module.exports = { init, syncEngagement, abandonedFor, _clear };
+module.exports = { init, syncEngagement, isAbandoned, abandonedRows, abandonedFor, _clear };

@@ -36,6 +36,12 @@ function init() {
     CREATE TABLE IF NOT EXISTS taste_changes (
       profile_id TEXT PRIMARY KEY, changed_at INTEGER, changes_since_build INTEGER);
   `);
+  // Trainer T2 (§4.4): additive migration — old DBs predate the built_changed_at
+  // column (the rebuild trigger's "last build that included it" stamp). ADD COLUMN
+  // guarded by PRAGMA table_info (N11: no DROP, no data copy).
+  if (!db.get().prepare('PRAGMA table_info(taste_changes)').all().some((c) => c.name === 'built_changed_at')) {
+    db.get().exec('ALTER TABLE taste_changes ADD COLUMN built_changed_at INTEGER');
+  }
   ready = true;
 }
 
@@ -203,11 +209,52 @@ function recordChange(profileId, now = Date.now()) {
   `).run(profileId, now);
 }
 
-// { changed_at: int|null, changes_since_build: int } for the banner.
+// Trainer T2 (N8): the rebuild debounce — a Trainer edit (rating / ignore /
+// finished) triggers a pool rebuild only after a 10-minute quiet period (the
+// family edits in bursts; a rebuild is expensive, so we wait for the burst to
+// settle).
+const REBUILD_DEBOUNCE_MS = 10 * 60e3;
+
+// { changed_at: int|null, changes_since_build: int, built_changed_at: int|null }
+// for the banner + the rebuild trigger. built_changed_at is the changed_at the
+// last successful build saw at its START (N8: a change landing DURING a build
+// stays newer than the stamp and triggers the NEXT build).
 function getTraining(profileId) {
   init();
-  const row = db.get().prepare('SELECT changed_at, changes_since_build FROM taste_changes WHERE profile_id = ?').get(profileId);
-  return { changed_at: row ? row.changed_at : null, changes_since_build: row ? row.changes_since_build : 0 };
+  const row = db.get().prepare('SELECT changed_at, changes_since_build, built_changed_at FROM taste_changes WHERE profile_id = ?').get(profileId);
+  return {
+    changed_at: row ? row.changed_at : null,
+    changes_since_build: row ? row.changes_since_build : 0,
+    built_changed_at: row ? row.built_changed_at : null,
+  };
+}
+
+// Trainer T2 (N8): stamp the last successful build's view of the change cursor.
+// `snapshotChangedAt` is the changed_at read at the build's START — a change
+// recorded during the build makes changed_at newer than the stamp, so the next
+// build is triggered. §4.4: the counter resets ONLY while the cursor is still
+// the snapshot (a mid-build edit keeps its count); a null snapshot (no row at
+// build start) is a no-op — no INSERT, no row created.
+function markTrainingBuilt(profileId, snapshotChangedAt) {
+  init();
+  if (snapshotChangedAt == null) return;
+  db.get().prepare(`
+    UPDATE taste_changes SET built_changed_at = ?,
+      changes_since_build = CASE WHEN changed_at IS ? THEN 0 ELSE changes_since_build END
+    WHERE profile_id = ?
+  `).run(snapshotChangedAt, snapshotChangedAt, profileId);
+}
+
+// Trainer T2 (N8): is a rebuild due for this profile's taste feedback? True
+// only when there is a change NEWER than the last build that included it
+// (changed_at > built_changed_at — or no build stamp yet) AND at least the
+// 10-minute quiet period has passed since the change.
+function trainingDue(profileId, now = Date.now()) {
+  init();
+  const row = db.get().prepare('SELECT changed_at, built_changed_at FROM taste_changes WHERE profile_id = ?').get(profileId);
+  if (!row || row.changed_at == null) return false; // no feedback → nothing to rebuild for
+  if (row.built_changed_at != null && row.changed_at <= row.built_changed_at) return false; // the last build that included it covered this change
+  return now - row.changed_at >= REBUILD_DEBOUNCE_MS; // the 10-minute quiet period
 }
 
 // T2 resets this after a successful build; exported now.
@@ -236,6 +283,9 @@ module.exports = {
   ignoredSet,
   recordChange,
   getTraining,
+  markTrainingBuilt,
+  trainingDue,
   resetChangesSinceBuild,
   deleteForProfile,
+  REBUILD_DEBOUNCE_MS,
 };

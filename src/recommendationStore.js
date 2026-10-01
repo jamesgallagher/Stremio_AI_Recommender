@@ -23,6 +23,8 @@ const settings = require('./settings');
 const tmdb = require('./services/tmdb');
 const animeMap = require('./services/animeMap');
 const watchedStore = require('./watchedStore');
+// Trainer T2 (N8): the taste-feedback store's rebuild trigger (Marquee-only).
+const tasteFeedback = require('./tasteFeedback');
 // The candidate-generation half of the build now lives in the Genesis Engine
 // (SC-01). recommendationStore keeps the pool table, serve path, decay, age gate
 // and the IMDb-rating heal — all engine-agnostic — and re-exports Genesis's pure
@@ -434,6 +436,12 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
   const tmdbKey = s?.keys?.tmdb_api_key;
   if (!tmdbKey) return { skipped: true, reason: 'no TMDB key in Server Config' };
 
+  // Trainer T2 (N8): snapshot the taste-feedback change cursor at the build's
+  // START — the stamp after a successful build is this value, so a Trainer
+  // edit landing DURING the build stays newer than the stamp and triggers the
+  // NEXT build.
+  const trainingSnap = tasteFeedback.getTraining(profile.id);
+
   const engines = require('./engines');
   const pipeline = require('./engines/pipeline');
   const filters = profile.filters || {};
@@ -513,6 +521,11 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
   }
 
   setBuiltAt(profile.id);
+  // Trainer T2 (N8): stamp the last successful build's view of the change
+  // cursor (spec §8: a successful build resets changes_since_build — the
+  // reset happens inside markTrainingBuilt, only while the cursor is still
+  // the snapshot, so a mid-build edit keeps its count).
+  tasteFeedback.markTrainingBuilt(profile.id, trainingSnap.changed_at);
 
   const seeds = m.seeds + sr.seeds;
   const stored = m.stored + sr.stored;
@@ -768,10 +781,19 @@ function noteMetaOpen(profileId, type, imdbId, nowMs = Date.now()) {
 
 // The pool only needs rebuilding when there are new SEEDS (watched history moved
 // since the last build) or it's empty — user-filter changes now apply at serve
-// time, so they never trigger a rebuild.
-function needsBuild(profileId) {
+// time, so they never trigger a rebuild. Trainer T2 (N8): a Trainer edit
+// (rating / ignore / finished) ALSO triggers a rebuild — only when the profile's
+// movie engine is Marquee (the only engine that reads the taste-feedback store),
+// only when the change is NEWER than the last build that included it, and only
+// after a 10-minute quiet period. A change landing DURING a build stays newer
+// than the build's stamp and triggers the NEXT build.
+function needsBuild(profileId, { profile = null, now = Date.now() } = {}) {
   if (countRecommended(profileId) === 0) return true;
-  return watchedStore.newestWatchedMs(profileId) > getBuiltAt(profileId);
+  if (watchedStore.newestWatchedMs(profileId) > getBuiltAt(profileId)) return true;
+  if (profile && require('./engines').resolveFor(profile, 'movie').id === 'marquee') {
+    return tasteFeedback.trainingDue(profileId, now);
+  }
+  return false;
 }
 
 // Build the pool NOW (buildRecommendations + ageGatePool) with progress. This is
@@ -797,7 +819,7 @@ async function buildPool(profile, log = console, onProgress = () => {}) {
 // Background trigger from the tick: enqueue a pool build only when it's needed.
 async function ensureBuilt(profile, log = console) {
   init();
-  if (!needsBuild(profile.id)) return { skipped: 'fresh' };
+  if (!needsBuild(profile.id, { profile })) return { skipped: 'fresh' };
   const jobs = require('./jobs');
   return jobs.enqueue(profile.id, 'recs', (progress) => buildPool(profile, log, progress));
 }
