@@ -29,19 +29,9 @@
 // the local data/DB entirely with explicit creds:
 //   SIMKL_CLIENT_ID=... SIMKL_ACCESS_TOKEN=... node --experimental-sqlite test/verify-trainer-live.js --confirm
 //
-// Output is counts + PASS/FAIL only — no titles (mandate M12 privacy).
-const path = require('path');
-const fs = require('fs');
-
-// The taste store for VT4 is isolated to a FRESH temp dir (the spec's
-// guardrail: a verify run must never clobber the profile's real taste_ratings).
-// Profile resolution still reads the ORIGINAL data dir, so a local profile works.
-const ORIGINAL_DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
-const FRESH_DATA_DIR = require('os').tmpdir() + '/trainer-verify-' + Date.now();
-process.env.DATA_DIR = FRESH_DATA_DIR;
-
+// Output is counts + PASS/FAIL only — no titles (mandate M12 privacy). The
+// target is shown only as simkl:<id>.
 const simkl = require('../src/services/simkl');
-const tasteFeedback = require('../src/tasteFeedback');
 
 const args = process.argv.slice(2);
 const flag = (name) => args.includes(`--${name}`);
@@ -52,24 +42,18 @@ const opt = (name, def = null) => {
 const confirm = flag('confirm');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Resolve the profile BEFORE the DATA_DIR repoint below, so config reads the
+// ORIGINAL data dir (the local profiles.json). config.listProfiles() returns
+// profiles already unsealed (keys + simkl_auth), so no manual crypto here.
 async function resolveProfile() {
   const envId = process.env.SIMKL_CLIENT_ID;
   const envTok = process.env.SIMKL_ACCESS_TOKEN;
   if (envId && envTok) {
     return { id: 'env', name: '(SIMKL_* env creds)', keys: { simkl_client_id: envId }, simkl_auth: { access_token: envTok } };
   }
-  // Read the local profile from the ORIGINAL data dir (the store above points at
-  // the fresh temp dir, so config would see an empty dir) and unseal the Simkl
-  // token the same way config does.
-  const secret = require('../src/services/crypto');
-  let profiles = [];
-  try { profiles = JSON.parse(fs.readFileSync(path.join(ORIGINAL_DATA_DIR, 'profiles.json'), 'utf8')).profiles || []; } catch { profiles = []; }
-  const unsealed = profiles.map((p) => {
-    const cp = JSON.parse(JSON.stringify(p));
-    if (cp.simkl_auth && cp.simkl_auth.access_token) cp.simkl_auth.access_token = secret.unseal(cp.simkl_auth.access_token);
-    return cp;
-  });
-  const connected = unsealed.filter((p) => p.keys?.simkl_client_id && p.simkl_auth?.access_token);
+  const config = require('../src/config'); // only here — the env path stays sqlite-free
+  const profiles = config.listProfiles();
+  const connected = profiles.filter((p) => p.keys?.simkl_client_id && p.simkl_auth?.access_token);
   const wanted = opt('profile');
   const chosen = wanted ? connected.find((p) => p.name === wanted) : connected[0];
   if (!chosen) {
@@ -80,16 +64,47 @@ async function resolveProfile() {
   return chosen;
 }
 
-// A movie to rate. Default: Inception (a movie almost certainly on a Simkl
-// account with any history). Override with --tmdb=/--imdb= if needed.
-function targetMovie() {
-  const tmdb = opt('tmdb'); const imdb = opt('imdb');
-  return { tmdb: tmdb || '27205', imdb: imdb || 'tt1375666' };
+// A movie to rate. Chosen from the account's OWN completed movies, minus every
+// movie already rated (matched by tmdb OR imdb OR simkl id), taking the most
+// recent by watched_at that carries a simkl_id. No hardcoded target, no flags.
+async function pickTarget(profile) {
+  const items = await simkl.getAllItems(profile, 'movies', { status: 'completed' });
+  const watched = simkl.parseWatchedItems(items, 'movies');
+  const ratings = await simkl.getRatings(profile, 'movies');
+  const ratedTmdb = new Set(); const ratedImdb = new Set(); const ratedSimkl = new Set();
+  for (const r of ratings) {
+    if (r.tmdb_id != null) ratedTmdb.add(String(r.tmdb_id));
+    if (r.imdb_id != null) ratedImdb.add(r.imdb_id);
+    if (r.simkl_id != null) ratedSimkl.add(Number(r.simkl_id));
+  }
+  const candidates = watched.filter((w) => {
+    const t = w.tmdb_id != null ? String(w.tmdb_id) : null;
+    const i = w.imdb_id != null ? w.imdb_id : null;
+    const s = w.simkl_id != null ? Number(w.simkl_id) : null;
+    if (t && ratedTmdb.has(t)) return false;
+    if (i && ratedImdb.has(i)) return false;
+    if (s != null && ratedSimkl.has(s)) return false;
+    return true;
+  });
+  let target = null;
+  for (const w of candidates) {
+    if (w.simkl_id == null) continue; // must carry a simkl_id to be rated
+    if (!target || (Date.parse(w.watched_at || '1970-01-01') > Date.parse(target.watched_at || '1970-01-01'))) target = w;
+  }
+  return target;
+}
+
+// Is the target present in a ratings list (matched by tmdb OR imdb OR simkl)?
+function isRated(ratings, target) {
+  return ratings.some((r) =>
+    (target.tmdb_id != null && r.tmdb_id != null && String(r.tmdb_id) === String(target.tmdb_id))
+    || (target.imdb_id != null && r.imdb_id != null && r.imdb_id === target.imdb_id)
+    || (target.simkl_id != null && r.simkl_id != null && Number(r.simkl_id) === Number(target.simkl_id)));
 }
 
 // Read back the account's current rating for a movie by tmdb or imdb.
 function ratingFor(ratings, t) {
-  const hit = ratings.find((r) => (t.tmdb && String(r.tmdb_id) === String(t.tmdb)) || (t.imdb && r.imdb_id === t.imdb));
+  const hit = ratings.find((r) => (t.tmdb_id && String(r.tmdb_id) === String(t.tmdb_id)) || (t.imdb_id && r.imdb_id === t.imdb_id));
   return hit ? hit.rating : null;
 }
 
@@ -100,22 +115,27 @@ function ratedAtOf(activities) {
 
 async function main() {
   if (flag('help')) {
-    console.log('Usage: node --experimental-sqlite test/verify-trainer-live.js [--confirm] [--profile=Name] [--tmdb=NNN] [--imdb=ttNNN]');
+    console.log('Usage: node --experimental-sqlite test/verify-trainer-live.js [--confirm] [--profile=Name]');
     console.log('Env creds (skip local data/DB): SIMKL_CLIENT_ID=... SIMKL_ACCESS_TOKEN=...');
     process.exit(0);
   }
 
   const profile = await resolveProfile();
-  console.log(`Profile: ${profile.name}`);
+  console.log('Profile: resolved');
   const conn = await simkl.checkConnection(profile.keys.simkl_client_id, profile.simkl_auth.access_token);
   if (!conn.valid) { console.error(`✗ Simkl connection invalid: ${conn.reason}`); process.exit(2); }
-  console.log(`✓ Simkl connected${conn.username ? ` as ${conn.username}` : ''}`);
+  console.log('✓ Simkl connected');
 
-  const t = targetMovie();
+  const target = await pickTarget(profile);
+  if (!target) {
+    console.log('SKIP: no unrated watched movie');
+    process.exit(0);
+  }
 
   if (!confirm) {
     console.log('\nDRY RUN (no writes). With --confirm this would:');
-    console.log(`  VT1  setRatings → 7 on the target movie (tmdb:${t.tmdb} imdb:${t.imdb}); read back the 7 + the activities rated_at change.`);
+    console.log(`  target: simkl:${target.simkl_id}`);
+    console.log('  VT1  setRatings → 7 on the target; read back the 7 + the activities rated_at change.');
     console.log('  VT2  setRatings → 10 (a love); read back the 10.');
     console.log('  VT3  removeRatings; read back that the rating is gone.');
     console.log('  VT4  tasteFeedback.syncRatings (force) into an isolated temp store; print ok + row count.');
@@ -124,44 +144,59 @@ async function main() {
   }
 
   console.log('\n⚠  LIVE MODE — writing to your Simkl account (self-cleaning, read-back-verified).');
+  // Isolate VT4's store to a FRESH temp dir (the spec's guardrail: a verify run
+  // must never clobber the profile's real taste_ratings). The repoint happens
+  // BEFORE the first tasteFeedback require (lazy, inside VT4).
+  process.env.DATA_DIR = require('os').tmpdir() + '/trainer-verify-' + Date.now();
   const results = [];
 
-  // VT1 — setRatings(7) lands + advances the activities gate.
-  {
-    console.log('\n── VT1: setRatings → 7 ──');
-    const ratedAtBefore = ratedAtOf(await simkl.getActivities(profile));
-    await simkl.setRatings(profile, [{ type: 'movie', tmdb_id: t.tmdb, imdb_id: t.imdb, rating: 7 }]);
-    await sleep(1500);
-    const got = ratingFor(await simkl.getRatings(profile, 'movies'), t);
-    const ratedAtAfter = ratedAtOf(await simkl.getActivities(profile));
-    const advanced = ratedAtAfter != null && ratedAtAfter !== ratedAtBefore;
-    console.log(`  read back rating=${got} (want 7); rated_at ${ratedAtBefore || 'null'} → ${ratedAtAfter || 'null'}`);
-    results.push({ name: 'VT1', pass: got === 7, detail: got === 7 ? (advanced ? 'rating 7 landed + activities rated_at advanced' : 'rating 7 landed (rated_at unchanged this run — expected if the gate was already current)') : `read back ${got}, not 7` });
-  }
+  try {
+    // Refuse (no writes) if a fresh getRatings shows the target already rated.
+    const fresh = await simkl.getRatings(profile, 'movies');
+    if (isRated(fresh, target)) {
+      console.error('✗ target already rated on the account — refusing to write (no changes made)');
+      process.exit(2);
+    }
 
-  // VT2 — setRatings(10) (a love) reads back as 10.
-  {
-    console.log('\n── VT2: setRatings → 10 (love) ──');
-    await simkl.setRatings(profile, [{ type: 'movie', tmdb_id: t.tmdb, imdb_id: t.imdb, rating: 10 }]);
-    await sleep(1500);
-    const got = ratingFor(await simkl.getRatings(profile, 'movies'), t);
-    console.log(`  read back rating=${got} (want 10)`);
-    results.push({ name: 'VT2', pass: got === 10, detail: got === 10 ? 'love (10) landed' : `read back ${got}, not 10` });
-  }
+    // VT1 — setRatings(7) lands + advances the activities gate.
+    {
+      console.log('\n── VT1: setRatings → 7 ──');
+      const ratedAtBefore = ratedAtOf(await simkl.getActivities(profile));
+      await simkl.setRatings(profile, [{ type: 'movie', simkl_id: target.simkl_id, imdb_id: target.imdb_id, tmdb_id: target.tmdb_id, rating: 7 }]);
+      await sleep(1500);
+      const got = ratingFor(await simkl.getRatings(profile, 'movies'), target);
+      const ratedAtAfter = ratedAtOf(await simkl.getActivities(profile));
+      const advanced = ratedAtAfter != null && ratedAtAfter !== ratedAtBefore;
+      console.log(`  read back rating=${got} (want 7); rated_at ${ratedAtBefore || 'null'} → ${ratedAtAfter || 'null'}`);
+      results.push({ name: 'VT1', pass: got === 7, detail: got === 7 ? (advanced ? 'rating 7 landed + activities rated_at advanced' : 'rating 7 landed (rated_at unchanged this run — expected if the gate was already current)') : `read back ${got}, not 7` });
+    }
 
-  // VT3 — removeRatings clears the rating (self-cleanup: restores the movie to unrated).
-  {
-    console.log('\n── VT3: removeRatings (clear) ──');
-    await simkl.removeRatings(profile, [{ type: 'movie', tmdb_id: t.tmdb, imdb_id: t.imdb }]);
-    await sleep(1500);
-    const got = ratingFor(await simkl.getRatings(profile, 'movies'), t);
-    console.log(`  read back rating=${got} (want null)`);
-    results.push({ name: 'VT3', pass: got === null, detail: got === null ? 'rating cleared (movie restored to unrated)' : `still ${got}, not cleared` });
+    // VT2 — setRatings(10) (a love) reads back as 10.
+    {
+      console.log('\n── VT2: setRatings → 10 (love) ──');
+      await simkl.setRatings(profile, [{ type: 'movie', simkl_id: target.simkl_id, imdb_id: target.imdb_id, tmdb_id: target.tmdb_id, rating: 10 }]);
+      await sleep(1500);
+      const got = ratingFor(await simkl.getRatings(profile, 'movies'), target);
+      console.log(`  read back rating=${got} (want 10)`);
+      results.push({ name: 'VT2', pass: got === 10, detail: got === 10 ? 'love (10) landed' : `read back ${got}, not 10` });
+    }
+  } finally {
+    // VT3 — removeRatings clears the rating (self-cleanup: restores the movie to
+    // unrated). Always runs if any write was attempted, even if VT1/VT2 threw.
+    {
+      console.log('\n── VT3: removeRatings (clear) ──');
+      await simkl.removeRatings(profile, [{ type: 'movie', simkl_id: target.simkl_id, imdb_id: target.imdb_id, tmdb_id: target.tmdb_id }]);
+      await sleep(1500);
+      const got = ratingFor(await simkl.getRatings(profile, 'movies'), target);
+      console.log(`  read back rating=${got} (want null)`);
+      results.push({ name: 'VT3', pass: got === null, detail: got === null ? 'rating cleared (movie restored to unrated)' : `still ${got}, not cleared` });
+    }
   }
 
   // VT4 — tasteFeedback.syncRatings (force) into the isolated temp store.
   {
     console.log('\n── VT4: tasteFeedback.syncRatings (force) ──');
+    const tasteFeedback = require('../src/tasteFeedback'); // lazy — store is the fresh temp dir
     const res = await tasteFeedback.syncRatings(profile, { force: true });
     console.log(`  ok=${res.ok} synced=${res.ok ? res.synced : '-'} unresolved=${res.ok ? res.unresolved : (res.error || '-')}`);
     results.push({ name: 'VT4', pass: res.ok === true, detail: res.ok ? `synced ${res.synced} movie rating(s) into the engine-agnostic store` : `sync failed: ${res.error}` });
