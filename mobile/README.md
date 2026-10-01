@@ -180,6 +180,10 @@ Steps are sequential; each is shippable on its own. **All four are built.**
 4. ✅ **[Step 4 — Recommendations tabs + swipe](docs/step-4-recommendations-tabs.md)** —
    reuses Step 3's watchlist write for swipe-left and `dontRecommend.suppress`
    for swipe-right; Undo via the new `recommendationStore.removeDontRecommend`.
+5. ✅ **[Step 6 — Trainer (Quick-train + List)](docs/step-6-trainer.md)** —
+   train the profile from the phone: Quick (one card at a time from the unrated)
+   and List (the portal's filtered, paged history); shared logic from
+   `public/trainer-ui.js`, session-scoped `/mobile/api/trainer*` routes.
 
 ## Out of scope for v1 (noted, not built)
 
