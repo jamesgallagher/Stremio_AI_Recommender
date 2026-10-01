@@ -13,76 +13,117 @@ const crypto = require('crypto');
 const watchedStore = require('../../watchedStore');
 const glassEvents = require('../glass/events');
 const glassTasteModel = require('../glass/tasteModel');
+const glassConfig = require('../glass/config');
 const watchedEnrichment = require('../glass/watchedEnrichment');
 const metaStore = require('../glass/metaStore');
+const tasteFeedback = require('../../tasteFeedback');
 const simklCache = require('./simklCache');
 const llmCache = require('./llmCache');
 const llm = require('../../services/llm');
 
 const DAY_MS = 24 * 3600e3;
 
-// Rating → event weight (spec §4.3): 9–10 → +2.0, 7–8 → +1.2, 5–6 → +0.4,
-// 1–4 → −1.2. Pure; null for an unrated title (it keeps the watched base).
+// Rating → event weight (Trainer T2, N4): 10 → +3.0 (Loved), 9 → +2.0,
+// 7–8 → +1.2, 5–6 → +0.4, 1–4 → −1.2. Pure; null for an unrated title (it
+// keeps the watched base).
 function ratingWeight(rating, cfg) {
   const rw = cfg?.rating_weights;
   if (!rw) return null;
   if (rating == null || !Number.isFinite(Number(rating))) return null;
   const r = Number(rating);
-  if (r >= 9) return rw.r9_10;
+  if (r === 10) return rw.r10;
+  if (r === 9) return rw.r9;
   if (r >= 7) return rw.r7_8;
   if (r >= 5) return rw.r5_6;
   if (r >= 1) return rw.r1_4;
   return null;
 }
 
-// The rating-weighted event list (spec §4.3): Glass's weighted event list with
-// each WATCHED event re-weighted by its Simkl rating (ev.rating set); rejection
-// events unchanged; a title rated but never watched is NOT added (only existing
-// watched events are re-weighted). `ratings` is a Map<tmdb_id, rating>
-// (defaults to simklCache.getRatingsMap).
-// m2 engagement: `abandoned` (Map<tmdb_id, { percent, ts }>, from
-// engagement.abandonedFor) adds one NEGATIVE event per film the profile started
-// but left before halfway — kind 'abandoned', weight cfg.engagement.weight,
-// recency-decayed from when it was last touched like every other event. Empty
-// (the default) leaves the list exactly Glass's + the rating re-weighting.
-function buildEvents(profileId, cfg, { nowMs = Date.now(), ratings, abandoned } = {}) {
+// Trainer T2 (N3): the Loved tier's recency factor. A 10/10's decay is FLOORED
+// at cfg.loved.decay_floor (0.5): a blendedWeight below the floor is scaled up
+// by floor/b so the effective decay never drops below the floor. `b` is the same
+// blended recency weight buildTasteModel applies (same days, half-lives,
+// horizon blend), so the floor is applied identically.
+function lovedFactor(days, cfg) {
+  const b = glassTasteModel.blendedWeight(days, glassConfig.halfLivesFor(cfg, 'movie'), cfg.horizon_blend);
+  const floor = cfg.loved?.decay_floor ?? 0.5;
+  if (b <= 0) return 1;
+  return b >= floor ? 1 : floor / b;
+}
+
+// The rating-weighted event list (spec §4.3 + Trainer T2): Glass's weighted
+// event list with each WATCHED event re-weighted by its Simkl rating
+// (ev.rating set); rejection events unchanged; a title rated but never watched
+// is NOT added (only existing watched events are re-weighted). `ratings` is a
+// Map<tmdb_id, rating> (defaults to simklCache.getRatingsMap). `ignored`
+// (Set<tmdb_id>, defaults to tasteFeedback.ignoredSet) removes the profile's
+// IGNORED films from the list entirely (N2: weight 0 — no taste event of any
+// kind; they stay in watchedIdSets, they just never steer taste). A film rated
+// 10 (Loved) additionally gets its recency decay floored at
+// cfg.loved.decay_floor (N3). Abandoned films are NEUTRAL (N5): no event of any
+// kind — the m2 negative 'abandoned' event is gone.
+function buildEvents(profileId, cfg, { nowMs = Date.now(), ratings, ignored } = {}) {
   const ratingsMap = ratings || simklCache.getRatingsMap(profileId);
+  const ignoredSet = ignored || tasteFeedback.ignoredSet(profileId, 'movie');
   const events = glassEvents.buildEventList(profileId, 'movie', cfg, { nowMs });
+  const kept = [];
   for (const ev of events) {
+    if (ev.kind === 'watched' && ignoredSet.has(String(ev.tmdb_id))) continue; // N2: ignored films never steer taste
+    kept.push(ev);
+  }
+  for (const ev of kept) {
     if (ev.kind !== 'watched') continue;
     const r = ratingsMap.get(ev.tmdb_id);
     if (r == null) continue;
     const w = ratingWeight(r, cfg);
-    if (w != null) { ev.weight = w; ev.rating = r; }
+    if (w != null) {
+      ev.weight = w;
+      ev.rating = r;
+      if (r === 10) {
+        const days = Number.isNaN(ev.ts) ? 0 : Math.max(0, (nowMs - ev.ts) / DAY_MS);
+        ev.weight *= lovedFactor(days, cfg); // N3: Loved decay floored at cfg.loved.decay_floor
+        ev.loved = true;
+      }
+    }
   }
-  const weight = cfg.engagement?.weight ?? -1.0;
-  for (const [tmdbId, a] of abandoned || new Map()) {
-    events.push({ type: 'movie', tmdb_id: String(tmdbId), weight, ts: a.ts || NaN, kind: 'abandoned', fallback_genre: null });
-  }
-  return events;
+  return kept;
 }
 
-// Full seed ordering (spec §4.3): watched movies with a tmdb_id, excluding
-// titles rated ≤ 4 (a low rating is a negative signal — never a seed), weight
-// = (ratingWeight ?? feedback.watched) × blendedWeight(days, half-lives,
-// horizon blend). Sorted by weight desc, ties by newer watched_at, then tmdb_id.
-function seedOrder(profileId, cfg, { nowMs = Date.now(), ratings } = {}) {
+// Full seed ordering (spec §4.3 + Trainer T2): watched movies with a tmdb_id,
+// excluding IGNORED films (N2 — never a seed) and titles rated ≤ 4 (a low
+// rating is a negative signal — never a seed), weight = (ratingWeight ??
+// feedback.watched) × blendedWeight(days, half-lives, horizon blend). A film
+// rated 10 (Loved) has its decay floored at cfg.loved.decay_floor (N3) and is
+// flagged `loved` so seedsFor can pin it. Sorted by weight desc, ties by newer
+// watched_at, then tmdb_id.
+function seedOrder(profileId, cfg, { nowMs = Date.now(), ratings, ignored } = {}) {
   const ratingsMap = ratings || simklCache.getRatingsMap(profileId);
+  const ignoredSet = ignored || tasteFeedback.ignoredSet(profileId, 'movie');
   const hl = cfg.half_life_days.movie;
   const blend = cfg.horizon_blend;
   const base = cfg.feedback?.watched ?? 1;
   const rows = watchedStore.getWatched(profileId, { type: 'movie' }).filter((w) => w.tmdb_id);
   const out = [];
   for (const w of rows) {
-    const r = ratingsMap.get(String(w.tmdb_id));
+    const id = String(w.tmdb_id);
+    if (ignoredSet.has(id)) continue; // N2: ignored films are never seeds
+    const r = ratingsMap.get(id);
     if (r != null && r <= 4) continue; // rated ≤ 4 → excluded (spec §4.3)
     const rw = ratingWeight(r, cfg);
     const ts = w.watched_at ? Date.parse(w.watched_at) : NaN;
     const days = Number.isNaN(ts) ? 0 : Math.max(0, (nowMs - ts) / DAY_MS);
-    const weight = (rw != null ? rw : base) * glassTasteModel.blendedWeight(days, hl, blend);
+    let weight = (rw != null ? rw : base) * glassTasteModel.blendedWeight(days, hl, blend);
+    let loved = false;
+    if (r === 10) {
+      // N3: Loved decay floored at cfg.loved.decay_floor.
+      const b = glassTasteModel.blendedWeight(days, hl, blend);
+      const floor = cfg.loved?.decay_floor ?? 0.5;
+      weight = (rw != null ? rw : base) * Math.max(b, floor);
+      loved = true;
+    }
     out.push({
-      tmdb_id: String(w.tmdb_id), simkl_id: w.simkl_id, imdb_id: w.imdb_id,
-      title: w.title, year: w.year, rating: r == null ? null : r, weight, watched_at: w.watched_at,
+      tmdb_id: id, simkl_id: w.simkl_id, imdb_id: w.imdb_id,
+      title: w.title, year: w.year, rating: r == null ? null : r, weight, watched_at: w.watched_at, loved,
     });
   }
   out.sort((a, b) => {
@@ -95,41 +136,41 @@ function seedOrder(profileId, cfg, { nowMs = Date.now(), ratings } = {}) {
   return out;
 }
 
-// The seeds (spec §4.3): the top cfg.seed_cap of the seed ordering.
-function seedsFor(profileId, cfg, { nowMs, ratings } = {}) {
-  return seedOrder(profileId, cfg, { nowMs, ratings }).slice(0, cfg.seed_cap ?? 40);
+// The seeds (spec §4.3 + Trainer T2): Loved films (rated 10) are PINNED at the
+// front of the seed list (at most cfg.loved.pinned_seed_cap), then the rest of
+// the seed ordering, capped at cfg.seed_cap (N3: always seeded).
+function seedsFor(profileId, cfg, { nowMs, ratings, ignored } = {}) {
+  const order = seedOrder(profileId, cfg, { nowMs, ratings, ignored });
+  const pinned = order.filter((s) => s.loved).slice(0, cfg.loved?.pinned_seed_cap ?? 15);
+  const pinnedSet = new Set(pinned.map((s) => s.tmdb_id));
+  const rest = order.filter((s) => !pinnedSet.has(s.tmdb_id));
+  return [...pinned, ...rest].slice(0, cfg.seed_cap ?? 40);
 }
 
-// The rating-weighted taste model (spec §4.3): top up watched enrichment first
-// (degrades, never throws — MI-3), then build Glass's taste model from the
-// rating-weighted events. Returns the taste model unchanged.
-async function buildTaste(profileId, apiKey, cfg, { nowMs = Date.now(), ratings, abandoned, enrichFetcher, log = console } = {}) {
+// The rating-weighted taste model (spec §4.3 + Trainer T2): top up watched
+// enrichment first (degrades, never throws — MI-3), then build Glass's taste
+// model from the rating-weighted events. Returns the taste model unchanged.
+async function buildTaste(profileId, apiKey, cfg, { nowMs = Date.now(), ratings, ignored, enrichFetcher, log = console } = {}) {
   try {
     await watchedEnrichment.enrichWatchedBatch(profileId, 'movie', apiKey, { cap: cfg.enrich_cap, fetcher: enrichFetcher, log });
   } catch (err) {
     log.warn(`[marquee] watched enrichment failed: ${err.message} — building taste without it`);
   }
-  // m2 engagement: an abandoned film only steers taste once its deep meta
-  // (director/genres/keywords…) is known — enrich a bounded batch, cached forever.
-  if (abandoned && abandoned.size) {
-    const missing = [...abandoned.keys()].filter((id) => !metaStore.has('movie', id)).slice(0, cfg.engagement?.enrich_cap ?? 30);
-    for (let i = 0; i < missing.length; i += 8) {
-      await Promise.all(missing.slice(i, i + 8).map((id) => metaStore.enrich(apiKey, 'movie', id, log, enrichFetcher ? { fetcher: enrichFetcher } : {}).catch(() => null)));
-    }
-  }
   return glassTasteModel.buildTasteModel(profileId, 'movie', cfg, {
     nowMs,
-    events: buildEvents(profileId, cfg, { nowMs, ratings, abandoned }),
+    events: buildEvents(profileId, cfg, { nowMs, ratings, ignored }),
   });
 }
 
-// Stable hash of the profile's movie watch history + ratings (spec §4.3):
-// SHA-256 over the sorted (tmdb_id, rating ?? '', watched_at) triples. Stable
-// across calls; changes when a watch or a rating changes.
-function historyHash(profileId, { ratings } = {}) {
+// Stable hash of the profile's movie watch history + ratings + ignores
+// (spec §4.3 + Trainer T2): SHA-256 over the sorted (tmdb_id, rating ?? '',
+// watched_at, ignored ? 'I' : '') quadruples. Stable across calls; changes when
+// a watch, a rating, or an ignore changes.
+function historyHash(profileId, { ratings, ignored } = {}) {
   const ratingsMap = ratings || simklCache.getRatingsMap(profileId);
+  const ignoredSet = ignored || tasteFeedback.ignoredSet(profileId, 'movie');
   const rows = watchedStore.getWatched(profileId, { type: 'movie' }).filter((w) => w.tmdb_id);
-  const parts = rows.map((w) => [String(w.tmdb_id), String(ratingsMap.get(String(w.tmdb_id)) ?? ''), w.watched_at || '']);
+  const parts = rows.map((w) => [String(w.tmdb_id), String(ratingsMap.get(String(w.tmdb_id)) ?? ''), w.watched_at || '', ignoredSet.has(String(w.tmdb_id)) ? 'I' : '']);
   parts.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
   const hash = crypto.createHash('sha256');
   for (const p of parts) hash.update(p.join('|') + '\n');
@@ -148,7 +189,8 @@ function buildBriefPrompt(input) {
     'Watch history (title, year, rating):',
   ];
   for (const h of input.watch_history) {
-    lines.push(`- ${h.title} (${h.year ?? 'n.d.'}) — ${h.rating == null ? 'unrated' : `rated ${h.rating}/10`} — ${h.genres.length ? h.genres.join(', ') : 'genre unknown'}`);
+    const rated = h.rating == null ? 'unrated' : (h.rating === 10 ? 'rated 10/10 (LOVED)' : `rated ${h.rating}/10`);
+    lines.push(`- ${h.title} (${h.year ?? 'n.d.'}) — ${rated} — ${h.genres.length ? h.genres.join(', ') : 'genre unknown'}`);
   }
   lines.push('', 'Taste dimensions (strongest first):');
   for (const d of input.tastes) lines.push(`- ${d.dim}: ${d.values.join(', ')}`);
@@ -193,9 +235,9 @@ function parseBrief(text) {
 // (top 2 from the Glass meta cache, else the watched primary_genre), plus the
 // top 8 POSITIVE entries of each taste dim (genres, directors, keywords,
 // decades).
-function buildBriefInput(profileId, taste, cfg, { nowMs, ratings } = {}) {
+function buildBriefInput(profileId, taste, cfg, { nowMs, ratings, ignored } = {}) {
   const ratingsMap = ratings || simklCache.getRatingsMap(profileId);
-  const order = seedOrder(profileId, cfg, { nowMs, ratings });
+  const order = seedOrder(profileId, cfg, { nowMs, ratings, ignored });
   const cap = cfg.brief?.input_cap ?? 60;
   const metas = metaStore.getMany('movie', order.map((s) => s.tmdb_id));
   const primaryGenre = new Map(watchedStore.getWatched(profileId, { type: 'movie' }).map((w) => [String(w.tmdb_id), w.primary_genre]));
@@ -226,12 +268,12 @@ function buildBriefInput(profileId, taste, cfg, { nowMs, ratings } = {}) {
 // is empty (no local LLM) return null WITHOUT any network call. Cached in
 // marquee_llm_cache (kind 'brief') keyed by historyHash — on a hit the LLM is
 // not called. A failed brief is NEVER cached (the next build retries).
-async function tasteBrief(profileId, taste, { chain = [], chat = llm.chat, cfg, ratings, log = console, now = Date.now() } = {}) {
+async function tasteBrief(profileId, taste, { chain = [], chat = llm.chat, cfg, ratings, ignored, log = console, now = Date.now() } = {}) {
   if (!chain || !chain.length) return null; // no local LLM → no brief, no network (MD-1)
-  const key = historyHash(profileId, { ratings });
+  const key = historyHash(profileId, { ratings, ignored });
   const cached = llmCache.get(profileId, 'brief', key, { now });
   if (cached) return cached;
-  const input = buildBriefInput(profileId, taste, cfg, { nowMs: now, ratings });
+  const input = buildBriefInput(profileId, taste, cfg, { nowMs: now, ratings, ignored });
   const timeoutMs = Number(process.env.MARQUEE_LLM_TIMEOUT_MS) || cfg.llm_timeout_ms;
   try {
     const brief = await chat(chain, [{ role: 'user', content: buildBriefPrompt(input) }], { temperature: 0, timeoutMs, validate: parseBrief }, log);
@@ -253,7 +295,9 @@ function briefHash(brief) {
 
 module.exports = {
   ratingWeight,
+  lovedFactor,
   buildEvents,
+  seedOrder,
   seedsFor,
   buildTaste,
   historyHash,

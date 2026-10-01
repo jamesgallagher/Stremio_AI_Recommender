@@ -126,6 +126,12 @@ function removeHoldout(profileId, targetIds, { db, noCache = false }) {
   if (tableExists(conn, 'taste_ratings')) {
     conn.prepare("DELETE FROM taste_ratings WHERE profile_id = ? AND type = 'movie' AND tmdb_id IN (" + inList + ")").run(profileId, ...targetIds);
   }
+  // Trainer T2 (§4.6): a held-out film the profile IGNORED would otherwise stay
+  // in taste_ignore and steer Marquee's taste (N2) — clear it alongside the
+  // ratings so the holdout cannot leak.
+  if (tableExists(conn, 'taste_ignore')) {
+    conn.prepare("DELETE FROM taste_ignore WHERE profile_id = ? AND type = 'movie' AND tmdb_id IN (" + inList + ")").run(profileId, ...targetIds);
+  }
   // m2 engagement: a held-out film the profile FINISHED may still carry an old
   // mid-watch progress row. With the film removed from `watched`, that row would
   // read as "abandoned" and Marquee would exclude it — an unfair miss. Clear it.

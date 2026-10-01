@@ -2082,7 +2082,7 @@ ok('marquee ME-03: parseMovieSummary users_recommendations, ids from item.ids, m
 ok('marquee ME-04: ratingWeight bands (spec §4.3) + unrated → null (B7)', () => {
   const taste = require('../src/engines/marquee/taste');
   const cfg = require('../src/engines/marquee/config').DEFAULTS;
-  assert.strictEqual(taste.ratingWeight(10, cfg), 2.0);
+  assert.strictEqual(taste.ratingWeight(10, cfg), 3.0);
   assert.strictEqual(taste.ratingWeight(9, cfg), 2.0);
   assert.strictEqual(taste.ratingWeight(8, cfg), 1.2);
   assert.strictEqual(taste.ratingWeight(7, cfg), 1.2);
@@ -2144,14 +2144,17 @@ ok('marquee ME-04: config copies Glass values independently + resolveConfig deep
   assert.deepStrictEqual(marqueeCfg.DEFAULTS.taste_dims, glassCfg.DEFAULTS.taste_dims);
   assert.deepStrictEqual(marqueeCfg.DEFAULTS.keyword_min_shared, glassCfg.DEFAULTS.keyword_min_shared);
   // Marquee-specific knobs
-  assert.deepStrictEqual(marqueeCfg.DEFAULTS.rating_weights, { r9_10: 2.0, r7_8: 1.2, r5_6: 0.4, r1_4: -1.2 });
+  // Trainer T2 (N4): the rating bands — 10 → +3.0 (Loved), 9 → +2.0, 7–8 → +1.2, 5–6 → +0.4, 1–4 → −1.2.
+  assert.deepStrictEqual(marqueeCfg.DEFAULTS.rating_weights, { r10: 3.0, r9: 2.0, r7_8: 1.2, r5_6: 0.4, r1_4: -1.2 });
+  // Trainer T2 (N3): the Loved tier knobs (decay floor + pinned seed cap).
+  assert.deepStrictEqual(marqueeCfg.DEFAULTS.loved, { decay_floor: 0.5, pinned_seed_cap: 15 });
   assert.strictEqual(marqueeCfg.DEFAULTS.seed_cap, 100); // m2: 40 → 100
   assert.strictEqual(marqueeCfg.DEFAULTS.enrich_cap, 60);
   assert.strictEqual(marqueeCfg.DEFAULTS.llm_timeout_ms, 60000);
   assert.deepStrictEqual(marqueeCfg.DEFAULTS.brief, { input_cap: 60 });
   // collab_reserve added in review round 1 (F1): the S2 collaborative reserve.
   assert.deepStrictEqual(marqueeCfg.DEFAULTS.simkl, { recs_max_uncached: 40, recs_ttl_days: 30, ratings_resolve_cap: 50, collab_reserve: 40 });
-  assert.strictEqual(marqueeCfg.ALGORITHM_VERSION, 'marquee-m2');
+  assert.strictEqual(marqueeCfg.ALGORITHM_VERSION, 'marquee-m3');
   // resolveConfig: deep clone — mutating the result must not touch DEFAULTS
   const resolved = marqueeCfg.resolveConfig({});
   resolved.half_life_days.movie.recent = 999;

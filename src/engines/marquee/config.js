@@ -10,7 +10,9 @@
 // m2 (2026-09-30, after the first live backtest): seed agreement became a
 // first-class signal (pre-score + final score), more seeds, a capped + taste-
 // gated trending intake. See spec §15.
-const ALGORITHM_VERSION = 'marquee-m2';
+// Trainer T2: the Marquee taste model now acts on the Trainer feedback store
+// (ignore, Loved tier, neutral abandoned) — see docs/trainer/.
+const ALGORITHM_VERSION = 'marquee-m3';
 
 const DEFAULTS = {
   // ── Copies of Glass's taste-model knobs (spec §4.5) ──
@@ -37,19 +39,26 @@ const DEFAULTS = {
   keyword_min_shared: 1,
 
   // ── Marquee-specific (spec §4.3 / §4.5) ──
-  // Rating → event weight bands (spec §4.3): 9–10 → +2.0, 7–8 → +1.2,
-  // 5–6 → +0.4, 1–4 → −1.2.
-  rating_weights: { r9_10: 2.0, r7_8: 1.2, r5_6: 0.4, r1_4: -1.2 },
+  // Rating → event weight bands (Trainer T2, N4): 10 → +3.0 (Loved), 9 → +2.0,
+  // 7–8 → +1.2, 5–6 → +0.4, 1–4 → −1.2. Rated 1–4 is never a seed.
+  rating_weights: { r10: 3.0, r9: 2.0, r7_8: 1.2, r5_6: 0.4, r1_4: -1.2 },
+  // Trainer T2 (N3): the Loved tier — a 10/10 is stronger (r10), its recency
+  // decay never drops below decay_floor, and it's always seeded (pinned at the
+  // front of the seed list, at most pinned_seed_cap). Computed from the rating,
+  // never stored.
+  loved: { decay_floor: 0.5, pinned_seed_cap: 15 },
   // m2: 100 seeds (was 40). The backtest showed Genesis — 150 seeds, ranked by
   // how many recent watches point at a title — out-recalling Marquee; more
   // seeds is the cheapest way to widen that agreement signal (2 TMDB calls/seed).
   seed_cap: 100,
   // m2 ENGAGEMENT (James, 2026-09-30): this family doesn't rate films. A film
   // watched to the end = liked (the watched base); a film started but left
-  // below abandon_below % and untouched for grace_days = didn't enjoy it: a
-  // negative taste event of `weight`, never recommended back by Marquee, never
-  // a seed. Source: the watch provider's progress (Nuvio). Marquee only.
-  engagement: { enabled: true, abandon_below: 50, grace_days: 7, weight: -1.0, sync_hours: 6, resolve_cap: 30, enrich_cap: 30 },
+  // below abandon_below % and untouched for grace_days = didn't enjoy it.
+  // Trainer T2 (TD-4): an abandoned film is now NEUTRAL — no taste event of any
+  // kind; it's still dropped as a candidate (sources.js) and never a seed.
+  // finish_pct / credits_min keep credits + rewatches out of the abandoned set
+  // (N6). Source: the watch provider's progress (Nuvio). Marquee only.
+  engagement: { enabled: true, abandon_below: 50, grace_days: 7, finish_pct: 90, credits_min: 20, sync_hours: 6, resolve_cap: 30 },
   enrich_cap: 60,
   llm_timeout_ms: 60000,
   brief: { input_cap: 60 },

@@ -2005,20 +2005,24 @@ async function main() {
     // Rated ≤ 4 excluded; no-tmdb row excluded.
     assert.ok(!seeds.some((s) => s.tmdb_id === '4'));
     assert.ok(!seeds.some((s) => s.tmdb_id === null));
-    // weight = ratingWeight × blendedWeight(days): recent rated-10 > unrated recent > old rated-10
+    // Trainer T2 (N3/N4): weight = ratingWeight × max(blendedWeight(days), loved decay floor).
+    // recent rated-10 (3.0 × bw) > old rated-10 (floored at 3.0 × 0.5) > unrated recent (1.0 × bw).
     const byId = new Map(seeds.map((s) => [s.tmdb_id, s]));
     const recentDays = (nowMs - Date.parse('2026-05-20T00:00:00Z')) / day;
     const oldDays = (nowMs - Date.parse('2024-06-01T00:00:00Z')) / day;
     const hl = cfg.half_life_days.movie;
     const blend = cfg.horizon_blend;
     const bw = (d) => blend.long * 0.5 ** (d / hl.long) + blend.medium * 0.5 ** (d / hl.medium) + blend.recent * 0.5 ** (d / hl.recent);
-    assert.ok(byId.get('1').weight > byId.get('3').weight, 'rated-10 recent beats unrated recent');
-    assert.ok(byId.get('3').weight > byId.get('2').weight, 'unrated recent beats old rated-10');
-    assert.ok(Math.abs(byId.get('1').weight - 2.0 * bw(recentDays)) < 1e-9);
+    assert.ok(byId.get('1').weight > byId.get('2').weight, 'rated-10 recent beats old rated-10');
+    assert.ok(byId.get('2').weight > byId.get('3').weight, 'old rated-10 (floored) beats unrated recent');
+    // recent rated-10: bw(recentDays) > floor → weight = r10 × bw.
+    assert.ok(Math.abs(byId.get('1').weight - 3.0 * bw(recentDays)) < 1e-9);
+    // unrated recent: base weight × bw.
     assert.ok(Math.abs(byId.get('3').weight - 1.0 * bw(recentDays)) < 1e-9);
-    assert.ok(Math.abs(byId.get('2').weight - 2.0 * bw(oldDays)) < 1e-9);
-    // sort: weight desc
-    assert.deepStrictEqual(seeds.map((s) => s.tmdb_id), ['1', '3', '2']);
+    // old rated-10: bw(oldDays) < floor → decay floored at cfg.loved.decay_floor.
+    assert.ok(Math.abs(byId.get('2').weight - 3.0 * cfg.loved.decay_floor) < 1e-9);
+    // sort: weight desc (Loved films pinned at the front)
+    assert.deepStrictEqual(seeds.map((s) => s.tmdb_id), ['1', '2', '3']);
     // rating carried through (null for unrated)
     assert.strictEqual(byId.get('1').rating, 10);
     assert.strictEqual(byId.get('3').rating, null);
@@ -2976,7 +2980,7 @@ async function main() {
     const stored = rs.getRecommended('p-mq19', { type: 'movie', limit: 10 })[0];
     assert.strictEqual(stored.affinity, row.rankScore, 'affinity = rankScore');
     assert.strictEqual(stored.rec_count, row.recCount, 'rec_count = recCount');
-    assert.strictEqual(stored.algorithm_version, 'marquee-m2', 'algorithm_version = marquee-m2');
+    assert.strictEqual(stored.algorithm_version, 'marquee-m3', 'algorithm_version = marquee-m3');
     const comps = JSON.parse(stored.score_components);
     assert.ok(comps.features && comps.weights, 'score_components JSON parses');
     rs.deleteForProfile('p-mq19');
@@ -3718,7 +3722,7 @@ async function main() {
     assert.strictEqual(by.get('sa3').scoreComponents.features.seed_affinity, 0);
     assert.ok('seed_affinity' in by.get('sa1').scoreComponents.weights, 'seed_affinity is a weighted feature');
     assert.ok(by.get('sa1').rankScore > by.get('sa2').rankScore && by.get('sa2').rankScore > by.get('sa3').rankScore, 'more agreement ranks higher, all else equal');
-    assert.strictEqual(by.get('sa1').algorithmVersion, 'marquee-m2');
+    assert.strictEqual(by.get('sa1').algorithmVersion, 'marquee-m3');
   });
 
   await it('bench m2: reachability + hit@20r + per-target positions and Marquee fate', async () => {
@@ -3813,24 +3817,22 @@ async function main() {
     mqEngagement._clear();
   });
 
-  await it('marquee m2 engagement: an abandoned film is a negative taste event (its director turns negative)', async () => {
+  await it('marquee m3 engagement: an abandoned film is NEUTRAL (no taste event of any kind)', async () => {
     const taste = require('../src/engines/marquee/taste');
     const profileId = 'p-eng3';
     glassMeta._clear();
     watchedStore.upsertMany(profileId, [{ simkl_id: 1, type: 'movie', imdb_id: 'ttw1', tmdb_id: 'w1', title: 'Liked', year: 2020, watched_at: '2026-05-01T00:00:00Z' }]);
     glassMeta.put('movie', 'w1', { genres: ['Drama'], director: ['Director Liked'], imdb_id: 'ttw1' });
+    // N5: the m2 `abandoned` option is removed — even if a caller passes it, no
+    // abandoned event of any kind is produced (abandoned films are NEUTRAL).
     const abandoned = new Map([['ab1', { percent: 25, ts: engNow - 20 * DAYMS }]]);
     const events = taste.buildEvents(profileId, mqCfgResolved, { nowMs: engNow, ratings: new Map(), abandoned });
-    const ev = events.find((e) => e.tmdb_id === 'ab1');
-    assert.strictEqual(ev.kind, 'abandoned');
-    assert.strictEqual(ev.weight, -1.0);
-    // The abandoned film's meta is enriched (bounded), then its director goes negative.
-    const tm = await taste.buildTaste(profileId, 'k', mqCfgResolved, {
-      nowMs: engNow, ratings: new Map(), abandoned, log: quiet,
-      enrichFetcher: async (_k, _t, id) => (id === 'ab1' ? { tmdb_id: 'ab1', imdb_id: 'ttab1', genres: ['Horror'], director: ['Director Disliked'] } : null),
-    });
-    assert.ok(tm.dims.directors['Director Disliked'] < 0, 'abandoned film pushes its director negative');
+    assert.ok(!events.some((e) => e.kind === 'abandoned'), 'no abandoned event of any kind');
+    assert.ok(!events.some((e) => e.tmdb_id === 'ab1'), 'the abandoned film is absent from the event list');
+    // The taste model carries no negative director from a (would-be) abandoned film.
+    const tm = await taste.buildTaste(profileId, 'k', mqCfgResolved, { nowMs: engNow, ratings: new Map(), log: quiet });
     assert.ok(tm.dims.directors['Director Liked'] > 0, 'finished film stays positive');
+    assert.ok(!('Director Disliked' in tm.dims.directors), 'no negative director from an abandoned film');
     watchedStore.deleteForProfile(profileId);
     glassMeta._clear();
   });
@@ -3967,6 +3969,160 @@ async function main() {
     assert.deepStrictEqual(ab.get('tmA'), { percent: 30, ts: now - 8 * day });
     assert.strictEqual(ab.has('tmB'), false, '95% not abandoned');
     db.get().prepare('DELETE FROM marquee_engagement WHERE profile_id = ?').run(profileId);
+  });
+
+  // ── Marquee m3 taste: rating bands, ignore, Loved tier (Trainer T2, §4.3) ──
+  await it('marquee m3: ratingWeight bands (N4)', async () => {
+    const taste = require('../src/engines/marquee/taste');
+    const cfg = mqCfgResolved;
+    assert.strictEqual(taste.ratingWeight(10, cfg), 3.0, '10 → r10');
+    assert.strictEqual(taste.ratingWeight(9, cfg), 2.0, '9 → r9');
+    assert.strictEqual(taste.ratingWeight(8, cfg), 1.2, '8 → r7_8');
+    assert.strictEqual(taste.ratingWeight(7, cfg), 1.2, '7 → r7_8');
+    assert.strictEqual(taste.ratingWeight(6, cfg), 0.4, '6 → r5_6');
+    assert.strictEqual(taste.ratingWeight(5, cfg), 0.4, '5 → r5_6');
+    assert.strictEqual(taste.ratingWeight(4, cfg), -1.2, '4 → r1_4');
+    assert.strictEqual(taste.ratingWeight(3, cfg), -1.2, '3 → r1_4');
+    assert.strictEqual(taste.ratingWeight(1, cfg), -1.2, '1 → r1_4');
+    assert.strictEqual(taste.ratingWeight(0, cfg), null, '0 → null');
+    assert.strictEqual(taste.ratingWeight(null, cfg), null, 'null → null');
+    assert.strictEqual(taste.ratingWeight('7', cfg), 1.2, 'string rating coerced');
+  });
+
+  await it('marquee m3: an ignored film never steers taste and is never a seed (N2)', async () => {
+    const taste = require('../src/engines/marquee/taste');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const profileId = 'p-ign1';
+    glassMeta._clear();
+    // Two watched films: one ignored (rated 10 — the strongest possible), one not.
+    watchedStore.upsertMany(profileId, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'ttig1', tmdb_id: 'ig1', title: 'Ignored', year: 2020, watched_at: '2026-05-01T00:00:00Z' },
+      { simkl_id: 2, type: 'movie', imdb_id: 'ttig2', tmdb_id: 'ig2', title: 'Kept', year: 2020, watched_at: '2026-05-01T00:00:00Z' },
+    ]);
+    glassMeta.put('movie', 'ig1', { genres: ['Drama'], director: ['Dir Ignored'], imdb_id: 'ttig1' });
+    glassMeta.put('movie', 'ig2', { genres: ['Action'], director: ['Dir Kept'], imdb_id: 'ttig2' });
+    const ratings = new Map([['ig1', 10], ['ig2', 7]]);
+    // Ignore ig1 (even though it is rated 10 — ignore beats any rating).
+    tasteFeedback.setIgnored(profileId, { type: 'movie', tmdb_id: 'ig1' }, true, engNow);
+    const ignored = tasteFeedback.ignoredSet(profileId, 'movie');
+    assert.ok(ignored.has('ig1'), 'ig1 is in the ignored set');
+    // buildEvents: the ignored film is absent (no taste event of any kind).
+    const events = taste.buildEvents(profileId, mqCfgResolved, { nowMs: engNow, ratings });
+    assert.ok(!events.some((e) => e.tmdb_id === 'ig1'), 'ignored film absent from the event list');
+    assert.ok(events.some((e) => e.tmdb_id === 'ig2'), 'non-ignored film present');
+    // seedOrder: the ignored film is never a seed (even at rating 10).
+    const seeds = taste.seedOrder(profileId, mqCfgResolved, { nowMs: engNow, ratings });
+    assert.ok(!seeds.some((s) => s.tmdb_id === 'ig1'), 'ignored film never a seed');
+    assert.ok(seeds.some((s) => s.tmdb_id === 'ig2'), 'non-ignored film is a seed');
+    // The ignored film stays in watchedIdSets (N2: ignore is local only).
+    const sets = watchedStore.watchedIdSets(profileId);
+    assert.ok(sets.tmdb.has('ig1'), 'ignored film stays in watchedIdSets');
+    tasteFeedback.deleteForProfile(profileId);
+    watchedStore.deleteForProfile(profileId);
+    glassMeta._clear();
+  });
+
+  await it('marquee m3: Loved decay is floored at cfg.loved.decay_floor (N3)', async () => {
+    const taste = require('../src/engines/marquee/taste');
+    const glassTasteModel = require('../src/engines/glass/tasteModel');
+    const glassConfig = require('../src/engines/glass/config');
+    const cfg = mqCfgResolved;
+    const floor = cfg.loved.decay_floor; // 0.5
+    const hl = glassConfig.halfLivesFor(cfg, 'movie');
+    // A recent Loved film: blendedWeight ≈ 1 (≥ floor) → no boost.
+    assert.strictEqual(taste.lovedFactor(0, cfg), 1, 'recent: no boost');
+    // An old Loved film: blendedWeight < floor → boosted so the effective decay = floor.
+    const days = 15000; // ~41 years → blendedWeight ≈ 1e-9
+    const b = glassTasteModel.blendedWeight(days, hl, cfg.horizon_blend);
+    assert.ok(b < floor, 'old film: blendedWeight below the floor');
+    const factor = taste.lovedFactor(days, cfg);
+    assert.ok(factor > 1, 'old film: boosted above 1');
+    const effective = b * factor;
+    assert.ok(Math.abs(effective - floor) < 1e-9, 'effective decay floored at the floor (to 1e-9)');
+  });
+
+  await it('marquee m3: Loved films are pinned at the front of the seeds (N3)', async () => {
+    const taste = require('../src/engines/marquee/taste');
+    const profileId = 'p-loved1';
+    glassMeta._clear();
+    // An old Loved film (weight floored at r10 × 0.5 = 1.5) + a recent rated-9
+    // film (weight ≈ 2.0 × 0.77 ≈ 1.54). Without pinning, the rated-9 film would
+    // sort first (1.54 > 1.5). Pinning puts the Loved film at the front.
+    watchedStore.upsertMany(profileId, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'ttlv1', tmdb_id: 'lv1', title: 'Loved (old)', year: 2020, watched_at: '2020-01-01T00:00:00Z' },
+      { simkl_id: 2, type: 'movie', imdb_id: 'ttlv2', tmdb_id: 'lv2', title: 'Rated 9 (recent)', year: 2024, watched_at: '2026-05-01T00:00:00Z' },
+    ]);
+    const ratings = new Map([['lv1', 10], ['lv2', 9]]);
+    const seeds = taste.seedsFor(profileId, mqCfgResolved, { nowMs: engNow, ratings });
+    assert.strictEqual(seeds[0].tmdb_id, 'lv1', 'Loved film pinned at the front (despite lower weight)');
+    assert.ok(seeds[0].loved, 'the front seed is Loved');
+    assert.strictEqual(seeds[0].rating, 10);
+    assert.strictEqual(seeds[1].tmdb_id, 'lv2', 'the rated-9 film is second');
+    watchedStore.deleteForProfile(profileId);
+    glassMeta._clear();
+  });
+
+  await it('marquee m3: historyHash changes when a film is ignored (N2)', async () => {
+    const taste = require('../src/engines/marquee/taste');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const profileId = 'p-hash1';
+    glassMeta._clear();
+    watchedStore.upsertMany(profileId, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'th1', tmdb_id: 'h1', title: 'Film 1', year: 2020, watched_at: '2026-05-01T00:00:00Z' },
+      { simkl_id: 2, type: 'movie', imdb_id: 'th2', tmdb_id: 'h2', title: 'Film 2', year: 2020, watched_at: '2026-05-02T00:00:00Z' },
+    ]);
+    const ratings = new Map([['h1', 7], ['h2', 8]]);
+    const hashBefore = taste.historyHash(profileId, { ratings });
+    // Ignore h1 → the hash changes.
+    tasteFeedback.setIgnored(profileId, { type: 'movie', tmdb_id: 'h1' }, true, engNow);
+    const hashIgnored = taste.historyHash(profileId, { ratings });
+    assert.notStrictEqual(hashIgnored, hashBefore, 'ignoring changes the hash');
+    // Un-ignore h1 → the hash returns to the original.
+    tasteFeedback.setIgnored(profileId, { type: 'movie', tmdb_id: 'h1' }, false, engNow);
+    const hashUnignored = taste.historyHash(profileId, { ratings });
+    assert.strictEqual(hashUnignored, hashBefore, 'un-ignoring restores the hash');
+    tasteFeedback.deleteForProfile(profileId);
+    watchedStore.deleteForProfile(profileId);
+    glassMeta._clear();
+  });
+
+  await it('marquee m3: a no-feedback profile is unchanged (N9 identity)', async () => {
+    const taste = require('../src/engines/marquee/taste');
+    const glassTasteModel = require('../src/engines/glass/tasteModel');
+    const profileId = 'p-n9';
+    glassMeta._clear();
+    // A no-feedback profile: watched films, NO ratings, NO ignores.
+    watchedStore.upsertMany(profileId, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'tn1', tmdb_id: 'n1', title: 'Film 1', year: 2020, watched_at: '2026-05-01T00:00:00Z' },
+      { simkl_id: 2, type: 'movie', imdb_id: 'tn2', tmdb_id: 'n2', title: 'Film 2', year: 2020, watched_at: '2026-05-02T00:00:00Z' },
+    ]);
+    glassMeta.put('movie', 'n1', { genres: ['Drama'], director: ['Dir 1'], imdb_id: 'tn1' });
+    glassMeta.put('movie', 'n2', { genres: ['Action'], director: ['Dir 2'], imdb_id: 'tn2' });
+    // The m3 taste model for a no-feedback profile == the pure Glass taste model
+    // (no rating re-weighting, no ignores, no abandoned events).
+    const m3 = await taste.buildTaste(profileId, 'k', mqCfgResolved, { nowMs: engNow, ratings: new Map(), log: quiet });
+    const glass = glassTasteModel.buildTasteModel(profileId, 'movie', mqCfgResolved, { nowMs: engNow });
+    assert.deepStrictEqual(m3.dims, glass.dims, 'm3 no-feedback dims == Glass dims');
+    assert.strictEqual(m3.totalWeight, glass.totalWeight, 'm3 no-feedback totalWeight == Glass');
+    assert.strictEqual(m3.seedCount, glass.seedCount, 'm3 no-feedback seedCount == Glass');
+    watchedStore.deleteForProfile(profileId);
+    glassMeta._clear();
+  });
+
+  await it('marquee m3: bench holdout clears taste_ignore rows (N2, §4.6)', async () => {
+    const bench = require('../src/bench/engineBench');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const profileId = 'p-bench-ign';
+    // A profile with two ignored films.
+    tasteFeedback.setIgnored(profileId, { type: 'movie', tmdb_id: 'bi1' }, true, engNow);
+    tasteFeedback.setIgnored(profileId, { type: 'movie', tmdb_id: 'bi2' }, true, engNow);
+    assert.strictEqual(tasteFeedback.ignoredSet(profileId, 'movie').size, 2, 'two ignored films before');
+    // removeHoldout deletes the holdout's taste_ignore rows (alongside taste_ratings).
+    bench.removeHoldout(profileId, ['bi1'], { db: require('../src/db') });
+    const after = tasteFeedback.ignoredSet(profileId, 'movie');
+    assert.ok(!after.has('bi1'), 'the holdout film is cleared from taste_ignore');
+    assert.ok(after.has('bi2'), 'the non-holdout film is kept');
+    tasteFeedback.deleteForProfile(profileId);
   });
 
   // Restore a clean-ish shared state for any process that runs after this one.
