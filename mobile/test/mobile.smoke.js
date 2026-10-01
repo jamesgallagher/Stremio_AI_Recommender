@@ -711,6 +711,45 @@ async function unitTests() {
     }
   });
 
+  await ok('handlers: trainer T3.1 — unwatched acts on the session profile only; body profile_id ignored', async () => {
+    const wStore = require('../../src/watchedStore');
+    const tasteFeedback = require('../../src/tasteFeedback');
+    const origHist = simkl.removeFromHistory;
+    const origRemove = simkl.removeRatings;
+    let histCalls = []; let removeCalls = [];
+    simkl.removeFromHistory = async (profile, items) => { histCalls.push({ profile: profile.id, items }); return {}; };
+    simkl.removeRatings = async (profile, items) => { removeCalls.push({ profile: profile.id, items }); return {}; };
+    const pid = 'trainer-u-' + Date.now();
+    const prof = { id: pid, name: 'Unwatch', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    try {
+      // Seed one watched movie.
+      wStore.upsertMany(pid, [{ simkl_id: 101, type: 'movie', imdb_id: 'tt1', tmdb_id: '603', title: 'Alpha', year: 2020, watched_at: new Date().toISOString() }]);
+
+      // unwatched — Simkl history removal called for the session profile (NOT body.profile_id), local rows removed.
+      let res = fakeRes();
+      await handlers.trainerUnwatchedHandler({ profile: prof, body: { type: 'movie', tmdb_id: '603', profile_id: 'B' } }, res);
+      assert.strictEqual(res.statusCode, 200);
+      assert.strictEqual(histCalls.length, 1);
+      assert.strictEqual(histCalls[0].profile, pid, 'session profile, NOT body.profile_id');
+      assert.strictEqual(res.body.item.status, 'unwatched');
+      assert.ok(!wStore.watchedIdSets(pid).tmdb.has('603'), 'watched row removed');
+
+      // not-in-history → 404; no-simkl → 400.
+      res = fakeRes();
+      await handlers.trainerUnwatchedHandler({ profile: prof, body: { type: 'movie', tmdb_id: '999999' } }, res);
+      assert.strictEqual(res.statusCode, 404);
+      res = fakeRes();
+      await handlers.trainerUnwatchedHandler({ profile: { id: 'B', keys: {}, simkl_auth: null }, body: { type: 'movie', tmdb_id: '603' } }, res);
+      assert.strictEqual(res.statusCode, 400);
+      assert.strictEqual(res.body.error, 'no-simkl');
+    } finally {
+      simkl.removeFromHistory = origHist;
+      simkl.removeRatings = origRemove;
+      wStore.deleteForProfile(pid);
+      tasteFeedback.deleteForProfile(pid);
+    }
+  });
+
   await ok('regression: recommendations are per-profile (isolation)', () => {
     const A = 'iso-A-' + Date.now(); const B = 'iso-B-' + Date.now();
     recommendationStore.upsertCandidates(A, [mkCand({ imdb_id: 'ttA', tmdb_id: '603', title: 'A-movie' })]);

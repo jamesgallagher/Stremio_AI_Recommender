@@ -212,6 +212,23 @@ async function removeRatings(profile, items) {
   return res.json().catch(() => ({}));
 }
 
+// POST /sync/history/remove — remove items from watch history (Trainer T3.1
+// "Mark unwatched"). Same lane and error contract as removeRatings (the
+// governed simkl_post lane). withRating:false → ids only, no rating field.
+async function removeFromHistory(profile, items) {
+  const clientId = profile.keys.simkl_client_id;
+  const token = profile.simkl_auth?.access_token;
+  if (!clientId || !token) throw new Error('Simkl is not connected for this profile');
+  const body = buildRatingsBody(items, { withRating: false });
+  if (!body.movies.length && !body.shows.length) throw new Error('nothing to remove');
+  const res = await governor.schedule('simkl_post', () => fetch(withParams(clientId, '/sync/history/remove'), {
+    method: 'POST', headers: headers(token), body: JSON.stringify(body),
+  }));
+  if (res.status === 401 || res.status === 403) throw new Error('Simkl token rejected — reconnect the account');
+  if (!res.ok) throw new Error(`Simkl POST /sync/history/remove failed (${res.status})`);
+  return res.json().catch(() => ({}));
+}
+
 // GET /movies/{simklId} — §12 L4: users_recommendations ("users also liked")
 // is present BY DEFAULT (no extra query params), so none are sent.
 async function getMovieSummary(profile, simklId) {
@@ -431,6 +448,7 @@ module.exports = {
   buildRatingsBody,
   setRatings,
   removeRatings,
+  removeFromHistory,
   getMovieSummary,
   parseMovieSummary,
   getAllItems,

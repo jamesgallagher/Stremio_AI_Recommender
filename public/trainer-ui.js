@@ -9,7 +9,32 @@ TrainerUI.VIEWS = [['all', 'All'], ['unrated', 'Unrated'], ['rated', 'Rated'], [
 
 // Every data-act value the portal controller switches on. The switch in
 // index.html has a case for each entry — keep the two in sync.
-TrainerUI.ACTIONS = ['star', 'clear', 'love', 'ignore', 'unignore', 'undo', 'finished', 'rebuild', 'prev', 'next'];
+TrainerUI.ACTIONS = ['star', 'clear', 'love', 'ignore', 'unignore', 'undo', 'unwatch', 'finished', 'rebuild', 'prev', 'next'];
+
+// Tooltips for every Trainer control (R7). The companion (T4) does not use
+// them. `star` is a template — {n} is replaced with the half's rating at
+// render time. A disabled rate control (no Simkl) keeps "Connect Simkl to rate".
+TrainerUI.TIPS = {
+  star: 'Rate {n}/10 — saves to your Simkl ratings and steers Marquee',
+  clear: 'Clear your rating (also removes it from Simkl)',
+  love: 'Love it — rates 10/10. Loved films always count as a favourite in Marquee',
+  unlove: 'Remove love — clears the 10/10 rating',
+  ignore: "Ignore — keep it in your history but stop it shaping recommendations. It won't be recommended again",
+  unignore: 'Stop ignoring — let this film shape recommendations again',
+  undo: 'Undo the ignore',
+  unwatch: 'Mark unwatched — removes it from your Simkl watch history (for films marked watched by mistake). It can be recommended again',
+  finished: 'I finished it — marks it watched on Simkl and moves it into your history',
+  rebuild: "Rebuild this profile's recommendations now instead of waiting for the hourly check",
+  search: 'Search your watch history by title',
+  prev: 'Previous page',
+  next: 'Next page',
+  chip_all: "Everything you've watched (except ignored)",
+  chip_unrated: "Watched films you haven't rated yet",
+  chip_rated: "Films you've rated (including loved)",
+  chip_loved: 'Films you rated 10/10',
+  chip_ignored: 'Films you told the recommender to ignore',
+  chip_unfinished: 'Films you started but stopped before halfway — never recommended back',
+};
 
 // Same mapping as index.html's esc. null/undefined → ''.
 TrainerUI.esc = (s) => {
@@ -47,10 +72,98 @@ TrainerUI.ratingFromStarClick = (index, half) => index * 2 + (half === 'left' ? 
 // ♥ shortcut: a 10 clears, anything else becomes a 10.
 TrainerUI.nextRatingForHeart = (r) => (r === 10 ? null : 10);
 
+// Star scrub (R9): map a pointer x (viewport px) to a 1–10 rating in half-star
+// steps, from the 5 star-wrap hit boxes. `rects` is the 5 wraps' { left, width }
+// in order. Within star i (0-based): the left half → 2i+1, the right half → 2i+2;
+// the gap after star i (before star i+1) → 2i+2; before the first star → null;
+// past the last star → 10. Pure — no DOM.
+TrainerUI.ratingFromPointer = (x, rects) => {
+  if (x < rects[0].left) return null;
+  for (let i = 0; i < 5; i++) {
+    const { left, width } = rects[i];
+    const mid = left + width / 2;
+    const right = left + width;
+    if (x < mid) return 2 * i + 1;
+    if (x <= right) return 2 * i + 2;
+    // x is past star i: a gap before star i+1 → 2i+2, otherwise fall through
+    // to the next star.
+    if (i < 4 && x < rects[i + 1].left) return 2 * i + 2;
+  }
+  return 10; // past the last star
+};
+
+// A 1–10 rating (or null) → the 5 fill widths as '0%'|'50%'|'100%'.
+TrainerUI.fillsForRating = (r) =>
+  TrainerUI.starsFromRating(r).map(l => (l === 1 ? '100%' : (l === 0.5 ? '50%' : '0%')));
+
+// Bind one .tr-stars group to pointer-event scrubbing. One implementation for
+// mouse and touch: mouse hover previews in half-star steps, a click (pointerdown
+// → pointerup) commits; touch taps preview, a sideways drag follows it, and
+// pointerup commits; a vertical drag scrolls the page (touch-action: pan-y) and
+// the browser fires pointercancel, which reverts the preview. Preview never
+// saves — only onCommit goes through the rate queue. Only addEventListener and
+// set/releasePointerCapture are used (no mouse/touch handlers); returns unbind().
+TrainerUI.bindStarScrub = (groupEl, { getRects, isEnabled, onPreview, onCommit, onCancel }) => {
+  let scrubbing = false;
+  let last = null; // last previewed value
+  const preview = (x) => {
+    const r = TrainerUI.ratingFromPointer(x, getRects());
+    last = r;
+    onPreview(r);
+  };
+  const onPointerMove = (e) => {
+    if (!isEnabled()) return;
+    if (scrubbing) {
+      const r = TrainerUI.ratingFromPointer(e.clientX, getRects());
+      if (r !== last) { last = r; onPreview(r); }
+    } else if (e.pointerType === 'mouse' && e.buttons === 0) {
+      preview(e.clientX); // hover
+    }
+  };
+  const onPointerDown = (e) => {
+    if (!isEnabled()) return;
+    if (e.button !== 0) return; // primary button only
+    scrubbing = true;
+    try { groupEl.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+    preview(e.clientX);
+  };
+  const release = (e) => {
+    try { groupEl.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+  };
+  const onPointerUp = (e) => {
+    if (!isEnabled() || !scrubbing) return;
+    release(e);
+    scrubbing = false;
+    if (last != null) onCommit(last);
+  };
+  const onPointerCancel = (e) => {
+    if (!isEnabled() || !scrubbing) return;
+    release(e);
+    scrubbing = false;
+    onCancel(); // no commit
+  };
+  const onPointerLeave = (e) => {
+    if (!isEnabled() || scrubbing) return;
+    if (e.pointerType === 'mouse') onCancel();
+  };
+  groupEl.addEventListener('pointermove', onPointerMove);
+  groupEl.addEventListener('pointerdown', onPointerDown);
+  groupEl.addEventListener('pointerup', onPointerUp);
+  groupEl.addEventListener('pointercancel', onPointerCancel);
+  groupEl.addEventListener('pointerleave', onPointerLeave);
+  return () => {
+    groupEl.removeEventListener('pointermove', onPointerMove);
+    groupEl.removeEventListener('pointerdown', onPointerDown);
+    groupEl.removeEventListener('pointerup', onPointerUp);
+    groupEl.removeEventListener('pointercancel', onPointerCancel);
+    groupEl.removeEventListener('pointerleave', onPointerLeave);
+  };
+};
+
 // Filter chips with counts; only the active one carries aria-pressed="true".
 TrainerUI.chipsHtml = (counts, active) =>
   TrainerUI.VIEWS.map(([id, label]) =>
-    `<button class="tr-chip" data-view="${id}" aria-pressed="${id === active ? 'true' : 'false'}">${label} <span class="tr-count">${counts[id] || 0}</span></button>`
+    `<button class="tr-chip" data-view="${id}" title="${TrainerUI.esc(TrainerUI.TIPS['chip_' + id])}" aria-pressed="${id === active ? 'true' : 'false'}">${label} <span class="tr-count">${counts[id] || 0}</span></button>`
   ).join('');
 
 // One row of the history table. `now` feeds whenText. canRate=false (no Simkl)
@@ -67,30 +180,32 @@ TrainerUI.rowHtml = (item, { canRate, now }) => {
     : TrainerUI.whenText(item.watched_at, now);
   const starsCell = () => {
     const levels = TrainerUI.starsFromRating(item.rating);
-    const starDis = !canRate ? ' disabled title="Connect Simkl to rate"' : (item.ignored ? ' disabled' : '');
     const wraps = [];
     for (let i = 0; i < 5; i++) {
       const lv = levels[i];
       const fillPct = lv === 1 ? '100%' : (lv === 0.5 ? '50%' : '0%');
       const halfBtn = (half) => {
         const rating = TrainerUI.ratingFromStarClick(i, half);
-        return `<button class="tr-star" data-act="star" data-half="${half}" data-rating="${rating}" aria-label="Rate ${rating} out of 10"${starDis}></button>`;
+        const disabled = !canRate || item.ignored;
+        const tip = !canRate ? 'Connect Simkl to rate' : TrainerUI.TIPS.star.replace('{n}', rating);
+        return `<button class="tr-star" data-act="star" data-half="${half}" data-rating="${rating}" aria-label="Rate ${rating} out of 10" title="${esc(tip)}"${disabled ? ' disabled' : ''}></button>`;
       };
       // Visual layer (glyph + fill) is separate from the two transparent hit
       // areas; the fill width comes from starsFromRating (0/0.5/1 → 0/50/100%).
       wraps.push(`<span class="tr-star-wrap"><span class="tr-glyph" aria-hidden="true">★</span><span class="tr-fill" aria-hidden="true" style="width:${fillPct}">★</span>${halfBtn('left')}${halfBtn('right')}</span>`);
     }
-    const clearDis = canRate ? '' : ' disabled title="Connect Simkl to rate"';
+    const clearTip = !canRate ? 'Connect Simkl to rate' : TrainerUI.TIPS.clear;
     const clear = item.rating != null
-      ? `<button class="ghost mini" data-act="clear" aria-label="Clear rating"${clearDis}>×</button>`
+      ? `<button class="ghost mini" data-act="clear" aria-label="Clear rating" title="${esc(clearTip)}"${canRate ? '' : ' disabled'}>×</button>`
       : '';
     return `<span class="tr-stars" role="group" aria-label="Your rating">${wraps.join('')}</span>${clear}`;
   };
+  const unwatchBtn = () => `<button class="ghost mini" data-act="unwatch" aria-label="Mark unwatched" title="${esc(!canRate ? 'Connect Simkl to rate' : TrainerUI.TIPS.unwatch)}"${canRate ? '' : ' disabled'}>Unwatch</button>`;
   const acts = item.status === 'unfinished'
-    ? `<button class="ghost mini" data-act="finished" aria-label="Mark finished"${canRate ? '' : ' disabled title="Connect Simkl to rate"'}>I finished it</button> <button class="ghost mini" data-act="ignore" aria-label="Ignore">Ignore</button>`
+    ? `<button class="ghost mini" data-act="finished" aria-label="Mark finished" title="${esc(!canRate ? 'Connect Simkl to rate' : TrainerUI.TIPS.finished)}"${canRate ? '' : ' disabled'}>I finished it</button> <button class="ghost mini" data-act="ignore" aria-label="Ignore" title="${esc(TrainerUI.TIPS.ignore)}">Ignore</button>`
     : item.ignored
-      ? '<button class="ghost mini" data-act="unignore" aria-label="Undo ignore">Unignore</button>'
-      : `<button class="ghost mini tr-heart" data-act="love" aria-pressed="${item.loved ? 'true' : 'false'}" aria-label="Love"${canRate ? '' : ' disabled title="Connect Simkl to rate"'}>♥</button> <button class="ghost mini" data-act="ignore" aria-label="Ignore">Ignore</button>`;
+      ? `<button class="ghost mini" data-act="unignore" aria-label="Undo ignore" title="${esc(TrainerUI.TIPS.unignore)}">Unignore</button> ${unwatchBtn()}`
+      : `<button class="ghost mini tr-heart" data-act="love" aria-pressed="${item.loved ? 'true' : 'false'}" aria-label="Love" title="${esc(!canRate ? 'Connect Simkl to rate' : (item.loved ? TrainerUI.TIPS.unlove : TrainerUI.TIPS.love))}"${canRate ? '' : ' disabled'}>♥</button> <button class="ghost mini" data-act="ignore" aria-label="Ignore" title="${esc(TrainerUI.TIPS.ignore)}">Ignore</button> ${unwatchBtn()}`;
   return `<div class="tr-row" data-key="${esc(item.key)}">
     <div class="tr-cell tr-title">${thumb}<span class="tr-tt">${title}</span></div>
     <div class="tr-cell">${genre}</div>
@@ -115,7 +230,7 @@ TrainerUI.bannerHtml = (training, now, { rebuilding = false } = {}) => {
       text += due <= now ? ' · rebuild due within the hour' : ` · rebuild in about ${Math.ceil((due - now) / 60000)} min`;
     }
   }
-  return `<div class="tr-banner">${text} <button class="ghost mini" data-act="rebuild">Rebuild now</button></div>`;
+  return `<div class="tr-banner">${text} <button class="ghost mini" data-act="rebuild" title="${TrainerUI.esc(TrainerUI.TIPS.rebuild)}">Rebuild now</button></div>`;
 };
 
 TrainerUI.pagerText = (page, pageSize, total) =>

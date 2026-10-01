@@ -187,3 +187,10 @@ do not trigger a build themselves.
 | T2 | Marquee semantics: ignore, r10 Loved tier + decay floor + pinned seeds, abandoned neutral + credits/rewatch guards, rebuild trigger, bench snapshot tables, m3 bump | to write after T1 review |
 | T3 | Portal Trainer tab | after T2 |
 | T4 | Companion Trainer route + quick-train | after T3 |
+
+## 11. T3.1 refinements (2026-10-01, James's feedback)
+
+- Rows never disappear on an action; only view/page/search changes re-fetch rows. Counts and the banner refresh quietly.
+- Mark unwatched: Simkl `/sync/history/remove` first (authority), then local watched/pending/ignore/rating rows are removed and an unwatch block stops the Nuvio/Stremio scrobble re-adding the film unless the provider records a newer watch. The film becomes recommendable again.
+- Every portal Trainer control has a tooltip (`TrainerUI.TIPS`); the companion (T4) does not use them.
+- Star scrub: one Pointer Events implementation (`TrainerUI.bindStarScrub`). Mouse hover previews in half-star steps and click commits; touch previews on tap, follows a sideways drag and commits on release; a vertical drag scrolls the page and cancels the preview (`touch-action: pan-y`). Preview never saves; one save per gesture; keyboard rating unchanged. T4 reuses it unchanged.

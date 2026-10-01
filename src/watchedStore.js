@@ -63,6 +63,19 @@ function init() {
       at         INTEGER,
       PRIMARY KEY (profile_id, type, id)
     );
+
+    -- Trainer T3.1 (R5): a per-profile unwatch block. When the user marks a
+    -- film unwatched (removed from Simkl history by mistake), the Nuvio/Stremio
+    -- scrobble must not re-add it. Keyed by imdb (the scrobble's movie key); a
+    -- provider watch NEWER than the block time is a genuine rewatch and clears it.
+    CREATE TABLE IF NOT EXISTS unwatched_block (
+      profile_id TEXT NOT NULL,
+      type       TEXT NOT NULL,
+      imdb_id    TEXT NOT NULL,
+      tmdb_id    TEXT,
+      at         INTEGER NOT NULL,
+      PRIMARY KEY (profile_id, type, imdb_id)
+    );
   `);
   ready = true;
 }
@@ -171,11 +184,74 @@ function newestWatchedMs(profileId) {
   return Number.isNaN(ms) ? 0 : ms;
 }
 
+// Trainer T3.1 (R3/R4): remove a film's watched + pending rows by tmdb OR imdb
+// id (a film marked watched by mistake). One synchronous transaction; a null
+// id's clause is skipped. Returns the number of `watched` rows deleted.
+function removeWatched(profileId, type, { tmdbId = null, imdbId = null } = {}) {
+  init();
+  const tmdb = tmdbId != null ? String(tmdbId) : null;
+  const imdb = imdbId != null && imdbId !== '' ? String(imdbId) : null;
+  if (!tmdb && !imdb) return 0;
+  const tmdbClause = tmdb ? 'tmdb_id = ?' : null;
+  const imdbClause = imdb ? 'imdb_id = ?' : null;
+  const watchedWhere = tmdbClause && imdbClause ? `${tmdbClause} OR ${imdbClause}` : (tmdbClause || imdbClause);
+  const watchedParams = [profileId, type, ...(tmdb ? [tmdb] : []), ...(imdb ? [imdb] : [])];
+  // pending_watched rows carry imdb_id / tmdb_id columns (the `id` dedupe key
+  // is one or the other); match the same way — by either column.
+  const pendingWhere = tmdbClause && imdbClause
+    ? '((imdb_id IS NOT NULL AND imdb_id = ?) OR (tmdb_id IS NOT NULL AND tmdb_id = ?))'
+    : (imdb ? 'imdb_id = ?' : 'tmdb_id = ?');
+  const pendingParams = [profileId, type, ...(imdb ? [imdb] : []), ...(tmdb ? [tmdb] : [])];
+  const conn = db.get();
+  conn.exec('BEGIN');
+  try {
+    const r = conn.prepare(`DELETE FROM watched WHERE profile_id = ? AND type = ? AND (${watchedWhere})`).run(...watchedParams);
+    conn.prepare(`DELETE FROM pending_watched WHERE profile_id = ? AND type = ? AND ${pendingWhere}`).run(...pendingParams);
+    conn.exec('COMMIT');
+    return Number(r.changes || 0);
+  } catch (err) {
+    conn.exec('ROLLBACK');
+    throw err;
+  }
+}
+
+// Trainer T3.1 (R5): record that the user unwatched a film — the scrobble must
+// not re-add it. Keyed by imdb (the scrobble's movie key); a film without an
+// imdb id is a no-op (nothing to key on). Upsert on (profile_id, type, imdb_id).
+function addUnwatchedBlock(profileId, type, { imdbId = null, tmdbId = null } = {}, at = Date.now()) {
+  init();
+  const imdb = imdbId != null && imdbId !== '' ? String(imdbId) : null;
+  if (!imdb) return false; // no imdb id — the scrobble keys on imdb, nothing to block
+  const tmdb = tmdbId != null ? String(tmdbId) : null;
+  db.get().prepare(`
+    INSERT INTO unwatched_block (profile_id, type, imdb_id, tmdb_id, at) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(profile_id, type, imdb_id) DO UPDATE SET tmdb_id = excluded.tmdb_id, at = excluded.at
+  `).run(profileId, type, imdb, tmdb, at);
+  return true;
+}
+
+// Map<imdb_id, at> of unwatch blocks for a profile + type.
+function unwatchedBlocks(profileId, type) {
+  init();
+  const out = new Map();
+  for (const r of db.get().prepare('SELECT imdb_id, at FROM unwatched_block WHERE profile_id = ? AND type = ?').all(profileId, type)) {
+    out.set(r.imdb_id, r.at);
+  }
+  return out;
+}
+
+// Drop one unwatch block (a genuine rewatch newer than the block clears it).
+function clearUnwatchedBlock(profileId, type, imdbId) {
+  init();
+  db.get().prepare('DELETE FROM unwatched_block WHERE profile_id = ? AND type = ? AND imdb_id = ?').run(profileId, type, imdbId);
+}
+
 function deleteForProfile(profileId) {
   init();
   db.get().prepare('DELETE FROM watched WHERE profile_id = ?').run(profileId);
   db.get().prepare('DELETE FROM sync_state WHERE profile_id = ?').run(profileId);
   db.get().prepare('DELETE FROM pending_watched WHERE profile_id = ?').run(profileId);
+  db.get().prepare('DELETE FROM unwatched_block WHERE profile_id = ?').run(profileId);
 }
 
 // ---- ingest enrichment: fill primary_genre + age_classification ----
@@ -301,6 +377,10 @@ module.exports = {
   watchedIdSets,
   addPendingWatched,
   clearSupersededPending,
+  removeWatched,
+  addUnwatchedBlock,
+  unwatchedBlocks,
+  clearUnwatchedBlock,
   newestWatchedMs,
   deleteForProfile,
   getSyncState,

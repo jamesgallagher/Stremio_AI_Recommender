@@ -82,12 +82,33 @@ async function syncProfile(profile, log = console, { full = false } = {}) {
   if (!cfg.password_enc) return { skipped: 'no credentials' };
   if (!profile.simkl_auth?.access_token) return { skipped: 'simkl not connected' };
 
-  const items = await pullProviderWatched(cfg);
+  let items = await pullProviderWatched(cfg);
   const pulled = {
     movies: items.filter((i) => i.type === 'movie').length,
     series: items.filter((i) => i.type === 'series').length,
   };
   log.log(`[scrobble] ${profile.name}: pulled ${items.length} from ${cfg.provider} (${pulled.movies} movies, ${pulled.series} episodes)${full ? ' — FULL REBUILD' : ''}`);
+
+  // Trainer T3.1 (R5): a film the user marked unwatched must not be re-added.
+  // A provider movie whose imdb id is blocked AND whose provider watchedAtMs is
+  // ≤ the block time (or missing) is dropped; a provider watch NEWER than the
+  // block (a genuine rewatch) is pushed and its block entry is deleted. Applies
+  // to `full` too. Episodes are unaffected.
+  const blocks = watchedStore.unwatchedBlocks(profile.id, 'movie');
+  if (blocks.size) {
+    let skipped = 0;
+    const filtered = items.filter((it) => {
+      if (it.type !== 'movie' || !blocks.has(it.imdbId)) return true;
+      if (it.watchedAtMs != null && it.watchedAtMs > blocks.get(it.imdbId)) {
+        watchedStore.clearUnwatchedBlock(profile.id, 'movie', it.imdbId);
+        return true;
+      }
+      skipped += 1;
+      return false;
+    });
+    if (skipped) log.log(`[scrobble] ${profile.name}: ${skipped} movie(s) skipped (unwatched by the user)`);
+    items = filtered;
+  }
 
   // Normal sync excludes movies already known-watched on Simkl (from the local
   // watched store). Per-episode state isn't tracked locally, so episodes are
