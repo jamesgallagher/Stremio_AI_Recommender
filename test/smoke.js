@@ -2734,6 +2734,84 @@ ok('trainer: createRateQueue — debounce, one in flight, next after settle', ()
   assert.strictEqual(q.pending('a'), false);
 });
 
+// H4a: settle order — a newer value queued while one is in flight is moved into
+// inflight before onSettle fires, so pending(key) is true inside the settled
+// value's onSettle. The newer value is sent right after.
+ok('trainer r1: H4a — settle order, pending reflects the queued next', () => {
+  const mkHarness = () => {
+    const timers = [];
+    const setTimer = (fn) => { timers.push({ fn, cancelled: false }); return timers.length - 1; };
+    const clearTimer = (id) => { timers[id].cancelled = true; };
+    const fire = (id) => { if (!timers[id].cancelled) timers[id].fn(); };
+    return { timers, setTimer, clearTimer, fire, latest: () => timers.length - 1 };
+  };
+  const h = mkHarness();
+  const sends = [];
+  const thenables = [];
+  // A thenable whose settle() invokes the .then callback synchronously, so the
+  // settle (and its onSettle) runs inside the call — the ok() harness is sync.
+  const makeThenable = () => {
+    let resolve = null;
+    return { then: (res) => { resolve = res; }, settle: (value) => { if (resolve) resolve(value); } };
+  };
+  const q = TrainerUI.createRateQueue({
+    send: (k, r) => {
+      const t = makeThenable();
+      thenables.push(t);
+      sends.push({ k, r });
+      return t;
+    },
+    delayMs: 800, setTimer: h.setTimer, clearTimer: h.clearTimer,
+  });
+  let pendingInA = null, pendingInB = null;
+  q.push('a', 3, (e, r) => { pendingInA = q.pending('a'); });
+  h.fire(h.latest()); // 3 goes in flight (send returns a pending thenable)
+  assert.deepStrictEqual(sends, [{ k: 'a', r: 3 }]);
+  q.push('a', 7, (e, r) => { pendingInB = q.pending('a'); });
+  h.fire(h.latest()); // 7 is queued as "next" while 3 is still in flight
+  thenables[0].settle({ ok: true }); // settle 3 (synchronous)
+  assert.strictEqual(pendingInA, true); // inside 3's onSettle, pending is true (7 on its way)
+  assert.deepStrictEqual(sends, [{ k: 'a', r: 3 }, { k: 'a', r: 7 }]); // 7 sent right after
+  thenables[1].settle({ ok: true }); // settle 7
+  assert.strictEqual(pendingInB, false); // inside 7's onSettle, pending is false
+});
+
+// H4b: a "next" equal to the in-flight value is NOT resent — no second send,
+// and pending(key) is false inside onSettle.
+ok('trainer r1: H4b — an equal next is not resent', () => {
+  const mkHarness = () => {
+    const timers = [];
+    const setTimer = (fn) => { timers.push({ fn, cancelled: false }); return timers.length - 1; };
+    const clearTimer = (id) => { timers[id].cancelled = true; };
+    const fire = (id) => { if (!timers[id].cancelled) timers[id].fn(); };
+    return { timers, setTimer, clearTimer, fire, latest: () => timers.length - 1 };
+  };
+  const h = mkHarness();
+  const sends = [];
+  const thenables = [];
+  const makeThenable = () => {
+    let resolve = null;
+    return { then: (res) => { resolve = res; }, settle: (value) => { if (resolve) resolve(value); } };
+  };
+  const q = TrainerUI.createRateQueue({
+    send: (k, r) => {
+      const t = makeThenable();
+      thenables.push(t);
+      sends.push({ k, r });
+      return t;
+    },
+    delayMs: 800, setTimer: h.setTimer, clearTimer: h.clearTimer,
+  });
+  let pendingInA = null;
+  q.push('a', 3, (e, r) => { pendingInA = q.pending('a'); });
+  h.fire(h.latest()); // 3 goes in flight
+  q.push('a', 3, (e, r) => {}); // same value again
+  h.fire(h.latest()); // "next" is 3, equal to the in-flight 3
+  thenables[0].settle({ ok: true }); // settle 3 (synchronous)
+  assert.strictEqual(pendingInA, false); // no newer value, so pending is false
+  assert.deepStrictEqual(sends, [{ k: 'a', r: 3 }]); // exactly one send, no second
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');

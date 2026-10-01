@@ -1391,7 +1391,7 @@ function trainerState(id) {
   if (!st) {
     st = {
       view: 'all', q: '', page: 1, data: null,
-      confirmed: new Map(), rebuilding: false,
+      confirmed: new Map(), shown: new Map(), rebuilding: false,
       queue: TrainerUI.createRateQueue({
         send: (key, rating) => api(`/profiles/${id}/trainer/rate`, { method: 'POST', body: { type: 'movie', tmdb_id: key, rating } }),
         delayMs: 800,
@@ -1416,7 +1416,10 @@ async function trainerLoad(id, { quiet = false } = {}) {
   try {
     const d = await api(`/profiles/${id}/trainer?view=${st.view}&q=${encodeURIComponent(st.q)}&page=${st.page}&page_size=25`);
     st.data = d;
-    d.items.forEach(item => { if (!st.confirmed.has(item.key)) st.confirmed.set(item.key, item); });
+    d.items.forEach(item => {
+      if (!st.confirmed.has(item.key)) st.confirmed.set(item.key, item);
+      st.shown.set(item.key, item.rating);
+    });
     trainerDraw(id);
   } catch (e) {
     panel.innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`;
@@ -1498,9 +1501,13 @@ function trainerClick(id, e) {
     case 'star':
     case 'clear':
     case 'love': {
+      // The ♥ toggle reads the rating currently on screen (st.shown), not the
+      // value from the last load (item.rating) — two quick ♥ clicks must toggle off.
+      const shown = st.shown.has(key) ? st.shown.get(key) : item.rating;
       const rating = btn.dataset.act === 'star' ? Number(btn.dataset.rating)
         : btn.dataset.act === 'clear' ? null
-        : TrainerUI.nextRatingForHeart(item.rating);
+        : TrainerUI.nextRatingForHeart(shown);
+      st.shown.set(key, rating);
       trainerRedrawRow(panel, key, { ...item, rating, loved: rating === 10 }, id);
       st.queue.push(key, rating, (err, result) => trainerRateSettle(id, key, err, result));
       break;
@@ -1584,13 +1591,24 @@ function trainerRateSettle(id, key, err, result) {
   const st = trainerState(id);
   const panel = document.querySelector(`.card[data-id="${id}"] .trainer-panel`);
   if (!panel) return;
+  if (st.queue.pending(key)) {
+    // A newer value is on its way (the queue moved it into inflight before this
+    // settle fired). Don't touch the row — no flicker back. Only stash the
+    // successful result so a later failure can roll back to it.
+    if (!err) st.confirmed.set(key, result.item);
+    return;
+  }
   if (err) {
     const prev = st.confirmed.get(key);
-    if (prev) trainerRedrawRow(panel, key, prev, id);
+    if (prev) {
+      trainerRedrawRow(panel, key, prev, id);
+      st.shown.set(key, prev.rating);
+    }
     toast('Couldn\'t save rating — ' + err.message);
     return;
   }
   st.confirmed.set(key, result.item);
+  st.shown.set(key, result.item.rating);
   trainerRedrawRow(panel, key, result.item, id);
   if (st.data && !st.data.items.some(item => st.queue.pending(item.key))) trainerLoad(id, { quiet: true });
 }

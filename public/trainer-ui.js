@@ -134,16 +134,23 @@ TrainerUI.createRateQueue = ({ send, delayMs = 800, setTimer, clearTimer }) => {
   };
   const settle = (key, rating, onSettle, err, result) => {
     const s = get(key);
-    onSettle(err, result);
+    // 1. Clear inflight.
     s.inflight = null;
+    // 2. If next exists and differs from the value just sent: move it to inflight
+    //    (so pending(key) is now true). Otherwise clear next.
+    let moved = false;
     if (s.next && s.next.rating !== rating) {
-      const carry = s.next;
+      s.inflight = { rating: s.next.rating, onSettle: s.next.onSettle };
       s.next = null;
-      s.inflight = { rating: carry.rating, onSettle: carry.onSettle };
-      sendNow(key);
+      moved = true;
     } else {
       s.next = null;
     }
+    // 3. Call onSettle — after the state update, so pending(key) reflects the
+    //    queued "next" (a newer value on its way) rather than the settled one.
+    onSettle(err, result);
+    // 4. If step 2 moved a value into inflight, send it (no extra delay).
+    if (moved) sendNow(key);
   };
   const sendNow = (key) => {
     const s = get(key);
