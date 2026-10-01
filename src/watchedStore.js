@@ -76,6 +76,21 @@ function init() {
       at         INTEGER NOT NULL,
       PRIMARY KEY (profile_id, type, imdb_id)
     );
+
+    -- Scrobble episode ledger: the episodes this app has already pushed to the
+    -- profile's Simkl history. Movies are de-duped against the watched store, but
+    -- per-episode state isn't tracked there, so without this every hourly
+    -- scrobble re-sent the provider's ENTIRE episode history (thousands of
+    -- episodes per profile, de-duped by Simkl but needless writes). A full
+    -- re-push ignores the ledger.
+    CREATE TABLE IF NOT EXISTS scrobble_pushed_episodes (
+      profile_id TEXT    NOT NULL,
+      imdb_id    TEXT    NOT NULL,
+      season     INTEGER NOT NULL,
+      episode    INTEGER NOT NULL,
+      pushed_at  INTEGER,
+      PRIMARY KEY (profile_id, imdb_id, season, episode)
+    );
   `);
   ready = true;
 }
@@ -246,8 +261,50 @@ function clearUnwatchedBlock(profileId, type, imdbId) {
   db.get().prepare('DELETE FROM unwatched_block WHERE profile_id = ? AND type = ? AND imdb_id = ?').run(profileId, type, imdbId);
 }
 
+// Scrobble ledger: Set of `${imdb}:${season}:${episode}` keys already pushed to
+// this profile's Simkl history (the same key shape computeDelta checks).
+function pushedEpisodeKeys(profileId) {
+  init();
+  const out = new Set();
+  for (const r of db.get().prepare('SELECT imdb_id, season, episode FROM scrobble_pushed_episodes WHERE profile_id = ?').all(profileId)) {
+    out.add(`${r.imdb_id}:${r.season}:${r.episode}`);
+  }
+  return out;
+}
+
+// Record the episodes of a /sync/history body that Simkl just accepted. One
+// synchronous transaction (no await inside). Returns the number recorded.
+function recordPushedEpisodes(profileId, body, at = Date.now()) {
+  init();
+  const conn = db.get();
+  const ins = conn.prepare(`
+    INSERT INTO scrobble_pushed_episodes (profile_id, imdb_id, season, episode, pushed_at) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(profile_id, imdb_id, season, episode) DO UPDATE SET pushed_at = excluded.pushed_at
+  `);
+  let n = 0;
+  conn.exec('BEGIN');
+  try {
+    for (const show of (body && body.shows) || []) {
+      const imdb = show && show.ids && show.ids.imdb;
+      if (!imdb) continue;
+      for (const s of show.seasons || []) {
+        for (const ep of s.episodes || []) {
+          ins.run(profileId, String(imdb), Number(s.number), Number(ep.number), at);
+          n++;
+        }
+      }
+    }
+    conn.exec('COMMIT');
+  } catch (err) {
+    conn.exec('ROLLBACK');
+    throw err;
+  }
+  return n;
+}
+
 function deleteForProfile(profileId) {
   init();
+  db.get().prepare('DELETE FROM scrobble_pushed_episodes WHERE profile_id = ?').run(profileId);
   db.get().prepare('DELETE FROM watched WHERE profile_id = ?').run(profileId);
   db.get().prepare('DELETE FROM sync_state WHERE profile_id = ?').run(profileId);
   db.get().prepare('DELETE FROM pending_watched WHERE profile_id = ?').run(profileId);
@@ -381,6 +438,8 @@ module.exports = {
   addUnwatchedBlock,
   unwatchedBlocks,
   clearUnwatchedBlock,
+  pushedEpisodeKeys,
+  recordPushedEpisodes,
   newestWatchedMs,
   deleteForProfile,
   getSyncState,
