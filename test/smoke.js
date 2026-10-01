@@ -2904,6 +2904,124 @@ ok('trainer T3.1 U5: TIPS has every key with the exact texts', () => {
   assert.strictEqual(T.chip_unfinished, 'Films you started but stopped before halfway — never recommended back');
 });
 
+ok('trainer T3.1 U7: ratingFromPointer maps pointer x to half-star ratings', () => {
+  const rects = [
+    { left: 0, width: 20 }, { left: 24, width: 20 }, { left: 48, width: 20 },
+    { left: 72, width: 20 }, { left: 96, width: 20 },
+  ];
+  assert.strictEqual(TrainerUI.ratingFromPointer(5, rects), 1);
+  assert.strictEqual(TrainerUI.ratingFromPointer(15, rects), 2);
+  assert.strictEqual(TrainerUI.ratingFromPointer(22, rects), 2); // gap after star 0
+  assert.strictEqual(TrainerUI.ratingFromPointer(30, rects), 3);
+  assert.strictEqual(TrainerUI.ratingFromPointer(110, rects), 10);
+  assert.strictEqual(TrainerUI.ratingFromPointer(200, rects), 10);
+  assert.strictEqual(TrainerUI.ratingFromPointer(-3, rects), null);
+  // Every half of every star maps correctly (loop over all 10).
+  for (let i = 0; i < 5; i++) {
+    const { left, width } = rects[i];
+    const mid = left + width / 2;
+    assert.strictEqual(TrainerUI.ratingFromPointer(left, rects), 2 * i + 1, 'left edge star ' + i);
+    assert.strictEqual(TrainerUI.ratingFromPointer(left + width * 0.25, rects), 2 * i + 1, 'left half star ' + i);
+    assert.strictEqual(TrainerUI.ratingFromPointer(mid, rects), 2 * i + 2, 'mid star ' + i);
+    assert.strictEqual(TrainerUI.ratingFromPointer(left + width * 0.75, rects), 2 * i + 2, 'right half star ' + i);
+  }
+});
+
+ok('trainer T3.1 U8: fillsForRating maps a rating to the 5 fill widths', () => {
+  assert.deepStrictEqual(TrainerUI.fillsForRating(7), ['100%', '100%', '100%', '50%', '0%']);
+  assert.deepStrictEqual(TrainerUI.fillsForRating(null), ['0%', '0%', '0%', '0%', '0%']);
+  assert.deepStrictEqual(TrainerUI.fillsForRating(10), ['100%', '100%', '100%', '100%', '100%']);
+});
+
+// A fake .tr-stars group: records listeners by type and pointer-capture calls,
+// and can dispatch a fake pointer event to the recorded listener.
+function fakeStarGroup() {
+  const listeners = {};
+  const caps = { set: [], release: [] };
+  return {
+    addEventListener: (type, fn) => { listeners[type] = fn; },
+    removeEventListener: (type, fn) => { if (listeners[type] === fn) delete listeners[type]; },
+    setPointerCapture: (id) => { caps.set.push(id); },
+    releasePointerCapture: (id) => { caps.release.push(id); },
+    _listeners: listeners,
+    _caps: caps,
+    fire: (type, e) => { if (listeners[type]) listeners[type](e); },
+  };
+}
+
+ok('trainer T3.1 U9: bindStarScrub — hover, touch scrub, scroll cancel, disabled, unbind', () => {
+  const rects = [
+    { left: 0, width: 20 }, { left: 24, width: 20 }, { left: 48, width: 20 },
+    { left: 72, width: 20 }, { left: 96, width: 20 },
+  ];
+  const mk = (isEnabled) => {
+    const el = fakeStarGroup();
+    const preview = [];
+    const commit = [];
+    const cancel = [];
+    const binding = TrainerUI.bindStarScrub(el, {
+      getRects: () => rects,
+      isEnabled: () => isEnabled,
+      onPreview: (r) => preview.push(r),
+      onCommit: (r) => commit.push(r),
+      onCancel: () => cancel.push(1),
+    });
+    return { el, preview, commit, cancel, binding };
+  };
+
+  // Hover — mouse moves with buttons:0 → onPreview values, no onCommit; pointerleave → onCancel.
+  {
+    const { el, preview, commit, cancel } = mk(true);
+    el.fire('pointermove', { pointerType: 'mouse', buttons: 0, clientX: 5 });
+    el.fire('pointermove', { pointerType: 'mouse', buttons: 0, clientX: 30 });
+    assert.deepStrictEqual(preview, [1, 3], 'hover previews');
+    assert.deepStrictEqual(commit, [], 'no commit on hover');
+    el.fire('pointerleave', { pointerType: 'mouse' });
+    assert.strictEqual(cancel.length, 1, 'pointerleave cancels');
+  }
+  // Touch scrub — pointerdown(x=5) → preview 1; moves to 30 and 55 → previews 3 and 5 (each change once); pointerup → one onCommit(5).
+  {
+    const { el, preview, commit, cancel } = mk(true);
+    el.fire('pointerdown', { pointerType: 'touch', button: 0, pointerId: 1, clientX: 5 });
+    assert.deepStrictEqual(preview, [1], 'down previews');
+    assert.strictEqual(el._caps.set.length, 1, 'capture on down');
+    el.fire('pointermove', { pointerType: 'touch', buttons: 1, pointerId: 1, clientX: 30 });
+    el.fire('pointermove', { pointerType: 'touch', buttons: 1, pointerId: 1, clientX: 55 });
+    assert.deepStrictEqual(preview, [1, 3, 5], 'scrub previews (each change once)');
+    el.fire('pointerup', { pointerType: 'touch', pointerId: 1, clientX: 55 });
+    assert.deepStrictEqual(commit, [5], 'one commit on up');
+    assert.strictEqual(el._caps.release.length, 1, 'release on up');
+    assert.deepStrictEqual(cancel, [], 'no cancel on a clean scrub');
+  }
+  // Scroll — pointerdown then pointercancel → onCancel, no commit.
+  {
+    const { el, preview, commit, cancel } = mk(true);
+    el.fire('pointerdown', { pointerType: 'touch', button: 0, pointerId: 1, clientX: 5 });
+    el.fire('pointercancel', { pointerType: 'touch', pointerId: 1, clientX: 5 });
+    assert.deepStrictEqual(commit, [], 'no commit on cancel');
+    assert.strictEqual(cancel.length, 1, 'pointercancel cancels');
+    assert.strictEqual(el._caps.release.length, 1, 'release on cancel');
+  }
+  // Disabled — isEnabled false → nothing is called.
+  {
+    const { el, preview, commit, cancel } = mk(false);
+    el.fire('pointermove', { pointerType: 'mouse', buttons: 0, clientX: 5 });
+    el.fire('pointerdown', { pointerType: 'touch', button: 0, pointerId: 1, clientX: 5 });
+    el.fire('pointermove', { pointerType: 'touch', buttons: 1, pointerId: 1, clientX: 30 });
+    el.fire('pointerup', { pointerType: 'touch', pointerId: 1, clientX: 30 });
+    assert.deepStrictEqual(preview, [], 'no preview when disabled');
+    assert.deepStrictEqual(commit, [], 'no commit when disabled');
+    assert.deepStrictEqual(cancel, [], 'no cancel when disabled');
+    assert.strictEqual(el._caps.set.length, 0, 'no capture when disabled');
+  }
+  // unbind() removes every listener.
+  {
+    const { el, binding } = mk(true);
+    binding();
+    assert.deepStrictEqual(Object.keys(el._listeners), [], 'all listeners removed');
+  }
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');

@@ -72,6 +72,94 @@ TrainerUI.ratingFromStarClick = (index, half) => index * 2 + (half === 'left' ? 
 // ♥ shortcut: a 10 clears, anything else becomes a 10.
 TrainerUI.nextRatingForHeart = (r) => (r === 10 ? null : 10);
 
+// Star scrub (R9): map a pointer x (viewport px) to a 1–10 rating in half-star
+// steps, from the 5 star-wrap hit boxes. `rects` is the 5 wraps' { left, width }
+// in order. Within star i (0-based): the left half → 2i+1, the right half → 2i+2;
+// the gap after star i (before star i+1) → 2i+2; before the first star → null;
+// past the last star → 10. Pure — no DOM.
+TrainerUI.ratingFromPointer = (x, rects) => {
+  if (x < rects[0].left) return null;
+  for (let i = 0; i < 5; i++) {
+    const { left, width } = rects[i];
+    const mid = left + width / 2;
+    const right = left + width;
+    if (x < mid) return 2 * i + 1;
+    if (x <= right) return 2 * i + 2;
+    // x is past star i: a gap before star i+1 → 2i+2, otherwise fall through
+    // to the next star.
+    if (i < 4 && x < rects[i + 1].left) return 2 * i + 2;
+  }
+  return 10; // past the last star
+};
+
+// A 1–10 rating (or null) → the 5 fill widths as '0%'|'50%'|'100%'.
+TrainerUI.fillsForRating = (r) =>
+  TrainerUI.starsFromRating(r).map(l => (l === 1 ? '100%' : (l === 0.5 ? '50%' : '0%')));
+
+// Bind one .tr-stars group to pointer-event scrubbing. One implementation for
+// mouse and touch: mouse hover previews in half-star steps, a click (pointerdown
+// → pointerup) commits; touch taps preview, a sideways drag follows it, and
+// pointerup commits; a vertical drag scrolls the page (touch-action: pan-y) and
+// the browser fires pointercancel, which reverts the preview. Preview never
+// saves — only onCommit goes through the rate queue. Only addEventListener and
+// set/releasePointerCapture are used (no mouse/touch handlers); returns unbind().
+TrainerUI.bindStarScrub = (groupEl, { getRects, isEnabled, onPreview, onCommit, onCancel }) => {
+  let scrubbing = false;
+  let last = null; // last previewed value
+  const preview = (x) => {
+    const r = TrainerUI.ratingFromPointer(x, getRects());
+    last = r;
+    onPreview(r);
+  };
+  const onPointerMove = (e) => {
+    if (!isEnabled()) return;
+    if (scrubbing) {
+      const r = TrainerUI.ratingFromPointer(e.clientX, getRects());
+      if (r !== last) { last = r; onPreview(r); }
+    } else if (e.pointerType === 'mouse' && e.buttons === 0) {
+      preview(e.clientX); // hover
+    }
+  };
+  const onPointerDown = (e) => {
+    if (!isEnabled()) return;
+    if (e.button !== 0) return; // primary button only
+    scrubbing = true;
+    try { groupEl.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+    preview(e.clientX);
+  };
+  const release = (e) => {
+    try { groupEl.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+  };
+  const onPointerUp = (e) => {
+    if (!isEnabled() || !scrubbing) return;
+    release(e);
+    scrubbing = false;
+    if (last != null) onCommit(last);
+  };
+  const onPointerCancel = (e) => {
+    if (!isEnabled() || !scrubbing) return;
+    release(e);
+    scrubbing = false;
+    onCancel(); // no commit
+  };
+  const onPointerLeave = (e) => {
+    if (!isEnabled() || scrubbing) return;
+    if (e.pointerType === 'mouse') onCancel();
+  };
+  groupEl.addEventListener('pointermove', onPointerMove);
+  groupEl.addEventListener('pointerdown', onPointerDown);
+  groupEl.addEventListener('pointerup', onPointerUp);
+  groupEl.addEventListener('pointercancel', onPointerCancel);
+  groupEl.addEventListener('pointerleave', onPointerLeave);
+  return () => {
+    groupEl.removeEventListener('pointermove', onPointerMove);
+    groupEl.removeEventListener('pointerdown', onPointerDown);
+    groupEl.removeEventListener('pointerup', onPointerUp);
+    groupEl.removeEventListener('pointercancel', onPointerCancel);
+    groupEl.removeEventListener('pointerleave', onPointerLeave);
+  };
+};
+
 // Filter chips with counts; only the active one carries aria-pressed="true".
 TrainerUI.chipsHtml = (counts, active) =>
   TrainerUI.VIEWS.map(([id, label]) =>

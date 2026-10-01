@@ -155,7 +155,8 @@
   .tr-tt { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .tr-thumb { width: 34px; height: 51px; border-radius: 6px; background: var(--card2);
     border: 1px solid var(--border); object-fit: cover; flex: 0 0 auto; }
-  .tr-stars { display: inline-flex; gap: 2px; align-items: center; }
+  .tr-stars { display: inline-flex; gap: 2px; align-items: center; touch-action: pan-y; cursor: pointer; }
+  .tr-stars.tr-previewing .tr-fill { color: var(--star); opacity: .85; }
   .tr-star-wrap { position: relative; display: inline-block; width: 22px; height: 22px; }
   .tr-glyph { position: absolute; top: 0; left: 0; width: 100%; height: 100%; font-size: 20px; line-height: 20px; color: var(--border); pointer-events: none; }
   .tr-fill { position: absolute; top: 0; left: 0; height: 100%; overflow: hidden; white-space: nowrap; font-size: 20px; line-height: 20px; color: var(--star); pointer-events: none; }
@@ -1471,6 +1472,7 @@ function trainerDraw(id) {
       <button class="ghost mini" data-act="next" title="${esc(TrainerUI.TIPS.next)}" ${st.page >= pages ? 'disabled' : ''}>Next</button>
     </div>`;
   trainerBind(panel, id);
+  panel.querySelectorAll('.tr-row').forEach(row => bindRowStars(row, row.dataset.key, id));
 }
 
 // One delegated listener pair per panel, attached once (data-bound flag).
@@ -1514,18 +1516,20 @@ function trainerClick(id, e) {
       st.page = btn.dataset.act === 'prev' ? st.page - 1 : st.page + 1;
       trainerLoad(id);
       break;
-    case 'star':
+    case 'star': {
+      // Keyboard (Enter/Space) only — e.detail === 0 means no mouse click. A
+      // mouse/touch click already committed via the pointer scrub on pointerup.
+      if (e.detail !== 0) break;
+      trainerRateStar(id, panel, key, item, Number(btn.dataset.rating));
+      break;
+    }
     case 'clear':
     case 'love': {
       // The ♥ toggle reads the rating currently on screen (st.shown), not the
       // value from the last load (item.rating) — two quick ♥ clicks must toggle off.
       const shown = st.shown.has(key) ? st.shown.get(key) : item.rating;
-      const rating = btn.dataset.act === 'star' ? Number(btn.dataset.rating)
-        : btn.dataset.act === 'clear' ? null
-        : TrainerUI.nextRatingForHeart(shown);
-      st.shown.set(key, rating);
-      trainerRedrawRow(panel, key, { ...item, rating, loved: rating === 10 }, id);
-      st.queue.push(key, rating, (err, result) => trainerRateSettle(id, key, err, result));
+      const rating = btn.dataset.act === 'clear' ? null : TrainerUI.nextRatingForHeart(shown);
+      trainerRateStar(id, panel, key, item, rating);
       break;
     }
     case 'ignore':
@@ -1612,12 +1616,58 @@ function trainerClick(id, e) {
   }
 }
 
-// Redraw one row from an item (an optimistic value or a server-confirmed DTO).
+// The star path: set the shown rating, optimistically redraw the row, and push
+// the value onto the per-title rate queue. Shared by the keyboard star click
+// (e.detail === 0) and the pointer scrub's onCommit — exactly one save per
+// gesture either way.
+function trainerRateStar(id, panel, key, item, rating) {
+  const st = trainerState(id);
+  st.shown.set(key, rating);
+  trainerRedrawRow(panel, key, { ...item, rating, loved: rating === 10 }, id);
+  st.queue.push(key, rating, (err, result) => trainerRateSettle(id, key, err, result));
+}
+
+// Bind the pointer-event star scrub to one row's .tr-stars group. Re-binding
+// replaces any prior binding on the (fresh) group. Inert (no preview, no
+// commit) unless Simkl is connected and the row is a watched, non-ignored film.
+function bindRowStars(row, key, id) {
+  const group = row.querySelector('.tr-stars');
+  if (!group) return;
+  const st = trainerState(id);
+  const p = PROFILES.find(x => x.id === id);
+  const canRate = !!(p && p.simkl_connected);
+  const panel = row.closest('.trainer-panel');
+  const item = st.data ? st.data.items.find(x => x.key === key) : null;
+  if (group._scrub) group._scrub();
+  group._scrub = TrainerUI.bindStarScrub(group, {
+    getRects: () => [...group.querySelectorAll('.tr-star-wrap')].map(w => { const r = w.getBoundingClientRect(); return { left: r.left, width: r.width }; }),
+    isEnabled: () => canRate && !!item && !item.ignored && item.status === 'watched',
+    onPreview: (r) => {
+      const fills = TrainerUI.fillsForRating(r);
+      group.querySelectorAll('.tr-fill').forEach((f, i) => { f.style.width = fills[i]; });
+      group.classList.add('tr-previewing');
+    },
+    onCancel: () => {
+      const rating = st.shown.has(key) ? st.shown.get(key) : (item ? item.rating : null);
+      const fills = TrainerUI.fillsForRating(rating);
+      group.querySelectorAll('.tr-fill').forEach((f, i) => { f.style.width = fills[i]; });
+      group.classList.remove('tr-previewing');
+    },
+    onCommit: (r) => {
+      trainerRateStar(id, panel, key, item, r);
+    },
+  });
+}
+
+// Redraw one row from an item (an optimistic value or a server-confirmed DTO),
+// then re-bind the star scrub on the new row's .tr-stars group.
 function trainerRedrawRow(panel, key, item, id) {
   const row = trainerRowEl(panel, key);
   if (!row) return;
   const p = PROFILES.find(x => x.id === id);
   row.outerHTML = TrainerUI.rowHtml(item, { canRate: !!(p && p.simkl_connected), now: Date.now() });
+  const newRow = trainerRowEl(panel, key);
+  if (newRow) bindRowStars(newRow, key, id);
 }
 
 function trainerRowEl(panel, key) {
