@@ -22,6 +22,7 @@ const trainer = require('./trainer');
 const tasteFeedback = require('./tasteFeedback');
 const engines = require('./engines');
 const catalogServe = require('./catalogServe');
+const metaStore = require('./engines/glass/metaStore');
 
 const { version } = require('../package.json');
 const USER_AGENT = `AI-Recommender/1.0 (+https://github.com/jamesgallagher/Stremio_AI_Recommender)`;
@@ -775,6 +776,26 @@ router.post('/profiles/:id/scrobble/sync', async (req, res) => {
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
+});
+
+// Read-only visibility (Part A): the films Simkl couldn't match. The scrobble
+// records each one and retries weekly; this is the Scrobble tab's read-out.
+// title/year come from the meta cache when cached, else null.
+router.get('/profiles/:id/scrobble/unmatched', (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  const items = watchedStore.listUnmatched(profile.id).map((r) => {
+    const meta = r.tmdb_id ? metaStore.get('movie', r.tmdb_id) : null;
+    return {
+      imdb_id: r.imdb_id,
+      tmdb_id: r.tmdb_id,
+      title: meta?.title || null,
+      year: meta?.year != null ? meta.year : null,
+      last_tried: r.last_tried,
+      attempts: r.attempts,
+    };
+  });
+  res.json({ items });
 });
 
 // ---- Server Config (global settings, v6) ----

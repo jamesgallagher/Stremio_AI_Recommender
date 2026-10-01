@@ -2868,6 +2868,32 @@ ok('trainer T4.1 F1: flush sends pending ratings on page hide', () => {
   q.push('b', 5, () => {});
   assert.strictEqual(q.flush(), 2);
   assert.deepStrictEqual(sends.sort((x, y) => x.k.localeCompare(y.k)), [{ k: 'a', r: 3 }, { k: 'b', r: 5 }]);
+  // B1: A in flight, B already queued as `next` behind it (timer fired) →
+  // flush() sends B immediately with { keepalive:true }; settling A later does
+  // not resend B. (Part B — a value queued behind an in-flight save now flushes.)
+  h = mkHarness();
+  sends = [];
+  let aThenable = null;
+  q = TrainerUI.createRateQueue({ send: (k, r, o) => { const t = makeThenable(); sends.push({ k, r, keepalive: !!o.keepalive }); if (r === 3) aThenable = t; return t; }, delayMs: 800, setTimer: h.setTimer, clearTimer: h.clearTimer });
+  q.push('a', 3, () => {});
+  h.fire(h.latest()); // A (3) goes in flight
+  q.push('a', 7, () => {});
+  h.fire(h.latest()); // B (7) queued as next behind the in-flight A
+  assert.strictEqual(q.flush(), 1);
+  assert.deepStrictEqual(sends, [{ k: 'a', r: 3, keepalive: false }, { k: 'a', r: 7, keepalive: true }]);
+  aThenable.settle({ ok: true }); // settling A later does not resend B
+  assert.deepStrictEqual(sends, [{ k: 'a', r: 3, keepalive: false }, { k: 'a', r: 7, keepalive: true }]);
+  // B2: same but B equals A → flush() sends nothing and clears next.
+  h = mkHarness();
+  sends = [];
+  q = TrainerUI.createRateQueue({ send: (k, r, o) => { const t = makeThenable(); sends.push({ k, r }); return t; }, delayMs: 800, setTimer: h.setTimer, clearTimer: h.clearTimer });
+  q.push('a', 3, () => {});
+  h.fire(h.latest()); // A (3) goes in flight
+  q.push('a', 3, () => {});
+  h.fire(h.latest()); // B (3) equals A, queued as next behind the in-flight A
+  assert.strictEqual(q.flush(), 0);
+  assert.deepStrictEqual(sends, [{ k: 'a', r: 3 }]);
+  // B3: the existing F1a–F1d cases above are unchanged and still pass.
 });
 
 // ---- Trainer T3.1 refinements: tooltips, unwatch button, rows stay put ----

@@ -4779,6 +4779,222 @@ async function main() {
     }
   });
 
+  // ── Scrobble Part A: Simkl not_found, one TMDB retry, weekly backoff ──────
+  await it('Scrobble A1: notFoundImdb — reads Simkl not_found.movies; missing/malformed → empty set, never throws', () => {
+    const scrobble = require('../src/services/scrobble');
+    assert.deepStrictEqual(
+      [...scrobble.notFoundImdb({ not_found: { movies: [{ ids: { imdb: 'tt1' } }, { ids: { imdb: 'tt2' } }, { ids: {} }, { ids: null }] } })],
+      ['tt1', 'tt2'],
+    );
+    assert.strictEqual(scrobble.notFoundImdb(undefined).size, 0, 'undefined');
+    assert.strictEqual(scrobble.notFoundImdb(null).size, 0, 'null');
+    assert.strictEqual(scrobble.notFoundImdb({}).size, 0, '{}');
+    assert.strictEqual(scrobble.notFoundImdb({ not_found: { movies: 'x' } }).size, 0, 'movies not an array');
+    assert.strictEqual(scrobble.notFoundImdb({ not_found: null }).size, 0, 'not_found null');
+    assert.strictEqual(scrobble.notFoundImdb({ not_found: {} }).size, 0, 'no movies key');
+  });
+
+  await it('Scrobble A2: not-found movie resolved to TMDB — exactly 2 POSTs, the retry carries {imdb, tmdb}, matched, nothing recorded', async () => {
+    const scrobble = require('../src/services/scrobble');
+    const nuvio = require('../src/services/nuvio');
+    const crypto = require('../src/services/crypto');
+    const profile = { id: 'p-a2', name: 'T', keys: { simkl_client_id: 'c', tmdb_api_key: 'k' }, simkl_auth: { access_token: 't' }, scrobble: { enabled: true, provider: 'nuvio', email: 'a@b.c', password_enc: crypto.encrypt('pw') } };
+    const origPull = nuvio.pullWatched; const origAdd = simkl.addToHistory; const origFind = tmdb.findByImdbId;
+    const calls = [];
+    simkl.addToHistory = async (_p, body) => {
+      calls.push(body);
+      return calls.length === 1 ? { not_found: { movies: [{ ids: { imdb: 'tt1' } }] } } : {};
+    };
+    tmdb.findByImdbId = async (_key, _type, imdb) => (imdb === 'tt1' ? 12600 : null);
+    try {
+      nuvio.pullWatched = async () => [{ type: 'movie', imdbId: 'tt1', watchedAtMs: 1000 }];
+      const res = await scrobble.syncProfile(profile, quiet);
+      assert.strictEqual(calls.length, 2, 'exactly two history POSTs');
+      assert.deepStrictEqual(calls[0].movies.map((m) => m.ids), [{ imdb: 'tt1' }], 'the first POST carries the imdb id');
+      assert.deepStrictEqual(calls[1].movies.map((m) => m.ids), [{ imdb: 'tt1', tmdb: '12600' }], 'the retry carries the TMDB id');
+      assert.deepStrictEqual(calls[1].shows, []);
+      assert.strictEqual(res.matchedOnRetry, 1, 'matched on the retry');
+      assert.strictEqual(res.unmatched, 0);
+      assert.strictEqual(watchedStore.listUnmatched(profile.id).length, 0, 'nothing recorded');
+    } finally {
+      nuvio.pullWatched = origPull; simkl.addToHistory = origAdd; tmdb.findByImdbId = origFind;
+      watchedStore.deleteForProfile(profile.id);
+    }
+  });
+
+  await it('Scrobble A3: still not found → recorded; within 7 days skipped (with the skip log); after 8 days tried again (attempts 2)', async () => {
+    const scrobble = require('../src/services/scrobble');
+    const nuvio = require('../src/services/nuvio');
+    const crypto = require('../src/services/crypto');
+    const db = require('../src/db');
+    const profile = { id: 'p-a3', name: 'T', keys: { simkl_client_id: 'c', tmdb_api_key: 'k' }, simkl_auth: { access_token: 't' }, scrobble: { enabled: true, provider: 'nuvio', email: 'a@b.c', password_enc: crypto.encrypt('pw') } };
+    const origPull = nuvio.pullWatched; const origAdd = simkl.addToHistory; const origFind = tmdb.findByImdbId;
+    const calls = [];
+    const logLines = [];
+    const log = { log: (m) => logLines.push(m), warn() {}, error() {} };
+    simkl.addToHistory = async (_p, body) => { calls.push(body); return { not_found: { movies: [{ ids: { imdb: 'tt1' } }] } }; };
+    tmdb.findByImdbId = async () => null; // no TMDB match — no retry POST
+    try {
+      nuvio.pullWatched = async () => [{ type: 'movie', imdbId: 'tt1', watchedAtMs: 1000 }];
+      // Run 1: not found → recorded (attempts 1).
+      await scrobble.syncProfile(profile, log);
+      let rows = watchedStore.listUnmatched(profile.id);
+      assert.strictEqual(rows.length, 1);
+      assert.strictEqual(rows[0].imdb_id, 'tt1');
+      assert.strictEqual(rows[0].attempts, 1);
+      // Run 2 (within 7 days): skipped — no POST, and the skip log appears.
+      const callsBefore = calls.length;
+      await scrobble.syncProfile(profile, log);
+      assert.strictEqual(calls.length, callsBefore, 'no history POST while in backoff');
+      assert.ok(logLines.some((l) => l.includes('1 movie(s) skipped (Simkl couldn\'t match')), 'the skip log appears');
+      // Backdate the attempt to 8 days ago — past the 7-day window.
+      db.get().prepare('UPDATE scrobble_unmatched SET last_tried = ? WHERE profile_id = ?').run(Date.now() - 8 * 86400e3, profile.id);
+      // Run 3: tried again → attempts 2.
+      await scrobble.syncProfile(profile, log);
+      rows = watchedStore.listUnmatched(profile.id);
+      assert.strictEqual(rows.length, 1);
+      assert.strictEqual(rows[0].attempts, 2, 'retried after the 7-day window');
+    } finally {
+      nuvio.pullWatched = origPull; simkl.addToHistory = origAdd; tmdb.findByImdbId = origFind;
+      watchedStore.deleteForProfile(profile.id);
+    }
+  });
+
+  await it('Scrobble A4: no TMDB match — recorded without a second POST', async () => {
+    const scrobble = require('../src/services/scrobble');
+    const nuvio = require('../src/services/nuvio');
+    const crypto = require('../src/services/crypto');
+    const profile = { id: 'p-a4', name: 'T', keys: { simkl_client_id: 'c', tmdb_api_key: 'k' }, simkl_auth: { access_token: 't' }, scrobble: { enabled: true, provider: 'nuvio', email: 'a@b.c', password_enc: crypto.encrypt('pw') } };
+    const origPull = nuvio.pullWatched; const origAdd = simkl.addToHistory; const origFind = tmdb.findByImdbId;
+    const calls = [];
+    simkl.addToHistory = async (_p, body) => { calls.push(body); return { not_found: { movies: [{ ids: { imdb: 'tt1' } }] } }; };
+    tmdb.findByImdbId = async () => null;
+    try {
+      nuvio.pullWatched = async () => [{ type: 'movie', imdbId: 'tt1', watchedAtMs: 1000 }];
+      const res = await scrobble.syncProfile(profile, quiet);
+      assert.strictEqual(calls.length, 1, 'no retry POST');
+      assert.strictEqual(res.unmatched, 1);
+      assert.strictEqual(res.matchedOnRetry, 0);
+      const rows = watchedStore.listUnmatched(profile.id);
+      assert.strictEqual(rows.length, 1);
+      assert.strictEqual(rows[0].imdb_id, 'tt1');
+      assert.strictEqual(rows[0].tmdb_id, null, 'no TMDB id to record');
+    } finally {
+      nuvio.pullWatched = origPull; simkl.addToHistory = origAdd; tmdb.findByImdbId = origFind;
+      watchedStore.deleteForProfile(profile.id);
+    }
+  });
+
+  await it('Scrobble A5: a thrown retry POST — no exception from syncProfile, the film is recorded (with the resolved TMDB id)', async () => {
+    const scrobble = require('../src/services/scrobble');
+    const nuvio = require('../src/services/nuvio');
+    const crypto = require('../src/services/crypto');
+    const profile = { id: 'p-a5', name: 'T', keys: { simkl_client_id: 'c', tmdb_api_key: 'k' }, simkl_auth: { access_token: 't' }, scrobble: { enabled: true, provider: 'nuvio', email: 'a@b.c', password_enc: crypto.encrypt('pw') } };
+    const origPull = nuvio.pullWatched; const origAdd = simkl.addToHistory; const origFind = tmdb.findByImdbId;
+    const calls = [];
+    simkl.addToHistory = async (_p, body) => {
+      calls.push(body);
+      if (calls.length === 1) return { not_found: { movies: [{ ids: { imdb: 'tt1' } }] } };
+      throw new Error('Simkl down');
+    };
+    tmdb.findByImdbId = async () => 12600;
+    try {
+      nuvio.pullWatched = async () => [{ type: 'movie', imdbId: 'tt1', watchedAtMs: 1000 }];
+      const res = await scrobble.syncProfile(profile, quiet); // must not throw
+      assert.strictEqual(calls.length, 2, 'the retry was attempted');
+      assert.strictEqual(res.unmatched, 1);
+      assert.strictEqual(res.matchedOnRetry, 0);
+      const rows = watchedStore.listUnmatched(profile.id);
+      assert.strictEqual(rows.length, 1);
+      assert.strictEqual(rows[0].imdb_id, 'tt1');
+      assert.strictEqual(rows[0].tmdb_id, '12600', 'the resolved TMDB id is kept on the record');
+    } finally {
+      nuvio.pullWatched = origPull; simkl.addToHistory = origAdd; tmdb.findByImdbId = origFind;
+      watchedStore.deleteForProfile(profile.id);
+    }
+  });
+
+  await it('Scrobble A6: a recorded film later in the watched store is cleared (even with no body); full ignores the backoff', async () => {
+    const scrobble = require('../src/services/scrobble');
+    const nuvio = require('../src/services/nuvio');
+    const crypto = require('../src/services/crypto');
+    const profile = { id: 'p-a6', name: 'T', keys: { simkl_client_id: 'c', tmdb_api_key: 'k' }, simkl_auth: { access_token: 't' }, scrobble: { enabled: true, provider: 'nuvio', email: 'a@b.c', password_enc: crypto.encrypt('pw') } };
+    const origPull = nuvio.pullWatched; const origAdd = simkl.addToHistory; const origFind = tmdb.findByImdbId;
+    const calls = [];
+    simkl.addToHistory = async (_p, body) => { calls.push(body); return {}; };
+    tmdb.findByImdbId = async () => null;
+    try {
+      // (a) tt1 is recorded, then later appears in the local watched store (a
+      // later Simkl sync found it). It is in backoff, so nothing is pushed
+      // (body null) — but the record is cleared.
+      watchedStore.recordUnmatched(profile.id, { imdbId: 'tt1' }, Date.now());
+      watchedStore.upsertMany(profile.id, [{ simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '12600', title: 'P', year: 2017, watched_at: '2026-01-01T00:00:00Z' }]);
+      nuvio.pullWatched = async () => [{ type: 'movie', imdbId: 'tt1', watchedAtMs: 1000 }];
+      await scrobble.syncProfile(profile, quiet);
+      assert.strictEqual(calls.length, 0, 'nothing pushed (the film is in backoff and watched)');
+      assert.strictEqual(watchedStore.listUnmatched(profile.id).length, 0, 'the record is cleared by the watched store');
+      // (b) full:true ignores the backoff — the film is in the body.
+      watchedStore.recordUnmatched(profile.id, { imdbId: 'tt2' }, Date.now());
+      nuvio.pullWatched = async () => [{ type: 'movie', imdbId: 'tt2', watchedAtMs: 2000 }];
+      calls.length = 0;
+      await scrobble.syncProfile(profile, quiet, { full: true });
+      assert.deepStrictEqual(calls[0].movies.map((m) => m.ids.imdb), ['tt2'], 'full re-pushes despite the backoff');
+    } finally {
+      nuvio.pullWatched = origPull; simkl.addToHistory = origAdd; tmdb.findByImdbId = origFind;
+      watchedStore.deleteForProfile(profile.id);
+    }
+  });
+
+  await it('Scrobble A7: deleteForProfile clears scrobble_unmatched', () => {
+    const A = 'p-a7';
+    watchedStore.recordUnmatched(A, { imdbId: 'tt1', tmdbId: '12600' });
+    watchedStore.recordUnmatched(A, { imdbId: 'tt2' });
+    assert.strictEqual(watchedStore.listUnmatched(A).length, 2);
+    watchedStore.deleteForProfile(A);
+    assert.strictEqual(watchedStore.listUnmatched(A).length, 0, 'profile delete clears the records');
+  });
+
+  await it('Scrobble A8: portal route — rows with title from the meta cache when present; unknown profile 404', async () => {
+    const express = require('express');
+    const portal = require('../src/portal');
+    const config = require('../src/config');
+    const metaStore = require('../src/engines/glass/metaStore');
+    const db = require('../src/db');
+    const port = 7315;
+    const app = express();
+    app.use('/api', portal.router);
+    const server = app.listen(port);
+    await new Promise((resolve, reject) => { server.on('listening', resolve); server.on('error', reject); });
+    const base = `http://localhost:${port}`;
+    let p;
+    try {
+      p = config.addProfile('ScrobbleUnmatched');
+      // One recorded film with a TMDB id (meta cached), one without.
+      watchedStore.recordUnmatched(p.id, { imdbId: 'tt0287635', tmdbId: '12600' }, 1000);
+      watchedStore.recordUnmatched(p.id, { imdbId: 'tt999' }, 2000);
+      metaStore.put('movie', '12600', { title: 'Pokémon 4Ever', year: 2017, imdb_id: 'tt0287635' });
+      let res = await fetch(`${base}/api/profiles/${p.id}/scrobble/unmatched`);
+      assert.strictEqual(res.status, 200);
+      const body = await res.json();
+      assert.strictEqual(body.items.length, 2);
+      const a = body.items.find((r) => r.imdb_id === 'tt0287635');
+      assert.strictEqual(a.title, 'Pokémon 4Ever', 'title from the meta cache');
+      assert.strictEqual(a.year, 2017);
+      assert.strictEqual(a.last_tried, 1000);
+      assert.strictEqual(a.attempts, 1);
+      const b = body.items.find((r) => r.imdb_id === 'tt999');
+      assert.strictEqual(b.title, null, 'no meta cache → title null');
+      assert.strictEqual(b.year, null);
+      // Unknown profile → 404.
+      res = await fetch(`${base}/api/profiles/nope/scrobble/unmatched`);
+      assert.strictEqual(res.status, 404);
+    } finally {
+      server.close();
+      if (p) { config.removeProfile(p.id); watchedStore.deleteForProfile(p.id); }
+      db.get().exec('DELETE FROM glass_metadata');
+    }
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();

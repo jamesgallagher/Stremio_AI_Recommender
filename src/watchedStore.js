@@ -91,6 +91,20 @@ function init() {
       pushed_at  INTEGER,
       PRIMARY KEY (profile_id, imdb_id, season, episode)
     );
+
+    -- Scrobble Part A: a film Simkl can't match (its imdb id comes back in
+    -- not_found). A recorded film is skipped by later runs until 7 days after its
+    -- last attempt, then tried once again. A film that later matches (it isn't in
+    -- not_found, or shows up in the local watched store) has its record deleted.
+    CREATE TABLE IF NOT EXISTS scrobble_unmatched (
+      profile_id TEXT NOT NULL,
+      imdb_id    TEXT NOT NULL,
+      tmdb_id    TEXT,
+      first_seen INTEGER NOT NULL,
+      last_tried INTEGER NOT NULL,
+      attempts   INTEGER NOT NULL,
+      PRIMARY KEY (profile_id, imdb_id)
+    );
   `);
   ready = true;
 }
@@ -302,6 +316,66 @@ function recordPushedEpisodes(profileId, body, at = Date.now()) {
   return n;
 }
 
+// Scrobble Part A: record a film Simkl could not match (its imdb id came back
+// in not_found). Upsert on (profile_id, imdb_id): on insert first_seen =
+// last_tried = at and attempts = 1; on conflict last_tried = at, attempts + 1,
+// and tmdb_id = COALESCE(new, old) (a later run's better id is kept).
+function recordUnmatched(profileId, { imdbId, tmdbId = null } = {}, at = Date.now()) {
+  init();
+  const imdb = imdbId != null && imdbId !== '' ? String(imdbId) : null;
+  if (!imdb) return false;
+  const tmdb = tmdbId != null && tmdbId !== '' ? String(tmdbId) : null;
+  db.get().prepare(`
+    INSERT INTO scrobble_unmatched (profile_id, imdb_id, tmdb_id, first_seen, last_tried, attempts)
+    VALUES (?, ?, ?, ?, ?, 1)
+    ON CONFLICT(profile_id, imdb_id) DO UPDATE SET
+      last_tried = excluded.last_tried,
+      attempts = scrobble_unmatched.attempts + 1,
+      tmdb_id = COALESCE(excluded.tmdb_id, scrobble_unmatched.tmdb_id)
+  `).run(profileId, imdb, tmdb, at, at);
+  return true;
+}
+
+// Set<imdb_id> of recorded films still inside their backoff window (to SKIP):
+// now - last_tried < days*DAY_MS. A film past the window is tried again.
+function unmatchedBackoff(profileId, now, days = 7) {
+  init();
+  const DAY_MS = 86400e3;
+  const out = new Set();
+  for (const r of db.get().prepare('SELECT imdb_id, last_tried FROM scrobble_unmatched WHERE profile_id = ?').all(profileId)) {
+    if (now - r.last_tried < days * DAY_MS) out.add(r.imdb_id);
+  }
+  return out;
+}
+
+// Delete the recorded rows for the given imdb id(s). Returns the count.
+function clearUnmatched(profileId, imdbIds) {
+  init();
+  const ids = Array.isArray(imdbIds) ? imdbIds : [imdbIds];
+  if (!ids.length) return 0;
+  const conn = db.get();
+  const stmt = conn.prepare('DELETE FROM scrobble_unmatched WHERE profile_id = ? AND imdb_id = ?');
+  let n = 0;
+  conn.exec('BEGIN');
+  try {
+    for (const id of ids) {
+      const r = stmt.run(profileId, id);
+      n += Number(r.changes || 0);
+    }
+    conn.exec('COMMIT');
+  } catch (err) {
+    conn.exec('ROLLBACK');
+    throw err;
+  }
+  return n;
+}
+
+// Recorded rows for a profile, ordered by last_tried DESC (newest attempts first).
+function listUnmatched(profileId) {
+  init();
+  return db.get().prepare('SELECT * FROM scrobble_unmatched WHERE profile_id = ? ORDER BY last_tried DESC').all(profileId);
+}
+
 function deleteForProfile(profileId) {
   init();
   db.get().prepare('DELETE FROM scrobble_pushed_episodes WHERE profile_id = ?').run(profileId);
@@ -309,6 +383,7 @@ function deleteForProfile(profileId) {
   db.get().prepare('DELETE FROM sync_state WHERE profile_id = ?').run(profileId);
   db.get().prepare('DELETE FROM pending_watched WHERE profile_id = ?').run(profileId);
   db.get().prepare('DELETE FROM unwatched_block WHERE profile_id = ?').run(profileId);
+  db.get().prepare('DELETE FROM scrobble_unmatched WHERE profile_id = ?').run(profileId);
 }
 
 // ---- ingest enrichment: fill primary_genre + age_classification ----
@@ -440,6 +515,10 @@ module.exports = {
   clearUnwatchedBlock,
   pushedEpisodeKeys,
   recordPushedEpisodes,
+  recordUnmatched,
+  unmatchedBackoff,
+  clearUnmatched,
+  listUnmatched,
   newestWatchedMs,
   deleteForProfile,
   getSyncState,

@@ -328,6 +328,19 @@ TrainerUI.createRateQueue = ({ send, delayMs = 800, setTimer, clearTimer }) => {
           started++;
         }
       }
+      // Part B (S6): a value already queued as `next` behind an in-flight save
+      // has no timer, so the loop above never sends it. Send it now too, unless
+      // it equals the in-flight value.
+      for (const [key, s] of states) {
+        if (!s.next) continue;
+        if (s.inflight && s.next.rating !== s.inflight.rating) {
+          sendSeparate(key, s.next, keepalive);
+          s.next = null;
+          started++;
+        } else {
+          s.next = null;
+        }
+      }
       return started;
     },
   };

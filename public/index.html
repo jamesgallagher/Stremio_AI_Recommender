@@ -469,6 +469,7 @@ function render(profiles) {
           <button class="ghost mini" onclick="testScrobble('${p.id}', this)">Test</button>
         </div>
         <span class="tres" data-tres="scrobble"></span>
+        <div class="scrobble-unmatched" data-id="${p.id}"></div>
         <div class="scrobble-profile" style="margin-top:10px;${p.scrobble.provider === 'nuvio' ? '' : 'display:none'}">
           <label>Which Nuvio profile</label>
           <select data-scrobble="nuvio_profile">
@@ -542,6 +543,7 @@ function activateTab(card, name, { silent = false } = {}) {
   card.querySelectorAll('.tab-panel').forEach(pn => pn.classList.toggle('active', pn.dataset.tab === name));
   if (!silent && name === 'simkl') checkSimklStatus(card.dataset.id);
   if (name === 'trainer') trainerOpen(card.dataset.id);
+  if (name === 'scrobble') scrobbleUnmatchedOpen(card.dataset.id);
 }
 function switchTab(btn, name) {
   activateTab(btn.closest('.card'), name);
@@ -1414,6 +1416,24 @@ window.addEventListener('pagehide', () => Object.values(TRAINER).forEach(st => s
 
 function trainerOpen(id) {
   trainerLoad(id);
+}
+
+// Part A read-out: the films Simkl couldn't match (the scrobble records them
+// and retries weekly). Rendered in the Scrobble tab only — nothing in the
+// companion. A failed fetch leaves the read-out empty.
+function scrobbleUnmatchedOpen(id) {
+  const el = document.querySelector(`.card[data-id="${id}"] .scrobble-unmatched`);
+  if (!el) return;
+  api(`/profiles/${id}/scrobble/unmatched`).then((d) => {
+    const items = d.items || [];
+    if (!items.length) { el.innerHTML = ''; return; }
+    const rows = items.map((r) => {
+      const label = r.title ? `${esc(r.title)} (${r.year != null ? esc(r.year) : '?'})` : esc(r.imdb_id);
+      const date = new Date(r.last_tried).toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric' });
+      return `<div>${label} <span class="muted">— last tried ${esc(date)}</span></div>`;
+    }).join('');
+    el.innerHTML = `<details><summary>Simkl couldn't match: ${items.length} film${items.length === 1 ? '' : 's'} — retried weekly</summary>${rows}</details>`;
+  }).catch(() => { el.innerHTML = ''; });
 }
 
 async function trainerLoad(id, { quiet = false } = {}) {
