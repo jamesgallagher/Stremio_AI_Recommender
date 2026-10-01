@@ -301,6 +301,14 @@ async function unitTests() {
     assert.strictEqual(clientUi.viewForState({ authed: true }), clientUi.DEFAULT_VIEW);
   });
 
+  // ---- Trainer T4 M7: the companion route is recognised by the pure UI helpers ----
+  await ok('ui: trainer route parses and renders for an authed user', () => {
+    assert.strictEqual(clientUi.parseRoute('#/trainer').view, 'trainer');
+    assert.strictEqual(clientUi.viewForState({ authed: true, route: 'trainer' }), 'trainer');
+    // Not authed -> login, even for the trainer route.
+    assert.strictEqual(clientUi.viewForState({ authed: false, route: 'trainer' }), 'login');
+  });
+
   // ---- Step 3: Simkl plan-to-watch write ----
   await ok('simkl: buildAddToListBody routes by kind, sets plantowatch, id preference, skips id-less', () => {
     const body = simkl.buildAddToListBody([
@@ -1199,6 +1207,20 @@ async function httpTests() {
     assert.ok(js.includes('bindStarScrub'), 'contains the shared scrub helper');
     console.log('  ✓ shell: GET /mobile/trainer-ui.js serves the shared pure module (public, JS, no session)');
   }
+
+  // Trainer T4 M8: the shell carries the Trainer tab + section + both script
+  // tags, and the companion's own controller is served.
+  await ok('shell: GET /mobile/ has the Trainer tab/section/scripts; trainer.js is served', async () => {
+    const res = await fetch(`${BASE}/mobile/`);
+    assert.strictEqual(res.status, 200);
+    const html = await res.text();
+    assert.ok(html.includes('data-route="trainer"'), 'has the Trainer tabbar button');
+    assert.ok(html.includes('id="view-trainer"'), 'has the Trainer section');
+    assert.ok(html.includes('trainer-ui.js'), 'references the shared pure module');
+    assert.ok(html.includes('trainer.js'), 'references the companion controller');
+    const jsRes = await fetch(`${BASE}/mobile/trainer.js`);
+    assert.strictEqual(jsRes.status, 200, 'trainer.js is served');
+  });
 
   // Config endpoint (public) returns app name + version.
   {

@@ -9,7 +9,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  const ROUTES = ['login', 'recs', 'search', 'settings'];
+  const ROUTES = ['login', 'recs', 'search', 'settings', 'trainer'];
   const DEFAULT_VIEW = 'recs'; // authed landing
 
   // '#/search' -> { view:'search' }; '', '#/' -> default; unknown -> default.
