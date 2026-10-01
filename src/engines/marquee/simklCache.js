@@ -11,10 +11,12 @@ const db = require('../../db');
 const simkl = require('../../services/simkl');
 const tmdb = require('../../services/tmdb');
 const settings = require('../../settings');
+const tasteFeedback = require('../../tasteFeedback');
 
 let ready = false;
 function init() {
   if (ready) return;
+  // marquee_ratings / marquee_sync are unused since Trainer T1 — kept, no destructive migration.
   db.get().exec(`
     CREATE TABLE IF NOT EXISTS marquee_ratings (
       profile_id TEXT NOT NULL, tmdb_id TEXT NOT NULL, imdb_id TEXT, simkl_id INTEGER,
@@ -27,109 +29,17 @@ function init() {
   ready = true;
 }
 
-// Activities-gated ratings sync (spec §4.2; §12 L2): read activities, compare
-// movies.rated_at against the stored value INCLUDING null (null === null is
-// unchanged; null stored as SQL NULL). No stored row = never synced → pull
-// once. A missing rated_at KEY (≠ null) degrades to a 24 h pull cap (§4.2(5)).
-// The whole-account ratings GET is one call; this profile's rows are replaced
-// in one transaction; an imdb-only entry is resolved to a tmdb id via
-// resolveTmdb, capped at 50 lookups per sync. Never throws (MI-3).
-async function syncRatings(profile, {
-  fetchActivities = simkl.getActivities,
-  fetchRatings = simkl.getRatings,
-  resolveTmdb,
-  now = Date.now(),
-  log = console,
-  force = false,
-  resolveCap = 50,
-} = {}) {
-  init();
-  const profileId = profile.id;
-  const resolver = resolveTmdb || ((imdbId) => tmdb.findByImdbId(settings.keyFor(profile, 'tmdb_api_key'), 'movie', imdbId));
-  try {
-    const activities = await fetchActivities(profile);
-    const movies = activities && typeof activities === 'object' ? activities.movies : null;
-    const hasKey = movies && typeof movies === 'object' && Object.prototype.hasOwnProperty.call(movies, 'rated_at');
-    const ratedAt = hasKey ? (movies.rated_at == null ? null : String(movies.rated_at)) : null;
-
-    const prev = db.get().prepare('SELECT ratings_activity, synced_at, degraded_synced_at FROM marquee_sync WHERE profile_id = ?').get(profileId);
-    if (!force) {
-      if (hasKey) {
-        // §12 L2: the gate compares the stored and current value INCLUDING null.
-        if (prev && (prev.ratings_activity == null ? ratedAt === null : prev.ratings_activity === ratedAt)) {
-          return { ok: true, skipped: 'unchanged' };
-        }
-      } else if (prev && prev.degraded_synced_at != null && now - prev.degraded_synced_at < 24 * 3600e3) {
-        // §4.2(5): the rated_at key itself is absent — no reliable gate, so pull
-        // at most once per 24 h (degraded_synced_at tracks the last DEGRADED pull,
-        // independent of the hasKey syncs above).
-        log.warn('[marquee] ratings gate degraded (activities.movies.rated_at key absent) — pulling at most once per 24 h');
-        return { ok: true, skipped: 'gate-degraded' };
-      }
-    }
-
-    // One GET for the whole account (spec §4.2(3): ~hundreds of entries).
-    const ratings = await fetchRatings(profile, 'movies');
-
-    // Resolve all imdb-only entries to a tmdb id BEFORE the transaction. The
-    // shared db.get() connection must never have a transaction open across an
-    // await: while a resolver lookup is pending, another writer's BEGIN would
-    // throw "cannot start a transaction within a transaction", and unrelated
-    // writes (e.g. recordImpressions on a catalog serve) would silently join
-    // this transaction and be discarded on a ROLLBACK. So the lookups happen
-    // first; the transaction below is fully synchronous (BEGIN → DELETE →
-    // inserts → COMMIT), as in upsertCandidates and trendingCache.replaceWindow.
-    let unresolved = 0;
-    let resolveCount = 0;
-    const rows = [];
-    for (const r of ratings) {
-      let tmdbId = r.tmdb_id;
-      if (!tmdbId && r.imdb_id && resolveCount < resolveCap) {
-        resolveCount += 1;
-        try { tmdbId = await resolver(r.imdb_id); } catch { /* counted unresolved below */ }
-      }
-      if (!tmdbId) { unresolved += 1; continue; } // no tmdb id — the table's primary key
-      rows.push({ tmdbId, imdb: r.imdb_id || null, simkl: r.simkl_id != null ? r.simkl_id : null, rating: r.rating, ratedAt: r.rated_at || null });
-    }
-
-    // Replace this profile's rows in one fully-synchronous transaction (zero
-    // rated entries is valid → the table is empty for this profile).
-    const conn = db.get();
-    conn.exec('BEGIN');
-    try {
-      conn.prepare('DELETE FROM marquee_ratings WHERE profile_id = ?').run(profileId);
-      const ins = conn.prepare('INSERT INTO marquee_ratings (profile_id, tmdb_id, imdb_id, simkl_id, rating, rated_at) VALUES (?, ?, ?, ?, ?, ?)');
-      for (const row of rows) {
-        ins.run(profileId, row.tmdbId, row.imdb, row.simkl, row.rating, row.ratedAt);
-      }
-      conn.exec('COMMIT');
-    } catch (err) {
-      try { conn.exec('ROLLBACK'); } catch { /* commit already ran */ }
-      throw err;
-    }
-    const synced = rows.length;
-    // Upsert the sync cursor with the current value (possibly null — §12 L2).
-    // In degraded mode (key absent) record the degraded-pull timestamp; in
-    // hasKey mode clear it so a future degraded stretch starts fresh.
-    db.get().prepare(`
-      INSERT INTO marquee_sync (profile_id, ratings_activity, synced_at, degraded_synced_at) VALUES (?, ?, ?, ?)
-      ON CONFLICT(profile_id) DO UPDATE SET ratings_activity = excluded.ratings_activity, synced_at = excluded.synced_at, degraded_synced_at = excluded.degraded_synced_at
-    `).run(profileId, hasKey ? ratedAt : null, now, hasKey ? null : now);
-    return { ok: true, synced, unresolved };
-  } catch (err) {
-    log.warn(`[marquee] ratings sync failed: ${err.message} — keeping existing rows`);
-    return { ok: false, error: err.message };
-  }
+// Activities-gated ratings sync (spec §4.2; §12 L2). Trainer T1: the whole
+// implementation lives in the engine-agnostic tasteFeedback store (type-scoped);
+// Marquee delegates for movies only (M9 — a pure move, identical behaviour).
+async function syncRatings(profile, opts = {}) {
+  return tasteFeedback.syncRatings(profile, { ...opts, type: 'movie' });
 }
 
-// Map<tmdb_id, rating> for one profile (spec §4.2).
+// Map<tmdb_id, rating> for one profile (spec §4.2). Trainer T1: delegated to
+// the engine-agnostic tasteFeedback store (movies only — M9, a pure move).
 function getRatingsMap(profileId) {
-  init();
-  const out = new Map();
-  for (const r of db.get().prepare('SELECT tmdb_id, rating FROM marquee_ratings WHERE profile_id = ?').all(profileId)) {
-    out.set(r.tmdb_id, r.rating);
-  }
-  return out;
+  return tasteFeedback.getRatingsMap(profileId, 'movie');
 }
 
 // "Users also liked" recommendations for seed simkl ids (spec §4.2): fresh

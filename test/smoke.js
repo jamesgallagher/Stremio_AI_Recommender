@@ -3915,7 +3915,94 @@ async function httpTests() {
     console.log('  ✓ /api/settings SC-07: enable/disable toggle, Genesis-lock + unknown-drop, disable→revert fan-out');
   }
 
-  console.log(`\nAll checks passed (${passed} unit + 55 async/http).`);
+  // ---- Trainer T1: portal routes over HTTP (F11.5) ----
+  // Hit every row of the shared httpStatus mapper: 200 ok; 400 bad-type /
+  // not-supported / bad-rating / bad-value / bad-view / no-simkl; 404
+  // not-in-history + unknown profile; 502 thrown Simkl write. The Simkl
+  // write is stubbed (smoke makes no network calls); setIgnored is local
+  // only (M2) and needs no stub.
+  {
+    const simkl = require('../src/services/simkl');
+    const watchedStore = require('../src/watchedStore');
+    const prof = config.addProfile('TrainerHTTP');
+    config.updateProfile(prof.id, {
+      keys: { simkl_client_id: 'cid-1', simkl_client_secret: 'sec-1' },
+      simkl_auth: { access_token: 'tok-1', username: 'james', connected_at: 1 },
+    });
+    watchedStore.upsertMany(prof.id, [{ simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'A', year: 2020, watched_at: '2026-01-01T00:00:00Z' }]);
+
+    // GET listing -> 200 with the seeded row.
+    let res = await fetch(`${BASE}/api/profiles/${prof.id}/trainer`);
+    assert.strictEqual(res.status, 200);
+    assert.ok((await res.json()).items.some((i) => i.tmdb_id === '1'));
+
+    // Rate -> 200 (Simkl write stubbed); F4 no-op: same value again ->
+    // unchanged, zero Simkl calls.
+    const origSet = simkl.setRatings;
+    simkl.setRatings = async () => ({});
+    try {
+      res = await fetch(`${BASE}/api/profiles/${prof.id}/trainer/rate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'movie', tmdb_id: '1', rating: 5 }) });
+      assert.strictEqual(res.status, 200);
+      let rated = await res.json();
+      assert.strictEqual(rated.item.rating, 5);
+      assert.strictEqual(rated.unchanged, false);
+      let calls = 0;
+      simkl.setRatings = async () => { calls += 1; return {}; };
+      res = await fetch(`${BASE}/api/profiles/${prof.id}/trainer/rate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'movie', tmdb_id: '1', rating: 5 }) });
+      assert.strictEqual(res.status, 200);
+      assert.strictEqual((await res.json()).unchanged, true);
+      assert.strictEqual(calls, 0);
+    } finally {
+      simkl.setRatings = origSet;
+    }
+    // 400: bad-type, not-supported, bad-rating (no Simkl involved).
+    res = await fetch(`${BASE}/api/profiles/${prof.id}/trainer/rate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'bogus', tmdb_id: '1', rating: 5 }) });
+    assert.strictEqual(res.status, 400);
+    res = await fetch(`${BASE}/api/profiles/${prof.id}/trainer/rate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'series', tmdb_id: '1', rating: 5 }) });
+    assert.strictEqual(res.status, 400);
+    res = await fetch(`${BASE}/api/profiles/${prof.id}/trainer/rate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'movie', tmdb_id: '1', rating: 11 }) });
+    assert.strictEqual(res.status, 400);
+    // 404: not-in-history (unknown title).
+    res = await fetch(`${BASE}/api/profiles/${prof.id}/trainer/rate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'movie', tmdb_id: '999', rating: 5 }) });
+    assert.strictEqual(res.status, 404);
+    // Ignore -> 200 (local only, M2); bad-value -> 400; not-in-history -> 404.
+    res = await fetch(`${BASE}/api/profiles/${prof.id}/trainer/ignore`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'movie', tmdb_id: '1', ignored: true }) });
+    assert.strictEqual(res.status, 200);
+    let ignored = await res.json();
+    assert.strictEqual(ignored.item.ignored, true);
+    assert.strictEqual(ignored.unchanged, false);
+    res = await fetch(`${BASE}/api/profiles/${prof.id}/trainer/ignore`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'movie', tmdb_id: '1', ignored: 'yes' }) });
+    assert.strictEqual(res.status, 400);
+    res = await fetch(`${BASE}/api/profiles/${prof.id}/trainer/ignore`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'movie', tmdb_id: '999', ignored: true }) });
+    assert.strictEqual(res.status, 404);
+    // Finished: a watched (not unfinished) row -> 404 not-in-history.
+    res = await fetch(`${BASE}/api/profiles/${prof.id}/trainer/finished`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'movie', tmdb_id: '1' }) });
+    assert.strictEqual(res.status, 404);
+    // 400: bad-view on the listing.
+    res = await fetch(`${BASE}/api/profiles/${prof.id}/trainer?view=bogus`);
+    assert.strictEqual(res.status, 400);
+    // 400: no-simkl (a profile without Simkl credentials).
+    const noSimkl = config.addProfile('TrainerNoSimkl');
+    res = await fetch(`${BASE}/api/profiles/${noSimkl.id}/trainer/rate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'movie', tmdb_id: '1', rating: 5 }) });
+    assert.strictEqual(res.status, 400);
+    // 404: unknown profile.
+    res = await fetch(`${BASE}/api/profiles/does-not-exist/trainer`);
+    assert.strictEqual(res.status, 404);
+    // 502: a thrown Simkl write (stubbed to throw).
+    simkl.setRatings = async () => { throw new Error('Simkl POST /sync/ratings failed (500)'); };
+    try {
+      res = await fetch(`${BASE}/api/profiles/${prof.id}/trainer/rate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'movie', tmdb_id: '1', rating: 6 }) });
+      assert.strictEqual(res.status, 502);
+    } finally {
+      simkl.setRatings = origSet;
+    }
+    watchedStore.deleteForProfile(prof.id);
+    config.removeProfile(prof.id);
+    config.removeProfile(noSimkl.id);
+    console.log('  ✓ trainer portal routes over HTTP: 200/400/404/502 (F11.5)');
+  }
+
+  console.log(`\nAll checks passed (${passed} unit + 56 async/http).`);
   process.exit(0);
 }
 

@@ -1217,12 +1217,12 @@ async function main() {
     let ratingsCalls = 0;
     // The fetchRatings seam returns PARSED ratings (the simkl.getRatings contract).
     const fetchRatings = async () => { ratingsCalls += 1; return simkl.parseRatings(body); };
-    // First sync: no marquee_sync row → pull once; null rated_at stored as SQL NULL (§12 L2).
+    // First sync: no taste_ratings_sync row → pull once; null rated_at stored as SQL NULL (§12 L2).
     let res = await simklCache.syncRatings(profile, { fetchActivities: async () => ({ movies: { rated_at: null } }), fetchRatings, now: 1000, log: quiet });
     assert.deepStrictEqual(res, { ok: true, synced: 1, unresolved: 0 });
     assert.strictEqual(ratingsCalls, 1);
-    const row = db.get().prepare('SELECT ratings_activity, synced_at FROM marquee_sync WHERE profile_id = ?').get('p-simkl');
-    assert.strictEqual(row.ratings_activity, null);
+    const row = db.get().prepare("SELECT activity, synced_at FROM taste_ratings_sync WHERE profile_id = ? AND type = 'movie'").get('p-simkl');
+    assert.strictEqual(row.activity, null);
     // Unchanged (null === null) → skip, no ratings call.
     res = await simklCache.syncRatings(profile, { fetchActivities: async () => ({ movies: { rated_at: null } }), fetchRatings, now: 2000, log: quiet });
     assert.deepStrictEqual(res, { ok: true, skipped: 'unchanged' });
@@ -1248,7 +1248,7 @@ async function main() {
     assert.strictEqual(res.ok, false);
     assert.ok(res.error);
     assert.deepStrictEqual([...simklCache.getRatingsMap('p-simkl').entries()], [['1', 8]]); // rows preserved
-    db.get().exec('DELETE FROM marquee_ratings; DELETE FROM marquee_sync');
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ratings_sync');
   });
 
   await it('marquee ME-03: syncRatings replace semantics + zero rated + resolve cap 50 (B4)', async () => {
@@ -1258,7 +1258,7 @@ async function main() {
     const profile = { id: 'p-replace', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
     const activities = async () => ({ movies: { rated_at: null } });
     // Seed another profile's row — must survive this profile's replace.
-    db.get().prepare('INSERT INTO marquee_ratings (profile_id, tmdb_id, rating) VALUES (?, ?, ?)').run('p-other', '99', 5);
+    db.get().prepare("INSERT INTO taste_ratings (profile_id, type, tmdb_id, rating) VALUES (?, ?, ?, ?)").run('p-other', 'movie', '99', 5);
     // Zero rated entries → this profile's table empty (valid state, §12 L3).
     let res = await simklCache.syncRatings(profile, { fetchActivities: activities, fetchRatings: async () => simkl.parseRatings({ movies: [{ user_rating: null, movie: { ids: { tmdb: '1' } } }] }), now: 1000, log: quiet });
     assert.deepStrictEqual(res, { ok: true, synced: 0, unresolved: 0 });
@@ -1281,7 +1281,629 @@ async function main() {
     res = await simklCache.syncRatings(profile, { fetchActivities: activities, fetchRatings: async () => simkl.parseRatings({ movies: [{ user_rating: 6, movie: { ids: { imdb: 'ttX' } } }] }), resolveTmdb: async () => { throw new Error('nope'); }, now: 3000, log: quiet, force: true });
     assert.deepStrictEqual(res, { ok: true, synced: 0, unresolved: 1 });
     assert.deepStrictEqual([...simklCache.getRatingsMap('p-replace').entries()], []);
-    db.get().exec('DELETE FROM marquee_ratings; DELETE FROM marquee_sync');
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ratings_sync');
+  });
+
+  await it('Trainer T1: buildRatingsBody shapes ids/ratings by type (test 1)', () => {
+    const simkl = require('../src/services/simkl');
+    // numeric simkl, string imdb/tmdb, movie → movies
+    let b = simkl.buildRatingsBody([{ type: 'movie', simkl_id: 5, imdb_id: 'tt1', tmdb_id: '10', rating: 8 }]);
+    assert.deepStrictEqual(b, { movies: [{ ids: { simkl: 5, imdb: 'tt1', tmdb: '10' }, rating: 8 }], shows: [] });
+    // series → shows
+    b = simkl.buildRatingsBody([{ type: 'series', simkl_id: 7, imdb_id: 'tt2', tmdb_id: '20', rating: 9 }]);
+    assert.deepStrictEqual(b, { movies: [], shows: [{ ids: { simkl: 7, imdb: 'tt2', tmdb: '20' }, rating: 9 }] });
+    // no ids → dropped
+    b = simkl.buildRatingsBody([{ type: 'movie', rating: 5 }]);
+    assert.deepStrictEqual(b, { movies: [], shows: [] });
+    // ratings 0, 11, 7.5, '8' → omitted (ids kept)
+    b = simkl.buildRatingsBody([
+      { type: 'movie', tmdb_id: '1', rating: 0 },
+      { type: 'movie', tmdb_id: '2', rating: 11 },
+      { type: 'movie', tmdb_id: '3', rating: 7.5 },
+      { type: 'movie', tmdb_id: '4', rating: '8' },
+    ]);
+    assert.deepStrictEqual(b, { movies: [{ ids: { tmdb: '1' } }, { ids: { tmdb: '2' } }, { ids: { tmdb: '3' } }, { ids: { tmdb: '4' } }], shows: [] });
+    // withRating:false → no rating field
+    b = simkl.buildRatingsBody([{ type: 'movie', tmdb_id: '1', rating: 8 }], { withRating: false });
+    assert.deepStrictEqual(b, { movies: [{ ids: { tmdb: '1' } }], shows: [] });
+    // both keys always present (empty input)
+    assert.deepStrictEqual(simkl.buildRatingsBody([]), { movies: [], shows: [] });
+  });
+
+  await it('Trainer T1: setRatings/removeRatings governed POST + error contract (test 2)', async () => {
+    const simkl = require('../src/services/simkl');
+    const governor = require('../src/services/governor');
+    const profile = { id: 'p-rate', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    const realFetch = global.fetch;
+    const realSchedule = governor.schedule;
+    let fetchCalls = [];
+    let laneCalls = [];
+    // Spy on governor.schedule: record the lane, run the fetch fn directly (no pacing in the test).
+    governor.schedule = (lane, fn) => { laneCalls.push(lane); return fn(); };
+    let fetchRes = { ok: true, status: 200, json: async () => ({}) };
+    global.fetch = (url, opts) => { fetchCalls.push({ url: String(url), opts }); return Promise.resolve(fetchRes); };
+    try {
+      // setRatings: /sync/ratings, POST, JSON body, simkl_post lane
+      await simkl.setRatings(profile, [{ type: 'movie', simkl_id: 5, tmdb_id: '10', rating: 8 }]);
+      assert.strictEqual(fetchCalls.length, 1);
+      assert.match(fetchCalls[0].url, /\/sync\/ratings\?/);
+      assert.strictEqual(fetchCalls[0].opts.method, 'POST');
+      assert.deepStrictEqual(JSON.parse(fetchCalls[0].opts.body), { movies: [{ ids: { simkl: 5, tmdb: '10' }, rating: 8 }], shows: [] });
+      assert.deepStrictEqual(laneCalls, ['simkl_post']);
+      // removeRatings: /sync/ratings/remove, withRating:false → no rating field
+      fetchCalls = []; laneCalls = [];
+      await simkl.removeRatings(profile, [{ type: 'movie', tmdb_id: '10' }]);
+      assert.match(fetchCalls[0].url, /\/sync\/ratings\/remove\?/);
+      assert.deepStrictEqual(JSON.parse(fetchCalls[0].opts.body), { movies: [{ ids: { tmdb: '10' } }], shows: [] });
+      assert.deepStrictEqual(laneCalls, ['simkl_post']);
+      // 401 → the token-rejected message
+      fetchRes = { ok: false, status: 401, json: async () => ({}) };
+      await assert.rejects(() => simkl.setRatings(profile, [{ type: 'movie', tmdb_id: '10', rating: 8 }]), /token rejected/);
+      // 500 → throws with the status
+      fetchRes = { ok: false, status: 500, json: async () => ({}) };
+      await assert.rejects(() => simkl.setRatings(profile, [{ type: 'movie', tmdb_id: '10', rating: 8 }]), /500/);
+      // empty body → throws with ZERO fetches
+      fetchCalls = [];
+      await assert.rejects(() => simkl.setRatings(profile, [{ type: 'movie' }]), /nothing to rate/);
+      assert.strictEqual(fetchCalls.length, 0);
+    } finally {
+      global.fetch = realFetch;
+      governor.schedule = realSchedule;
+    }
+  });
+
+  await it('Trainer T1: tasteFeedback.syncRatings — type-scoped, series throws not-supported, movie never touches series rows (test 3)', async () => {
+    const tasteFeedback = require('../src/tasteFeedback');
+    const simkl = require('../src/services/simkl');
+    const db = require('../src/db');
+    const profile = { id: 'p-tf', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    tasteFeedback.init();
+    // Seed a type='series' row for the same profile — a movie sync must NOT touch it.
+    db.get().prepare("INSERT INTO taste_ratings (profile_id, type, tmdb_id, rating) VALUES (?, ?, ?, ?)").run('p-tf', 'series', '500', 4);
+    const fetchRatings = async () => simkl.parseRatings({ movies: [
+      { user_rating: 9, user_rated_at: '2026-01-01T00:00:00Z', movie: { title: 'A', ids: { simkl: 1, imdb: 'tt1', tmdb: '1' } } },
+      { user_rating: 5, movie: { title: 'B', ids: { tmdb: '2' } } },
+    ] });
+    // A movie sync (force) replaces only type='movie' rows.
+    let res = await tasteFeedback.syncRatings(profile, { type: 'movie', fetchActivities: async () => ({ movies: { rated_at: null } }), fetchRatings, now: 1000, log: quiet, force: true });
+    assert.deepStrictEqual(res, { ok: true, synced: 2, unresolved: 0 });
+    assert.deepStrictEqual([...tasteFeedback.getRatingsMap('p-tf', 'movie').entries()], [['1', 9], ['2', 5]]);
+    // the series row is untouched.
+    assert.deepStrictEqual([...tasteFeedback.getRatingsMap('p-tf', 'series').entries()], [['500', 4]]);
+    // A second movie sync with the same gate → unchanged (null === null).
+    res = await tasteFeedback.syncRatings(profile, { type: 'movie', fetchActivities: async () => ({ movies: { rated_at: null } }), fetchRatings, now: 2000, log: quiet });
+    assert.deepStrictEqual(res, { ok: true, skipped: 'unchanged' });
+    // series → not-supported (the ONLY throw in the store).
+    await assert.rejects(() => tasteFeedback.syncRatings(profile, { type: 'series', fetchActivities: async () => ({ movies: { rated_at: null } }), fetchRatings, now: 3000, log: quiet }), /not-supported/);
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ratings_sync');
+  });
+
+  await it('Trainer T1: simklCache delegates to tasteFeedback — upsertRating rows surface in getRatingsMap; syncRatings writes taste_ratings (test 4)', async () => {
+    const simklCache = require('../src/engines/marquee/simklCache');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const simkl = require('../src/services/simkl');
+    const db = require('../src/db');
+    const profile = { id: 'p-deleg', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    simklCache.init();
+    // upsertRating (movie) → visible through the Marquee getRatingsMap (delegation).
+    tasteFeedback.upsertRating('p-deleg', { type: 'movie', tmdb_id: '10', imdb_id: 'tt10', simkl_id: 10, rating: 8, rated_at: '2026-01-01T00:00:00Z' });
+    assert.deepStrictEqual([...simklCache.getRatingsMap('p-deleg').entries()], [['10', 8]]);
+    // a series rating is NOT visible through the movie-scoped getRatingsMap.
+    tasteFeedback.upsertRating('p-deleg', { type: 'series', tmdb_id: '10', rating: 7 });
+    assert.deepStrictEqual([...simklCache.getRatingsMap('p-deleg').entries()], [['10', 8]]);
+    // simklCache.syncRatings (movies only) writes taste_ratings with type='movie'.
+    const fetchRatings = async () => simkl.parseRatings({ movies: [
+      { user_rating: 6, user_rated_at: '2026-02-01T00:00:00Z', movie: { title: 'C', ids: { tmdb: '20', imdb: 'tt20' } } },
+    ] });
+    const res = await simklCache.syncRatings(profile, { fetchActivities: async () => ({ movies: { rated_at: null } }), fetchRatings, now: 1000, log: quiet, force: true });
+    assert.deepStrictEqual(res, { ok: true, synced: 1, unresolved: 0 });
+    const row = db.get().prepare("SELECT type, tmdb_id, rating FROM taste_ratings WHERE profile_id = ? AND tmdb_id = '20'").get('p-deleg');
+    assert.strictEqual(row.type, 'movie');
+    assert.strictEqual(row.rating, 6);
+    // the series row for tmdb 10 is still intact (movie sync never touched it).
+    assert.deepStrictEqual([...tasteFeedback.getRatingsMap('p-deleg', 'series').entries()], [['10', 7]]);
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ratings_sync');
+  });
+
+  await it('Trainer T1: deleteForProfile removes all taste_* rows for that profile, none for another (test 10)', () => {
+    const tasteFeedback = require('../src/tasteFeedback');
+    const db = require('../src/db');
+    tasteFeedback.init();
+    const A = 'p-del-a';
+    const B = 'p-del-b';
+    // A: rows in all four tables.
+    tasteFeedback.upsertRating(A, { type: 'movie', tmdb_id: '1', rating: 8 });
+    db.get().prepare("INSERT INTO taste_ratings_sync (profile_id, type, activity, synced_at, degraded_synced_at) VALUES (?, ?, ?, ?, ?)").run(A, 'movie', null, 1000, null);
+    tasteFeedback.setIgnored(A, { type: 'movie', tmdb_id: '2', simkl_id: 2 }, true, 1000);
+    tasteFeedback.recordChange(A, 1000);
+    tasteFeedback.recordChange(A, 2000);
+    // B: its own rows.
+    tasteFeedback.upsertRating(B, { type: 'movie', tmdb_id: '3', rating: 9 });
+    tasteFeedback.setIgnored(B, { type: 'movie', tmdb_id: '4', simkl_id: 4 }, true, 1000);
+    tasteFeedback.recordChange(B, 1000);
+    tasteFeedback.deleteForProfile(A);
+    // A: all four tables empty.
+    assert.deepStrictEqual([...tasteFeedback.getRatingsMap(A, 'movie').entries()], []);
+    assert.strictEqual(db.get().prepare('SELECT COUNT(*) AS n FROM taste_ratings_sync WHERE profile_id = ?').get(A).n, 0);
+    assert.deepStrictEqual([...tasteFeedback.ignoredSet(A, 'movie')], []);
+    assert.deepStrictEqual(tasteFeedback.getTraining(A), { changed_at: null, changes_since_build: 0 });
+    // B: untouched.
+    assert.deepStrictEqual([...tasteFeedback.getRatingsMap(B, 'movie').entries()], [['3', 9]]);
+    assert.deepStrictEqual([...tasteFeedback.ignoredSet(B, 'movie')], ['4']);
+    assert.deepStrictEqual(tasteFeedback.getTraining(B), { changed_at: 1000, changes_since_build: 1 });
+    tasteFeedback.deleteForProfile(B);
+  });
+
+  await it('Trainer T1: rate — Simkl authority (M1): write first, local row only on success; clear; bad-rating; not-in-history; no-simkl (test 5)', async () => {
+    const trainer = require('../src/trainer');
+    const watchedStore = require('../src/watchedStore');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const db = require('../src/db');
+    const profile = { id: 'p-rate', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    watchedStore.upsertMany(profile.id, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'A', year: 2020, watched_at: '2026-01-01T00:00:00Z' },
+      { simkl_id: 2, type: 'movie', imdb_id: 'tt2', tmdb_id: '2', title: 'B', year: 2020, watched_at: '2026-01-02T00:00:00Z' },
+    ]);
+    const simklCalls = [];
+    const deps = {
+      simkl: {
+        setRatings: async (_p, items) => { simklCalls.push(['set', items]); },
+        removeRatings: async (_p, items) => { simklCalls.push(['remove', items]); },
+      },
+      now: () => 1000,
+      log: quiet,
+    };
+    // rate 8 → setRatings called, local row written, change recorded. Full DTO (F8).
+    let res = await trainer.rate(profile, { type: 'movie', tmdb_id: '1' }, 8, deps);
+    assert.deepStrictEqual(res, { ok: true, item: { key: '1', type: 'movie', simkl_id: 1, tmdb_id: '1', imdb_id: 'tt1', title: 'A', year: 2020, genre: null, poster: null, watched_at: '2026-01-01T00:00:00Z', rating: 8, loved: false, ignored: false, status: 'watched', percent: null }, unchanged: false });
+    assert.deepStrictEqual(simklCalls, [['set', [{ type: 'movie', simkl_id: 1, imdb_id: 'tt1', tmdb_id: '1', rating: 8 }]]]);
+    assert.strictEqual(tasteFeedback.getRating(profile.id, 'movie', '1'), 8);
+    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 1000, changes_since_build: 1 });
+    // rate 10 → loved computed (M3).
+    res = await trainer.rate(profile, { type: 'movie', tmdb_id: '1' }, 10, deps);
+    assert.strictEqual(res.item.loved, true);
+    assert.strictEqual(res.item.rating, 10);
+    assert.strictEqual(tasteFeedback.getRating(profile.id, 'movie', '1'), 10);
+    // clear (null) → removeRatings called, local row deleted. Full DTO.
+    res = await trainer.rate(profile, { type: 'movie', tmdb_id: '1' }, null, deps);
+    assert.deepStrictEqual(res, { ok: true, item: { key: '1', type: 'movie', simkl_id: 1, tmdb_id: '1', imdb_id: 'tt1', title: 'A', year: 2020, genre: null, poster: null, watched_at: '2026-01-01T00:00:00Z', rating: null, loved: false, ignored: false, status: 'watched', percent: null }, unchanged: false });
+    assert.strictEqual(tasteFeedback.getRating(profile.id, 'movie', '1'), null);
+    // bad-rating (0, 11, 7.5) → no Simkl call, no local change.
+    simklCalls.length = 0;
+    res = await trainer.rate(profile, { type: 'movie', tmdb_id: '2' }, 0, deps);
+    assert.deepStrictEqual(res, { ok: false, reason: 'bad-rating' });
+    res = await trainer.rate(profile, { type: 'movie', tmdb_id: '2' }, 11, deps);
+    assert.deepStrictEqual(res, { ok: false, reason: 'bad-rating' });
+    res = await trainer.rate(profile, { type: 'movie', tmdb_id: '2' }, 7.5, deps);
+    assert.deepStrictEqual(res, { ok: false, reason: 'bad-rating' });
+    assert.strictEqual(simklCalls.length, 0);
+    // not-in-history (unknown ref).
+    res = await trainer.rate(profile, { type: 'movie', tmdb_id: '999' }, 5, deps);
+    assert.deepStrictEqual(res, { ok: false, reason: 'not-in-history' });
+    // no-simkl (profile not connected) → no Simkl call.
+    res = await trainer.rate({ id: 'p-rate', name: 'T', keys: {} }, { type: 'movie', tmdb_id: '1' }, 5, deps);
+    assert.deepStrictEqual(res, { ok: false, reason: 'no-simkl' });
+    // Simkl write throws → local row NOT written (M1).
+    const failingSimkl = {
+      setRatings: async () => { throw new Error('Simkl POST /sync/ratings failed (500)'); },
+      removeRatings: async () => { throw new Error('Simkl POST /sync/ratings/remove failed (500)'); },
+    };
+    await assert.rejects(() => trainer.rate(profile, { type: 'movie', tmdb_id: '2' }, 6, { ...deps, simkl: failingSimkl }));
+    assert.strictEqual(tasteFeedback.getRating(profile.id, 'movie', '2'), null); // unchanged
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_changes');
+    watchedStore.deleteForProfile(profile.id);
+  });
+
+  await it('Trainer T1: setIgnored — local only (M2): never calls Simkl, never touches watched; ignored stays in watchedIdSets (test 6)', async () => {
+    const trainer = require('../src/trainer');
+    const watchedStore = require('../src/watchedStore');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const db = require('../src/db');
+    const profile = { id: 'p-ignore', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    watchedStore.upsertMany(profile.id, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'A', year: 2020, watched_at: '2026-01-01T00:00:00Z' },
+    ]);
+    const simklCalls = [];
+    const deps = {
+      simkl: {
+        setRatings: async () => { simklCalls.push('set'); },
+        removeRatings: async () => { simklCalls.push('remove'); },
+      },
+      now: () => 1000,
+      log: quiet,
+    };
+    // ignore → local row written, NO Simkl call, watched row untouched. Full DTO (F8).
+    let res = await trainer.setIgnored(profile, { type: 'movie', tmdb_id: '1' }, true, deps);
+    assert.deepStrictEqual(res, { ok: true, item: { key: '1', type: 'movie', simkl_id: 1, tmdb_id: '1', imdb_id: 'tt1', title: 'A', year: 2020, genre: null, poster: null, watched_at: '2026-01-01T00:00:00Z', rating: null, loved: false, ignored: true, status: 'watched', percent: null }, unchanged: false });
+    assert.strictEqual(simklCalls.length, 0); // M2: never calls Simkl
+    assert.ok(tasteFeedback.ignoredSet(profile.id, 'movie').has('1'));
+    // the watched row is still there (not removed/edited).
+    assert.strictEqual(watchedStore.getWatched(profile.id, { type: 'movie' }).length, 1);
+    // the ignored film stays in watchedIdSets (M2).
+    assert.ok(watchedStore.watchedIdSets(profile.id).tmdb.has('1'));
+    // un-ignore → local row removed. Full DTO.
+    res = await trainer.setIgnored(profile, { type: 'movie', tmdb_id: '1' }, false, deps);
+    assert.deepStrictEqual(res, { ok: true, item: { key: '1', type: 'movie', simkl_id: 1, tmdb_id: '1', imdb_id: 'tt1', title: 'A', year: 2020, genre: null, poster: null, watched_at: '2026-01-01T00:00:00Z', rating: null, loved: false, ignored: false, status: 'watched', percent: null }, unchanged: false });
+    assert.strictEqual(tasteFeedback.ignoredSet(profile.id, 'movie').size, 0);
+    // not-in-history (unknown ref).
+    res = await trainer.setIgnored(profile, { type: 'movie', tmdb_id: '999' }, true, deps);
+    assert.deepStrictEqual(res, { ok: false, reason: 'not-in-history' });
+    // bad-type (series → not-supported).
+    res = await trainer.setIgnored(profile, { type: 'series', tmdb_id: '1' }, true, deps);
+    assert.deepStrictEqual(res, { ok: false, reason: 'not-supported' });
+    db.get().exec('DELETE FROM taste_ignore; DELETE FROM taste_changes');
+    watchedStore.deleteForProfile(profile.id);
+  });
+
+  await it('Trainer T1: markFinished — delegates to markWatched; unfinished only (test 7)', async () => {
+    const trainer = require('../src/trainer');
+    const watchedStore = require('../src/watchedStore');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const engagement = require('../src/engines/marquee/engagement');
+    const db = require('../src/db');
+    const profile = { id: 'p-finished', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    // A watched row (completed) — must NOT be markable finished.
+    watchedStore.upsertMany(profile.id, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'A', year: 2020, watched_at: '2026-01-01T00:00:00Z' },
+    ]);
+    // An abandoned (unfinished) row: started 30%, untouched for >7 days.
+    engagement.init();
+    const abandonedAt = Date.now() - 8 * 24 * 3600e3;
+    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at) VALUES (?, ?, ?, ?, ?, ?)').run(profile.id, 'tt2', '2', 30, abandonedAt, abandonedAt);
+    const markWatchedCalls = [];
+    const deps = {
+      markWatched: async (_p, args, _log) => { markWatchedCalls.push(args); return { ok: true, type: args.type, tmdbId: args.tmdbId }; },
+      now: () => 1000,
+      log: quiet,
+    };
+    // markFinished on the unfinished row → markWatched called with the row's own ids (F6.5).
+    let res = await trainer.markFinished(profile, { type: 'movie', tmdb_id: '2' }, deps);
+    assert.deepStrictEqual(res, { ok: true });
+    assert.deepStrictEqual(markWatchedCalls, [{ type: 'movie', imdbId: 'tt2', tmdbId: '2', title: null }]);
+    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 1000, changes_since_build: 1 });
+    // markFinished on a WATCHED row → not-in-history (unfinished only).
+    res = await trainer.markFinished(profile, { type: 'movie', tmdb_id: '1' }, deps);
+    assert.deepStrictEqual(res, { ok: false, reason: 'not-in-history' });
+    // markWatched returns { ok:false, reason } → propagated.
+    res = await trainer.markFinished(profile, { type: 'movie', tmdb_id: '2' }, { ...deps, markWatched: async () => ({ ok: false, reason: 'no-simkl' }) });
+    assert.deepStrictEqual(res, { ok: false, reason: 'no-simkl' });
+    engagement._clear();
+    watchedStore.deleteForProfile(profile.id);
+  });
+
+  await it('Trainer T1: listHistory — views, counts, dedupe, unresolved, q, pagination, loved, enrichment (test 8)', async () => {
+    const trainer = require('../src/trainer');
+    const watchedStore = require('../src/watchedStore');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const db = require('../src/db');
+    // tmdb_api_key set so the page's lazy enrichment runs (F2 gate).
+    const profile = { id: 'p-list', name: 'T', keys: { simkl_client_id: 'c', tmdb_api_key: 'test-key' }, simkl_auth: { access_token: 't' } };
+    // Watched rows: 3 with a tmdb_id, 1 without (unresolved).
+    watchedStore.upsertMany(profile.id, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'Alpha', year: 2020, watched_at: '2026-01-01T00:00:00Z' },
+      { simkl_id: 2, type: 'movie', imdb_id: 'tt2', tmdb_id: '2', title: 'Beta', year: 2021, watched_at: '2026-01-03T00:00:00Z' },
+      { simkl_id: 3, type: 'movie', imdb_id: 'tt3', tmdb_id: '3', title: 'Gamma', year: 2019, watched_at: '2026-01-02T00:00:00Z' },
+      { simkl_id: 4, type: 'movie', imdb_id: 'tt4', tmdb_id: null, title: 'NoTmdb', year: 2020, watched_at: '2026-01-04T00:00:00Z' },
+    ]);
+    // Ratings: Alpha=10 (loved), Beta=7 (rated), Gamma=null (unrated).
+    tasteFeedback.upsertRating(profile.id, { type: 'movie', tmdb_id: '1', rating: 10 });
+    tasteFeedback.upsertRating(profile.id, { type: 'movie', tmdb_id: '2', rating: 7 });
+    // Ignore Beta.
+    tasteFeedback.setIgnored(profile.id, { type: 'movie', tmdb_id: '2' }, true, 1000);
+    const enrichCalls = [];
+    const deps = {
+      enrich: async (_apiKey, _type, tmdbId, _log, _opts) => { enrichCalls.push(tmdbId); return { poster: 'poster-' + tmdbId, genres: ['Action'], primary_genre: 'Action', title: 'Meta' + tmdbId, year: 2000 }; },
+      now: () => 1000,
+      log: quiet,
+    };
+    // all view: watched minus ignored → Gamma (Jan 2), Alpha (Jan 1); Beta ignored.
+    let res = await trainer.listHistory(profile, { type: 'movie' }, deps);
+    assert.strictEqual(res.total, 2);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['3', '1']);
+    assert.deepStrictEqual(res.counts, { all: 2, unrated: 1, rated: 1, loved: 1, ignored: 1, unfinished: 0, unresolved: 1 });
+    const alpha = res.items.find((i) => i.tmdb_id === '1');
+    assert.strictEqual(alpha.rating, 10);
+    assert.strictEqual(alpha.loved, true);
+    assert.strictEqual(alpha.poster, 'poster-1'); // enriched
+    assert.strictEqual(alpha.genre, 'Action'); // enriched (primary_genre was null)
+    // unrated view → Gamma.
+    res = await trainer.listHistory(profile, { type: 'movie', view: 'unrated' }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['3']);
+    // rated view → Alpha (a 10 counts as rated — F5).
+    res = await trainer.listHistory(profile, { type: 'movie', view: 'rated' }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['1']);
+    // loved view → Alpha.
+    res = await trainer.listHistory(profile, { type: 'movie', view: 'loved' }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['1']);
+    // ignored view → Beta.
+    res = await trainer.listHistory(profile, { type: 'movie', view: 'ignored' }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['2']);
+    // q search (case-insensitive) on the all view.
+    res = await trainer.listHistory(profile, { type: 'movie', q: 'alpha' }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['1']);
+    // pagination.
+    res = await trainer.listHistory(profile, { type: 'movie', pageSize: 1 }, deps);
+    assert.strictEqual(res.items.length, 1);
+    assert.strictEqual(res.total, 2);
+    res = await trainer.listHistory(profile, { type: 'movie', page: 2, pageSize: 1 }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['1']); // Alpha (2nd page)
+    // bad-view / bad-type / not-supported.
+    res = await trainer.listHistory(profile, { type: 'movie', view: 'bogus' }, deps);
+    assert.deepStrictEqual(res, { ok: false, reason: 'bad-view' });
+    res = await trainer.listHistory(profile, { type: 'series' }, deps);
+    assert.deepStrictEqual(res, { ok: false, reason: 'not-supported' });
+    res = await trainer.listHistory(profile, { type: 'bogus' }, deps);
+    assert.deepStrictEqual(res, { ok: false, reason: 'bad-type' });
+    // dedupe: a newer watch of the same tmdb_id → keep the newest.
+    watchedStore.upsertMany(profile.id, [
+      { simkl_id: 5, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'Alpha', year: 2020, watched_at: '2026-01-05T00:00:00Z' },
+    ]);
+    res = await trainer.listHistory(profile, { type: 'movie' }, deps);
+    const alpha2 = res.items.find((i) => i.tmdb_id === '1');
+    assert.strictEqual(alpha2.simkl_id, 5); // the newer row
+    assert.strictEqual(res.counts.all, 2); // still 2 (Alpha, Gamma)
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ignore; DELETE FROM taste_changes');
+    watchedStore.deleteForProfile(profile.id);
+  });
+
+  await it('Trainer T1: rate — no-op, validation, type, ignored, Simkl throw, simkl_id string (F11.1)', async () => {
+    const trainer = require('../src/trainer');
+    const watchedStore = require('../src/watchedStore');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const db = require('../src/db');
+    const profile = { id: 'p-r11', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    watchedStore.upsertMany(profile.id, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'A', year: 2020, watched_at: '2026-01-01T00:00:00Z' },
+      { simkl_id: 2, type: 'movie', imdb_id: 'tt2', tmdb_id: '2', title: 'B', year: 2020, watched_at: '2026-01-02T00:00:00Z' },
+    ]);
+    const simklCalls = [];
+    const deps = {
+      simkl: {
+        setRatings: async (_p, items) => { simklCalls.push(['set', items]); },
+        removeRatings: async (_p, items) => { simklCalls.push(['remove', items]); },
+      },
+      now: () => 1000,
+      log: quiet,
+    };
+    // same value twice → second is a no-op: zero Simkl calls, unchanged:true, changes_since_build unchanged.
+    await trainer.rate(profile, { type: 'movie', tmdb_id: '1' }, 5, deps);
+    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 1000, changes_since_build: 1 });
+    simklCalls.length = 0;
+    let res = await trainer.rate(profile, { type: 'movie', tmdb_id: '1' }, 5, deps);
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.unchanged, true);
+    assert.strictEqual(simklCalls.length, 0); // zero Simkl calls on the no-op
+    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 1000, changes_since_build: 1 }); // unchanged
+    // '8' (string) and undefined → bad-rating.
+    res = await trainer.rate(profile, { type: 'movie', tmdb_id: '1' }, '8', deps);
+    assert.deepStrictEqual(res, { ok: false, reason: 'bad-rating' });
+    res = await trainer.rate(profile, { type: 'movie', tmdb_id: '1' }, undefined, deps);
+    assert.deepStrictEqual(res, { ok: false, reason: 'bad-rating' });
+    // 'series' → not-supported; 'anime' → bad-type.
+    res = await trainer.rate(profile, { type: 'series', tmdb_id: '1' }, 5, deps);
+    assert.deepStrictEqual(res, { ok: false, reason: 'not-supported' });
+    res = await trainer.rate(profile, { type: 'anime', tmdb_id: '1' }, 5, deps);
+    assert.deepStrictEqual(res, { ok: false, reason: 'bad-type' });
+    // not-in-history: a ref that belongs to ANOTHER profile's history.
+    const other = { id: 'p-r11-other', name: 'O', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    watchedStore.upsertMany(other.id, [
+      { simkl_id: 10, type: 'movie', imdb_id: 'tt10', tmdb_id: '10', title: 'Other', year: 2020, watched_at: '2026-01-01T00:00:00Z' },
+    ]);
+    res = await trainer.rate(profile, { type: 'movie', tmdb_id: '10' }, 5, deps);
+    assert.deepStrictEqual(res, { ok: false, reason: 'not-in-history' });
+    // not-in-history: a watched row with no tmdb_id can't be acted on.
+    watchedStore.upsertMany(profile.id, [
+      { simkl_id: 3, type: 'movie', imdb_id: 'tt3', tmdb_id: null, title: 'NoTmdb', year: 2020, watched_at: '2026-01-03T00:00:00Z' },
+    ]);
+    res = await trainer.rate(profile, { type: 'movie', imdb_id: 'tt3' }, 5, deps);
+    assert.deepStrictEqual(res, { ok: false, reason: 'not-in-history' });
+    // rating an ignored film works and stays ignored.
+    tasteFeedback.setIgnored(profile.id, { type: 'movie', tmdb_id: '2' }, true, 1000);
+    res = await trainer.rate(profile, { type: 'movie', tmdb_id: '2' }, 7, deps);
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.item.rating, 7);
+    assert.strictEqual(res.item.ignored, true); // stays ignored
+    assert.ok(tasteFeedback.ignoredSet(profile.id, 'movie').has('2'));
+    // Simkl throw leaves changes_since_build unchanged (M1).
+    const failingSimkl = {
+      setRatings: async () => { throw new Error('Simkl POST /sync/ratings failed (500)'); },
+      removeRatings: async () => { throw new Error('Simkl POST /sync/ratings/remove failed (500)'); },
+    };
+    const before = tasteFeedback.getTraining(profile.id);
+    await assert.rejects(() => trainer.rate(profile, { type: 'movie', tmdb_id: '1' }, 9, { ...deps, simkl: failingSimkl }));
+    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), before); // unchanged
+    // simkl_id as string "1" resolves.
+    res = await trainer.rate(profile, { type: 'movie', simkl_id: '1' }, 6, deps);
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.item.tmdb_id, '1');
+    assert.strictEqual(tasteFeedback.getRating(profile.id, 'movie', '1'), 6);
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ignore; DELETE FROM taste_changes');
+    watchedStore.deleteForProfile(profile.id);
+    watchedStore.deleteForProfile(other.id);
+  });
+
+  await it('Trainer T1: setIgnored — bad-value, no-op, unfinished row (F11.2)', async () => {
+    const trainer = require('../src/trainer');
+    const watchedStore = require('../src/watchedStore');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const engagement = require('../src/engines/marquee/engagement');
+    const db = require('../src/db');
+    const profile = { id: 'p-ig11', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    watchedStore.upsertMany(profile.id, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'A', year: 2020, watched_at: '2026-01-01T00:00:00Z' },
+    ]);
+    const deps = { now: () => 1000, log: quiet };
+    // 'yes' / 1 / missing → bad-value, no change recorded.
+    for (const bad of ['yes', 1, undefined]) {
+      const before = tasteFeedback.getTraining(profile.id);
+      const res = await trainer.setIgnored(profile, { type: 'movie', tmdb_id: '1' }, bad, deps);
+      assert.deepStrictEqual(res, { ok: false, reason: 'bad-value' });
+      assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), before); // no change recorded
+    }
+    // true twice → second is a no-op: unchanged:true, no change recorded.
+    let res = await trainer.setIgnored(profile, { type: 'movie', tmdb_id: '1' }, true, deps);
+    assert.strictEqual(res.unchanged, false);
+    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 1000, changes_since_build: 1 });
+    res = await trainer.setIgnored(profile, { type: 'movie', tmdb_id: '1' }, true, deps);
+    assert.strictEqual(res.unchanged, true);
+    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 1000, changes_since_build: 1 }); // unchanged
+    // ignoring an unfinished row works.
+    engagement.init();
+    const at = Date.now() - 8 * 24 * 3600e3;
+    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at) VALUES (?, ?, ?, ?, ?, ?)').run(profile.id, 'tt2', '2', 30, at, at);
+    res = await trainer.setIgnored(profile, { type: 'movie', tmdb_id: '2' }, true, deps);
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.item.status, 'unfinished');
+    assert.strictEqual(res.item.ignored, true);
+    assert.ok(tasteFeedback.ignoredSet(profile.id, 'movie').has('2'));
+    db.get().exec('DELETE FROM taste_ignore; DELETE FROM taste_changes');
+    engagement._clear();
+    watchedStore.deleteForProfile(profile.id);
+  });
+
+  await it('Trainer T1: listHistory — §6 fixture: views, counts, DTO keys, q, pagination, profile isolation (F11.3a)', async () => {
+    const trainer = require('../src/trainer');
+    const watchedStore = require('../src/watchedStore');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const engagement = require('../src/engines/marquee/engagement');
+    const db = require('../src/db');
+    const profile = { id: 'p-lh11', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    // 9 watched rows: 2 ignored, 1 rated 10, 1 rated 4, 1 no tmdb_id, 2 sharing tmdb_id.
+    watchedStore.upsertMany(profile.id, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'Alpha', year: 2020, watched_at: '2026-01-01T00:00:00Z' },
+      { simkl_id: 2, type: 'movie', imdb_id: 'tt2', tmdb_id: '2', title: 'Beta', year: 2021, watched_at: '2026-01-02T00:00:00Z' },
+      { simkl_id: 3, type: 'movie', imdb_id: 'tt3', tmdb_id: '3', title: 'Gamma', year: 2019, watched_at: '2026-01-03T00:00:00Z' },
+      { simkl_id: 4, type: 'movie', imdb_id: 'tt4', tmdb_id: '4', title: 'Delta', year: 2020, watched_at: '2026-01-04T00:00:00Z' },
+      { simkl_id: 5, type: 'movie', imdb_id: 'tt5', tmdb_id: null, title: 'Epsilon', year: 2020, watched_at: '2026-01-05T00:00:00Z' },
+      { simkl_id: 6, type: 'movie', imdb_id: 'tt6', tmdb_id: '6', title: 'Zeta', year: 2020, watched_at: '2026-01-06T00:00:00Z' },
+      { simkl_id: 7, type: 'movie', imdb_id: 'tt7', tmdb_id: '6', title: 'Eta', year: 2020, watched_at: '2026-01-07T00:00:00Z' }, // shares tmdb 6 with Zeta
+      { simkl_id: 8, type: 'movie', imdb_id: 'tt8', tmdb_id: '8', title: 'Theta', year: 2020, watched_at: '2026-01-08T00:00:00Z' },
+      { simkl_id: 9, type: 'movie', imdb_id: 'tt9', tmdb_id: '9', title: 'Iota', year: 2020, watched_at: '2026-01-09T00:00:00Z' },
+    ]);
+    // Ratings: Gamma=10 (loved), Delta=4.
+    tasteFeedback.upsertRating(profile.id, { type: 'movie', tmdb_id: '3', rating: 10 });
+    tasteFeedback.upsertRating(profile.id, { type: 'movie', tmdb_id: '4', rating: 4 });
+    // Ignore Alpha + Beta (watched) and the unfinished row (tmdb 12).
+    tasteFeedback.setIgnored(profile.id, { type: 'movie', tmdb_id: '1' }, true, 1000);
+    tasteFeedback.setIgnored(profile.id, { type: 'movie', tmdb_id: '2' }, true, 1000);
+    tasteFeedback.setIgnored(profile.id, { type: 'movie', tmdb_id: '12' }, true, 1000);
+    // 3 engagement rows: 30% not watched→unfinished; 30% but watched→NOT unfinished (rewatch); 30% and ignored→ignored only.
+    engagement.init();
+    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at) VALUES (?, ?, ?, ?, ?, ?)').run(profile.id, 'tt10', '10', 30, Date.parse('2026-01-06T00:00:00Z'), Date.parse('2026-01-06T00:00:00Z'));
+    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at) VALUES (?, ?, ?, ?, ?, ?)').run(profile.id, 'tt4', '4', 30, Date.parse('2026-01-06T00:00:00Z'), Date.parse('2026-01-06T00:00:00Z')); // rewatch of Delta (tmdb 4 watched)
+    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at) VALUES (?, ?, ?, ?, ?, ?)').run(profile.id, 'tt12', '12', 30, Date.parse('2026-01-05T00:00:00Z'), Date.parse('2026-01-05T00:00:00Z'));
+    const deps = {
+      enrich: async () => { throw new Error('enrich must not run without a TMDB key'); },
+      settings: { keyFor: () => '' },
+      now: () => 1000,
+      log: quiet,
+    };
+    // all view: watched minus ignored, newest first (dedupe keeps Eta for tmdb 6).
+    let res = await trainer.listHistory(profile, { type: 'movie' }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['9', '8', '6', '4', '3']);
+    assert.deepStrictEqual(res.counts, { all: 5, unrated: 3, rated: 2, loved: 1, ignored: 3, unfinished: 1, unresolved: 1 });
+    // unrated view.
+    res = await trainer.listHistory(profile, { type: 'movie', view: 'unrated' }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['9', '8', '6']);
+    // rated view (a 10 counts as rated — F5).
+    res = await trainer.listHistory(profile, { type: 'movie', view: 'rated' }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['4', '3']);
+    // loved view.
+    res = await trainer.listHistory(profile, { type: 'movie', view: 'loved' }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['3']);
+    // ignored view: ignored watched (Beta, Alpha) + ignored unfinished (tmdb 12), newest first.
+    res = await trainer.listHistory(profile, { type: 'movie', view: 'ignored' }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['12', '2', '1']);
+    // unfinished view: only the not-watched, not-ignored 30% row (tmdb 10).
+    res = await trainer.listHistory(profile, { type: 'movie', view: 'unfinished' }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['10']);
+    // counts ignore q.
+    res = await trainer.listHistory(profile, { type: 'movie', q: 'gamma' }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['3']);
+    assert.deepStrictEqual(res.counts, { all: 5, unrated: 3, rated: 2, loved: 1, ignored: 3, unfinished: 1, unresolved: 1 });
+    // pageSize 500 → clamped to 100.
+    res = await trainer.listHistory(profile, { type: 'movie', pageSize: 500 }, deps);
+    assert.strictEqual(res.pageSize, 100);
+    // exact DTO key set (watched).
+    res = await trainer.listHistory(profile, { type: 'movie' }, deps);
+    const watchedItem = res.items.find((i) => i.status === 'watched');
+    assert.deepStrictEqual(Object.keys(watchedItem).sort(), ['genre', 'ignored', 'imdb_id', 'key', 'loved', 'percent', 'poster', 'rating', 'simkl_id', 'status', 'title', 'tmdb_id', 'type', 'watched_at', 'year']);
+    // exact DTO key set (unfinished) + the row's real imdb_id + rounded percent (F6.4).
+    res = await trainer.listHistory(profile, { type: 'movie', view: 'unfinished' }, deps);
+    const unfinishedItem = res.items.find((i) => i.status === 'unfinished');
+    assert.deepStrictEqual(Object.keys(unfinishedItem).sort(), ['genre', 'ignored', 'imdb_id', 'key', 'loved', 'percent', 'poster', 'rating', 'simkl_id', 'status', 'title', 'tmdb_id', 'type', 'watched_at', 'year']);
+    assert.strictEqual(unfinishedItem.imdb_id, 'tt10');
+    assert.strictEqual(unfinishedItem.percent, 30);
+    // a second profile's rows never appear.
+    const other = { id: 'p-lh11-other', name: 'O', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    watchedStore.upsertMany(other.id, [
+      { simkl_id: 100, type: 'movie', imdb_id: 'tt100', tmdb_id: '100', title: 'Other', year: 2020, watched_at: '2026-01-09T00:00:00Z' },
+    ]);
+    res = await trainer.listHistory(profile, { type: 'movie' }, deps);
+    assert.ok(!res.items.some((i) => i.tmdb_id === '100'));
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ignore; DELETE FROM taste_changes');
+    engagement._clear();
+    watchedStore.deleteForProfile(profile.id);
+    watchedStore.deleteForProfile(other.id);
+  });
+
+  await it('Trainer T1: listHistory — enrichment: ≤25 cap, throwing enrich, no-key, cached meta (F11.3b)', async () => {
+    const trainer = require('../src/trainer');
+    const watchedStore = require('../src/watchedStore');
+    const metaStore = require('../src/engines/glass/metaStore');
+    const db = require('../src/db');
+    const profile = { id: 'p-lh11b', name: 'T', keys: { simkl_client_id: 'c', tmdb_api_key: 'test-key' }, simkl_auth: { access_token: 't' } };
+    // 30 watched rows (all missing a poster) → the page enriches ≤ 25.
+    const items = [];
+    for (let i = 1; i <= 30; i++) {
+      items.push({ simkl_id: i, type: 'movie', imdb_id: 'tt' + i, tmdb_id: String(i), title: 'T' + i, year: 2020, watched_at: '2026-01-' + String(i).padStart(2, '0') + 'T00:00:00Z' });
+    }
+    watchedStore.upsertMany(profile.id, items);
+    const enrichCalls = [];
+    const deps = {
+      enrich: async (_k, _t, tmdbId) => { enrichCalls.push(tmdbId); return { poster: 'p' + tmdbId, genres: ['Action'], primary_genre: 'Action', title: 'Meta' + tmdbId, year: 2000 }; },
+      settings: { keyFor: (_p, f) => (f === 'tmdb_api_key' ? 'test-key' : '') },
+      now: () => 1000,
+      log: quiet,
+    };
+    // 30-item page → enrich called exactly 25 times (capped).
+    let res = await trainer.listHistory(profile, { type: 'movie', pageSize: 100 }, deps);
+    assert.strictEqual(res.items.length, 30);
+    assert.strictEqual(enrichCalls.length, 25);
+    // throwing enrich still ok:true (each .catch(() => null)).
+    res = await trainer.listHistory(profile, { type: 'movie', pageSize: 100 }, { ...deps, enrich: async () => { throw new Error('tmdb down'); } });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.items.length, 30);
+    // no TMDB key → enrich never called.
+    enrichCalls.length = 0;
+    res = await trainer.listHistory(profile, { type: 'movie', pageSize: 100 }, { ...deps, settings: { keyFor: () => '' } });
+    assert.strictEqual(enrichCalls.length, 0);
+    // cached meta via metaGet used with no enrich call.
+    metaStore.put('movie', '1', { poster: 'cached-poster', genres: ['Drama'], primary_genre: 'Drama', title: 'Cached', year: 2015, imdb_id: 'tt1' });
+    enrichCalls.length = 0;
+    res = await trainer.listHistory(profile, { type: 'movie', pageSize: 100 }, deps);
+    const item1 = res.items.find((i) => i.tmdb_id === '1');
+    assert.strictEqual(item1.poster, 'cached-poster'); // from the cache, not enrich
+    assert.strictEqual(item1.genre, 'Drama');
+    assert.ok(!enrichCalls.includes('1')); // tmdb 1 served from the cache, so enrich skipped it
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ignore; DELETE FROM taste_changes');
+    metaStore._clear();
+    watchedStore.deleteForProfile(profile.id);
+  });
+
+  await it('Trainer T1: isUnfinishedRow — pure rule (F11.4)', () => {
+    const trainer = require('../src/trainer');
+    const watchedIds = { imdb: new Set(['tt2']), tmdb: new Set(['2']) };
+    // 30% not watched → true.
+    assert.strictEqual(trainer.isUnfinishedRow({ tmdb_id: '1', imdb_id: 'tt1', percent: 30 }, watchedIds), true);
+    // 30% watched by tmdb → false.
+    assert.strictEqual(trainer.isUnfinishedRow({ tmdb_id: '2', imdb_id: 'tt2', percent: 30 }, watchedIds), false);
+    // 30% watched by imdb only → false.
+    assert.strictEqual(trainer.isUnfinishedRow({ tmdb_id: '3', imdb_id: 'tt2', percent: 30 }, watchedIds), false);
+    // 50% → false.
+    assert.strictEqual(trainer.isUnfinishedRow({ tmdb_id: '4', imdb_id: 'tt4', percent: 50 }, watchedIds), false);
+    // no tmdb_id → false.
+    assert.strictEqual(trainer.isUnfinishedRow({ tmdb_id: null, imdb_id: 'tt5', percent: 30 }, watchedIds), false);
   });
 
   await it('marquee ME-03: ensureRecs sequential fetch, cap, stale served, per-id error (B6)', async () => {
@@ -1499,7 +2121,7 @@ async function main() {
     // Both writes persist: the profile's rating row AND the concurrent writer's row.
     assert.deepStrictEqual([...simklCache.getRatingsMap('p-txn').entries()], [['tmdb-ttF1', 7]]);
     assert.deepStrictEqual(db.get().prepare('SELECT note FROM test_scratch').all().map((r) => r.note), ['concurrent-write']);
-    db.get().exec('DELETE FROM marquee_ratings; DELETE FROM marquee_sync; DELETE FROM test_scratch');
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ratings_sync; DELETE FROM test_scratch');
     db.get().exec('DROP TABLE IF EXISTS test_scratch');
   });
 
@@ -2948,8 +3570,8 @@ async function main() {
       // Held-out ratings: a target's rating must NOT steer the build.
       simklCache.init();
       const conn = db.get();
-      const ins = conn.prepare('INSERT INTO marquee_ratings (profile_id, tmdb_id, imdb_id, simkl_id, rating, rated_at) VALUES (?, ?, ?, ?, ?, ?)');
-      for (const t of expectedTargets.slice(0, 5)) ins.run(p.id, t, 'tt' + t, null, 8, Date.now());
+      const ins = conn.prepare("INSERT INTO taste_ratings (profile_id, type, tmdb_id, imdb_id, simkl_id, rating, rated_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
+      for (const t of expectedTargets.slice(0, 5)) ins.run(p.id, 'movie', t, 'tt' + t, null, 8, Date.now());
       const results = await bench.runBench({
         profile: config.getProfile(p.id), engineIds: ['bench-stub'], holdout: 10,
         deps: { engines, pipeline, rs, watchedStore, db, settings, selectServe: rs.selectServe, log: quiet },
@@ -2958,7 +3580,7 @@ async function main() {
       const sets = watchedStore.watchedIdSets(p.id);
       for (const t of expectedTargets) assert.ok(!sets.tmdb.has(t), 'no target in the watched set: ' + t);
       for (const t of expectedTargets) {
-        assert.ok(!conn.prepare('SELECT tmdb_id FROM marquee_ratings WHERE profile_id = ? AND tmdb_id = ?').get(p.id, t), 'no marquee_ratings row for target: ' + t);
+        assert.ok(!conn.prepare("SELECT tmdb_id FROM taste_ratings WHERE profile_id = ? AND type = 'movie' AND tmdb_id = ?").get(p.id, t), 'no taste_ratings row for target: ' + t);
       }
     } finally {
       dispose();

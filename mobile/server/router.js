@@ -124,6 +124,11 @@ router.get('/api/recommendations', requireSession, handlers.recommendationsHandl
 router.post('/api/recommend/suppress', requireSession, handlers.suppressHandler);      // Step 4: swipe-right remove
 router.post('/api/recommend/unsuppress', requireSession, handlers.unsuppressHandler);  // Step 4: undo a remove
 router.post('/api/watched', requireSession, handlers.watchedHandler);                  // MW-00: mark as watched (Simkl history)
+router.get('/api/trainer', requireSession, handlers.trainerHandler);                  // Trainer T1: list watch history
+router.post('/api/trainer/rate', requireSession, handlers.trainerRateHandler);        // Trainer T1: rate 1–10 (or clear)
+router.post('/api/trainer/ignore', requireSession, handlers.trainerIgnoreHandler);    // Trainer T1: ignore / un-ignore
+router.post('/api/trainer/finished', requireSession, handlers.trainerFinishedHandler);// Trainer T1: mark unfinished film finished
+router.post('/api/trainer/rebuild', requireSession, handlers.trainerRebuildHandler);  // Trainer T1: trigger a rebuild
 router.get('/api/settings', requireSession, handlers.settingsGetHandler);              // Step 5: editable filters + view pref
 router.post('/api/settings', requireSession, handlers.settingsPostHandler);            // Step 5: save filters + view pref
 router.get('/api/catalogs/:catalogId/preview', requireSession, handlers.catalogPreviewHandler); // CP-02: served-titles preview (session-scoped)

@@ -123,8 +123,8 @@ function removeHoldout(profileId, targetIds, { db, noCache = false }) {
   conn.prepare('DELETE FROM pending_watched WHERE profile_id = ? AND tmdb_id IN (' + inList + ')').run(profileId, ...targetIds);
   conn.prepare('DELETE FROM dont_recommend WHERE profile_id = ? AND tmdb_id IN (' + inList + ')').run(profileId, ...targetIds);
   conn.prepare('DELETE FROM recommended WHERE profile_id = ?').run(profileId);
-  if (tableExists(conn, 'marquee_ratings')) {
-    conn.prepare('DELETE FROM marquee_ratings WHERE profile_id = ? AND tmdb_id IN (' + inList + ')').run(profileId, ...targetIds);
+  if (tableExists(conn, 'taste_ratings')) {
+    conn.prepare("DELETE FROM taste_ratings WHERE profile_id = ? AND type = 'movie' AND tmdb_id IN (" + inList + ")").run(profileId, ...targetIds);
   }
   // m2 engagement: a held-out film the profile FINISHED may still carry an old
   // mid-watch progress row. With the film removed from `watched`, that row would
