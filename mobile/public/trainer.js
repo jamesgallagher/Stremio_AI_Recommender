@@ -96,8 +96,7 @@
     if (st.mode === 'quick') {
       els.quick.hidden = false;
       els.list.hidden = true;
-      // Quick mode lands in the next step (T4 Step 3); List is live now.
-      els.quick.innerHTML = '<span class="muted">Quick mode lands in the next step — use List for now.</span>';
+      loadQuick();
     } else {
       els.quick.hidden = true;
       els.list.hidden = false;
@@ -352,6 +351,295 @@
       onCommit: (r) => {
         rateStar(key, item, r);
       },
+    });
+  }
+
+  // ---- Quick mode (§5.4–5.6) ----
+  async function loadQuick() {
+    st.quick.items = [];
+    st.quick.handled = new Set();
+    st.quick.current = 0;
+    st.quick.page = 0;
+    await fetchQuickPages();
+    drawQuick();
+  }
+
+  // Re-run the page walk from page 1 (the server's unrated view changes as the
+  // user rates/ignores). Append new cards (not already in st.quick.items) and
+  // stop once we have a new card or exhaust the pages.
+  async function fetchQuickPages() {
+    let page = 1;
+    let gotNew = false;
+    while (true) {
+      const data = await api('/trainer?view=unrated&page=' + page + '&page_size=50');
+      const batch = T.pickQuickBatch(data.items, st.quick.handled);
+      for (const item of batch) {
+        if (!st.quick.items.some((x) => x.key === item.key)) {
+          st.quick.items.push(item);
+          gotNew = true;
+        }
+      }
+      st.quick.counts = data.counts;
+      if (gotNew) break;
+      const totalPages = Math.ceil(data.total / data.pageSize);
+      if (page >= totalPages) break;
+      page++;
+    }
+    st.quick.page = page;
+  }
+
+  function drawQuick() {
+    if (els.section.hidden) return; // view is hidden — tolerate (§5.6)
+    const item = st.quick.items[st.quick.current];
+    const left = st.quick.counts ? (st.quick.counts.unrated || 0) : 0;
+    if (!item) {
+      els.quick.innerHTML = '<div class="tq-empty">All caught up — everything you\'ve watched is rated or ignored. 🎉<br><button class="ghost" data-tact="review">Review in List</button></div>';
+      const btn = els.quick.querySelector('[data-tact="review"]');
+      if (btn) btn.addEventListener('click', () => { st.mode = 'list'; saveMode(); drawMode(); });
+      return;
+    }
+    const poster = item.poster
+      ? '<img class="tq-poster" src="' + esc(item.poster) + '" alt="">'
+      : '<div class="tq-poster tq-noposter"></div>';
+    const meta = esc(item.title || '?') + (item.year ? ' <span class="muted">(' + esc(item.year) + ')</span>' : '')
+      + '<br><span class="muted">' + esc(item.genre || '—') + ' · ' + T.whenText(item.watched_at, Date.now()) + '</span>';
+    const stars = buildStarsHtml(item);
+    const shown = st.shown.has(item.key) ? st.shown.get(item.key) : item.rating;
+    els.quick.innerHTML = '<div class="tq-left">' + left + ' left to rate</div>'
+      + '<div class="tq-card" data-key="' + esc(item.key) + '">'
+      + poster
+      + '<div class="tq-meta">' + meta + '</div>'
+      + stars
+      + '<div class="tq-rating-text">' + T.ratingText(shown) + '</div>'
+      + '<div class="tq-actions">'
+      + '<button class="tq-btn tq-love" data-tact="love">♥</button>'
+      + '<button class="tq-btn tq-ignore" data-tact="ignore">Ignore</button>'
+      + '<button class="tq-btn tq-skip" data-tact="skip">Skip</button>'
+      + '<button class="tq-unwatch" data-tact="unwatch">Unwatch</button>'
+      + '</div>'
+      + '<div class="tq-hint">Swipe ← ignore · → skip · ↑ love</div>'
+      + '<div class="tq-overlay"></div>'
+      + '</div>';
+    bindQuickCard(item);
+  }
+
+  function buildStarsHtml(item) {
+    const levels = T.starsFromRating(item.rating);
+    const wraps = [];
+    for (let i = 0; i < 5; i++) {
+      const lv = levels[i];
+      const fillPct = lv === 1 ? '100%' : (lv === 0.5 ? '50%' : '0%');
+      const halfBtn = (half) => {
+        const rating = T.ratingFromStarClick(i, half);
+        const disabled = !st.canRate || item.ignored;
+        return '<button class="tr-star" data-tact="star" data-half="' + half + '" data-rating="' + rating + '" aria-label="Rate ' + rating + ' out of 10"' + (disabled ? ' disabled' : '') + '></button>';
+      };
+      wraps.push('<span class="tr-star-wrap"><span class="tr-glyph" aria-hidden="true">★</span><span class="tr-fill" aria-hidden="true" style="width:' + fillPct + '">★</span>' + halfBtn('left') + halfBtn('right') + '</span>');
+    }
+    return '<span class="tr-stars" role="group" aria-label="Your rating">' + wraps.join('') + '</span>';
+  }
+
+  function bindQuickCard(item) {
+    const card = els.quick.querySelector('.tq-card');
+    if (!card) return;
+    const group = card.querySelector('.tr-stars');
+    if (group) {
+      if (group._scrub) group._scrub();
+      group._scrub = T.bindStarScrub(group, {
+        getRects: () => [...group.querySelectorAll('.tr-star-wrap')].map((w) => { const r = w.getBoundingClientRect(); return { left: r.left, width: r.width }; }),
+        isEnabled: () => {
+          const cur = st.confirmed.get(item.key) || item;
+          return st.canRate && !!cur && !cur.ignored && cur.status === 'watched';
+        },
+        onPreview: (r) => {
+          const fills = T.fillsForRating(r);
+          group.querySelectorAll('.tr-fill').forEach((f, i) => { f.style.width = fills[i]; });
+          group.classList.add('tr-previewing');
+        },
+        onCancel: () => {
+          const rating = st.shown.has(item.key) ? st.shown.get(item.key) : item.rating;
+          const fills = T.fillsForRating(rating);
+          group.querySelectorAll('.tr-fill').forEach((f, i) => { f.style.width = fills[i]; });
+          group.classList.remove('tr-previewing');
+        },
+        onCommit: (r) => {
+          quickRate(item, r);
+        },
+      });
+    }
+    // Buttons (every action has a button — keyboard/desktop).
+    card.querySelectorAll('[data-tact]').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (btn.dataset.tact === 'star') {
+          // Keyboard only (e.detail === 0). Mouse/touch already committed via the scrub.
+          if (e.detail !== 0) return;
+          quickRate(item, Number(btn.dataset.rating));
+          return;
+        }
+        quickAction(item, btn.dataset.tact);
+      });
+    });
+    bindSwipe(card, item);
+  }
+
+  function quickRate(item, rating) {
+    st.shown.set(item.key, rating);
+    st.confirmed.set(item.key, { ...item, rating, loved: rating === 10 });
+    updateQuickStars(item, rating);
+    st.quick.handled.add(item.key);
+    queue.push(item.key, rating, (err, result) => quickRateSettle(item, err, result));
+    setTimeout(() => advanceQuick(), 600);
+  }
+
+  function updateQuickStars(item, rating) {
+    const card = els.quick.querySelector('.tq-card');
+    if (!card) return;
+    const group = card.querySelector('.tr-stars');
+    if (group) {
+      const fills = T.fillsForRating(rating);
+      group.querySelectorAll('.tr-fill').forEach((f, i) => { f.style.width = fills[i]; });
+    }
+    const rt = card.querySelector('.tq-rating-text');
+    if (rt) rt.textContent = T.ratingText(rating);
+  }
+
+  function quickRateSettle(item, err, result) {
+    if (err) {
+      comp.showSnack('Couldn\'t save rating for "' + (item.title || '') + '" — ' + err.message, () => {
+        // Retry: push the same value again.
+        queue.push(item.key, st.shown.get(item.key), (e2, r2) => quickRateSettle(item, e2, r2));
+      });
+      return;
+    }
+    st.confirmed.set(item.key, result.item);
+    st.shown.set(item.key, result.item.rating);
+  }
+
+  async function quickAction(item, act) {
+    switch (act) {
+      case 'love':
+        quickRate(item, 10);
+        break;
+      case 'ignore':
+        doQuickIgnore(item);
+        break;
+      case 'skip':
+        st.quick.handled.add(item.key);
+        advanceQuick();
+        break;
+      case 'unwatch':
+        doQuickUnwatch(item);
+        break;
+    }
+  }
+
+  async function doQuickIgnore(item) {
+    try {
+      const r = await api('/trainer/ignore', { method: 'POST', body: { type: 'movie', tmdb_id: item.key, ignored: true } });
+      st.confirmed.set(item.key, r.item);
+      st.quick.handled.add(item.key);
+      advanceQuick();
+      comp.showSnack('Ignored "' + (item.title || '') + '"', () => {
+        (async () => {
+          try {
+            const r2 = await api('/trainer/ignore', { method: 'POST', body: { type: 'movie', tmdb_id: item.key, ignored: false } });
+            st.confirmed.set(item.key, r2.item);
+            st.quick.handled.delete(item.key);
+            const idx = st.quick.items.findIndex((x) => x.key === item.key);
+            if (idx !== -1) { st.quick.current = idx; drawQuick(); }
+          } catch (err) { comp.showSnack("Couldn't undo — " + err.message, null); }
+        })();
+      });
+    } catch (err) {
+      comp.showSnack("Couldn't ignore — " + err.message, null);
+    }
+  }
+
+  async function doQuickUnwatch(item) {
+    if (!confirm('Remove "' + item.title + '" from your Simkl watch history?\n\nUse this if it was marked watched by mistake. It can be recommended to you again.')) return;
+    try {
+      const r = await api('/trainer/unwatched', { method: 'POST', body: { type: 'movie', tmdb_id: item.key, imdb_id: item.imdb_id } });
+      st.confirmed.set(item.key, r.item);
+      st.quick.handled.add(item.key);
+      advanceQuick();
+      comp.showSnack('Removed "' + item.title + '" from your watch history', null);
+    } catch (err) {
+      comp.showSnack("Couldn't mark unwatched — " + err.message, null);
+    }
+  }
+
+  async function advanceQuick() {
+    st.quick.current++;
+    if (st.quick.current >= st.quick.items.length) {
+      await fetchQuickPages();
+    }
+    drawQuick();
+    // Prefetch in the background if fewer than 5 cards remain.
+    const remaining = st.quick.items.length - st.quick.current;
+    if (remaining < 5) fetchQuickPages();
+  }
+
+  // Card swipe: left = Ignore, right = Skip, up = Love. Never starts on the star
+  // group or a button (P5).
+  function bindSwipe(card, item) {
+    let dragging = false, startX = 0, startY = 0, w = 0, h = 0;
+    const overlayOf = () => card.querySelector('.tq-overlay');
+    const resetOverlay = () => {
+      const overlay = overlayOf();
+      if (overlay) { overlay.style.opacity = '0'; overlay.className = 'tq-overlay'; }
+    };
+    card.addEventListener('pointerdown', (e) => {
+      if (e.target.closest('.tr-stars, button')) return;
+      dragging = true;
+      startX = e.clientX; startY = e.clientY;
+      w = card.offsetWidth; h = card.offsetHeight;
+      try { card.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+    });
+    card.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      const dx = e.clientX - startX, dy = e.clientY - startY;
+      const o = T.cardSwipeOutcome(dx, dy, w, h);
+      card.style.transform = 'translate(' + dx + 'px,' + dy + 'px) rotate(' + (dx / 20) + 'deg)';
+      const overlay = overlayOf();
+      if (overlay) {
+        overlay.textContent = o.label;
+        overlay.style.opacity = String(o.progress);
+        // Colour follows the direction: green Skip, red Ignore, pink Love.
+        const col = o.label === 'Skip' ? 'skip' : (o.label === 'Ignore' ? 'ignore' : (o.label ? 'love' : ''));
+        overlay.className = col ? 'tq-overlay tq-' + col : 'tq-overlay';
+      }
+    });
+    const end = (e) => {
+      if (!dragging) return;
+      dragging = false;
+      const dx = e.clientX - startX, dy = e.clientY - startY;
+      const o = T.cardSwipeOutcome(dx, dy, w, h);
+      if (o.action !== 'none') {
+        const tx = o.action === 'skip' ? 300 : (o.action === 'ignore' ? -300 : 0);
+        const ty = o.action === 'love' ? -300 : 0;
+        card.style.transition = 'transform 200ms';
+        card.style.transform = 'translate(' + tx + 'px,' + ty + 'px)';
+        setTimeout(() => {
+          card.style.transform = '';
+          card.style.transition = '';
+          quickAction(item, o.action);
+        }, 200);
+      } else {
+        card.style.transition = 'transform 200ms';
+        card.style.transform = '';
+        resetOverlay();
+        setTimeout(() => { card.style.transition = ''; }, 200);
+      }
+    };
+    card.addEventListener('pointerup', end);
+    card.addEventListener('pointercancel', () => {
+      if (!dragging) return;
+      dragging = false;
+      card.style.transition = 'transform 200ms';
+      card.style.transform = '';
+      resetOverlay();
+      setTimeout(() => { card.style.transition = ''; }, 200);
     });
   }
 
