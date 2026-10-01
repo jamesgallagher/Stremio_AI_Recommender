@@ -1215,6 +1215,7 @@ async function httpTests() {
     assert.strictEqual(res.status, 200);
     const html = await res.text();
     assert.ok(html.includes('data-route="trainer"'), 'has the Trainer tabbar button');
+    assert.ok(html.includes('data-route="trainer" role="tab">Ratings</button>') && !html.includes('>Trainer</button>'), 'the tab is labelled Ratings (UI rename)');
     assert.ok(html.includes('id="view-trainer"'), 'has the Trainer section');
     assert.ok(html.includes('trainer-ui.js'), 'references the shared pure module');
     assert.ok(html.includes('trainer.js'), 'references the companion controller');
