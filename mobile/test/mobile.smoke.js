@@ -1188,6 +1188,18 @@ async function httpTests() {
     console.log('  ✓ shell: styles.css responsive contract + [hidden] enforced');
   }
 
+  // Trainer T4 M6: the portal's pure Trainer helpers, served to the companion as
+  // the SAME file — public (no session needed), application/javascript, and it
+  // carries the shared star-scrub helper (proof it is the portal's file, not a fork).
+  {
+    const res = await fetch(`${BASE}/mobile/trainer-ui.js`);
+    assert.strictEqual(res.status, 200);
+    assert.ok((res.headers.get('content-type') || '').includes('application/javascript'), 'served as JS');
+    const js = await res.text();
+    assert.ok(js.includes('bindStarScrub'), 'contains the shared scrub helper');
+    console.log('  ✓ shell: GET /mobile/trainer-ui.js serves the shared pure module (public, JS, no session)');
+  }
+
   // Config endpoint (public) returns app name + version.
   {
     const cfg = await (await fetch(`${BASE}/mobile/api/config`)).json();

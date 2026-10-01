@@ -295,4 +295,51 @@ TrainerUI.createRateQueue = ({ send, delayMs = 800, setTimer, clearTimer }) => {
   };
 };
 
+// ---- Trainer T4: pure helpers for the companion (no DOM) ----
+
+// A 1–10 rating (or null) → a human-readable value string, so a rated card's
+// state is never conveyed by colour alone (P7). null → 'Not rated'; 10 →
+// '5★ · 10/10 · Loved'; otherwise `${r/2}★ · ${r}/10` with a .5 written as ½.
+TrainerUI.ratingText = (r) => {
+  if (r == null) return 'Not rated';
+  if (r === 10) return '5★ · 10/10 · Loved';
+  const whole = Math.floor(r / 2);
+  const starStr = r % 2 === 1 ? (whole === 0 ? '½' : whole + '½') : String(whole);
+  return starStr + '★ · ' + r + '/10';
+};
+
+// Card swipe → an action. `dx`/`dy` are the pointer's net movement (px, y up is
+// negative), `w`/`h` the card's width/height. Up (dy<0 and |dy|>|dx|) → love;
+// left (dx<0) → ignore; right (dx>0) → skip. The action only counts once the
+// drag passes 22% of the height (up) or 28% of the width (left/right); below
+// that the action is 'none' but label/progress are still set (live feedback).
+TrainerUI.cardSwipeOutcome = (dx, dy, w, h) => {
+  if (dx === 0 && dy === 0) return { action: 'none', label: '', progress: 0 };
+  let label = '';
+  let progress = 0;
+  let action = 'none';
+  if (dy < 0 && Math.abs(dy) > Math.abs(dx)) {
+    label = 'Love ♥';
+    progress = Math.min(1, -dy / (0.22 * h));
+    if (progress >= 1) action = 'love';
+  } else if (dx < 0) {
+    label = 'Ignore';
+    progress = Math.min(1, -dx / (0.28 * w));
+    if (progress >= 1) action = 'ignore';
+  } else if (dx > 0) {
+    label = 'Skip';
+    progress = Math.min(1, dx / (0.28 * w));
+    if (progress >= 1) action = 'skip';
+  }
+  return { action, label, progress };
+};
+
+// The quick-train batch: watched, not ignored, not yet rated, and not already
+// handled this session. Order preserved.
+TrainerUI.pickQuickBatch = (items, handled) =>
+  items.filter(i => i.status === 'watched' && !i.ignored && i.rating == null && !handled.has(i.key));
+
+// The five quick-card actions, in order.
+TrainerUI.QUICK_ACTIONS = ['love', 'ignore', 'skip', 'unwatch', 'undo'];
+
 if (typeof module !== 'undefined' && module.exports) module.exports = TrainerUI; else window.TrainerUI = TrainerUI;
