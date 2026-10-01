@@ -2505,6 +2505,196 @@ ok('marquee ME-09: resolveConfig — Tier-2 merge semantics (spec §4.5)', () =>
   assert.strictEqual(mc.DEFAULTS.weights.quality, 0.10, 'DEFAULTS untouched');
 });
 
+// ---- Trainer UI (T3): the pure helpers in public/trainer-ui.js ----
+const TrainerUI = require('../public/trainer-ui');
+
+ok('trainer: esc escapes all 5 chars, null/undefined → empty', () => {
+  assert.strictEqual(TrainerUI.esc('<img src=x onerror=alert(1)>'), '&lt;img src=x onerror=alert(1)&gt;');
+  assert.strictEqual(TrainerUI.esc('a&b"c\'d'), 'a&amp;b&quot;c&#39;d');
+  assert.strictEqual(TrainerUI.esc(null), '');
+  assert.strictEqual(TrainerUI.esc(undefined), '');
+  assert.strictEqual(TrainerUI.esc(42), '42');
+});
+
+ok('trainer: whenText — today, yesterday, N days ago, en-AU date, null → —', () => {
+  const now = Date.parse('2026-03-15T12:00:00Z');
+  assert.strictEqual(TrainerUI.whenText('2026-03-15T08:00:00Z', now), 'today');
+  assert.strictEqual(TrainerUI.whenText('2026-03-14T12:00:00Z', now), 'yesterday');
+  assert.strictEqual(TrainerUI.whenText('2026-03-10T12:00:00Z', now), '5 days ago');
+  assert.strictEqual(TrainerUI.whenText('2026-02-01T12:00:00Z', now), '1 Feb 2026');
+  assert.strictEqual(TrainerUI.whenText(null, now), '—');
+  assert.strictEqual(TrainerUI.whenText('not-a-date', now), '—');
+});
+
+ok('trainer: starsFromRating + ratingFromStarClick round trip', () => {
+  assert.deepStrictEqual(TrainerUI.starsFromRating(null), [0, 0, 0, 0, 0]);
+  assert.deepStrictEqual(TrainerUI.starsFromRating(1), [0.5, 0, 0, 0, 0]);
+  assert.deepStrictEqual(TrainerUI.starsFromRating(2), [1, 0, 0, 0, 0]);
+  assert.deepStrictEqual(TrainerUI.starsFromRating(7), [1, 1, 1, 0.5, 0]);
+  assert.deepStrictEqual(TrainerUI.starsFromRating(10), [1, 1, 1, 1, 1]);
+  assert.strictEqual(TrainerUI.ratingFromStarClick(3, 'left'), 7);
+  assert.strictEqual(TrainerUI.ratingFromStarClick(3, 'right'), 8);
+  // All 10 halves: the clicked half is lit, earlier stars full, later empty.
+  for (let i = 0; i < 5; i++) {
+    for (const half of ['left', 'right']) {
+      const r = TrainerUI.ratingFromStarClick(i, half);
+      const levels = TrainerUI.starsFromRating(r);
+      assert.strictEqual(levels[i], half === 'left' ? 0.5 : 1);
+      assert.ok(levels.slice(0, i).every(x => x === 1));
+      assert.ok(levels.slice(i + 1).every(x => x === 0));
+    }
+  }
+});
+
+ok('trainer: nextRatingForHeart — 10 clears, anything else loves', () => {
+  assert.strictEqual(TrainerUI.nextRatingForHeart(10), null);
+  assert.strictEqual(TrainerUI.nextRatingForHeart(7), 10);
+  assert.strictEqual(TrainerUI.nextRatingForHeart(null), 10);
+});
+
+ok('trainer: chipsHtml — 6 chips with counts, exactly one aria-pressed=true', () => {
+  const counts = { all: 10, unrated: 4, rated: 3, loved: 1, ignored: 2, unfinished: 5 };
+  const html = TrainerUI.chipsHtml(counts, 'loved');
+  for (const [id, label] of TrainerUI.VIEWS) {
+    assert.ok(html.includes(`data-view="${id}"`), 'chip ' + id);
+    assert.ok(html.includes(label), 'label ' + label);
+  }
+  assert.ok(html.includes('<span class="tr-count">10</span>'));
+  assert.ok(html.includes('<span class="tr-count">5</span>'));
+  assert.strictEqual((html.match(/aria-pressed="true"/g) || []).length, 1);
+  assert.ok(html.includes('data-view="loved" aria-pressed="true"'));
+  assert.ok(html.includes('data-view="all" aria-pressed="false"'));
+});
+
+ok('trainer: rowHtml — stars, actions, disabled states, XSS title', () => {
+  const now = Date.parse('2026-03-15T12:00:00Z');
+  const base = { key: '1', type: 'movie', simkl_id: 11, tmdb_id: '1', imdb_id: 'tt1', title: 'The Film', year: 2024, genre: 'Drama', poster: 'https://img.example/p.jpg', watched_at: '2026-03-10T12:00:00Z', rating: null, loved: false, ignored: false, status: 'watched', percent: 100 };
+  // Watched item: 10 star buttons with the right aria-labels, group labelled.
+  let html = TrainerUI.rowHtml(base, { canRate: true, now });
+  for (let n = 1; n <= 10; n++) assert.ok(html.includes(`aria-label="Rate ${n} out of 10"`), 'aria ' + n);
+  assert.strictEqual(html.match(/data-rating="/g).length, 10);
+  assert.ok(html.includes('role="group"') && html.includes('aria-label="Your rating"'));
+  // Loved: ♥ aria-pressed=true; a clear button appears once rated.
+  html = TrainerUI.rowHtml({ ...base, rating: 10, loved: true }, { canRate: true, now });
+  assert.ok(html.includes('data-act="love" aria-pressed="true"'));
+  assert.ok(html.includes('data-act="clear"'));
+  html = TrainerUI.rowHtml(base, { canRate: true, now });
+  assert.ok(!html.includes('data-act="clear"'));
+  // Ignored: Unignore action, stars still rendered but disabled.
+  html = TrainerUI.rowHtml({ ...base, ignored: true, rating: 5, loved: false }, { canRate: true, now });
+  assert.ok(html.includes('data-act="unignore"'));
+  assert.ok(html.includes('disabled'));
+  assert.ok(!html.includes('data-act="love"'));
+  // Unfinished: Stopped at 30%, no star buttons, "I finished it".
+  html = TrainerUI.rowHtml({ ...base, status: 'unfinished', percent: 30, rating: null }, { canRate: true, now });
+  assert.ok(html.includes('Stopped at 30%'));
+  assert.ok(html.includes('data-act="finished"'));
+  assert.ok(!html.includes('data-rating'));
+  assert.ok(!html.includes('data-act="clear"'));
+  // canRate=false: every rating control disabled (ignore stays enabled).
+  const disabledCount = (h) => (h.match(/disabled title="Connect Simkl to rate"/g) || []).length;
+  assert.strictEqual(disabledCount(TrainerUI.rowHtml(base, { canRate: false, now })), 11); // 10 stars + ♥
+  assert.strictEqual(disabledCount(TrainerUI.rowHtml({ ...base, rating: 7 }, { canRate: false, now })), 12); // + clear
+  assert.strictEqual(disabledCount(TrainerUI.rowHtml({ ...base, status: 'unfinished', percent: 30 }, { canRate: false, now })), 1); // finished
+  // XSS title is escaped: with poster null the output has no raw <img.
+  const xss = TrainerUI.rowHtml({ ...base, poster: null, title: '<img src=x onerror=alert(1)>' }, { canRate: true, now });
+  assert.ok(!xss.includes('<img'));
+  assert.ok(xss.includes('&lt;img src=x onerror=alert(1)&gt;'));
+});
+
+ok('trainer: bannerHtml — empty, about M min, due within the hour, rebuilding', () => {
+  const now = 1_700_000_000_000;
+  const none = { changes_since_build: 0, changed_at: null, rebuild_due_at: null, built_changed_at: null };
+  assert.strictEqual(TrainerUI.bannerHtml(none, now, { rebuilding: false }), '');
+  let html = TrainerUI.bannerHtml({ changes_since_build: 3, changed_at: now - 60000, rebuild_due_at: now + 7 * 60000, built_changed_at: now - 3600e3 }, now, { rebuilding: false });
+  assert.ok(html.includes('3 changes since the last build'));
+  assert.ok(html.includes('rebuild in about 7 min'));
+  assert.ok(html.includes('data-act="rebuild"'));
+  assert.ok(html.includes('Rebuild now'));
+  html = TrainerUI.bannerHtml({ changes_since_build: 1, changed_at: now - 60000, rebuild_due_at: now - 60000, built_changed_at: null }, now, { rebuilding: false });
+  assert.ok(html.includes('1 change since the last build'));
+  assert.ok(html.includes('rebuild due within the hour'));
+  html = TrainerUI.bannerHtml(none, now, { rebuilding: true });
+  assert.ok(html.includes('Rebuilding…'));
+  assert.ok(html.includes('tr-joblabel'));
+  assert.ok(html.includes('Rebuild now'));
+});
+
+ok('trainer: createRateQueue — debounce, one in flight, next after settle', () => {
+  const mkHarness = () => {
+    const timers = [];
+    const setTimer = (fn) => { timers.push({ fn, cancelled: false }); return timers.length - 1; };
+    const clearTimer = (id) => { timers[id].cancelled = true; };
+    const fire = (id) => { if (!timers[id].cancelled) timers[id].fn(); };
+    return { timers, setTimer, clearTimer, fire, latest: () => timers.length - 1 };
+  };
+  // 3 pushes within 800 ms → exactly 1 send, with the last value.
+  let h = mkHarness();
+  let sends = [];
+  let settles = [];
+  let q = TrainerUI.createRateQueue({ send: (k, r) => { sends.push({ k, r }); return { ok: true }; }, delayMs: 800, setTimer: h.setTimer, clearTimer: h.clearTimer });
+  q.push('a', 3, (e, r) => settles.push({ e: !!e, r }));
+  q.push('a', 5, (e, r) => settles.push({ e: !!e, r }));
+  q.push('a', 7, (e, r) => settles.push({ e: !!e, r }));
+  assert.strictEqual(h.timers[0].cancelled, true);
+  assert.strictEqual(h.timers[1].cancelled, true);
+  assert.strictEqual(q.pending('a'), true);
+  h.fire(h.latest());
+  assert.deepStrictEqual(sends, [{ k: 'a', r: 7 }]);
+  assert.strictEqual(settles.length, 1);
+  assert.strictEqual(q.pending('a'), false);
+  assert.strictEqual(q.pending('b'), false);
+  // A push while one is in flight → sent right after it settles.
+  h = mkHarness();
+  sends = [];
+  let inFlight = false;
+  q = TrainerUI.createRateQueue({
+    send: (k, r) => {
+      sends.push({ k, r });
+      if (!inFlight) { inFlight = true; q.push(k, 5, () => {}); h.fire(h.latest()); }
+      return { ok: true };
+    },
+    delayMs: 800, setTimer: h.setTimer, clearTimer: h.clearTimer,
+  });
+  q.push('a', 3, () => {});
+  h.fire(h.latest());
+  assert.deepStrictEqual(sends, [{ k: 'a', r: 3 }, { k: 'a', r: 5 }]);
+  assert.strictEqual(q.pending('a'), false);
+  // A "next" equal to the in-flight value → not resent.
+  h = mkHarness();
+  sends = [];
+  let pushed = false;
+  q = TrainerUI.createRateQueue({
+    send: (k, r) => {
+      sends.push({ k, r });
+      if (!pushed) { pushed = true; q.push(k, 3, () => {}); h.fire(h.latest()); }
+      return { ok: true };
+    },
+    delayMs: 800, setTimer: h.setTimer, clearTimer: h.clearTimer,
+  });
+  q.push('a', 3, () => {});
+  h.fire(h.latest());
+  assert.deepStrictEqual(sends, [{ k: 'a', r: 3 }]);
+  // Two different keys are independent.
+  h = mkHarness();
+  sends = [];
+  q = TrainerUI.createRateQueue({ send: (k, r) => { sends.push({ k, r }); return {}; }, delayMs: 800, setTimer: h.setTimer, clearTimer: h.clearTimer });
+  q.push('a', 3, () => {});
+  q.push('b', 5, () => {});
+  h.fire(h.latest());
+  h.fire(h.timers.length - 2);
+  assert.deepStrictEqual(sends.sort((x, y) => x.k.localeCompare(y.k)), [{ k: 'a', r: 3 }, { k: 'b', r: 5 }]);
+  // onSettle gets the error on failure.
+  h = mkHarness();
+  let settled = null;
+  q = TrainerUI.createRateQueue({ send: () => { throw new Error('boom'); }, delayMs: 800, setTimer: h.setTimer, clearTimer: h.clearTimer });
+  q.push('a', 3, (e, r) => { settled = { e: e && e.message, r }; });
+  h.fire(h.latest());
+  assert.strictEqual(settled.e, 'boom');
+  assert.strictEqual(settled.r, null);
+  assert.strictEqual(q.pending('a'), false);
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');
