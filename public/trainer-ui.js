@@ -351,4 +351,8 @@ TrainerUI.jsonRequest = (opts) => {
   return { ...opts, body: JSON.stringify(opts.body) };
 };
 
+// K3: a pending advance from a card only applies if that card is still the
+// current one (a re-rate within the delay must not skip past the next card).
+TrainerUI.shouldAdvance = (currentKey, fromKey) => currentKey === fromKey;
+
 if (typeof module !== 'undefined' && module.exports) module.exports = TrainerUI; else window.TrainerUI = TrainerUI;

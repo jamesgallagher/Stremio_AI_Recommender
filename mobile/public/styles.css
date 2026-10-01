@@ -335,24 +335,39 @@ select:focus { border-color: var(--accent); }
 .tr-notice { color: var(--muted); font-size: 12px; margin: 8px 0; }
 .tr-pager { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
 
-/* Quick card (Quick mode). */
-.tq-left { text-align: center; color: var(--muted); font-size: 13px; margin: 8px 0; }
+/* Quick card (Quick mode) — one screen, no scroll (K2). The trainer section is
+   a flex column filling the space between the top bar and the tab bar; the card
+   fills the remaining space, and the poster is the only flexible item. */
+#view-trainer {
+  display: flex; flex-direction: column;
+  height: calc(100dvh - var(--topbar-h) - var(--tabbar-h) - env(safe-area-inset-bottom) - 8px);
+}
+.trainer-tabs { flex: 0 0 auto; }
+#trainer-notice { flex: 0 0 auto; }
+#trainer-banner { flex: 0 0 auto; }
+#trainer-quick { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+/* List mode scrolls within the fixed-height flex column (K2). */
+#trainer-list { flex: 1; min-height: 0; overflow-y: auto; }
+.tq-left { flex: 0 0 auto; text-align: center; color: var(--muted); font-size: 13px; margin: 8px 0; }
 .tq-card {
   position: relative; width: 100%; max-width: 420px; margin: 0 auto;
   background: var(--card); border: 1px solid var(--border); border-radius: 14px;
   padding: 14px; touch-action: none; /* the card owns the swipe gesture */
+  display: flex; flex-direction: column; min-height: 0; flex: 1;
 }
 /* But the star group keeps pan-y so it never fights the card swipe (P5). */
-.tq-card .tr-stars { touch-action: pan-y; }
-.tq-poster { width: 100%; aspect-ratio: 2/3; max-height: 46vh; object-fit: cover;
+.tq-card .tr-stars { touch-action: pan-y; flex: 0 0 auto; }
+/* The poster is the only flexible item — it shrinks to fit the card. */
+.tq-poster { flex: 1 1 auto; min-height: 0; width: auto; max-width: 100%;
+  aspect-ratio: 2/3; object-fit: cover; align-self: center;
   border-radius: 10px; background: var(--card2); }
 .tq-noposter { display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 12px; }
-.tq-meta { margin: 10px 0 6px; }
+.tq-meta { flex: 0 0 auto; margin: 10px 0 6px; }
 /* The quick card's star row is bigger: 48x48 per star. */
 .tq-card .tr-star-wrap { width: 48px; height: 48px; }
 .tq-card .tr-glyph, .tq-card .tr-fill { font-size: 46px; line-height: 46px; }
-.tq-rating-text { margin: 4px 0 8px; color: var(--text); font-size: 14px; }
-.tq-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.tq-rating-text { flex: 0 0 auto; margin: 4px 0 8px; color: var(--text); font-size: 14px; }
+.tq-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .tq-btn { flex: 1; min-height: 48px; font-size: 16px; }
 .tq-love { background: var(--love); color: #fff; }
 .tq-love:hover { background: var(--love); }
@@ -370,3 +385,10 @@ select:focus { border-color: var(--accent); }
 .tq-overlay.tq-ignore { color: var(--err); }
 .tq-overlay.tq-love { color: var(--love); }
 .tq-empty { text-align: center; color: var(--muted); padding: 32px 16px; }
+/* K2.3: in Quick mode the P8 notice and the banner are one line each. */
+.tr-notice-quick { display: flex; align-items: center; gap: 8px; }
+.tr-banner-quick { display: flex; align-items: center; gap: 8px; }
+/* K2.4: hide the hint line on short viewports. */
+@media (max-height: 700px) {
+  .tq-hint { display: none; }
+}

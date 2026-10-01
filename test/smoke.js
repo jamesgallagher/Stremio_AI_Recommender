@@ -3099,6 +3099,11 @@ ok('trainer T4 K1a: jsonRequest — object body → JSON string; string/no body 
   assert.deepStrictEqual(obj.body, { type: 'movie', tmdb_id: '1', ignored: true });
 });
 
+ok('trainer T4 K3a: shouldAdvance — only advance if the current card is still the key', () => {
+  assert.strictEqual(TrainerUI.shouldAdvance('a', 'a'), true);
+  assert.strictEqual(TrainerUI.shouldAdvance('b', 'a'), false);
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');

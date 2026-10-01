@@ -20,7 +20,7 @@
     settings: null, // GET /settings (once per session)
     canRate: false, // me.simkl_connected (once)
     canRateFetched: false,
-    quick: { items: [], page: 0, handled: new Set(), current: 0, counts: null },
+    quick: { items: [], page: 0, handled: new Set(), current: 0, counts: null, training: null, left: 0, counted: new Set(), advanceT: null },
   };
 
   const queue = T.createRateQueue({
@@ -66,7 +66,6 @@
       st.canRateFetched = true;
     }
     loadMode();
-    drawNotice();
     drawMode();
   }
 
@@ -79,7 +78,18 @@
     const movieEngines = (engines.available && engines.available.movie) || [];
     const engine = movieEngines.find((e) => e.id === engineMovie);
     const engineName = engine ? engine.name : (engineMovie || 'another engine');
-    els.notice.innerHTML = '<div class="tr-notice">Ratings still save to Simkl, but this profile\'s movies come from ' + esc(engineName) + ', so the Trainer won\'t change its recommendations. Switch the Movies engine to Marquee in Filters.</div>';
+    const fullText = "Ratings still save to Simkl, but this profile's movies come from " + engineName + ", so the Trainer won't change its recommendations. Switch the Movies engine to Marquee in Filters.";
+    // K2.3: in Quick mode the notice is one line with a "More" button; List
+    // keeps the full text.
+    if (st.mode === 'quick') {
+      els.notice.innerHTML = '<div class="tr-notice tr-notice-quick">ⓘ Ratings won\'t change Genesis picks <button class="link" data-tact="notice-more">More</button></div>';
+      const btn = els.notice.querySelector('[data-tact="notice-more"]');
+      if (btn) btn.addEventListener('click', () => {
+        els.notice.innerHTML = '<div class="tr-notice">' + esc(fullText) + '</div>';
+      });
+    } else {
+      els.notice.innerHTML = '<div class="tr-notice">' + esc(fullText) + '</div>';
+    }
   }
 
   // ---- mode switch ----
@@ -94,6 +104,7 @@
   }
   function drawMode() {
     els.tabs.forEach((tab) => tab.classList.toggle('active', tab.dataset.tmode === st.mode));
+    drawNotice();
     if (st.mode === 'quick') {
       els.quick.hidden = false;
       els.list.hidden = true;
@@ -359,6 +370,7 @@
   async function loadQuick() {
     st.quick.items = [];
     st.quick.handled = new Set();
+    st.quick.counted = new Set(); // K4: fresh load — the "left" count restarts
     st.quick.current = 0;
     st.quick.page = 0;
     await fetchQuickPages();
@@ -381,6 +393,8 @@
         }
       }
       st.quick.counts = data.counts;
+      st.quick.training = data.training;
+      st.quick.left = data.counts ? (data.counts.unrated || 0) : 0;
       if (gotNew) break;
       const totalPages = Math.ceil(data.total / data.pageSize);
       if (page >= totalPages) break;
@@ -391,8 +405,11 @@
 
   function drawQuick() {
     if (els.section.hidden) return; // view is hidden — tolerate (§5.6)
+    // K2.3: in Quick mode the banner is one line (N changes · Rebuild).
+    const training = st.quick.training || { changes_since_build: 0 };
+    els.banner.innerHTML = '<div class="tr-banner tr-banner-quick">' + (training.changes_since_build || 0) + ' changes · <button class="ghost mini" data-act="rebuild"' + (st.rebuilding ? ' disabled' : '') + '>Rebuild</button></div>';
     const item = st.quick.items[st.quick.current];
-    const left = st.quick.counts ? (st.quick.counts.unrated || 0) : 0;
+    const left = st.quick.left;
     if (!item) {
       els.quick.innerHTML = '<div class="tq-empty">All caught up — everything you\'ve watched is rated or ignored. 🎉<br><button class="ghost" data-tact="review">Review in List</button></div>';
       const btn = els.quick.querySelector('[data-tact="review"]');
@@ -413,10 +430,10 @@
       + stars
       + '<div class="tq-rating-text">' + T.ratingText(shown) + '</div>'
       + '<div class="tq-actions">'
-      + '<button class="tq-btn tq-love" data-tact="love">♥</button>'
-      + '<button class="tq-btn tq-ignore" data-tact="ignore">Ignore</button>'
-      + '<button class="tq-btn tq-skip" data-tact="skip">Skip</button>'
-      + '<button class="tq-unwatch" data-tact="unwatch">Unwatch</button>'
+      + '<button class="tq-btn tq-love" data-tact="love" aria-label="Love">♥</button>'
+      + '<button class="tq-btn tq-ignore" data-tact="ignore" aria-label="Ignore">Ignore</button>'
+      + '<button class="tq-btn tq-skip" data-tact="skip" aria-label="Skip">Skip</button>'
+      + '<button class="tq-unwatch" data-tact="unwatch" aria-label="Mark unwatched">Unwatch</button>'
       + '</div>'
       + '<div class="tq-hint">Swipe ← ignore · → skip · ↑ love</div>'
       + '<div class="tq-overlay"></div>'
@@ -456,12 +473,16 @@
           const fills = T.fillsForRating(r);
           group.querySelectorAll('.tr-fill').forEach((f, i) => { f.style.width = fills[i]; });
           group.classList.add('tr-previewing');
+          const rt = card.querySelector('.tq-rating-text'); // K6: rating text follows the scrub preview
+          if (rt) rt.textContent = T.ratingText(r);
         },
         onCancel: () => {
           const rating = st.shown.has(item.key) ? st.shown.get(item.key) : item.rating;
           const fills = T.fillsForRating(rating);
           group.querySelectorAll('.tr-fill').forEach((f, i) => { f.style.width = fills[i]; });
           group.classList.remove('tr-previewing');
+          const rt = card.querySelector('.tq-rating-text'); // K6: restore the shown value
+          if (rt) rt.textContent = T.ratingText(rating);
         },
         onCommit: (r) => {
           quickRate(item, r);
@@ -490,7 +511,10 @@
     updateQuickStars(item, rating);
     st.quick.handled.add(item.key);
     queue.push(item.key, rating, (err, result) => quickRateSettle(item, err, result));
-    setTimeout(() => advanceQuick(), 600);
+    decrementLeft(item.key); // K4: once per card, not on a re-rate
+    // K3: one pending advance — a re-rate within 600 ms replaces the timer.
+    clearTimeout(st.quick.advanceT);
+    st.quick.advanceT = setTimeout(() => advanceFrom(item.key), 600);
   }
 
   function updateQuickStars(item, rating) {
@@ -517,6 +541,31 @@
     st.shown.set(item.key, result.item.rating);
   }
 
+  // K4: the "N left to rate" count. Decrement once per card on the first rate /
+  // Love / Ignore / Unwatch (not Skip, not a re-rate); increment on Undo of an
+  // ignore. Redraw .tq-left immediately.
+  function decrementLeft(key) {
+    if (st.quick.counted.has(key)) return;
+    st.quick.counted.add(key);
+    st.quick.left = Math.max(0, st.quick.left - 1);
+    const el = els.quick.querySelector('.tq-left');
+    if (el) el.textContent = st.quick.left + ' left to rate';
+  }
+  function incrementLeft(key) {
+    if (!st.quick.counted.has(key)) return;
+    st.quick.counted.delete(key);
+    st.quick.left += 1;
+    const el = els.quick.querySelector('.tq-left');
+    if (el) el.textContent = st.quick.left + ' left to rate';
+  }
+
+  // K3: only advance if the current card is still the one that triggered it.
+  function advanceFrom(key) {
+    const current = st.quick.items[st.quick.current];
+    if (!current || !T.shouldAdvance(current.key, key)) return;
+    advanceQuick();
+  }
+
   async function quickAction(item, act) {
     switch (act) {
       case 'love':
@@ -526,6 +575,7 @@
         doQuickIgnore(item);
         break;
       case 'skip':
+        clearTimeout(st.quick.advanceT); // K3: clear any pending advance
         st.quick.handled.add(item.key);
         advanceQuick();
         break;
@@ -540,6 +590,8 @@
       const r = await api('/trainer/ignore', { method: 'POST', body: { type: 'movie', tmdb_id: item.key, ignored: true } });
       st.confirmed.set(item.key, r.item);
       st.quick.handled.add(item.key);
+      decrementLeft(item.key); // K4
+      clearTimeout(st.quick.advanceT); // K3
       advanceQuick();
       comp.showSnack('Ignored "' + (item.title || '') + '"', () => {
         (async () => {
@@ -547,6 +599,7 @@
             const r2 = await api('/trainer/ignore', { method: 'POST', body: { type: 'movie', tmdb_id: item.key, ignored: false } });
             st.confirmed.set(item.key, r2.item);
             st.quick.handled.delete(item.key);
+            incrementLeft(item.key); // K4: Undo of an ignore
             const idx = st.quick.items.findIndex((x) => x.key === item.key);
             if (idx !== -1) { st.quick.current = idx; drawQuick(); }
           } catch (err) { comp.showSnack("Couldn't undo — " + err.message, null); }
@@ -563,6 +616,8 @@
       const r = await api('/trainer/unwatched', { method: 'POST', body: { type: 'movie', tmdb_id: item.key, imdb_id: item.imdb_id } });
       st.confirmed.set(item.key, r.item);
       st.quick.handled.add(item.key);
+      decrementLeft(item.key); // K4
+      clearTimeout(st.quick.advanceT); // K3
       advanceQuick();
       comp.showSnack('Removed "' + item.title + '" from your watch history', null);
     } catch (err) {
