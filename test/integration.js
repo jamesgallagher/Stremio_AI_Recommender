@@ -4954,6 +4954,47 @@ async function main() {
     assert.strictEqual(watchedStore.listUnmatched(A).length, 0, 'profile delete clears the records');
   });
 
+  await it('Scrobble A8: portal route — rows with title from the meta cache when present; unknown profile 404', async () => {
+    const express = require('express');
+    const portal = require('../src/portal');
+    const config = require('../src/config');
+    const metaStore = require('../src/engines/glass/metaStore');
+    const db = require('../src/db');
+    const port = 7315;
+    const app = express();
+    app.use('/api', portal.router);
+    const server = app.listen(port);
+    await new Promise((resolve, reject) => { server.on('listening', resolve); server.on('error', reject); });
+    const base = `http://localhost:${port}`;
+    let p;
+    try {
+      p = config.addProfile('ScrobbleUnmatched');
+      // One recorded film with a TMDB id (meta cached), one without.
+      watchedStore.recordUnmatched(p.id, { imdbId: 'tt0287635', tmdbId: '12600' }, 1000);
+      watchedStore.recordUnmatched(p.id, { imdbId: 'tt999' }, 2000);
+      metaStore.put('movie', '12600', { title: 'Pokémon 4Ever', year: 2017, imdb_id: 'tt0287635' });
+      let res = await fetch(`${base}/api/profiles/${p.id}/scrobble/unmatched`);
+      assert.strictEqual(res.status, 200);
+      const body = await res.json();
+      assert.strictEqual(body.items.length, 2);
+      const a = body.items.find((r) => r.imdb_id === 'tt0287635');
+      assert.strictEqual(a.title, 'Pokémon 4Ever', 'title from the meta cache');
+      assert.strictEqual(a.year, 2017);
+      assert.strictEqual(a.last_tried, 1000);
+      assert.strictEqual(a.attempts, 1);
+      const b = body.items.find((r) => r.imdb_id === 'tt999');
+      assert.strictEqual(b.title, null, 'no meta cache → title null');
+      assert.strictEqual(b.year, null);
+      // Unknown profile → 404.
+      res = await fetch(`${base}/api/profiles/nope/scrobble/unmatched`);
+      assert.strictEqual(res.status, 404);
+    } finally {
+      server.close();
+      if (p) { config.removeProfile(p.id); watchedStore.deleteForProfile(p.id); }
+      db.get().exec('DELETE FROM glass_metadata');
+    }
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();
