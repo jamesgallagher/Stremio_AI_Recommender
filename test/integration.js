@@ -1547,8 +1547,10 @@ async function main() {
       { simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'A', year: 2020, watched_at: '2026-01-01T00:00:00Z' },
     ]);
     // An abandoned (unfinished) row: started 30%, untouched for >7 days.
+    // The grace period runs on the action clock (deps.now = 1000), so the
+    // row's timestamps are relative to that same clock.
     engagement.init();
-    const abandonedAt = Date.now() - 8 * 24 * 3600e3;
+    const abandonedAt = 1000 - 8 * 24 * 3600e3;
     db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at) VALUES (?, ?, ?, ?, ?, ?)').run(profile.id, 'tt2', '2', 30, abandonedAt, abandonedAt);
     const markWatchedCalls = [];
     const deps = {
@@ -1747,9 +1749,10 @@ async function main() {
     res = await trainer.setIgnored(profile, { type: 'movie', tmdb_id: '1' }, true, deps);
     assert.strictEqual(res.unchanged, true);
     assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 1000, changes_since_build: 1, built_changed_at: null }); // unchanged
-    // ignoring an unfinished row works.
+    // ignoring an unfinished row works. The grace period runs on the action
+    // clock (deps.now = 1000), so the row's timestamps are relative to it.
     engagement.init();
-    const at = Date.now() - 8 * 24 * 3600e3;
+    const at = 1000 - 8 * 24 * 3600e3;
     db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at) VALUES (?, ?, ?, ?, ?, ?)').run(profile.id, 'tt2', '2', 30, at, at);
     res = await trainer.setIgnored(profile, { type: 'movie', tmdb_id: '2' }, true, deps);
     assert.strictEqual(res.ok, true);
@@ -1792,10 +1795,13 @@ async function main() {
     db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at) VALUES (?, ?, ?, ?, ?, ?)').run(profile.id, 'tt10', '10', 30, Date.parse('2026-01-06T00:00:00Z'), Date.parse('2026-01-06T00:00:00Z'));
     db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at) VALUES (?, ?, ?, ?, ?, ?)').run(profile.id, 'tt4', '4', 30, Date.parse('2026-01-06T00:00:00Z'), Date.parse('2026-01-06T00:00:00Z')); // rewatch of Delta (tmdb 4 watched)
     db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at) VALUES (?, ?, ?, ?, ?, ?)').run(profile.id, 'tt12', '12', 30, Date.parse('2026-01-05T00:00:00Z'), Date.parse('2026-01-05T00:00:00Z'));
+    // The engagement rows below are seeded against the real clock (Jan 2026,
+    // >7 days old), so the action clock must be the real one for the grace
+    // period to see them as abandoned.
     const deps = {
       enrich: async () => { throw new Error('enrich must not run without a TMDB key'); },
       settings: { keyFor: () => '' },
-      now: () => 1000,
+      now: () => Date.now(),
       log: quiet,
     };
     // all view: watched minus ignored, newest first (dedupe keeps Eta for tmdb 6).
@@ -4264,20 +4270,19 @@ async function main() {
     const db = require('../src/db');
     const profileId = 'p-t14';
     const profile = { id: profileId, name: 'T14', keys: {} };
-    const now = Date.parse('2026-06-01T00:00:00Z'); // the action clock (training cursor)
-    const realNow = Date.now(); // the abandoned rule's grace period measures REAL elapsed time
+    const now = Date.parse('2026-06-01T00:00:00Z'); // the action clock (deps.now)
     const day = 24 * 3600e3;
     engagement.init();
     // Five engagement rows: one abandoned (30%, untouched 8 days), one in the
     // grace period (30%, touched 1 day ago), one credits (40% of 30 min → 18 min
     // left), one finished (95%), one watched (30% but completed in the watched
-    // store — the rewatch rule). updated_at is seeded against the real clock:
-    // the Trainer's unfinished rule runs on Date.now(), like the engine's.
-    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)').run(profileId, 'ttt14a', 't14a', 30, realNow - 8 * day, realNow - 8 * day, null);
-    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)').run(profileId, 'ttt14b', 't14b', 30, realNow - 1 * day, realNow - 1 * day, null);
-    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)').run(profileId, 'ttt14c', 't14c', 40, realNow - 8 * day, realNow - 8 * day, 30 * 60000);
-    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)').run(profileId, 'ttt14d', 't14d', 95, realNow - 8 * day, realNow - 8 * day, null);
-    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)').run(profileId, 'ttt14e', 't14e', 30, realNow - 8 * day, realNow - 8 * day, null);
+    // store — the rewatch rule). The grace period runs on the action clock
+    // (deps.now), so the row timestamps are relative to that same clock.
+    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)').run(profileId, 'ttt14a', 't14a', 30, now - 8 * day, now - 8 * day, null);
+    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)').run(profileId, 'ttt14b', 't14b', 30, now - 1 * day, now - 1 * day, null);
+    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)').run(profileId, 'ttt14c', 't14c', 40, now - 8 * day, now - 8 * day, 30 * 60000);
+    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)').run(profileId, 'ttt14d', 't14d', 95, now - 8 * day, now - 8 * day, null);
+    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)').run(profileId, 'ttt14e', 't14e', 30, now - 8 * day, now - 8 * day, null);
     watchedStore.upsertMany(profileId, [
       { simkl_id: 1, type: 'movie', imdb_id: 'ttt14e', tmdb_id: 't14e', title: 'E', year: 2020, watched_at: '2026-05-01T00:00:00Z' },
     ]);
@@ -4287,19 +4292,104 @@ async function main() {
     assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['t14a'], 'only the abandoned row is unfinished');
     assert.strictEqual(res.counts.unfinished, 1);
     // N7: the Trainer's list == the engine's abandoned set (one rule, two consumers).
-    // Both run on the real clock (the grace period measures real elapsed time).
-    assert.deepStrictEqual([...engagement.abandonedFor(profileId, mqCfg.resolveConfig({}), { now: realNow }).keys()], ['t14a'], 'the engine agrees');
+    // Both run on the action clock (deps.now).
+    assert.deepStrictEqual([...engagement.abandonedFor(profileId, mqCfg.resolveConfig({}), { now }).keys()], ['t14a'], 'the engine agrees');
     // The training DTO surfaces the rebuild due time (change + the quiet period).
     tasteFeedback.recordChange(profileId, now - 2 * 60e3);
     const res2 = await trainer.listHistory(profile, { type: 'movie' }, deps);
-    assert.deepStrictEqual(res2.training, { changes_since_build: 1, changed_at: now - 2 * 60e3, rebuild_due_at: now + 8 * 60e3 });
+    assert.deepStrictEqual(res2.training, { changes_since_build: 1, changed_at: now - 2 * 60e3, rebuild_due_at: now + 8 * 60e3, built_changed_at: null });
     // a build that included the change → no due time.
     tasteFeedback.markTrainingBuilt(profileId, now - 2 * 60e3);
     const res3 = await trainer.listHistory(profile, { type: 'movie' }, deps);
     assert.strictEqual(res3.training.rebuild_due_at, null, 'the build covered the change');
+    assert.strictEqual(res3.training.built_changed_at, now - 2 * 60e3, 'the build stamp is surfaced');
     db.get().prepare('DELETE FROM marquee_engagement WHERE profile_id = ?').run(profileId);
     watchedStore.deleteForProfile(profileId);
     tasteFeedback.deleteForProfile(profileId);
+  });
+
+  await it('Trainer T2 r1: G3a — the brief marks 10/10 as LOVED, 9 and unrated (§6 test 10)', () => {
+    const taste = require('../src/engines/marquee/taste');
+    const prompt = taste.buildBriefPrompt({
+      watch_history: [
+        { title: 'A', year: 2020, rating: 10, genres: ['Sci-Fi'] },
+        { title: 'B', year: 2019, rating: 9, genres: [] },
+        { title: 'C', year: 2018, rating: null, genres: [] },
+      ],
+      tastes: [],
+    });
+    assert.ok(prompt.includes('rated 10/10 (LOVED)'), 'a 10/10 is marked LOVED');
+    assert.ok(prompt.includes('rated 9/10'), 'a 9 is rated 9/10');
+    assert.ok(prompt.includes('unrated'), 'a null rating is unrated');
+  });
+
+  await it('Trainer T2 r1: G3b — a rating change (7 → 8) changes historyHash (§6 test 8)', () => {
+    const taste = require('../src/engines/marquee/taste');
+    const watchedStore = require('../src/watchedStore');
+    const profileId = 'p-g3b';
+    watchedStore.upsertMany(profileId, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'ttg3b', tmdb_id: 'g3b', title: 'G', year: 2020, watched_at: '2026-01-01T00:00:00Z' },
+    ]);
+    const h7 = taste.historyHash(profileId, { ratings: new Map([['g3b', 7]]), ignored: new Set() });
+    const h8 = taste.historyHash(profileId, { ratings: new Map([['g3b', 8]]), ignored: new Set() });
+    assert.notStrictEqual(h7, h8, 'changing the rating changes the brief cache key');
+    watchedStore.deleteForProfile(profileId);
+  });
+
+  await it('Trainer T2 r1: G3c — a mid-build edit keeps its change count (§6 test 11)', () => {
+    const tasteFeedback = require('../src/tasteFeedback');
+    const db = require('../src/db');
+    const profileId = 'p-g3c';
+    const T0 = Date.parse('2026-06-01T00:00:00Z');
+    tasteFeedback.recordChange(profileId, T0);
+    // The build-start snapshot: the cursor the build sees at its START.
+    const snap = tasteFeedback.getTraining(profileId);
+    assert.strictEqual(snap.changed_at, T0);
+    // A mid-build edit (newer than the snapshot).
+    tasteFeedback.recordChange(profileId, T0 + 60e3);
+    assert.strictEqual(tasteFeedback.getTraining(profileId).changes_since_build, 2);
+    // The build finishes and stamps the snapshot: the mid-build edit keeps its count.
+    tasteFeedback.markTrainingBuilt(profileId, T0);
+    let t = tasteFeedback.getTraining(profileId);
+    assert.strictEqual(t.changes_since_build, 2, 'the mid-build edit is NOT zeroed');
+    assert.strictEqual(t.built_changed_at, T0);
+    // The change is newer than the stamp and the quiet period has passed → due.
+    assert.strictEqual(tasteFeedback.trainingDue(profileId, T0 + 12 * 60e3), true);
+    // The next build (snapshot = the mid-build change) resets the count.
+    tasteFeedback.markTrainingBuilt(profileId, T0 + 60e3);
+    t = tasteFeedback.getTraining(profileId);
+    assert.strictEqual(t.changes_since_build, 0, 'the second build resets the count');
+    db.get().prepare('DELETE FROM taste_changes WHERE profile_id = ?').run(profileId);
+  });
+
+  await it('Trainer T2 r1: G3d — a skipped build leaves the change count alone (§6 test 13)', async () => {
+    const rs = require('../src/recommendationStore');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const settings = require('../src/settings');
+    const db = require('../src/db');
+    const profileId = 'p-g3d';
+    const T0 = Date.parse('2026-06-01T00:00:00Z');
+    tasteFeedback.recordChange(profileId, T0);
+    const before = tasteFeedback.getTraining(profileId);
+    const prevKeys = settings.getSettings().keys;
+    settings.updateSettings({ keys: { tmdb_api_key: '' } });
+    try {
+      const res = await rs.buildRecommendations({ id: profileId, name: 'G3D', filters: {} }, quiet);
+      assert.ok(res.skipped && res.reason.includes('TMDB key'), 'no TMDB key → skipped');
+      assert.deepStrictEqual(tasteFeedback.getTraining(profileId), before, 'the skipped build left the change count alone');
+    } finally {
+      settings.updateSettings({ keys: prevKeys });
+    }
+    db.get().prepare('DELETE FROM taste_changes WHERE profile_id = ?').run(profileId);
+  });
+
+  await it('Trainer T2 r1: G3e — markTrainingBuilt creates no row when none exists', () => {
+    const tasteFeedback = require('../src/tasteFeedback');
+    const db = require('../src/db');
+    const profileId = 'p-g3e';
+    tasteFeedback.markTrainingBuilt(profileId, Date.parse('2026-06-01T00:00:00Z'));
+    assert.deepStrictEqual(tasteFeedback.getTraining(profileId), { changed_at: null, changes_since_build: 0, built_changed_at: null });
+    assert.strictEqual(db.get().prepare('SELECT COUNT(*) AS n FROM taste_changes WHERE profile_id = ?').get(profileId).n, 0, 'no row created');
   });
 
   // Restore a clean-ish shared state for any process that runs after this one.

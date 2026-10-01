@@ -232,13 +232,17 @@ function getTraining(profileId) {
 // Trainer T2 (N8): stamp the last successful build's view of the change cursor.
 // `snapshotChangedAt` is the changed_at read at the build's START — a change
 // recorded during the build makes changed_at newer than the stamp, so the next
-// build is triggered.
+// build is triggered. §4.4: the counter resets ONLY while the cursor is still
+// the snapshot (a mid-build edit keeps its count); a null snapshot (no row at
+// build start) is a no-op — no INSERT, no row created.
 function markTrainingBuilt(profileId, snapshotChangedAt) {
   init();
+  if (snapshotChangedAt == null) return;
   db.get().prepare(`
-    INSERT INTO taste_changes (profile_id, changed_at, changes_since_build, built_changed_at) VALUES (?, ?, 0, ?)
-    ON CONFLICT(profile_id) DO UPDATE SET built_changed_at = excluded.built_changed_at
-  `).run(profileId, null, snapshotChangedAt != null ? snapshotChangedAt : null);
+    UPDATE taste_changes SET built_changed_at = ?,
+      changes_since_build = CASE WHEN changed_at IS ? THEN 0 ELSE changes_since_build END
+    WHERE profile_id = ?
+  `).run(snapshotChangedAt, snapshotChangedAt, profileId);
 }
 
 // Trainer T2 (N8): is a rebuild due for this profile's taste feedback? True

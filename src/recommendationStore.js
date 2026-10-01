@@ -522,9 +522,10 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
 
   setBuiltAt(profile.id);
   // Trainer T2 (N8): stamp the last successful build's view of the change
-  // cursor (spec §8: a successful build resets changes_since_build).
+  // cursor (spec §8: a successful build resets changes_since_build — the
+  // reset happens inside markTrainingBuilt, only while the cursor is still
+  // the snapshot, so a mid-build edit keeps its count).
   tasteFeedback.markTrainingBuilt(profile.id, trainingSnap.changed_at);
-  tasteFeedback.resetChangesSinceBuild(profile.id);
 
   const seeds = m.seeds + sr.seeds;
   const stored = m.stored + sr.stored;

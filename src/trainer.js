@@ -165,12 +165,10 @@ function isUnfinishedRow(row, watchedIds, { now = Date.now(), deps = {} } = {}) 
 
 // The profile's unfinished rows: the shared engagement.abandonedRows (N7 —
 // one rule, two consumers). Injectable for tests (deps.unfinishedRows).
-// The grace period measures REAL elapsed time (engagement rows are stamped
-// with Date.now()), so the rule runs on the real clock even when D.now() is
-// an injectable action clock used for recording changes.
+// §4.5: the rule runs on the action clock (D.now), so tests control time.
 function unfinishedRows(profileId, D) {
   const cfg = D.marqueeConfig.resolveConfig(D.settings.getSettings ? D.settings.getSettings() : null);
-  return D.engagement.abandonedRows(profileId, cfg, { now: Date.now() });
+  return D.engagement.abandonedRows(profileId, cfg, { now: D.now() });
 }
 
 // Resolve a ref against THIS profile's unfinished rows (spec §6: setIgnored and
@@ -325,7 +323,7 @@ async function listHistory(profile, { type: typeIn, view = 'all', q = null, page
     pageSize: ps,
     total,
     counts,
-    training: { changes_since_build: training.changes_since_build, changed_at: training.changed_at, rebuild_due_at: rebuildDueAt },
+    training: { changes_since_build: training.changes_since_build, changed_at: training.changed_at, rebuild_due_at: rebuildDueAt, built_changed_at: training.built_changed_at },
   };
 }
 
