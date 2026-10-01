@@ -241,10 +241,10 @@ TrainerUI.pagerText = (page, pageSize, total) =>
 // arrives while one is in flight waits and is sent right after it settles.
 // Timers are injected, so tests drive them by hand.
 TrainerUI.createRateQueue = ({ send, delayMs = 800, setTimer, clearTimer }) => {
-  const states = new Map(); // key → { timer, inflight, next }
+  const states = new Map(); // key → { timer, inflight, next, pending }
   const get = (key) => {
     let s = states.get(key);
-    if (!s) { s = { timer: null, inflight: null, next: null }; states.set(key, s); }
+    if (!s) { s = { timer: null, inflight: null, next: null, pending: null }; states.set(key, s); }
     return s;
   };
   const settle = (key, rating, onSettle, err, result) => {
@@ -267,30 +267,68 @@ TrainerUI.createRateQueue = ({ send, delayMs = 800, setTimer, clearTimer }) => {
     // 4. If step 2 moved a value into inflight, send it (no extra delay).
     if (moved) sendNow(key);
   };
-  const sendNow = (key) => {
+  const sendNow = (key, keepalive = false) => {
     const s = get(key);
     const { rating, onSettle } = s.inflight;
     let r;
-    try { r = send(key, rating); } catch (e) { settle(key, rating, onSettle, e, null); return; }
+    try { r = send(key, rating, { keepalive }); } catch (e) { settle(key, rating, onSettle, e, null); return; }
     if (r && typeof r.then === 'function') {
       r.then(res => settle(key, rating, onSettle, null, res), err => settle(key, rating, onSettle, err, null));
     } else {
       settle(key, rating, onSettle, null, r);
     }
   };
+  // F1: send a pending value directly — a second send for the same key, used by
+  // flush when a send is already in flight. Doesn't touch s.inflight.
+  const sendSeparate = (key, p, keepalive) => {
+    let r;
+    try { r = send(key, p.rating, { keepalive }); } catch (e) { p.onSettle(e, null); return; }
+    if (r && typeof r.then === 'function') {
+      r.then(res => p.onSettle(null, res), err => p.onSettle(err, null));
+    } else {
+      p.onSettle(null, r);
+    }
+  };
   return {
     push(key, rating, onSettle) {
       const s = get(key);
       if (s.timer != null) { clearTimer(s.timer); s.timer = null; }
+      s.pending = { rating, onSettle };
       s.timer = setTimer(() => {
         s.timer = null;
-        if (s.inflight) { s.next = { rating, onSettle }; }
-        else { s.inflight = { rating, onSettle }; sendNow(key); }
+        const p = s.pending; s.pending = null;
+        if (s.inflight) { s.next = p; }
+        else { s.inflight = p; sendNow(key); }
       }, delayMs);
     },
     pending(key) {
       const s = states.get(key);
       return !!s && (s.timer != null || !!s.inflight || !!s.next);
+    },
+    // F1: send every pending-timer value now (the page is hidden/closing). For
+    // each key with a pending timer: clear the timer; if nothing is in flight,
+    // send the pending value now; if a send is in flight, send the pending value
+    // now too, unless it equals the in-flight value (FIFO lane keeps order).
+    // Returns the number of sends started.
+    flush({ keepalive = true } = {}) {
+      let started = 0;
+      for (const [key, s] of states) {
+        if (s.timer == null) continue;
+        clearTimer(s.timer);
+        s.timer = null;
+        const p = s.pending;
+        s.pending = null;
+        if (!p) continue;
+        if (!s.inflight) {
+          s.inflight = p;
+          sendNow(key, keepalive);
+          started++;
+        } else if (p.rating !== s.inflight.rating) {
+          sendSeparate(key, p, keepalive);
+          started++;
+        }
+      }
+      return started;
     },
   };
 };

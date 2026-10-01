@@ -355,6 +355,8 @@ select:focus { border-color: var(--accent); }
   padding: 14px; touch-action: none; /* the card owns the swipe gesture */
   display: flex; flex-direction: column; min-height: 0; flex: 1;
 }
+/* F2: a mouse drag on the poster must not start a native image drag (desktop). */
+.tq-card, .tq-card img { -webkit-user-drag: none; user-select: none; -webkit-user-select: none; }
 /* But the star group keeps pan-y so it never fights the card swipe (P5). */
 .tq-card .tr-stars { touch-action: pan-y; flex: 0 0 auto; }
 /* The poster is the only flexible item — it shrinks to fit the card. */

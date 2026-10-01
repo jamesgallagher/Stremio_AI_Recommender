@@ -2812,6 +2812,64 @@ ok('trainer r1: H4b — an equal next is not resent', () => {
   assert.deepStrictEqual(sends, [{ k: 'a', r: 3 }]); // exactly one send, no second
 });
 
+// F1: flush() sends every pending-timer value now — used when the page is
+// hidden/closing, so a rating made just before leaving is never lost.
+ok('trainer T4.1 F1: flush sends pending ratings on page hide', () => {
+  const mkHarness = () => {
+    const timers = [];
+    const setTimer = (fn) => { timers.push({ fn, cancelled: false }); return timers.length - 1; };
+    const clearTimer = (id) => { timers[id].cancelled = true; };
+    const fire = (id) => { if (!timers[id].cancelled) timers[id].fn(); };
+    return { timers, setTimer, clearTimer, fire, latest: () => timers.length - 1 };
+  };
+  const makeThenable = () => {
+    let resolve = null;
+    return { then: (res) => { resolve = res; }, settle: (value) => { if (resolve) resolve(value); } };
+  };
+  // F1a: push A, then flush() before the timer → exactly 1 send of A with
+  // { keepalive:true }, and the timer is cancelled (firing it later sends nothing).
+  let h = mkHarness();
+  let sends = [];
+  let q = TrainerUI.createRateQueue({ send: (k, r, o) => { sends.push({ k, r, keepalive: !!o.keepalive }); return { ok: true }; }, delayMs: 800, setTimer: h.setTimer, clearTimer: h.clearTimer });
+  q.push('a', 7, () => {});
+  assert.strictEqual(q.flush(), 1);
+  assert.deepStrictEqual(sends, [{ k: 'a', r: 7, keepalive: true }]);
+  h.fire(h.latest()); // the cancelled timer does not send again
+  assert.deepStrictEqual(sends, [{ k: 'a', r: 7, keepalive: true }]);
+  // F1b: with nothing pending → flush() returns 0 and sends nothing.
+  h = mkHarness();
+  sends = [];
+  q = TrainerUI.createRateQueue({ send: (k, r, o) => { sends.push({ k, r }); return { ok: true }; }, delayMs: 800, setTimer: h.setTimer, clearTimer: h.clearTimer });
+  assert.strictEqual(q.flush(), 0);
+  assert.deepStrictEqual(sends, []);
+  // F1c: A in flight and B pending on a timer → flush() sends B immediately;
+  // if B equals A → no send.
+  h = mkHarness();
+  sends = [];
+  q = TrainerUI.createRateQueue({ send: (k, r, o) => { const t = makeThenable(); sends.push({ k, r }); return t; }, delayMs: 800, setTimer: h.setTimer, clearTimer: h.clearTimer });
+  q.push('a', 3, () => {});
+  h.fire(h.latest()); // A (3) goes in flight
+  q.push('a', 7, () => {}); // B (7) pending on a timer
+  assert.strictEqual(q.flush(), 1);
+  assert.deepStrictEqual(sends, [{ k: 'a', r: 3 }, { k: 'a', r: 7 }]);
+  h = mkHarness();
+  sends = [];
+  q = TrainerUI.createRateQueue({ send: (k, r, o) => { const t = makeThenable(); sends.push({ k, r }); return t; }, delayMs: 800, setTimer: h.setTimer, clearTimer: h.clearTimer });
+  q.push('a', 3, () => {});
+  h.fire(h.latest()); // A (3) goes in flight
+  q.push('a', 3, () => {}); // B equals A
+  assert.strictEqual(q.flush(), 0);
+  assert.deepStrictEqual(sends, [{ k: 'a', r: 3 }]);
+  // F1d: two keys pending → 2 sends.
+  h = mkHarness();
+  sends = [];
+  q = TrainerUI.createRateQueue({ send: (k, r, o) => { sends.push({ k, r }); return { ok: true }; }, delayMs: 800, setTimer: h.setTimer, clearTimer: h.clearTimer });
+  q.push('a', 3, () => {});
+  q.push('b', 5, () => {});
+  assert.strictEqual(q.flush(), 2);
+  assert.deepStrictEqual(sends.sort((x, y) => x.k.localeCompare(y.k)), [{ k: 'a', r: 3 }, { k: 'b', r: 5 }]);
+});
+
 // ---- Trainer T3.1 refinements: tooltips, unwatch button, rows stay put ----
 ok('trainer T3.1 U1: every button/chip has a title; disabled rate controls say "Connect Simkl to rate"', () => {
   const now = Date.parse('2026-03-15T12:00:00Z');

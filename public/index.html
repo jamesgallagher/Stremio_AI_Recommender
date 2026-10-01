@@ -1394,7 +1394,7 @@ function trainerState(id) {
       view: 'all', q: '', page: 1, data: null,
       confirmed: new Map(), shown: new Map(), rebuilding: false,
       queue: TrainerUI.createRateQueue({
-        send: (key, rating) => api(`/profiles/${id}/trainer/rate`, { method: 'POST', body: { type: 'movie', tmdb_id: key, rating } }),
+        send: (key, rating, o) => api(`/profiles/${id}/trainer/rate`, { method: 'POST', body: { type: 'movie', tmdb_id: key, rating }, keepalive: !!(o && o.keepalive) }),
         delayMs: 800,
         setTimer: (fn, ms) => setTimeout(fn, ms),
         clearTimer: (t) => clearTimeout(t),
@@ -1404,6 +1404,13 @@ function trainerState(id) {
   }
   return st;
 }
+
+// F1: flush every profile's pending ratings when the page is hidden or closing,
+// so a rating made just before leaving the app is never lost.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') Object.values(TRAINER).forEach(st => st.queue.flush());
+});
+window.addEventListener('pagehide', () => Object.values(TRAINER).forEach(st => st.queue.flush()));
 
 function trainerOpen(id) {
   trainerLoad(id);

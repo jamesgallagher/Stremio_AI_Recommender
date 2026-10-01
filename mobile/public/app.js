@@ -33,6 +33,9 @@
   // Trainer T4: the companion exposes its fetch + snackbar to the Trainer controller
   // (trainer.js), so it can drive the same session-scoped API and snackbars.
   window.companion = { apiFetch, showSnack, hideSnack };
+  // F4: an expired session sends the companion back to login — the Trainer's
+  // api() calls this on a 401 so the user isn't stuck on a dead Trainer screen.
+  window.companion.onSessionExpired = () => { state.authed = false; state.profile = null; location.hash = '#/login'; render(); setMsg('Your session expired — sign in again.'); };
   const setMsg = (text, kind) => { els.msg.textContent = text || ''; els.msg.className = 'msg' + (kind ? ' ' + kind : ''); };
 
   // ---- render ----
