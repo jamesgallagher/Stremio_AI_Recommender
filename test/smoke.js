@@ -19,6 +19,7 @@ const config = require('../src/config');
 const rebuild = require('../src/rebuild');
 const groq = require('../src/services/groq');
 const tmdb = require('../src/services/tmdb');
+const serveCalibration = require('../src/serveCalibration');
 
 let passed = 0;
 function ok(name, fn) {
@@ -3186,6 +3187,136 @@ ok('trainer T4 K1a: jsonRequest — object body → JSON string; string/no body 
 ok('trainer T4 K3a: shouldAdvance — only advance if the current card is still the key', () => {
   assert.strictEqual(TrainerUI.shouldAdvance('a', 'a'), true);
   assert.strictEqual(TrainerUI.shouldAdvance('b', 'a'), false);
+});
+
+// ---- Calibrated serving (spec §16): pure helpers + ordering (K1–K9) ----
+ok('calibrated K1: rowGenres strips Anime, trims, de-dups', () => {
+  assert.deepStrictEqual(serveCalibration.rowGenres({ genres: 'Action, Drama ,Action, Anime' }), ['Action', 'Drama']);
+  assert.deepStrictEqual(serveCalibration.rowGenres({ genres: '  Comedy ,  Comedy' }), ['Comedy']);
+  assert.deepStrictEqual(serveCalibration.rowGenres({ primary_genre: 'Horror' }), ['Horror']);
+  assert.deepStrictEqual(serveCalibration.rowGenres({ genres: 'Anime' }), []);
+  assert.deepStrictEqual(serveCalibration.rowGenres({}), []);
+});
+
+ok('calibrated K2: genreMix fractional 1/k, sums to 1', () => {
+  const rows = [
+    { genres: 'Action,Drama' },   // 1/2 each
+    { genres: 'Action' },          // 1 Action
+    { genres: 'Comedy,Horror' },   // 1/2 each
+  ];
+  const mix = serveCalibration.genreMix(rows);
+  assert.ok(Math.abs(mix.get('Action') - 0.5) < 1e-9);
+  assert.ok(Math.abs(mix.get('Drama') - 1 / 6) < 1e-9);
+  assert.ok(Math.abs(mix.get('Comedy') - 1 / 6) < 1e-9);
+  assert.ok(Math.abs(mix.get('Horror') - 1 / 6) < 1e-9);
+  const total = [...mix.values()].reduce((a, b) => a + b, 0);
+  assert.ok(Math.abs(total - 1) < 1e-9);
+  assert.deepStrictEqual([...serveCalibration.genreMix([]).entries()], []);
+});
+
+ok('calibrated K3: computeTarget ignores weight ≤0, splits multi-genre, sorts, {} empty', () => {
+  const films = [
+    { genres: ['Action', 'Drama'], weight: 2 },  // 1 each
+    { genres: ['Action'], weight: 2 },            // 2 Action
+    { genres: ['Comedy'], weight: -1 },           // ignored
+    { genres: ['Comedy'], weight: 0 },           // ignored
+  ];
+  const t = serveCalibration.computeTarget(films);
+  assert.ok(Math.abs(t.Action - 0.75) < 1e-9);
+  assert.ok(Math.abs(t.Drama - 0.25) < 1e-9);
+  assert.strictEqual(t.Comedy, undefined);
+  assert.deepStrictEqual(Object.keys(t), ['Action', 'Drama']); // sorted by share desc
+  assert.deepStrictEqual(serveCalibration.computeTarget([]), {});
+  assert.deepStrictEqual(serveCalibration.computeTarget([{ genres: ['X'], weight: 0 }]), {});
+});
+
+ok('calibrated K4: applyExclusions renormalises; all excluded → {}', () => {
+  const t = { Action: 0.5, Drama: 0.3, Comedy: 0.2 };
+  const r = serveCalibration.applyExclusions(t, ['Comedy']);
+  assert.ok(Math.abs(r.Action - 0.625) < 1e-9);
+  assert.ok(Math.abs(r.Drama - 0.375) < 1e-9);
+  assert.strictEqual(r.Comedy, undefined);
+  assert.deepStrictEqual(serveCalibration.applyExclusions(t, ['Action', 'Drama', 'Comedy']), {});
+});
+
+ok('calibrated K5: klDivergence 0 when q=p, >0 otherwise (hand-computed)', () => {
+  const p = { A: 0.5, B: 0.3, C: 0.2 };
+  assert.ok(Math.abs(serveCalibration.klDivergence(p, new Map(Object.entries(p)))) < 1e-9);
+  const q = new Map([['A', 0.2], ['B', 0.2], ['C', 0.6]]);
+  const a = 0.01;
+  let expect = 0;
+  for (const [g, pv] of Object.entries(p)) expect += pv * Math.log(pv / ((1 - a) * q.get(g) + a * pv));
+  assert.ok(Math.abs(serveCalibration.klDivergence(p, q) - expect) < 1e-9);
+  assert.ok(serveCalibration.klDivergence(p, q) > 0);
+});
+
+ok('calibrated K6: calibration beats round-robin (mix near target, window-only)', () => {
+  const rows = [];
+  const mk = (genre, score, id) => ({ tmdb_id: id, genres: genre, affinity: score });
+  const A = [100, 99, 98, 97, 96, 95, 94, 93, 92, 91, 50, 49, 48, 47, 46, 45, 44, 43, 42, 41];
+  const B = [90.9, 90.8, 90.7, 90.6, 90.5, 90.4, 90.3, 90.2, 90.1, 90.0, 40, 39, 38, 37, 36, 35, 34, 33, 32, 31];
+  const C = [89.9, 89.8, 89.7, 89.6, 89.5, 89.4, 89.3, 89.2, 89.1, 89.0, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21];
+  A.forEach((s, i) => rows.push(mk('Action', s, 'a' + i)));
+  B.forEach((s, i) => rows.push(mk('Drama', s, 'b' + i)));
+  C.forEach((s, i) => rows.push(mk('Comedy', s, 'c' + i)));
+  const sorted = rows.slice().sort((x, y) => y.affinity - x.affinity);
+  const target = { Action: 0.5, Drama: 0.3, Comedy: 0.2 };
+  const order = serveCalibration.calibratedOrder(sorted, target, { listSize: 10 });
+  const top10 = order.slice(0, 10);
+  // Calibration beats a score-only serve: its genre mix is much closer to the
+  // target (lower KL) than the top-10-by-score mix (which is all Action here).
+  const calKL = serveCalibration.klDivergence(target, serveCalibration.genreMix(top10));
+  const scoreKL = serveCalibration.klDivergence(target, serveCalibration.genreMix(sorted.slice(0, 10)));
+  assert.ok(calKL < scoreKL, `calibrated KL ${calKL.toFixed(4)} must beat score-only KL ${scoreKL.toFixed(4)}`);
+  assert.ok(calKL < 0.5, `calibrated KL ${calKL.toFixed(4)} is close to the target`);
+  // Every chosen row is inside the quality window (top W = 30).
+  const windowIds = new Set(sorted.slice(0, 30).map((r) => r.tmdb_id));
+  for (const r of top10) assert.ok(windowIds.has(r.tmdb_id), 'chosen row outside window: ' + r.tmdb_id);
+  // A score-only serve of the same pool is all Action (the problem calibration fixes).
+  assert.ok(sorted.slice(0, 10).every((r) => r.genres === 'Action'), 'score-only top-10 is all Action');
+});
+
+ok('calibrated K7: quality window — a liked genre with no strong candidate is under-filled', () => {
+  const rows = [];
+  for (let i = 0; i < 20; i++) rows.push({ tmdb_id: 'a' + i, genres: 'Action', affinity: 200 - i });
+  for (let i = 0; i < 19; i++) rows.push({ tmdb_id: 'b' + i, genres: 'Drama', affinity: 190 - i });
+  rows.push({ tmdb_id: 'c0', genres: 'Comedy', affinity: 1 }); // lowest, outside W
+  const sorted = rows.slice().sort((x, y) => y.affinity - x.affinity);
+  const target = { Action: 0.4, Drama: 0.4, Comedy: 0.2 }; // target includes Comedy
+  const order = serveCalibration.calibratedOrder(sorted, target, { listSize: 10 });
+  const calibratedPart = order.slice(0, 30); // the window part (W = min(40, 30) = 30)
+  assert.ok(!calibratedPart.some((r) => r.genres === 'Comedy'), 'Comedy row leaked into the calibrated part');
+  assert.ok(order.some((r) => r.genres === 'Comedy'), 'Comedy row still present in the full ordering');
+});
+
+ok('calibrated K8: one full ordering + determinism', () => {
+  const rows = [];
+  for (let i = 0; i < 15; i++) rows.push({ tmdb_id: 'id' + i, genres: i % 2 ? 'Drama' : 'Action', affinity: 100 - i });
+  const target = { Action: 0.6, Drama: 0.4 };
+  const o1 = serveCalibration.calibratedOrder(rows.slice(), target, { listSize: 10 });
+  const o2 = serveCalibration.calibratedOrder(rows.slice(), target, { listSize: 10 });
+  const ids = o1.map((r) => r.tmdb_id);
+  assert.strictEqual(ids.length, rows.length);
+  assert.strictEqual(new Set(ids).size, rows.length); // no dups
+  assert.deepStrictEqual(ids.sort(), rows.map((r) => r.tmdb_id).sort()); // full ordering
+  assert.deepStrictEqual(o1.map((r) => r.tmdb_id), o2.map((r) => r.tmdb_id)); // deterministic
+});
+
+ok('calibrated K9: wildcard slot', () => {
+  const rows = [];
+  for (let i = 0; i < 30; i++) rows.push({ tmdb_id: 'a' + i, genres: 'Action', affinity: 300 - i });
+  rows.push({ tmdb_id: 'd0', genres: 'Drama', affinity: 5 }); // lowest, within 2W, outside window
+  const sorted = rows.slice().sort((x, y) => y.affinity - x.affinity);
+  const listSize = 10;
+  // Qualifying target: Drama share 0.04 < 0.05 → the Drama row qualifies.
+  const orderQual = serveCalibration.calibratedOrder(sorted, { Action: 0.96, Drama: 0.04 }, { listSize, wildcardSlots: 1 });
+  assert.strictEqual(orderQual[5].tmdb_id, 'd0', 'qualifying wildcard placed at index 5');
+  // wildcardSlots:0 → no wildcard; the Drama row stays in its rest position.
+  const orderOff = serveCalibration.calibratedOrder(sorted, { Action: 0.96, Drama: 0.04 }, { listSize, wildcardSlots: 0 });
+  assert.notStrictEqual(orderOff[5].tmdb_id, 'd0');
+  // No qualifier → order unchanged (Drama share 0.1 ≥ 0.05 → doesn't qualify).
+  const orderNoQual = serveCalibration.calibratedOrder(sorted, { Action: 0.9, Drama: 0.1 }, { listSize, wildcardSlots: 1 });
+  assert.notStrictEqual(orderNoQual[5].tmdb_id, 'd0');
 });
 
 // ---- HTTP surface ----
