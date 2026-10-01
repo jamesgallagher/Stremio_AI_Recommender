@@ -89,11 +89,11 @@
     const movieEngines = (engines.available && engines.available.movie) || [];
     const engine = movieEngines.find((e) => e.id === engineMovie);
     const engineName = engine ? engine.name : (engineMovie || 'another engine');
-    const fullText = "Ratings still save to Simkl, but this profile's movies come from " + engineName + ", so the Trainer won't change its recommendations. Switch the Movies engine to Marquee in Filters.";
+    const fullText = "Ratings still save to Simkl, but this profile's movies come from " + engineName + ", so your ratings won't change its recommendations. Switch the Movies engine to Marquee in Filters.";
     // K2.3: in Quick mode the notice is one line with a "More" button; List
     // keeps the full text.
     if (st.mode === 'quick') {
-      els.notice.innerHTML = '<div class="tr-notice tr-notice-quick">ⓘ Ratings won\'t change Genesis picks <button class="link" data-tact="notice-more">More</button></div>';
+      els.notice.innerHTML = '<div class="tr-notice tr-notice-quick">ⓘ Ratings won\'t change ' + esc(String(engineName).replace(/ Engine$/, '')) + ' picks <button class="link" data-tact="notice-more">More</button></div>';
       const btn = els.notice.querySelector('[data-tact="notice-more"]');
       if (btn) btn.addEventListener('click', () => {
         els.notice.innerHTML = '<div class="tr-notice">' + esc(fullText) + '</div>';
