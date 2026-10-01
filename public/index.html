@@ -342,7 +342,7 @@ function render(profiles) {
         <button class="tab-btn" data-tab="simkl" onclick="switchTab(this,'simkl')">Simkl</button>
         <button class="tab-btn" data-tab="filters" onclick="switchTab(this,'filters')">Filters</button>
         <button class="tab-btn" data-tab="catalogs" onclick="switchTab(this,'catalogs')">Catalogs</button>
-        <button class="tab-btn" data-tab="trainer" onclick="switchTab(this,'trainer')">Trainer</button>
+        <button class="tab-btn" data-tab="trainer" onclick="switchTab(this,'trainer')">Ratings</button>
         <button class="tab-btn" data-tab="scrobble" onclick="switchTab(this,'scrobble')">Scrobble</button>
         <button class="tab-btn" data-tab="install" onclick="switchTab(this,'install')">Install</button>
         <button class="tab-btn" data-tab="advanced" onclick="switchTab(this,'advanced')">Advanced</button>
@@ -1463,7 +1463,7 @@ function trainerDraw(id) {
   const now = Date.now();
   const engine = p && ENGINES.find(e => e.id === p.filters.engine_movie);
   const notice = (p && p.filters.engine_movie !== 'marquee')
-    ? `<div class="tr-notice">Ratings still save to Simkl, but this profile's movies come from ${esc(engine ? engine.name : (p.filters.engine_movie || 'another engine'))}, so the Trainer won't change its recommendations. Switch the Movies engine to Marquee in Filters.</div>`
+    ? `<div class="tr-notice">Ratings still save to Simkl, but this profile's movies come from ${esc(engine ? engine.name : (p.filters.engine_movie || 'another engine'))}, so your ratings won't change its recommendations. Switch the Movies engine to Marquee in Filters.</div>`
     : '';
   const rows = d.items.length
     ? d.items.map(item => TrainerUI.rowHtml(item, { canRate, now })).join('')
