@@ -340,7 +340,7 @@ select:focus { border-color: var(--accent); }
    fills the remaining space, and the poster is the only flexible item. */
 #view-trainer {
   display: flex; flex-direction: column;
-  height: calc(100dvh - var(--topbar-h) - var(--tabbar-h) - env(safe-area-inset-bottom) - 8px);
+  height: calc(100dvh - var(--topbar-h) - var(--tabbar-h) - env(safe-area-inset-bottom) - 8px - 16px); /* - 16px: #content padding-top */
 }
 .trainer-tabs { flex: 0 0 auto; }
 #trainer-notice { flex: 0 0 auto; }
