@@ -1453,6 +1453,32 @@ async function httpTests() {
     console.log('  ✓ trainer companion: unauthenticated 401 + query profile_id ignored (F11.6)');
   }
 
+  // ---- Trainer T4 K1b: the companion's POST body is real JSON, not "[object Object]" ----
+  // POST /mobile/api/trainer/ignore with a real JSON body + session → 200 (or
+  // 404 not-in-history for an unknown film) — never 400.
+  {
+    const watchedStore = require('../../src/watchedStore');
+    const emailK = uniqEmail(); const pK = seedProfile('TrainerK1', emailK);
+    watchedStore.upsertMany(pK.id, [{ simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '1', title: 'Mine', year: 2020, watched_at: '2026-01-01T00:00:00Z' }]);
+    const cookie = await sessionCookieFor(emailK);
+    // Known film → 200.
+    const known = await fetch(`${BASE}/mobile/api/trainer/ignore`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ type: 'movie', tmdb_id: '1', ignored: true }),
+    });
+    assert.strictEqual(known.status, 200, 'known film → 200, got ' + known.status);
+    // Unknown film → 404 not-in-history (not 400).
+    const unknown = await fetch(`${BASE}/mobile/api/trainer/ignore`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ type: 'movie', tmdb_id: '999999', ignored: true }),
+    });
+    assert.strictEqual(unknown.status, 404, 'unknown film → 404, got ' + unknown.status);
+    assert.match((await unknown.json()).error, /not-in-history/);
+    watchedStore.deleteForProfile(pK.id);
+    config.removeProfile(pK.id);
+    console.log('  ✓ trainer K1b: POST /mobile/api/trainer/ignore with a real JSON body → 200/404, never 400');
+  }
+
   console.log(`\nAll mobile checks passed (${passed} unit + http).`);
   process.exit(0);
 }

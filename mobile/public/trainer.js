@@ -43,7 +43,8 @@
 
   // ---- API helpers (session-scoped, no profile id) ----
   async function api(path, opts) {
-    const res = await comp.apiFetch(path, opts);
+    // K1: JSON-encode an object body (apiFetch passes it to fetch unchanged).
+    const res = await comp.apiFetch(path, T.jsonRequest(opts));
     const body = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error((body && body.error) || ('HTTP ' + res.status));
     return body;

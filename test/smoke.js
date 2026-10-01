@@ -3079,6 +3079,26 @@ ok('trainer T4 M4: QUICK_ACTIONS is exactly the list', () => {
   assert.deepStrictEqual(TrainerUI.QUICK_ACTIONS, ['love', 'ignore', 'skip', 'unwatch', 'undo']);
 });
 
+ok('trainer T4 K1a: jsonRequest — object body → JSON string; string/no body unchanged; input never mutated', () => {
+  // Object body → a JSON string (the fix for the "[object Object]" 400).
+  const obj = { method: 'POST', body: { type: 'movie', tmdb_id: '1', ignored: true } };
+  const r1 = TrainerUI.jsonRequest(obj);
+  assert.strictEqual(r1.body, JSON.stringify(obj.body));
+  assert.strictEqual(r1.method, 'POST'); // other opts preserved
+  // The result is a fresh copy, not the input.
+  assert.notStrictEqual(r1, obj);
+  // String body → unchanged (same reference).
+  const str = { method: 'POST', body: '{"a":1}' };
+  assert.strictEqual(TrainerUI.jsonRequest(str), str);
+  // No body → unchanged (same reference).
+  const nob = { method: 'POST' };
+  assert.strictEqual(TrainerUI.jsonRequest(nob), nob);
+  // The input is never mutated.
+  assert.deepStrictEqual(obj, { method: 'POST', body: { type: 'movie', tmdb_id: '1', ignored: true } });
+  r1.body = 'mutated';
+  assert.deepStrictEqual(obj.body, { type: 'movie', tmdb_id: '1', ignored: true });
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');

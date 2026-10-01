@@ -342,4 +342,13 @@ TrainerUI.pickQuickBatch = (items, handled) =>
 // The five quick-card actions, in order.
 TrainerUI.QUICK_ACTIONS = ['love', 'ignore', 'skip', 'unwatch', 'undo'];
 
+// K1: the companion's api() hands a plain object body to fetch, which
+// serialises to "[object Object]" and the server's JSON parser rejects with 400.
+// jsonRequest JSON-encodes an object body; a string body or no body passes
+// through unchanged. Pure — never mutates its input.
+TrainerUI.jsonRequest = (opts) => {
+  if (!opts || opts.body == null || typeof opts.body === 'string') return opts;
+  return { ...opts, body: JSON.stringify(opts.body) };
+};
+
 if (typeof module !== 'undefined' && module.exports) module.exports = TrainerUI; else window.TrainerUI = TrainerUI;
