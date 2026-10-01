@@ -1540,6 +1540,7 @@ function trainerClick(id, e) {
           const row = trainerRowEl(panel, key);
           if (row) {
             row.classList.add('tr-dim');
+            row.querySelectorAll('.tr-stars button').forEach(b => b.disabled = true); // R9: no commit on an ignored row
             const acts = row.querySelector('.tr-acts');
             if (acts) acts.innerHTML = `Ignored · <button class="ghost mini" data-act="undo" aria-label="Undo ignore" title="${esc(TrainerUI.TIPS.undo)}">Undo</button>`;
           }
@@ -1562,7 +1563,8 @@ function trainerClick(id, e) {
       if (!item || !confirm('Remove "' + item.title + '" from your Simkl watch history?\n\nUse this if it was marked watched by mistake. It can be recommended to you again.')) break;
       (async () => {
         try {
-          await api(`/profiles/${id}/trainer/unwatched`, { method: 'POST', body: { type: 'movie', tmdb_id: key, imdb_id: item.imdb_id } });
+          const r = await api(`/profiles/${id}/trainer/unwatched`, { method: 'POST', body: { type: 'movie', tmdb_id: key, imdb_id: item.imdb_id } });
+          st.confirmed.set(key, r.item); // status 'unwatched' → star scrub inert
           const row = trainerRowEl(panel, key);
           if (row) {
             row.classList.add('tr-dim');
@@ -1641,7 +1643,14 @@ function bindRowStars(row, key, id) {
   if (group._scrub) group._scrub();
   group._scrub = TrainerUI.bindStarScrub(group, {
     getRects: () => [...group.querySelectorAll('.tr-star-wrap')].map(w => { const r = w.getBoundingClientRect(); return { left: r.left, width: r.width }; }),
-    isEnabled: () => canRate && !!item && !item.ignored && item.status === 'watched',
+    // Inert (no preview, no commit) unless Simkl is connected and the row is a
+    // watched, non-ignored film. Reads the current confirmed state (updated by
+    // each action), not the bind-time item, so ignore/unwatch take effect live.
+    isEnabled: () => {
+      if (!canRate) return false;
+      const cur = st.confirmed.get(key) || item;
+      return !!cur && !cur.ignored && cur.status === 'watched';
+    },
     onPreview: (r) => {
       const fills = TrainerUI.fillsForRating(r);
       group.querySelectorAll('.tr-fill').forEach((f, i) => { f.style.width = fills[i]; });
