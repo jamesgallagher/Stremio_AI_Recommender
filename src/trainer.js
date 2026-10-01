@@ -29,6 +29,7 @@ const engagement = require('./engines/marquee/engagement');
 const metaStore = require('./engines/glass/metaStore');
 const markWatchedMod = require('./markWatched');
 const settings = require('./settings');
+const db = require('./db');
 
 // The filter views (spec §6).
 const VIEWS = ['all', 'unrated', 'rated', 'loved', 'ignored', 'unfinished'];
@@ -43,6 +44,9 @@ const defaultDeps = {
   markWatched: markWatchedMod.markWatched,
   settings,
   enrich: metaStore.enrich,
+  metaGet: metaStore.get,
+  unfinishedRows,
+  db,
   now: Date.now,
   log: console,
 };
@@ -73,9 +77,48 @@ function hasSimkl(profile) {
   return !!(profile && profile.keys && profile.keys.simkl_client_id && profile.simkl_auth && profile.simkl_auth.access_token);
 }
 
+// The 15-key trainer item DTO (spec §6). `key` is the tmdb id (unique after
+// dedupe; the stable id for actions). `loved` is computed, never stored (M3).
+function toItem(row, status, { ratings, ignored, meta }) {
+  const tmdbId = row.tmdb_id != null ? String(row.tmdb_id) : null;
+  const rating = tmdbId != null && ratings.has(tmdbId) ? ratings.get(tmdbId) : null;
+  const genre = row.primary_genre || (meta && (meta.primary_genre || (meta.genres && meta.genres[0]) || null)) || null;
+  const poster = meta ? meta.poster : null;
+  const title = row.title || (meta && meta.title) || null;
+  const year = row.year != null ? row.year : (meta ? meta.year : null);
+  const imdbId = row.imdb_id != null ? row.imdb_id : (meta && meta.imdb_id) || null;
+  return {
+    key: tmdbId,
+    type: row.type || 'movie',
+    simkl_id: row.simkl_id != null ? row.simkl_id : null,
+    tmdb_id: tmdbId,
+    imdb_id: imdbId,
+    title,
+    year,
+    genre,
+    poster,
+    watched_at: row.watched_at != null ? row.watched_at : null,
+    rating,
+    loved: rating === 10,
+    ignored: tmdbId != null ? ignored.has(tmdbId) : false,
+    status,
+    percent: row.percent != null ? Math.round(Number(row.percent)) : null,
+  };
+}
+
+// Build the full DTO for an action's resolved row (F8: rate/setIgnored return
+// the same shape as listHistory, so the two surfaces can't drift).
+function buildItem(D, profile, type, row, status = 'watched') {
+  const ratings = D.tasteFeedback.getRatingsMap(profile.id, type);
+  const ignored = D.tasteFeedback.ignoredSet(profile.id, type);
+  const meta = row.tmdb_id != null ? D.metaGet(type, row.tmdb_id) : null;
+  return toItem(row, status, { ratings, ignored, meta });
+}
+
 // Resolve a ref against THIS profile's watched rows (type-scoped), deduplicated
 // by tmdb_id keeping the newest watched_at. Rows without a tmdb_id can't be
-// acted on (M5). Returns the row or null.
+// acted on (M5). Resolution order: simkl_id → tmdb_id → imdb_id, each compared
+// as normalized strings. Returns the row or null.
 function resolveWatchedRow(profileId, type, ref, watchedStore) {
   if (!ref || typeof ref !== 'object') return null;
   const rows = watchedStore.getWatched(profileId, { type });
@@ -83,6 +126,11 @@ function resolveWatchedRow(profileId, type, ref, watchedStore) {
   for (const r of rows) {
     const tmdbId = r.tmdb_id != null ? String(r.tmdb_id) : null;
     if (tmdbId && !byTmdb.has(tmdbId)) byTmdb.set(tmdbId, r);
+  }
+  if (ref.simkl_id != null) {
+    const r = rows.find((x) => x.simkl_id != null && String(x.simkl_id) === String(ref.simkl_id));
+    const tmdbId = r && r.tmdb_id != null ? String(r.tmdb_id) : null;
+    if (tmdbId) return byTmdb.get(tmdbId) || null;
   }
   if (ref.tmdb_id != null && ref.tmdb_id !== '') {
     return byTmdb.get(String(ref.tmdb_id)) || null;
@@ -92,31 +140,45 @@ function resolveWatchedRow(profileId, type, ref, watchedStore) {
     const tmdbId = r && r.tmdb_id != null ? String(r.tmdb_id) : null;
     return tmdbId ? byTmdb.get(tmdbId) : null;
   }
-  if (ref.simkl_id != null) {
-    const r = rows.find((x) => x.simkl_id === ref.simkl_id);
-    const tmdbId = r && r.tmdb_id != null ? String(r.tmdb_id) : null;
-    return tmdbId ? byTmdb.get(tmdbId) : null;
-  }
   return null;
 }
 
-// Resolve a ref against THIS profile's UNFINISHED (abandoned) rows, keyed by
-// tmdb_id (spec §6: setIgnored can hide an unfinished row). Returns { tmdb_id }
-// or null.
-function resolveUnfinishedRow(profileId, type, ref, engagement, settings) {
+// Is a marquee_engagement row an unfinished (abandoned) row? PURE (F6): true iff
+// it has a tmdb_id, its furthest progress is < 50%, and it is not in the
+// watched store under either id (a completed watch — or a rewatch — always wins).
+function isUnfinishedRow(row, watchedIds) {
+  return row.tmdb_id != null
+    && Number(row.percent) < 50
+    && !watchedIds.tmdb.has(String(row.tmdb_id))
+    && !watchedIds.imdb.has(row.imdb_id);
+}
+
+// The profile's unfinished rows: read marquee_engagement directly (no
+// abandonedFor, no settings-as-config), keep the rows that areUnfinishedRow.
+// Injectable for tests (deps.unfinishedRows).
+function unfinishedRows(profileId, D) {
+  D.engagement.init();
+  const rows = D.db.get().prepare('SELECT imdb_id, tmdb_id, percent, updated_at FROM marquee_engagement WHERE profile_id = ?').all(profileId);
+  const watchedIds = D.watchedStore.watchedIdSets(profileId);
+  return rows.filter((row) => isUnfinishedRow(row, watchedIds));
+}
+
+// Resolve a ref against THIS profile's unfinished rows (spec §6: setIgnored and
+// markFinished can act on an unfinished row). Match by imdb_id, then tmdb_id.
+// Returns the whole row or null.
+function resolveUnfinishedRow(profileId, type, ref, D) {
   if (!ref || typeof ref !== 'object') return null;
-  const cfg = settings.getSettings() || {};
-  const abandoned = engagement.abandonedFor(profileId, cfg, { now: Date.now() });
+  const rows = D.unfinishedRows(profileId, D);
+  if (ref.imdb_id) {
+    const r = rows.find((x) => x.imdb_id === ref.imdb_id);
+    if (r) return r;
+  }
   if (ref.tmdb_id != null && ref.tmdb_id !== '') {
     const tmdbId = String(ref.tmdb_id);
-    return abandoned.has(tmdbId) ? { tmdb_id: tmdbId } : null;
+    const r = rows.find((x) => x.tmdb_id != null && String(x.tmdb_id) === tmdbId);
+    if (r) return r;
   }
   return null;
-}
-
-// Is a trainer item an unfinished (abandoned) row?
-function isUnfinishedRow(item) {
-  return !!(item && item.status === 'unfinished');
 }
 
 // listHistory — the per-profile watch-history listing (spec §6). Returns
@@ -132,6 +194,9 @@ async function listHistory(profile, { type: typeIn, view = 'all', q = null, page
   const ps = Math.min(100, Math.max(1, Math.floor(Number(pageSize)) || 25));
   const pg = Math.max(1, Math.floor(Number(page)) || 1);
 
+  const ratings = D.tasteFeedback.getRatingsMap(profile.id, type);
+  const ignored = D.tasteFeedback.ignoredSet(profile.id, type);
+
   // Watched rows, deduplicated by tmdb_id keeping the newest watched_at.
   const rows = D.watchedStore.getWatched(profile.id, { type });
   const byTmdb = new Map();
@@ -141,63 +206,29 @@ async function listHistory(profile, { type: typeIn, view = 'all', q = null, page
     if (!tmdbId) { unresolved += 1; continue; } // no tmdb_id → can't be acted on
     if (!byTmdb.has(tmdbId)) byTmdb.set(tmdbId, r); // rows are newest-first
   }
-  const ratings = D.tasteFeedback.getRatingsMap(profile.id, type);
-  const ignored = D.tasteFeedback.ignoredSet(profile.id, type);
-
   const watchedItems = [];
   for (const [tmdbId, r] of byTmdb) {
-    const rating = ratings.get(tmdbId) != null ? ratings.get(tmdbId) : null;
-    watchedItems.push({
-      key: tmdbId,
-      type,
-      simkl_id: r.simkl_id,
-      tmdb_id: tmdbId,
-      imdb_id: r.imdb_id,
-      title: r.title,
-      year: r.year,
-      genre: r.primary_genre || null,
-      poster: null,
-      watched_at: r.watched_at,
-      rating,
-      loved: rating === 10,
-      ignored: ignored.has(tmdbId),
-      status: 'watched',
-      percent: null,
-      _sortMs: r.watched_at ? (Date.parse(r.watched_at) || 0) : 0,
-    });
+    const item = toItem(r, 'watched', { ratings, ignored, meta: null });
+    item._sortMs = r.watched_at ? (Date.parse(r.watched_at) || 0) : 0;
+    watchedItems.push(item);
   }
 
   // Unfinished (abandoned) items — movies only, keyed by tmdb_id.
-  const cfg = D.settings.getSettings() || {};
-  const abandoned = D.engagement.abandonedFor(profile.id, cfg, { now: D.now() });
+  const unfinishedRowsList = D.unfinishedRows(profile.id, D);
   const unfinishedItems = [];
-  for (const [tmdbId, info] of abandoned) {
-    const rating = ratings.get(tmdbId) != null ? ratings.get(tmdbId) : null;
-    unfinishedItems.push({
-      key: tmdbId,
-      type,
-      simkl_id: null,
-      tmdb_id: tmdbId,
-      imdb_id: null,
-      title: null,
-      year: null,
-      genre: null,
-      poster: null,
-      watched_at: null,
-      rating,
-      loved: rating === 10,
-      ignored: ignored.has(tmdbId),
-      status: 'unfinished',
-      percent: info.percent,
-      _sortMs: info.ts || 0,
-    });
+  for (const row of unfinishedRowsList) {
+    const item = toItem(row, 'unfinished', { ratings, ignored, meta: null });
+    item._sortMs = row.updated_at || 0;
+    item._imdbId = row.imdb_id;
+    unfinishedItems.push(item);
   }
 
-  // Counts (filter chips) — over the whole universe, per view.
+  // Counts (filter chips) — over the whole universe, per view. F5: rated
+  // includes a 10 (loved); the loved chip is the 10 subset.
   const counts = {
     all: watchedItems.filter((i) => !i.ignored).length,
     unrated: watchedItems.filter((i) => !i.ignored && i.rating == null).length,
-    rated: watchedItems.filter((i) => !i.ignored && i.rating != null && i.rating < 10).length,
+    rated: watchedItems.filter((i) => !i.ignored && i.rating != null).length,
     loved: watchedItems.filter((i) => !i.ignored && i.rating === 10).length,
     ignored: watchedItems.filter((i) => i.ignored).length + unfinishedItems.filter((i) => i.ignored).length,
     unfinished: unfinishedItems.filter((i) => !i.ignored).length,
@@ -209,45 +240,65 @@ async function listHistory(profile, { type: typeIn, view = 'all', q = null, page
   switch (v) {
     case 'all': viewItems = watchedItems.filter((i) => !i.ignored); break;
     case 'unrated': viewItems = watchedItems.filter((i) => !i.ignored && i.rating == null); break;
-    case 'rated': viewItems = watchedItems.filter((i) => !i.ignored && i.rating != null && i.rating < 10); break;
+    case 'rated': viewItems = watchedItems.filter((i) => !i.ignored && i.rating != null); break;
     case 'loved': viewItems = watchedItems.filter((i) => !i.ignored && i.rating === 10); break;
     case 'ignored': viewItems = [...watchedItems.filter((i) => i.ignored), ...unfinishedItems.filter((i) => i.ignored)]; break;
     case 'unfinished': viewItems = unfinishedItems.filter((i) => !i.ignored); break;
   }
 
-  // Case-insensitive title search.
-  if (q) {
-    const needle = String(q).toLowerCase();
+  // Case-insensitive title search (F9: trim; skip the filter when empty).
+  const qStr = q == null ? '' : String(q).trim();
+  if (qStr) {
+    const needle = qStr.toLowerCase();
     viewItems = viewItems.filter((i) => i.title && String(i.title).toLowerCase().includes(needle));
   }
 
-  // Sort: watched_at DESC, simkl_id DESC (watched); updated_at DESC (unfinished).
+  // Sort: watched_at DESC, simkl_id DESC (watched); updated_at DESC, imdb_id
+  // (unfinished) — F6 tie-break.
   viewItems.sort((a, b) => {
     if (b._sortMs !== a._sortMs) return b._sortMs - a._sortMs;
-    return (b.simkl_id || 0) - (a.simkl_id || 0);
+    const sim = (b.simkl_id || 0) - (a.simkl_id || 0);
+    if (sim !== 0) return sim;
+    const ia = a._imdbId || '', ib = b._imdbId || '';
+    if (ia < ib) return 1;
+    if (ia > ib) return -1;
+    return 0;
   });
 
   const total = viewItems.length;
   const pageItems = viewItems.slice((pg - 1) * ps, pg * ps);
 
-  // Lazily enrich ≤ 25 poster/title misses on the page (M11: the enrich seam is
-  // injectable, so tests never hit the network).
-  const apiKey = D.settings.keyFor(profile, 'tmdb_api_key');
-  let misses = 0;
+  // F2: fill poster/genre/title/year from the meta cache (no network) for every
+  // page item, then lazily enrich ≤ 25 still-missing posters (batches of 8).
   for (const item of pageItems) {
-    if (!item.tmdb_id) continue;
-    if (item.poster != null && item.title != null) continue;
-    if (misses >= 25) break;
-    misses += 1;
-    const meta = await D.enrich(apiKey, type, item.tmdb_id, D.log, {});
-    if (meta) {
-      if (item.poster == null) item.poster = meta.poster;
-      if (item.genre == null) item.genre = meta.primary_genre || (meta.genres && meta.genres[0]) || null;
-      if (item.title == null) item.title = meta.title;
-      if (item.year == null) item.year = meta.year;
+    if (item.tmdb_id != null) {
+      const meta = D.metaGet(type, item.tmdb_id);
+      if (meta) {
+        if (item.poster == null) item.poster = meta.poster;
+        if (item.genre == null) item.genre = meta.primary_genre || (meta.genres && meta.genres[0]) || null;
+        if (item.title == null) item.title = meta.title;
+        if (item.year == null) item.year = meta.year;
+      }
     }
   }
-  for (const item of pageItems) delete item._sortMs;
+  const apiKey = D.settings.keyFor(profile, 'tmdb_api_key');
+  if (apiKey) {
+    const missing = pageItems.filter((i) => i.tmdb_id != null && i.poster == null);
+    const toEnrich = missing.slice(0, 25);
+    for (let i = 0; i < toEnrich.length; i += 8) {
+      const batch = toEnrich.slice(i, i + 8);
+      const metas = await Promise.all(batch.map((item) => D.enrich(apiKey, type, item.tmdb_id, D.log, {}).catch(() => null)));
+      metas.forEach((meta, idx) => {
+        const item = batch[idx];
+        if (!meta) return;
+        if (item.poster == null) item.poster = meta.poster;
+        if (item.genre == null) item.genre = meta.primary_genre || (meta.genres && meta.genres[0]) || null;
+        if (item.title == null) item.title = meta.title;
+        if (item.year == null) item.year = meta.year;
+      });
+    }
+  }
+  for (const item of pageItems) { delete item._sortMs; delete item._imdbId; }
 
   const training = D.tasteFeedback.getTraining(profile.id);
   return {
@@ -263,7 +314,8 @@ async function listHistory(profile, { type: typeIn, view = 'all', q = null, page
 }
 
 // rate — rate a title 1–10 (or null to clear). Simkl is the authority (M1): the
-// write happens first; the local row is written only on success.
+// write happens first; the local row is written only on success. A no-op (same
+// value) makes zero Simkl calls and records no change (F4).
 async function rate(profile, ref, rating, deps = {}) {
   const D = mergeDeps(deps);
   const t = resolveType(ref && ref.type);
@@ -272,10 +324,14 @@ async function rate(profile, ref, rating, deps = {}) {
   if (rating != null && (!Number.isInteger(rating) || rating < 1 || rating > 10)) {
     return { ok: false, reason: 'bad-rating' };
   }
+  if (!hasSimkl(profile)) return { ok: false, reason: 'no-simkl' };
   const row = resolveWatchedRow(profile.id, type, ref, D.watchedStore);
   if (!row) return { ok: false, reason: 'not-in-history' };
-  if (!hasSimkl(profile)) return { ok: false, reason: 'no-simkl' };
-
+  // F4 no-op: same value (both null counts too) → no Simkl call, no change.
+  const current = D.tasteFeedback.getRating(profile.id, type, row.tmdb_id);
+  if (current === rating) {
+    return { ok: true, item: buildItem(D, profile, type, row), unchanged: true };
+  }
   // M7: every Simkl write goes through the governed simkl_post lane.
   if (rating == null) {
     await D.simkl.removeRatings(profile, [{ type, simkl_id: row.simkl_id, imdb_id: row.imdb_id, tmdb_id: row.tmdb_id }]);
@@ -290,51 +346,50 @@ async function rate(profile, ref, rating, deps = {}) {
   }
   D.tasteFeedback.recordChange(profile.id, now);
   D.log.log(`[trainer] ${profile.name}: rated ${type} tmdb:${row.tmdb_id} → ${rating == null ? 'cleared' : rating}`);
-  return { ok: true, item: { type, tmdb_id: row.tmdb_id, imdb_id: row.imdb_id, simkl_id: row.simkl_id, rating, loved: rating === 10 } };
+  return { ok: true, item: buildItem(D, profile, type, row), unchanged: false };
 }
 
 // setIgnored — ignore/un-ignore a title (local only — M2: never calls Simkl,
 // never touches watched rows). Resolves against watched rows, then unfinished.
+// The value must be a boolean (F3); a no-op records no change.
 async function setIgnored(profile, ref, ignored, deps = {}) {
   const D = mergeDeps(deps);
   const t = resolveType(ref && ref.type);
   if (!t.ok) return { ok: false, reason: t.reason };
   const type = t.type;
-  const row = resolveWatchedRow(profile.id, type, ref, D.watchedStore);
-  let key;
-  let simklId = null;
-  let imdbId = null;
-  if (row) {
-    key = String(row.tmdb_id);
-    simklId = row.simkl_id;
-    imdbId = row.imdb_id;
-  } else {
-    const un = resolveUnfinishedRow(profile.id, type, ref, D.engagement, D.settings);
-    if (!un) return { ok: false, reason: 'not-in-history' };
-    key = un.tmdb_id;
+  if (typeof ignored !== 'boolean') return { ok: false, reason: 'bad-value' };
+  let row = resolveWatchedRow(profile.id, type, ref, D.watchedStore);
+  let status = 'watched';
+  if (!row) {
+    row = resolveUnfinishedRow(profile.id, type, ref, D);
+    status = 'unfinished';
+    if (!row) return { ok: false, reason: 'not-in-history' };
   }
+  const tmdbId = String(row.tmdb_id);
   const now = D.now();
-  D.tasteFeedback.setIgnored(profile.id, { type, tmdb_id: key, simkl_id: simklId, imdb_id: imdbId }, !!ignored, now);
-  D.tasteFeedback.recordChange(profile.id, now);
-  D.log.log(`[trainer] ${profile.name}: ${ignored ? 'ignored' : 'un-ignored'} ${type} tmdb:${key}`);
-  return { ok: true, item: { type, tmdb_id: key, ignored: !!ignored } };
+  const changed = D.tasteFeedback.setIgnored(profile.id, { type, tmdb_id: tmdbId, simkl_id: row.simkl_id, imdb_id: row.imdb_id }, ignored, now);
+  if (changed) D.tasteFeedback.recordChange(profile.id, now);
+  D.log.log(`[trainer] ${profile.name}: ${ignored ? 'ignored' : 'un-ignored'} ${type} tmdb:${tmdbId}`);
+  return { ok: true, item: buildItem(D, profile, type, row, status), unchanged: !changed };
 }
 
 // markFinished — mark an unfinished (abandoned) film finished. Delegates to the
-// shared markWatched action (writes Simkl + pins a pending-watched shim).
+// shared markWatched action (writes Simkl + pins a pending-watched shim). Uses
+// the row's own ids (F6.5), never the ref's.
 async function markFinished(profile, ref, deps = {}) {
   const D = mergeDeps(deps);
   const t = resolveType(ref && ref.type);
   if (!t.ok) return { ok: false, reason: t.reason };
   const type = t.type;
-  const un = resolveUnfinishedRow(profile.id, type, ref, D.engagement, D.settings);
-  if (!un) return { ok: false, reason: 'not-in-history' };
-  const res = await D.markWatched(profile, { type, imdbId: ref.imdb_id || null, tmdbId: un.tmdb_id, title: ref.title || null }, D.log);
+  const row = resolveUnfinishedRow(profile.id, type, ref, D);
+  if (!row) return { ok: false, reason: 'not-in-history' };
+  const meta = row.tmdb_id != null ? D.metaGet(type, row.tmdb_id) : null;
+  const res = await D.markWatched(profile, { type, imdbId: row.imdb_id, tmdbId: String(row.tmdb_id), title: (meta && meta.title) || null }, D.log);
   if (res && res.ok === false) return { ok: false, reason: res.reason };
   const now = D.now();
   D.tasteFeedback.recordChange(profile.id, now);
-  D.log.log(`[trainer] ${profile.name}: marked finished ${type} tmdb:${un.tmdb_id}`);
-  return { ok: true, item: { type, tmdb_id: un.tmdb_id, status: 'watched' } };
+  D.log.log(`[trainer] ${profile.name}: marked finished ${type} tmdb:${row.tmdb_id}`);
+  return { ok: true };
 }
 
 module.exports = {
