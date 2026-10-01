@@ -2602,6 +2602,45 @@ ok('trainer: rowHtml — stars, actions, disabled states, XSS title', () => {
   assert.ok(xss.includes('&lt;img src=x onerror=alert(1)&gt;'));
 });
 
+ok('trainer r1: rowHtml — 10 star hit areas with data-act="star"', () => {
+  const now = Date.parse('2026-03-15T12:00:00Z');
+  const base = { key: '1', type: 'movie', simkl_id: 11, tmdb_id: '1', imdb_id: 'tt1', title: 'The Film', year: 2024, genre: 'Drama', poster: 'https://img.example/p.jpg', watched_at: '2026-03-10T12:00:00Z', rating: null, loved: false, ignored: false, status: 'watched', percent: 100 };
+  const html = TrainerUI.rowHtml(base, { canRate: true, now });
+  assert.strictEqual(html.match(/data-act="star"/g).length, 10);
+});
+
+ok('trainer r1: every data-act value is in TrainerUI.ACTIONS', () => {
+  const now = Date.parse('2026-03-15T12:00:00Z');
+  const base = { key: '1', type: 'movie', simkl_id: 11, tmdb_id: '1', imdb_id: 'tt1', title: 'The Film', year: 2024, genre: 'Drama', poster: 'https://img.example/p.jpg', watched_at: '2026-03-10T12:00:00Z', rating: 7, loved: false, ignored: false, status: 'watched', percent: 100 };
+  const variants = [
+    TrainerUI.rowHtml(base, { canRate: true, now }),
+    TrainerUI.rowHtml({ ...base, ignored: true }, { canRate: true, now }),
+    TrainerUI.rowHtml({ ...base, status: 'unfinished', percent: 30, rating: null }, { canRate: true, now }),
+    TrainerUI.rowHtml({ ...base, rating: 10, loved: true }, { canRate: true, now }),
+    TrainerUI.bannerHtml({ changes_since_build: 3, changed_at: now - 60000, rebuild_due_at: now + 7 * 60000, built_changed_at: now - 3600e3 }, now, { rebuilding: false }),
+    TrainerUI.pagerText(1, 25, 40),
+  ];
+  for (const html of variants) {
+    for (const m of html.matchAll(/data-act="([^"]+)"/g)) {
+      assert.ok(TrainerUI.ACTIONS.includes(m[1]), 'data-act ' + m[1] + ' not in ACTIONS');
+    }
+  }
+});
+
+ok('trainer r1: star wrap has glyph, fill, two hit areas; no clip-path', () => {
+  const now = Date.parse('2026-03-15T12:00:00Z');
+  const base = { key: '1', type: 'movie', simkl_id: 11, tmdb_id: '1', imdb_id: 'tt1', title: 'The Film', year: 2024, genre: 'Drama', poster: 'https://img.example/p.jpg', watched_at: '2026-03-10T12:00:00Z', rating: 7, loved: false, ignored: false, status: 'watched', percent: 100 };
+  const html = TrainerUI.rowHtml(base, { canRate: true, now });
+  assert.strictEqual(html.match(/class="tr-star-wrap"/g).length, 5);
+  assert.strictEqual(html.match(/class="tr-glyph"/g).length, 5);
+  assert.strictEqual(html.match(/class="tr-fill"/g).length, 5);
+  assert.strictEqual(html.match(/class="tr-star"/g).length, 10);
+  // Rating 7 → stars 1–3 full (100%), star 4 half (50%), star 5 empty (0%).
+  const fills = [...html.matchAll(/class="tr-fill"[^>]*style="width:([^"]+)"/g)].map(m => m[1]);
+  assert.deepStrictEqual(fills, ['100%', '100%', '100%', '50%', '0%']);
+  assert.ok(!html.includes('clip-path'));
+});
+
 ok('trainer: bannerHtml — empty, about M min, due within the hour, rebuilding', () => {
   const now = 1_700_000_000_000;
   const none = { changes_since_build: 0, changed_at: null, rebuild_due_at: null, built_changed_at: null };

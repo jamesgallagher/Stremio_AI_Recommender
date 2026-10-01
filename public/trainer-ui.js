@@ -7,6 +7,10 @@ const TrainerUI = {};
 // Filter views, in chip order.
 TrainerUI.VIEWS = [['all', 'All'], ['unrated', 'Unrated'], ['rated', 'Rated'], ['loved', 'Loved ♥'], ['ignored', 'Ignored'], ['unfinished', 'Unfinished']];
 
+// Every data-act value the portal controller switches on. The switch in
+// index.html has a case for each entry — keep the two in sync.
+TrainerUI.ACTIONS = ['star', 'clear', 'love', 'ignore', 'unignore', 'undo', 'finished', 'rebuild', 'prev', 'next'];
+
 // Same mapping as index.html's esc. null/undefined → ''.
 TrainerUI.esc = (s) => {
   if (s == null) return '';
@@ -67,12 +71,14 @@ TrainerUI.rowHtml = (item, { canRate, now }) => {
     const wraps = [];
     for (let i = 0; i < 5; i++) {
       const lv = levels[i];
+      const fillPct = lv === 1 ? '100%' : (lv === 0.5 ? '50%' : '0%');
       const halfBtn = (half) => {
         const rating = TrainerUI.ratingFromStarClick(i, half);
-        const on = (half === 'left' ? lv >= 0.5 : lv === 1) ? ' tr-on' : '';
-        return `<button class="tr-star${on}" data-half="${half}" data-rating="${rating}" aria-label="Rate ${rating} out of 10"${starDis}>★</button>`;
+        return `<button class="tr-star" data-act="star" data-half="${half}" data-rating="${rating}" aria-label="Rate ${rating} out of 10"${starDis}></button>`;
       };
-      wraps.push(`<span class="tr-star-wrap">${halfBtn('left')}${halfBtn('right')}</span>`);
+      // Visual layer (glyph + fill) is separate from the two transparent hit
+      // areas; the fill width comes from starsFromRating (0/0.5/1 → 0/50/100%).
+      wraps.push(`<span class="tr-star-wrap"><span class="tr-glyph" aria-hidden="true">★</span><span class="tr-fill" aria-hidden="true" style="width:${fillPct}">★</span>${halfBtn('left')}${halfBtn('right')}</span>`);
     }
     const clearDis = canRate ? '' : ' disabled title="Connect Simkl to rate"';
     const clear = item.rating != null

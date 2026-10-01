@@ -10,7 +10,7 @@
   :root {
     --bg: #0f1117; --card: #171a23; --card2: #1e222e; --border: #2a2f3d;
     --text: #e6e8ee; --muted: #8b91a3; --accent: #8b5cf6; --accent2: #6d3fe0;
-    --ok: #34d399; --warn: #fbbf24; --err: #f87171; --love: #f472b6;
+    --ok: #34d399; --warn: #fbbf24; --err: #f87171; --love: #f472b6; --star: #ffd34d;
   }
   * { box-sizing: border-box; }
   body { margin: 0; font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); }
@@ -157,12 +157,13 @@
     border: 1px solid var(--border); object-fit: cover; flex: 0 0 auto; }
   .tr-stars { display: inline-flex; gap: 2px; align-items: center; }
   .tr-star-wrap { position: relative; display: inline-block; width: 22px; height: 22px; }
-  .tr-star { position: absolute; top: 0; width: 50%; height: 100%; padding: 0; border: 0; background: transparent;
-    cursor: pointer; font-size: 20px; line-height: 20px; color: var(--border); border-radius: 0; }
-  .tr-star[data-half="left"] { left: 0; clip-path: inset(0 50% 0 0); }
-  .tr-star[data-half="right"] { left: 50%; clip-path: inset(0 0 0 50%); }
-  .tr-star.tr-on { color: #ffd34d; }
-  .tr-star:hover { color: var(--accent); }
+  .tr-glyph { position: absolute; top: 0; left: 0; width: 100%; height: 100%; font-size: 20px; line-height: 20px; color: var(--border); pointer-events: none; }
+  .tr-fill { position: absolute; top: 0; left: 0; height: 100%; overflow: hidden; white-space: nowrap; font-size: 20px; line-height: 20px; color: var(--star); pointer-events: none; }
+  .tr-star { position: absolute; top: 0; height: 100%; width: 50%; padding: 0; border: 0; background: transparent; cursor: pointer; }
+  .tr-star[data-half="left"] { left: 0; }
+  .tr-star[data-half="right"] { left: 50%; }
+  .tr-star:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .tr-row .tr-star-wrap button.tr-star { border: 0; background: transparent; }
   .tr-row button { background: transparent; border: 1px solid var(--border); color: var(--muted); }
   .tr-row button:hover { background: transparent; color: var(--text); border-color: var(--muted); }
   .tr-heart[aria-pressed="true"] { color: var(--love); border-color: var(--love); }
@@ -179,7 +180,7 @@
     .tr-rating { margin: 6px 0; }
     .tr-acts { margin-top: 6px; flex-wrap: wrap; }
     .tr-star-wrap { width: 36px; height: 36px; }
-    .tr-star { font-size: 34px; line-height: 34px; }
+    .tr-glyph, .tr-fill { font-size: 34px; line-height: 34px; }
   }
 </style>
 </head>
@@ -1486,6 +1487,7 @@ function trainerClick(id, e) {
   const rowEl = btn.closest('.tr-row');
   const key = rowEl ? rowEl.dataset.key : null;
   const item = st.data ? st.data.items.find(x => x.key === key) : null;
+  // One case per entry of TrainerUI.ACTIONS — keep the two in sync.
   switch (btn.dataset.act) {
     case 'prev':
     case 'next':
