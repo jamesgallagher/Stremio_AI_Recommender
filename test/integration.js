@@ -3863,6 +3863,112 @@ async function main() {
     }
   });
 
+  // ── Marquee m3 engagement: the abandoned rule — credits, finish, rewatch (N6) ──
+  await it('marquee m3 engagement: migration adds duration_ms to the old schema without losing rows', async () => {
+    const db = require('../src/db');
+    // Simulate an OLD db: drop the table, recreate it WITHOUT duration_ms.
+    db.get().exec('DROP TABLE IF EXISTS marquee_engagement');
+    db.get().exec(`
+      CREATE TABLE marquee_engagement (
+        profile_id  TEXT NOT NULL,
+        imdb_id     TEXT NOT NULL,
+        tmdb_id     TEXT,
+        percent     REAL,
+        updated_at  INTEGER,
+        seen_at     INTEGER,
+        PRIMARY KEY (profile_id, imdb_id)
+      );
+    `);
+    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at) VALUES (?, ?, ?, ?, ?, ?)').run('p-mig', 'ttM', 'tmM', 30, 1000, 1000);
+    // Run the migration exactly as init() does (PRAGMA-guarded ADD COLUMN).
+    {
+      const cols = db.get().prepare('PRAGMA table_info(marquee_engagement)').all();
+      assert.ok(!cols.some((c) => c.name === 'duration_ms'), 'old schema has no duration_ms');
+      if (!cols.some((c) => c.name === 'duration_ms')) db.get().exec('ALTER TABLE marquee_engagement ADD COLUMN duration_ms INTEGER');
+    }
+    const colsAfter = db.get().prepare('PRAGMA table_info(marquee_engagement)').all();
+    assert.ok(colsAfter.some((c) => c.name === 'duration_ms'), 'duration_ms added');
+    const oldRow = db.get().prepare('SELECT tmdb_id, percent, duration_ms FROM marquee_engagement WHERE profile_id = ?').get('p-mig');
+    assert.strictEqual(oldRow.tmdb_id, 'tmM', 'row preserved');
+    assert.strictEqual(oldRow.percent, 30);
+    assert.strictEqual(oldRow.duration_ms, null, 'old row has null duration');
+    // syncEngagement stores durationMs; a later row without a duration keeps the stored one.
+    mqEngagement._clear();
+    const profile = { id: 'p-mig', name: 'MIG' };
+    await mqEngagement.syncEngagement(profile, mqCfgResolved, {
+      pull: async () => [
+        { type: 'movie', imdbId: 'ttM', percent: 30, updatedAtMs: 1000, durationMs: 7200000 },
+        { type: 'movie', imdbId: 'ttM2', percent: 40, updatedAtMs: 1000 },
+      ],
+      resolveTmdb: async (id) => id.replace('tt', 'tm'), now: 2000, log: quiet,
+    });
+    const rM = db.get().prepare('SELECT duration_ms FROM marquee_engagement WHERE profile_id = ? AND imdb_id = ?').get('p-mig', 'ttM');
+    assert.strictEqual(rM.duration_ms, 7200000, 'duration stored');
+    const rM2 = db.get().prepare('SELECT duration_ms FROM marquee_engagement WHERE profile_id = ? AND imdb_id = ?').get('p-mig', 'ttM2');
+    assert.strictEqual(rM2.duration_ms, null, 'no duration → null');
+    // A later row without a duration keeps the stored one (COALESCE on conflict).
+    await mqEngagement.syncEngagement(profile, mqCfgResolved, {
+      pull: async () => [{ type: 'movie', imdbId: 'ttM', percent: 45, updatedAtMs: 3000 }],
+      resolveTmdb: async (id) => id.replace('tt', 'tm'), now: 4000, log: quiet, force: true,
+    });
+    const rM3 = db.get().prepare('SELECT duration_ms, percent FROM marquee_engagement WHERE profile_id = ? AND imdb_id = ?').get('p-mig', 'ttM');
+    assert.strictEqual(rM3.duration_ms, 7200000, 'stored duration kept when a later row has none');
+    assert.strictEqual(rM3.percent, 45, 'percent updated');
+    mqEngagement._clear();
+  });
+
+  await it('marquee m3 engagement: isAbandoned — credits, finish, rewatch, grace, watched guards', async () => {
+    const eng = mqCfgResolved.engagement;
+    const now = Date.parse('2026-06-01T00:00:00Z');
+    const day = 24 * 3600e3;
+    const watchedEmpty = { tmdb: new Set(), imdb: new Set() };
+    // 30% of a 120-min film, 8 days old, not watched → true.
+    assert.strictEqual(mqEngagement.isAbandoned({ tmdb_id: 'g1', imdb_id: 'ttg1', percent: 30, updated_at: now - 8 * day, duration_ms: 7200000 }, eng, { now, watchedIds: watchedEmpty }), true);
+    // 45% of a 30-min film (16.5 min left) → false (credits).
+    assert.strictEqual(mqEngagement.isAbandoned({ tmdb_id: 'g2', imdb_id: 'ttg2', percent: 45, updated_at: now - 8 * day, duration_ms: 1800000 }, eng, { now, watchedIds: watchedEmpty }), false);
+    // 92% → false (finish_pct); 49% with no duration → true.
+    assert.strictEqual(mqEngagement.isAbandoned({ tmdb_id: 'g3', imdb_id: 'ttg3', percent: 92, updated_at: now - 8 * day, duration_ms: 7200000 }, eng, { now, watchedIds: watchedEmpty }), false);
+    assert.strictEqual(mqEngagement.isAbandoned({ tmdb_id: 'g4', imdb_id: 'ttg4', percent: 49, updated_at: now - 8 * day, duration_ms: null }, eng, { now, watchedIds: watchedEmpty }), true);
+    // The Goonies case: a watched row from 2024 plus a 30% engagement row from 2026, same tmdb → false.
+    const gooniesWatched = { tmdb: new Set(['goonies']), imdb: new Set() };
+    assert.strictEqual(mqEngagement.isAbandoned({ tmdb_id: 'goonies', imdb_id: 'ttgoonies', percent: 30, updated_at: now - 1 * day, duration_ms: 7200000 }, eng, { now, watchedIds: gooniesWatched }), false);
+    // The same case matched by imdb only → false.
+    const gooniesImdb = { tmdb: new Set(), imdb: new Set(['ttgoonies']) };
+    assert.strictEqual(mqEngagement.isAbandoned({ tmdb_id: 'goonies2', imdb_id: 'ttgoonies', percent: 30, updated_at: now - 1 * day, duration_ms: 7200000 }, eng, { now, watchedIds: gooniesImdb }), false);
+    // A pending-watched shim → false (watchedIdSets includes it).
+    const shimWatched = { tmdb: new Set(['shim']), imdb: new Set() };
+    assert.strictEqual(mqEngagement.isAbandoned({ tmdb_id: 'shim', imdb_id: 'ttshim', percent: 30, updated_at: now - 8 * day, duration_ms: 7200000 }, eng, { now, watchedIds: shimWatched }), false);
+    // 3 days old → false (grace).
+    assert.strictEqual(mqEngagement.isAbandoned({ tmdb_id: 'g5', imdb_id: 'ttg5', percent: 30, updated_at: now - 3 * day, duration_ms: 7200000 }, eng, { now, watchedIds: watchedEmpty }), false);
+    // tmdb_id null → false.
+    assert.strictEqual(mqEngagement.isAbandoned({ tmdb_id: null, imdb_id: 'ttg6', percent: 30, updated_at: now - 8 * day, duration_ms: 7200000 }, eng, { now, watchedIds: watchedEmpty }), false);
+    // enabled:false → false.
+    assert.strictEqual(mqEngagement.isAbandoned({ tmdb_id: 'g7', imdb_id: 'ttg7', percent: 30, updated_at: now - 8 * day, duration_ms: 7200000 }, { ...eng, enabled: false }, { now, watchedIds: watchedEmpty }), false);
+  });
+
+  await it('marquee m3 engagement: abandonedRows returns full rows (incl. duration_ms); abandonedFor unchanged', async () => {
+    const db = require('../src/db');
+    mqEngagement._clear();
+    const profileId = 'p-rows';
+    const now = Date.parse('2026-06-01T00:00:00Z');
+    const day = 24 * 3600e3;
+    // Direct insert: one abandoned (30%, 8 days, 120-min) + one not (95%).
+    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)').run(profileId, 'ttA', 'tmA', 30, now - 8 * day, now - 8 * day, 7200000);
+    db.get().prepare('INSERT INTO marquee_engagement (profile_id, imdb_id, tmdb_id, percent, updated_at, seen_at, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)').run(profileId, 'ttB', 'tmB', 95, now - 8 * day, now - 8 * day, 7200000);
+    const rows = mqEngagement.abandonedRows(profileId, mqCfgResolved, { now });
+    assert.strictEqual(rows.length, 1, 'only the abandoned row');
+    assert.strictEqual(rows[0].tmdb_id, 'tmA');
+    assert.strictEqual(rows[0].imdb_id, 'ttA');
+    assert.strictEqual(rows[0].percent, 30);
+    assert.strictEqual(rows[0].duration_ms, 7200000, 'duration_ms included');
+    assert.strictEqual(rows[0].updated_at, now - 8 * day);
+    // abandonedFor unchanged shape: Map<tmdb_id, { percent, ts }>.
+    const ab = mqEngagement.abandonedFor(profileId, mqCfgResolved, { now });
+    assert.deepStrictEqual(ab.get('tmA'), { percent: 30, ts: now - 8 * day });
+    assert.strictEqual(ab.has('tmB'), false, '95% not abandoned');
+    db.get().prepare('DELETE FROM marquee_engagement WHERE profile_id = ?').run(profileId);
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();
