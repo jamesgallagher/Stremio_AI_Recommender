@@ -2562,8 +2562,8 @@ ok('trainer: chipsHtml — 6 chips with counts, exactly one aria-pressed=true', 
   assert.ok(html.includes('<span class="tr-count">10</span>'));
   assert.ok(html.includes('<span class="tr-count">5</span>'));
   assert.strictEqual((html.match(/aria-pressed="true"/g) || []).length, 1);
-  assert.ok(html.includes('data-view="loved" aria-pressed="true"'));
-  assert.ok(html.includes('data-view="all" aria-pressed="false"'));
+  assert.ok(html.includes('data-view="loved" title="Films you rated 10/10" aria-pressed="true"'));
+  assert.ok(html.includes('data-view="all" title="Everything you&#39;ve watched (except ignored)" aria-pressed="false"'));
 });
 
 ok('trainer: rowHtml — stars, actions, disabled states, XSS title', () => {
@@ -2592,9 +2592,9 @@ ok('trainer: rowHtml — stars, actions, disabled states, XSS title', () => {
   assert.ok(!html.includes('data-rating'));
   assert.ok(!html.includes('data-act="clear"'));
   // canRate=false: every rating control disabled (ignore stays enabled).
-  const disabledCount = (h) => (h.match(/disabled title="Connect Simkl to rate"/g) || []).length;
-  assert.strictEqual(disabledCount(TrainerUI.rowHtml(base, { canRate: false, now })), 11); // 10 stars + ♥
-  assert.strictEqual(disabledCount(TrainerUI.rowHtml({ ...base, rating: 7 }, { canRate: false, now })), 12); // + clear
+  const disabledCount = (h) => (h.match(/title="Connect Simkl to rate"/g) || []).length;
+  assert.strictEqual(disabledCount(TrainerUI.rowHtml(base, { canRate: false, now })), 12); // 10 stars + ♥ + unwatch
+  assert.strictEqual(disabledCount(TrainerUI.rowHtml({ ...base, rating: 7 }, { canRate: false, now })), 13); // + clear
   assert.strictEqual(disabledCount(TrainerUI.rowHtml({ ...base, status: 'unfinished', percent: 30 }, { canRate: false, now })), 1); // finished
   // XSS title is escaped: with poster null the output has no raw <img.
   const xss = TrainerUI.rowHtml({ ...base, poster: null, title: '<img src=x onerror=alert(1)>' }, { canRate: true, now });
@@ -2810,6 +2810,98 @@ ok('trainer r1: H4b — an equal next is not resent', () => {
   thenables[0].settle({ ok: true }); // settle 3 (synchronous)
   assert.strictEqual(pendingInA, false); // no newer value, so pending is false
   assert.deepStrictEqual(sends, [{ k: 'a', r: 3 }]); // exactly one send, no second
+});
+
+// ---- Trainer T3.1 refinements: tooltips, unwatch button, rows stay put ----
+ok('trainer T3.1 U1: every button/chip has a title; disabled rate controls say "Connect Simkl to rate"', () => {
+  const now = Date.parse('2026-03-15T12:00:00Z');
+  const base = { key: '1', type: 'movie', simkl_id: 11, tmdb_id: '1', imdb_id: 'tt1', title: 'The Film', year: 2024, genre: 'Drama', poster: 'https://img.example/p.jpg', watched_at: '2026-03-10T12:00:00Z', rating: 7, loved: false, ignored: false, status: 'watched', percent: 100 };
+  const variants = [
+    TrainerUI.rowHtml(base, { canRate: true, now }),
+    TrainerUI.rowHtml({ ...base, rating: 10, loved: true }, { canRate: true, now }),
+    TrainerUI.rowHtml({ ...base, ignored: true }, { canRate: true, now }),
+    TrainerUI.rowHtml({ ...base, status: 'unfinished', percent: 30, rating: null }, { canRate: true, now }),
+    TrainerUI.rowHtml(base, { canRate: false, now }),
+  ];
+  for (const html of variants) {
+    for (const b of [...html.matchAll(/<button[^>]*>/g)].map(m => m[0])) assert.ok(b.includes('title="'), 'row button has a title: ' + b);
+  }
+  const chips = TrainerUI.chipsHtml({ all: 1, unrated: 1, rated: 1, loved: 1, ignored: 1, unfinished: 1 }, 'all');
+  for (const b of [...chips.matchAll(/<button[^>]*>/g)].map(m => m[0])) assert.ok(b.includes('title="'), 'chip has a title: ' + b);
+  const banner = TrainerUI.bannerHtml({ changes_since_build: 3, changed_at: now - 60000, rebuild_due_at: now + 7 * 60000, built_changed_at: now - 3600e3 }, now, { rebuilding: false });
+  for (const b of [...banner.matchAll(/<button[^>]*>/g)].map(m => m[0])) assert.ok(b.includes('title="'), 'banner button has a title: ' + b);
+  // the disabled rate controls (canRate:false) say "Connect Simkl to rate"
+  const dis = TrainerUI.rowHtml(base, { canRate: false, now });
+  const disButtons = [...dis.matchAll(/<button[^>]*>/g)].map(m => m[0]).filter(b => b.includes('disabled'));
+  assert.ok(disButtons.length >= 10, 'rate controls are disabled');
+  for (const b of disButtons) assert.ok(b.includes('title="Connect Simkl to rate"'), 'disabled rate control says Connect Simkl to rate: ' + b);
+});
+
+ok('trainer T3.1 U2: star titles read "Rate N/10"; ♥ uses unlove when loved, love otherwise', () => {
+  const now = Date.parse('2026-03-15T12:00:00Z');
+  const base = { key: '1', type: 'movie', simkl_id: 11, tmdb_id: '1', imdb_id: 'tt1', title: 'The Film', year: 2024, genre: 'Drama', poster: 'https://img.example/p.jpg', watched_at: '2026-03-10T12:00:00Z', rating: 7, loved: false, ignored: false, status: 'watched', percent: 100 };
+  const html = TrainerUI.rowHtml(base, { canRate: true, now });
+  for (const m of html.matchAll(/<button[^>]*data-act="star"[^>]*data-rating="(\d+)"[^>]*title="([^"]*)"/g)) {
+    assert.ok(m[2].startsWith('Rate ' + m[1] + '/10'), 'star title for rating ' + m[1] + ': ' + m[2]);
+  }
+  const star7 = html.match(/<button[^>]*data-rating="7"[^>]*title="([^"]*)"/);
+  assert.ok(star7 && star7[1].startsWith('Rate 7/10'), 'data-rating="7" → Rate 7/10 title');
+  const loved = TrainerUI.rowHtml({ ...base, rating: 10, loved: true }, { canRate: true, now });
+  assert.ok(loved.includes('title="Remove love — clears the 10/10 rating"'), 'unlove tip when loved');
+  assert.ok(loved.includes('title="Love it — rates 10/10. Loved films always count as a favourite in Marquee"') === false, 'no love tip when loved');
+  const notLoved = TrainerUI.rowHtml(base, { canRate: true, now });
+  assert.ok(notLoved.includes('title="Love it — rates 10/10. Loved films always count as a favourite in Marquee"'), 'love tip when not loved');
+});
+
+ok('trainer T3.1 U3: a watched row (ignored or not) has exactly one unwatch; an unfinished row has none', () => {
+  const now = Date.parse('2026-03-15T12:00:00Z');
+  const base = { key: '1', type: 'movie', simkl_id: 11, tmdb_id: '1', imdb_id: 'tt1', title: 'The Film', year: 2024, genre: 'Drama', poster: 'https://img.example/p.jpg', watched_at: '2026-03-10T12:00:00Z', rating: 7, loved: false, ignored: false, status: 'watched', percent: 100 };
+  const count = (h) => (h.match(/data-act="unwatch"/g) || []).length;
+  assert.strictEqual(count(TrainerUI.rowHtml(base, { canRate: true, now })), 1, 'non-ignored watched row');
+  assert.strictEqual(count(TrainerUI.rowHtml({ ...base, ignored: true }, { canRate: true, now })), 1, 'ignored watched row');
+  assert.strictEqual(count(TrainerUI.rowHtml({ ...base, status: 'unfinished', percent: 30, rating: null }, { canRate: true, now })), 0, 'unfinished row');
+});
+
+ok('trainer T3.1 U4: ACTIONS includes unwatch; every emitted data-act is in ACTIONS', () => {
+  assert.ok(TrainerUI.ACTIONS.includes('unwatch'), 'ACTIONS includes unwatch');
+  const now = Date.parse('2026-03-15T12:00:00Z');
+  const base = { key: '1', type: 'movie', simkl_id: 11, tmdb_id: '1', imdb_id: 'tt1', title: 'The Film', year: 2024, genre: 'Drama', poster: 'https://img.example/p.jpg', watched_at: '2026-03-10T12:00:00Z', rating: 7, loved: false, ignored: false, status: 'watched', percent: 100 };
+  const variants = [
+    TrainerUI.rowHtml(base, { canRate: true, now }),
+    TrainerUI.rowHtml({ ...base, ignored: true }, { canRate: true, now }),
+    TrainerUI.rowHtml({ ...base, status: 'unfinished', percent: 30, rating: null }, { canRate: true, now }),
+    TrainerUI.rowHtml({ ...base, rating: 10, loved: true }, { canRate: true, now }),
+    TrainerUI.chipsHtml({ all: 1, unrated: 1, rated: 1, loved: 1, ignored: 1, unfinished: 1 }, 'all'),
+    TrainerUI.bannerHtml({ changes_since_build: 3, changed_at: now - 60000, rebuild_due_at: now + 7 * 60000, built_changed_at: now - 3600e3 }, now, { rebuilding: false }),
+  ];
+  for (const html of variants) {
+    for (const m of html.matchAll(/data-act="([^"]+)"/g)) {
+      assert.ok(TrainerUI.ACTIONS.includes(m[1]), 'data-act ' + m[1] + ' not in ACTIONS');
+    }
+  }
+});
+
+ok('trainer T3.1 U5: TIPS has every key with the exact texts', () => {
+  const T = TrainerUI.TIPS;
+  assert.strictEqual(T.star, 'Rate {n}/10 — saves to your Simkl ratings and steers Marquee');
+  assert.strictEqual(T.clear, 'Clear your rating (also removes it from Simkl)');
+  assert.strictEqual(T.love, 'Love it — rates 10/10. Loved films always count as a favourite in Marquee');
+  assert.strictEqual(T.unlove, 'Remove love — clears the 10/10 rating');
+  assert.strictEqual(T.ignore, "Ignore — keep it in your history but stop it shaping recommendations. It won't be recommended again");
+  assert.strictEqual(T.unignore, 'Stop ignoring — let this film shape recommendations again');
+  assert.strictEqual(T.undo, 'Undo the ignore');
+  assert.strictEqual(T.unwatch, 'Mark unwatched — removes it from your Simkl watch history (for films marked watched by mistake). It can be recommended again');
+  assert.strictEqual(T.finished, 'I finished it — marks it watched on Simkl and moves it into your history');
+  assert.strictEqual(T.rebuild, "Rebuild this profile's recommendations now instead of waiting for the hourly check");
+  assert.strictEqual(T.search, 'Search your watch history by title');
+  assert.strictEqual(T.prev, 'Previous page');
+  assert.strictEqual(T.next, 'Next page');
+  assert.strictEqual(T.chip_all, "Everything you've watched (except ignored)");
+  assert.strictEqual(T.chip_unrated, "Watched films you haven't rated yet");
+  assert.strictEqual(T.chip_rated, "Films you've rated (including loved)");
+  assert.strictEqual(T.chip_loved, 'Films you rated 10/10');
+  assert.strictEqual(T.chip_ignored, 'Films you told the recommender to ignore');
+  assert.strictEqual(T.chip_unfinished, 'Films you started but stopped before halfway — never recommended back');
 });
 
 // ---- HTTP surface ----
@@ -4327,7 +4419,15 @@ async function httpTests() {
     console.log('  ✓ trainer portal UI: trainer-ui.js served + tab wiring in index.html');
   }
 
-  console.log(`\nAll checks passed (${passed} unit + 58 async/http).`);
+  // T3.1 U6: the served index.html has no _undoT/6000 auto-refresh left (R1).
+  {
+    const body = await (await fetch(`${BASE}/configure/`)).text();
+    assert.ok(!body.includes('_undoT'), 'no _undoT auto-refresh');
+    assert.ok(!body.includes('6000'), 'no 6000ms auto-refresh');
+    console.log('  ✓ T3.1 U6: no _undoT/6000 auto-refresh left in the served index.html');
+  }
+
+  console.log(`\nAll checks passed (${passed} unit + 59 async/http).`);
   process.exit(0);
 }
 

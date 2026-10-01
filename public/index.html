@@ -1426,6 +1426,25 @@ async function trainerLoad(id, { quiet = false } = {}) {
   }
 }
 
+// R2: refresh ONLY the counts + banner (the "N changes since the last build"
+// line) — never the table. Rows stay put after an action; only a view/page/
+// search change or a Rebuild re-fetches rows. Quiet: a failed fetch leaves the
+// panel exactly as it is.
+async function trainerRefreshMeta(id) {
+  const st = trainerState(id);
+  const panel = document.querySelector(`.card[data-id="${id}"] .trainer-panel`);
+  if (!panel || !st.data) return;
+  try {
+    const d = await api(`/profiles/${id}/trainer?view=${st.view}&q=${encodeURIComponent(st.q)}&page=${st.page}&page_size=25`);
+    st.data.counts = d.counts;
+    st.data.training = d.training;
+    const chips = panel.querySelector('.tr-chips');
+    if (chips) chips.innerHTML = TrainerUI.chipsHtml(d.counts, st.view);
+    const slot = panel.querySelector('.tr-banner-slot');
+    if (slot) slot.innerHTML = TrainerUI.bannerHtml(d.training, Date.now(), { rebuilding: st.rebuilding });
+  } catch (e) { /* quiet — leave the rows alone */ }
+}
+
 function trainerDraw(id) {
   const st = trainerState(id);
   const panel = document.querySelector(`.card[data-id="${id}"] .trainer-panel`);
@@ -1442,14 +1461,14 @@ function trainerDraw(id) {
     ? d.items.map(item => TrainerUI.rowHtml(item, { canRate, now })).join('')
     : '<div class="muted">No films in this view yet.</div>';
   const pages = Math.max(1, Math.ceil(d.total / d.pageSize));
-  panel.innerHTML = `${notice}${TrainerUI.bannerHtml(d.training, now, { rebuilding: st.rebuilding })}
+  panel.innerHTML = `${notice}<div class="tr-banner-slot">${TrainerUI.bannerHtml(d.training, now, { rebuilding: st.rebuilding })}</div>
     <div class="tr-chips">${TrainerUI.chipsHtml(d.counts, st.view)}</div>
-    <div class="tr-search-row"><input type="text" class="tr-search" placeholder="Search titles…" value="${esc(st.q)}"></div>
+    <div class="tr-search-row"><input type="text" class="tr-search" placeholder="Search titles…" value="${esc(st.q)}" title="${esc(TrainerUI.TIPS.search)}"></div>
     <div class="tr-table">${rows}</div>
     <div class="tr-pager">
-      <button class="ghost mini" data-act="prev" ${st.page <= 1 ? 'disabled' : ''}>Prev</button>
+      <button class="ghost mini" data-act="prev" title="${esc(TrainerUI.TIPS.prev)}" ${st.page <= 1 ? 'disabled' : ''}>Prev</button>
       <span class="muted">${TrainerUI.pagerText(d.page, d.pageSize, d.total)}</span>
-      <button class="ghost mini" data-act="next" ${st.page >= pages ? 'disabled' : ''}>Next</button>
+      <button class="ghost mini" data-act="next" title="${esc(TrainerUI.TIPS.next)}" ${st.page >= pages ? 'disabled' : ''}>Next</button>
     </div>`;
   trainerBind(panel, id);
 }
@@ -1467,7 +1486,6 @@ function trainerBind(panel, id) {
       const st = trainerState(id);
       st.q = v;
       st.page = 1;
-      clearTimeout(st._undoT);
       trainerLoad(id);
     }, 300);
   });
@@ -1480,7 +1498,6 @@ function trainerClick(id, e) {
   if (chip) {
     st.view = chip.dataset.view;
     st.page = 1;
-    clearTimeout(st._undoT);
     trainerLoad(id);
     return;
   }
@@ -1495,7 +1512,6 @@ function trainerClick(id, e) {
     case 'prev':
     case 'next':
       st.page = btn.dataset.act === 'prev' ? st.page - 1 : st.page + 1;
-      clearTimeout(st._undoT);
       trainerLoad(id);
       break;
     case 'star':
@@ -1521,10 +1537,9 @@ function trainerClick(id, e) {
           if (row) {
             row.classList.add('tr-dim');
             const acts = row.querySelector('.tr-acts');
-            if (acts) acts.innerHTML = `Ignored · <button class="ghost mini" data-act="undo" aria-label="Undo ignore">Undo</button>`;
+            if (acts) acts.innerHTML = `Ignored · <button class="ghost mini" data-act="undo" aria-label="Undo ignore" title="${esc(TrainerUI.TIPS.undo)}">Undo</button>`;
           }
-          clearTimeout(st._undoT);
-          st._undoT = setTimeout(() => trainerLoad(id), 6000);
+          trainerRefreshMeta(id);
         } catch (err) { toast("Couldn't ignore — " + err.message); }
       })();
       break;
@@ -1532,9 +1547,28 @@ function trainerClick(id, e) {
     case 'unignore':
       (async () => {
         try {
-          await api(`/profiles/${id}/trainer/ignore`, { method: 'POST', body: { type: 'movie', tmdb_id: key, ignored: false } });
-          trainerLoad(id);
+          const r = await api(`/profiles/${id}/trainer/ignore`, { method: 'POST', body: { type: 'movie', tmdb_id: key, ignored: false } });
+          st.confirmed.set(key, r.item);
+          trainerRedrawRow(panel, key, r.item, id);
+          trainerRefreshMeta(id);
         } catch (err) { toast("Couldn't unignore — " + err.message); }
+      })();
+      break;
+    case 'unwatch':
+      if (!item || !confirm('Remove "' + item.title + '" from your Simkl watch history?\n\nUse this if it was marked watched by mistake. It can be recommended to you again.')) break;
+      (async () => {
+        try {
+          await api(`/profiles/${id}/trainer/unwatched`, { method: 'POST', body: { type: 'movie', tmdb_id: key, imdb_id: item.imdb_id } });
+          const row = trainerRowEl(panel, key);
+          if (row) {
+            row.classList.add('tr-dim');
+            row.querySelectorAll('.tr-stars button').forEach(b => b.disabled = true);
+            const acts = row.querySelector('.tr-acts');
+            if (acts) acts.innerHTML = 'Removed from history';
+          }
+          toast('Removed from watch history');
+          trainerRefreshMeta(id);
+        } catch (err) { toast("Couldn't mark unwatched — " + err.message); }
       })();
       break;
     case 'finished':
@@ -1542,16 +1576,22 @@ function trainerClick(id, e) {
       (async () => {
         try {
           await api(`/profiles/${id}/trainer/finished`, { method: 'POST', body: { type: 'movie', tmdb_id: key, imdb_id: item.imdb_id } });
+          const row = trainerRowEl(panel, key);
+          if (row) {
+            row.classList.add('tr-dim');
+            const acts = row.querySelector('.tr-acts');
+            if (acts) acts.innerHTML = 'Marked watched';
+          }
           toast('Marked as watched');
-          trainerLoad(id);
+          trainerRefreshMeta(id);
         } catch (err) { toast("Couldn't mark finished — " + err.message); }
       })();
       break;
     case 'rebuild':
       (async () => {
-        const banner = panel.querySelector('.tr-banner');
+        const slot = panel.querySelector('.tr-banner-slot');
         st.rebuilding = true;
-        if (banner) banner.innerHTML = TrainerUI.bannerHtml(st.data.training, Date.now(), { rebuilding: true });
+        if (slot) slot.innerHTML = TrainerUI.bannerHtml(st.data.training, Date.now(), { rebuilding: true });
         try {
           await api(`/profiles/${id}/recommend/build`, { method: 'POST' });
           const job = await trackJob(id, j => {
@@ -1564,7 +1604,7 @@ function trainerClick(id, e) {
           pollStatus();
         } catch (err) {
           st.rebuilding = false;
-          if (banner) banner.innerHTML = TrainerUI.bannerHtml(st.data.training, Date.now(), { rebuilding: false });
+          if (slot) slot.innerHTML = TrainerUI.bannerHtml(st.data.training, Date.now(), { rebuilding: false });
           toast('Rebuild failed: ' + err.message);
         }
       })();
@@ -1610,7 +1650,7 @@ function trainerRateSettle(id, key, err, result) {
   st.confirmed.set(key, result.item);
   st.shown.set(key, result.item.rating);
   trainerRedrawRow(panel, key, result.item, id);
-  if (st.data && !st.data.items.some(item => st.queue.pending(item.key))) trainerLoad(id, { quiet: true });
+  if (st.data && !st.data.items.some(item => st.queue.pending(item.key))) trainerRefreshMeta(id);
 }
 
 // The status heartbeat. Deliberately NON-DESTRUCTIVE: it updates ONLY the header
