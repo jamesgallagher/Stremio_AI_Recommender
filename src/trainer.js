@@ -26,6 +26,7 @@ const simkl = require('./services/simkl');
 const watchedStore = require('./watchedStore');
 const tasteFeedback = require('./tasteFeedback');
 const engagement = require('./engines/marquee/engagement');
+const marqueeConfig = require('./engines/marquee/config');
 const metaStore = require('./engines/glass/metaStore');
 const markWatchedMod = require('./markWatched');
 const settings = require('./settings');
@@ -41,6 +42,7 @@ const defaultDeps = {
   watchedStore,
   tasteFeedback,
   engagement,
+  marqueeConfig,
   markWatched: markWatchedMod.markWatched,
   settings,
   enrich: metaStore.enrich,
@@ -143,24 +145,32 @@ function resolveWatchedRow(profileId, type, ref, watchedStore) {
   return null;
 }
 
-// Is a marquee_engagement row an unfinished (abandoned) row? PURE (F6): true iff
-// it has a tmdb_id, its furthest progress is < 50%, and it is not in the
-// watched store under either id (a completed watch — or a rewatch — always wins).
-function isUnfinishedRow(row, watchedIds) {
-  return row.tmdb_id != null
-    && Number(row.percent) < 50
-    && !watchedIds.tmdb.has(String(row.tmdb_id))
-    && !watchedIds.imdb.has(row.imdb_id);
+// The Marquee engagement config for the shared abandoned rule (N7): the same
+// resolved config Marquee builds with, so the two consumers can't disagree.
+// A test-injected `settings` without getSettings falls back to the defaults.
+function engagementCfg(D) {
+  const s = D.settings.getSettings ? D.settings.getSettings() : null;
+  return D.marqueeConfig.resolveConfig(s).engagement;
 }
 
-// The profile's unfinished rows: read marquee_engagement directly (no
-// abandoned-query helper, no settings-as-config), keep the rows that
-// areUnfinishedRow. Injectable for tests (deps.unfinishedRows).
+// Is a marquee_engagement row an unfinished (abandoned) row? PURE (F6).
+// Trainer T2 (N7): the ONE rule — engagement.isAbandoned, the same function
+// Marquee uses for its abandoned set — so the Trainer's "Unfinished" list and
+// the engine's dropped set can never disagree. `watchedIds` is
+// watchedStore.watchedIdSets (it already includes the pending shim).
+function isUnfinishedRow(row, watchedIds, { now = Date.now(), deps = {} } = {}) {
+  const D = mergeDeps(deps);
+  return D.engagement.isAbandoned(row, engagementCfg(D), { now, watchedIds });
+}
+
+// The profile's unfinished rows: the shared engagement.abandonedRows (N7 —
+// one rule, two consumers). Injectable for tests (deps.unfinishedRows).
+// The grace period measures REAL elapsed time (engagement rows are stamped
+// with Date.now()), so the rule runs on the real clock even when D.now() is
+// an injectable action clock used for recording changes.
 function unfinishedRows(profileId, D) {
-  D.engagement.init();
-  const rows = D.db.get().prepare('SELECT imdb_id, tmdb_id, percent, updated_at FROM marquee_engagement WHERE profile_id = ?').all(profileId);
-  const watchedIds = D.watchedStore.watchedIdSets(profileId);
-  return rows.filter((row) => isUnfinishedRow(row, watchedIds));
+  const cfg = D.marqueeConfig.resolveConfig(D.settings.getSettings ? D.settings.getSettings() : null);
+  return D.engagement.abandonedRows(profileId, cfg, { now: Date.now() });
 }
 
 // Resolve a ref against THIS profile's unfinished rows (spec §6: setIgnored and
@@ -301,6 +311,13 @@ async function listHistory(profile, { type: typeIn, view = 'all', q = null, page
   for (const item of pageItems) { delete item._sortMs; delete item._imdbId; }
 
   const training = D.tasteFeedback.getTraining(profile.id);
+  // Trainer T2 (N8): when the change is NEWER than the last build that
+  // included it, the rebuild becomes due after the 10-minute quiet period.
+  let rebuildDueAt = null;
+  if (training.changed_at != null
+    && !(training.built_changed_at != null && training.changed_at <= training.built_changed_at)) {
+    rebuildDueAt = training.changed_at + D.tasteFeedback.REBUILD_DEBOUNCE_MS;
+  }
   return {
     ok: true,
     items: pageItems,
@@ -308,8 +325,7 @@ async function listHistory(profile, { type: typeIn, view = 'all', q = null, page
     pageSize: ps,
     total,
     counts,
-    // rebuild_due_at is T2 (the 10-min debounce); T1 leaves it null.
-    training: { changes_since_build: training.changes_since_build, changed_at: training.changed_at, rebuild_due_at: null },
+    training: { changes_since_build: training.changes_since_build, changed_at: training.changed_at, rebuild_due_at: rebuildDueAt },
   };
 }
 
