@@ -1222,6 +1222,21 @@ async function httpTests() {
     assert.strictEqual(jsRes.status, 200, 'trainer.js is served');
   });
 
+  // F2a: the Quick poster <img> is not draggable (no native image drag on desktop).
+  {
+    const js = await (await fetch(`${BASE}/mobile/trainer.js`)).text();
+    assert.ok(js.includes('draggable="false"'), 'Quick poster img has draggable="false"');
+    console.log('  ✓ F2a: GET /mobile/trainer.js has draggable="false" on the Quick poster');
+  }
+
+  // F3a: Quick fetches 25 per page (the server enriches at most 25 posters).
+  {
+    const js = await (await fetch(`${BASE}/mobile/trainer.js`)).text();
+    assert.ok(js.includes('page_size=25'), 'Quick fetches page_size=25');
+    assert.ok(!js.includes('page_size=50'), 'Quick no longer fetches page_size=50');
+    console.log('  ✓ F3a: GET /mobile/trainer.js fetches page_size=25 (not 50)');
+  }
+
   // Config endpoint (public) returns app name + version.
   {
     const cfg = await (await fetch(`${BASE}/mobile/api/config`)).json();

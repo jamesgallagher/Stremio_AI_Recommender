@@ -51,6 +51,9 @@
   async function api(path, opts) {
     // K1: JSON-encode an object body (apiFetch passes it to fetch unchanged).
     const res = await comp.apiFetch(path, T.jsonRequest(opts));
+    // F4: a 401 means the session expired — send the companion back to login and
+    // throw a sentinel the Trainer's catch blocks recognise (they skip the snackbar).
+    if (res.status === 401) { comp.onSessionExpired(); throw new Error('session-expired'); }
     const body = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error((body && body.error) || ('HTTP ' + res.status));
     return body;
@@ -259,6 +262,7 @@
       return;
     }
     if (err) {
+      if (err.message === 'session-expired') return;
       const prev = st.confirmed.get(key);
       if (prev) {
         redrawRow(key, prev);
@@ -291,7 +295,7 @@
       }
       refreshMeta();
     } catch (err) {
-      comp.showSnack("Couldn't ignore — " + err.message, null);
+      if (err.message !== 'session-expired') comp.showSnack("Couldn't ignore — " + err.message, null);
     }
   }
 
@@ -310,7 +314,7 @@
       comp.showSnack('Removed "' + (item.title || '') + '" from your watch history', null);
       refreshMeta();
     } catch (err) {
-      comp.showSnack("Couldn't mark unwatched — " + err.message, null);
+      if (err.message !== 'session-expired') comp.showSnack("Couldn't mark unwatched — " + err.message, null);
     }
   }
 
@@ -327,7 +331,7 @@
       comp.showSnack('Marked "' + (item.title || '') + '" as watched', null);
       refreshMeta();
     } catch (err) {
-      comp.showSnack("Couldn't mark finished — " + err.message, null);
+      if (err.message !== 'session-expired') comp.showSnack("Couldn't mark finished — " + err.message, null);
     }
   }
 
@@ -340,7 +344,7 @@
       setTimeout(() => { st.rebuilding = false; refreshMeta(); }, 3000);
     } catch (err) {
       st.rebuilding = false;
-      comp.showSnack('Rebuild failed: ' + err.message, null);
+      if (err.message !== 'session-expired') comp.showSnack('Rebuild failed: ' + err.message, null);
     }
   }
 
@@ -392,7 +396,9 @@
     let page = 1;
     let gotNew = false;
     while (true) {
-      const data = await api('/trainer?view=unrated&page=' + page + '&page_size=50');
+      // F3: the server enriches at most 25 posters per list request, so fetch
+      // 25 per page — every card in a batch is inside the enrichment window.
+      const data = await api('/trainer?view=unrated&page=' + page + '&page_size=25');
       const batch = T.pickQuickBatch(data.items, st.quick.handled);
       for (const item of batch) {
         if (!st.quick.items.some((x) => x.key === item.key)) {
@@ -425,7 +431,7 @@
       return;
     }
     const poster = item.poster
-      ? '<img class="tq-poster" src="' + esc(item.poster) + '" alt="">'
+      ? '<img class="tq-poster" src="' + esc(item.poster) + '" alt="" draggable="false">'
       : '<div class="tq-poster tq-noposter"></div>';
     const meta = esc(item.title || '?') + (item.year ? ' <span class="muted">(' + esc(item.year) + ')</span>' : '')
       + '<br><span class="muted">' + esc(item.genre || '—') + ' · ' + T.whenText(item.watched_at, Date.now()) + '</span>';
@@ -520,9 +526,24 @@
     st.quick.handled.add(item.key);
     queue.push(item.key, rating, (err, result) => quickRateSettle(item, err, result));
     decrementLeft(item.key); // K4: once per card, not on a re-rate
+    // F5: a rate/Love commit can be undone before the card advances (Undo pushes
+    // null through the queue; if the save is still pending it collapses to a no-op).
+    comp.showSnack('Rated "' + (item.title || '') + '" ' + T.ratingText(rating), () => undoQuickRate(item));
     // K3: one pending advance — a re-rate within 600 ms replaces the timer.
     clearTimeout(st.quick.advanceT);
     st.quick.advanceT = setTimeout(() => advanceFrom(item.key), 600);
+  }
+
+  // F5: undo a Quick rating — push null through the same queue, restore the
+  // shown/handled/left state (undoing K4's decrement), and redraw the card.
+  function undoQuickRate(item) {
+    queue.push(item.key, null, (err, result) => quickRateSettle(item, err, result));
+    st.shown.set(item.key, null);
+    st.quick.handled.delete(item.key);
+    incrementLeft(item.key); // undo K4's decrement
+    clearTimeout(st.quick.advanceT); // clear any pending advance
+    const idx = st.quick.items.findIndex((x) => x.key === item.key);
+    if (idx !== -1) { st.quick.current = idx; drawQuick(); }
   }
 
   function updateQuickStars(item, rating) {
@@ -539,6 +560,7 @@
 
   function quickRateSettle(item, err, result) {
     if (err) {
+      if (err.message === 'session-expired') return;
       comp.showSnack('Couldn\'t save rating for "' + (item.title || '') + '" — ' + err.message, () => {
         // Retry: push the same value again.
         queue.push(item.key, st.shown.get(item.key), (e2, r2) => quickRateSettle(item, e2, r2));
@@ -610,11 +632,11 @@
             incrementLeft(item.key); // K4: Undo of an ignore
             const idx = st.quick.items.findIndex((x) => x.key === item.key);
             if (idx !== -1) { st.quick.current = idx; drawQuick(); }
-          } catch (err) { comp.showSnack("Couldn't undo — " + err.message, null); }
+          } catch (err) { if (err.message !== 'session-expired') comp.showSnack("Couldn't undo — " + err.message, null); }
         })();
       });
     } catch (err) {
-      comp.showSnack("Couldn't ignore — " + err.message, null);
+      if (err.message !== 'session-expired') comp.showSnack("Couldn't ignore — " + err.message, null);
     }
   }
 
@@ -629,7 +651,7 @@
       advanceQuick();
       comp.showSnack('Removed "' + item.title + '" from your watch history', null);
     } catch (err) {
-      comp.showSnack("Couldn't mark unwatched — " + err.message, null);
+      if (err.message !== 'session-expired') comp.showSnack("Couldn't mark unwatched — " + err.message, null);
     }
   }
 
@@ -655,6 +677,9 @@
     };
     card.addEventListener('pointerdown', (e) => {
       if (e.target.closest('.tr-stars, button')) return;
+      // F2: stop the native image drag on a mouse drag (so the swipe works on
+      // desktop); never for touch, so scrolling and taps keep working.
+      if (e.pointerType === 'mouse') e.preventDefault();
       dragging = true;
       startX = e.clientX; startY = e.clientY;
       w = card.offsetWidth; h = card.offsetHeight;
