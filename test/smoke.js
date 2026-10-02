@@ -4682,6 +4682,106 @@ ok('TV-2 C4: Dockerfile ships scripts/ (bench tool) in the image', () => {
   assert.ok(dockerfile.includes('COPY scripts ./scripts'), 'Dockerfile ships scripts/ (COPY scripts ./scripts)');
 });
 
+// ---- Marquee TV (TV-2): pure filters + format history (spec §4.1–4.4) ----
+ok('TV-2 F1: tvGenres — split combined genres + Horror from keywords (spec §4.1)', () => {
+  const { tvGenres } = require('../src/engines/marqueeTv/filters');
+  // Sci-Fi & Fantasy splits into Science Fiction + Fantasy; Drama passes through.
+  assert.deepStrictEqual(tvGenres({ genres: ['Sci-Fi & Fantasy', 'Drama'] }), ['Science Fiction', 'Fantasy', 'Drama']);
+  // a horror keyword adds Horror.
+  assert.deepStrictEqual(tvGenres({ genres: ['Drama'], keywords: ['vampire'] }), ['Drama', 'Horror']);
+  // no duplicate Horror when a Horror genre and a horror keyword both apply.
+  assert.deepStrictEqual(tvGenres({ genres: ['Horror'], keywords: ['vampire'] }), ['Horror']);
+});
+
+ok('TV-2 F2: isAnimeShow — four signals, any one → anime (spec §4.2)', () => {
+  const { isAnimeShow } = require('../src/engines/marqueeTv/filters');
+  const am = { isAnime: (imdbId, tmdbId) => (imdbId === 'ttanime' || tmdbId === '12345') };
+  // simklType 'anime' → true (short-circuits).
+  assert.strictEqual(isAnimeShow({ simklType: 'anime' }, { animeMap: am }), true);
+  // an anime-map hit → true.
+  assert.strictEqual(isAnimeShow({ imdb_id: 'ttanime' }, { animeMap: am }), true);
+  // Animation + origin_country JP → true.
+  assert.strictEqual(isAnimeShow({ genres: ['Animation'], origin_country: ['JP'] }, { animeMap: am }), true);
+  // Animation + original_language ja → true.
+  assert.strictEqual(isAnimeShow({ genres: ['Animation'], original_language: 'ja' }, { animeMap: am }), true);
+  // Animation + US → false.
+  assert.strictEqual(isAnimeShow({ genres: ['Animation'], origin_country: ['US'] }, { animeMap: am }), false);
+  // Drama + JP → false (animation is required).
+  assert.strictEqual(isAnimeShow({ genres: ['Drama'], origin_country: ['JP'] }, { animeMap: am }), false);
+});
+
+ok('TV-2 F3: compileTvFilter — 8 hard-filter reasons, first failing wins (spec §4.3)', () => {
+  const { compileTvFilter } = require('../src/engines/marqueeTv/filters');
+  const { tierFor } = require('../src/ageVerification/tiers');
+  // voteFloor(series) = round(50/5) = 10.
+  const filters = { min_year: 2010, excluded_genres: ['Horror'], min_rating: 7, vote_count_floor: 50 };
+  const base = {
+    imdb_id: 'tt1',
+    tvType: 'Scripted',
+    genres: ['Drama'],
+    keywords: [],
+    first_air_date: '2015-01-01',
+    last_air_date: '2020-01-01',
+    vote_count: 100,
+    vote_average: 8,
+    certAU: null,
+    certUS: null,
+  };
+  const mk = (over) => ({ ...base, ...over });
+  const f1 = compileTvFilter(filters, { nowYear: 2026, formatsAllowed: new Set(['scripted']), tier: null });
+  // no_imdb: no imdb_id.
+  assert.deepStrictEqual(f1.check({}), { ok: false, reason: 'no_imdb' });
+  // anime (and genre): simklType 'anime' reports anime even though it also has an excluded genre (order: anime before genre).
+  assert.deepStrictEqual(f1.check(mk({ simklType: 'anime', genres: ['Horror'] })), { ok: false, reason: 'anime' });
+  // format: Reality not in formatsAllowed.
+  assert.deepStrictEqual(f1.check(mk({ tvType: 'Reality' })), { ok: false, reason: 'format' });
+  // genre: Scripted but an excluded genre.
+  assert.deepStrictEqual(f1.check(mk({ genres: ['Horror'] })), { ok: false, reason: 'genre' });
+  // recency uses last_air_date: first 2005, last 2008 → 2008 < 2010 → recency.
+  assert.deepStrictEqual(f1.check(mk({ first_air_date: '2005-01-01', last_air_date: '2008-01-01' })), { ok: false, reason: 'recency' });
+  // ...and last aired 2023 → passes recency (everything else passes → ok).
+  assert.deepStrictEqual(f1.check(mk({ first_air_date: '2005-01-01', last_air_date: '2023-01-01' })), { ok: true });
+  // votes: vote_count 5 < 10.
+  assert.deepStrictEqual(f1.check(mk({ vote_count: 5 })), { ok: false, reason: 'votes' });
+  // rating: shown (vote_average 5) < min_rating 7.
+  assert.deepStrictEqual(f1.check(mk({ vote_average: 5 })), { ok: false, reason: 'rating' });
+  // an unknown rating (no imdb_rating, no vote_average) passes the rating gate.
+  assert.deepStrictEqual(f1.check(mk({ vote_average: 0, imdb_rating: 0 })), { ok: true });
+  // age floor: AU R18+ at TV-14 → age_floor.
+  const tv14 = compileTvFilter(filters, { nowYear: 2026, formatsAllowed: new Set(['scripted']), tier: tierFor({ age_limit: 14 }) });
+  assert.deepStrictEqual(tv14.check(mk({ certAU: 'R18+' })), { ok: false, reason: 'age_floor' });
+  // AU MA15+ at TV-14 → passes (not on the TV-14 hard floor).
+  assert.deepStrictEqual(tv14.check(mk({ certAU: 'MA15+' })), { ok: true });
+  // AU MA15+ at 10+ → age_floor.
+  const age10 = compileTvFilter(filters, { nowYear: 2026, formatsAllowed: new Set(['scripted']), tier: tierFor({ age_limit: 10 }) });
+  assert.deepStrictEqual(age10.check(mk({ certAU: 'MA15+' })), { ok: false, reason: 'age_floor' });
+  // the stats count every reason (with a tier so age_floor fires too).
+  const f2 = compileTvFilter(filters, { nowYear: 2026, formatsAllowed: new Set(['scripted']), tier: tierFor({ age_limit: 14 }) });
+  f2.check({});                                             // no_imdb
+  f2.check(mk({ simklType: 'anime', genres: ['Horror'] })); // anime
+  f2.check(mk({ tvType: 'Reality' }));                      // format
+  f2.check(mk({ genres: ['Horror'] }));                    // genre
+  f2.check(mk({ first_air_date: '2005-01-01', last_air_date: '2008-01-01' })); // recency
+  f2.check(mk({ vote_count: 5 }));                          // votes
+  f2.check(mk({ vote_average: 5 }));                        // rating
+  f2.check(mk({ certAU: 'R18+' }));                         // age_floor
+  assert.deepStrictEqual(f2.stats(), { no_imdb: 1, anime: 1, format: 1, genre: 1, recency: 1, votes: 1, rating: 1, age_floor: 1 });
+});
+
+ok('TV-2 F4: formatHistory — families at rung tried or better; cold start → scripted (spec §4.4)', () => {
+  const { formatHistory } = require('../src/engines/marqueeTv/taste');
+  // Reality only via sampled_left → NOT allowed (sampled_left is below tried → cold start → scripted).
+  const metaA = new Map([['1', { tvType: 'Reality' }]]);
+  assert.deepStrictEqual([...formatHistory([{ rung: 'sampled_left', value: 0.5, row: { tmdb_id: '1' } }], metaA)], ['scripted'], 'sampled_left alone → scripted');
+  // via tried → allowed.
+  assert.deepStrictEqual([...formatHistory([{ rung: 'tried', value: 1, row: { tmdb_id: '1' } }], metaA)], ['reality'], 'tried → reality allowed');
+  // Miniseries maps to scripted.
+  const metaB = new Map([['2', { tvType: 'Miniseries' }]]);
+  assert.deepStrictEqual([...formatHistory([{ rung: 'committed', value: 2, row: { tmdb_id: '2' } }], metaB)], ['scripted'], 'Miniseries → scripted');
+  // no history → {scripted}.
+  assert.deepStrictEqual([...formatHistory([], new Map())], ['scripted'], 'no history → scripted');
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');
