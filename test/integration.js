@@ -7152,6 +7152,49 @@ async function main() {
     assert.strictEqual(fetchCalls.length, 3, 'after TTL the id refetches');
   });
 
+  // ── TV-2 N3: ensureShowRecs (fetch /tv/{id}?extended=full, parse, TTL 30d, cap, failure) ──
+  await it('TV-2 N3: ensureShowRecs — /tv/{id}?extended=full, parse (drop anime/TMDB-less), TTL 30d, cap, failure', async () => {
+    const simklRecs = require('../src/engines/marqueeTv/simklRecs');
+    const p = config.addProfile('INT-TV2-N3');
+    config.updateProfile(p.id, { keys: { simkl_client_id: 'c3' }, simkl_auth: { access_token: 'tok' } });
+    const profile = config.getProfile(p.id);
+    const origAuthedGet = simkl.authedGet;
+    const calls = [];
+    const body = {
+      users_recommendations: [
+        { title: 'Webster', year: 1983, type: 'tv', ids: { simkl: 7492, imdb: 'tt0085109', tmdb: '3804' } },
+        { title: 'Anime Rec', year: 2010, type: 'anime', ids: { simkl: 1, imdb: 'ttanime', tmdb: '1' } },
+        { title: 'No TMDB', year: 2000, type: 'tv', ids: { simkl: 2, imdb: 'ttnotmdb' } },
+      ],
+    };
+    try {
+      simkl.authedGet = (prof, path, extra) => {
+        calls.push({ path, extra });
+        return Promise.resolve(body);
+      };
+      // (1) Fetch + parse: /tv/100?extended=full; drops anime + TMDB-less.
+      const out = await simklRecs.ensureShowRecs(profile, [100], { now: Date.now(), log: quiet });
+      assert.ok(calls.some((c) => c.path === '/tv/100' && c.extra && c.extra.extended === 'full'), 'calls /tv/100?extended=full');
+      assert.deepStrictEqual(out.get(100), [{ tmdb_id: '3804', imdb_id: 'tt0085109', title: 'Webster', year: 1983 }]);
+      const n1 = calls.length;
+      // (2) Caching: a second call within 30 days makes zero fetches.
+      const out2 = await simklRecs.ensureShowRecs(profile, [100], { now: Date.now() + 1000, log: quiet });
+      assert.strictEqual(calls.length, n1, 'second call within 30d fetches nothing');
+      assert.deepStrictEqual(out2.get(100), [{ tmdb_id: '3804', imdb_id: 'tt0085109', title: 'Webster', year: 1983 }]);
+      // (3) Cap: 6 uncached ids, cap 2 → only 2 fetched.
+      const n2 = calls.length;
+      await simklRecs.ensureShowRecs(profile, [200, 201, 202, 203, 204, 205], { cap: 2, now: Date.now(), log: quiet });
+      assert.strictEqual(calls.length - n2, 2, 'cap: only 2 fetched');
+      // (4) Failure: a throwing fetcher gives no recs for that id without throwing.
+      simkl.authedGet = () => { throw new Error('simkl down'); };
+      const out4 = await simklRecs.ensureShowRecs(profile, [300], { now: Date.now(), log: quiet });
+      assert.strictEqual(out4.get(300), undefined, 'failure: no recs for the id');
+    } finally {
+      simkl.authedGet = origAuthedGet;
+      config.removeProfile(p.id);
+    }
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();
