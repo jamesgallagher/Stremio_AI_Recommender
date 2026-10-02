@@ -4383,11 +4383,18 @@ ok('calibrated A2: incremental greedy is fast (425 rows, listSize 50)', () => {
     }
   });
 
-  // ---- AGE-1 T4: simklCerts fetch-level (F5) — the /search/id → /tv|/movies
-  // call sequence and paths, the certification parse, the 20-title cap, and the
-  // no-auth → empty Map. Monkey-patches simkl.authedGet (isolated from the
-  // parallel global-fetch stubs of the other AGE-1 async tests). ----
-  okAsync('AGE-1 T4: simklCerts — /search/id → /tv|/movies parse; 20-title cap; no auth → empty', async () => {
+  // ---- AGE-1 T4 + AGE-2 T11 (merged): simklCerts fetch-level, the §2.8 real
+  // response shapes. The /search/id body is an ARRAY of
+  // { type: <string>, ids: { simkl: N } } (type is a STRING: 'tv'/'show'/
+  // 'anime'/'movie'); the media GET returns { title, certification } with the
+  // certification at the TOP LEVEL (no .tv/.movie wrapper); the endpoint is
+  // chosen by the type string ('tv'/'show' → /tv, 'anime' → /anime,
+  // 'movie' → /movies); the match whose kind fits the requested chain type is
+  // preferred (series → tv/show/anime, movie → movie), else the first match.
+  // Also: the call sequence/paths, the 20-title cap, and no-auth → empty Map.
+  // ONE test patches simkl.authedGet — the okAsync tests run in parallel, so a
+  // second test patching the same module property would race. ----
+  okAsync('AGE-1 T4 / AGE-2 T11: simklCerts — real shapes, kind preference, anime path; 20-title cap; no auth → empty', async () => {
     const simkl = require('../src/services/simkl');
     const calls = [];
     const origAuthedGet = simkl.authedGet;
@@ -4395,23 +4402,56 @@ ok('calibrated A2: incremental greedy is fast (425 rows, listSize 50)', () => {
       calls.push({ path, extra });
       if (path === '/search/id') {
         const imdb = extra.imdb;
-        if (imdb === 'tttv') return { tv: [{ ids: { simkl: 324126 }, type: 2 }] };
-        if (imdb === 'ttmovie') return { movies: [{ ids: { simkl: 12345 }, type: 1 }] };
-        return { movies: [], tv: [] }; // no match
+        // Basic shapes: 'tv' → /tv, 'movie' → /movies.
+        if (imdb === 'tttv') return [{ type: 'tv', ids: { simkl: 324126 } }];
+        if (imdb === 'ttmovie') return [{ type: 'movie', ids: { simkl: 12345 } }];
+        // Kind preference: a series request prefers 'show' over the movie.
+        if (imdb === 'ttshow') return [{ type: 'movie', ids: { simkl: 9001 } }, { type: 'show', ids: { simkl: 9002 } }];
+        // 'anime' type string → /anime.
+        if (imdb === 'ttanime') return [{ type: 'anime', ids: { simkl: 9003 } }];
+        // Kind preference: a movie request prefers 'movie' over the tv.
+        if (imdb === 'ttmov') return [{ type: 'tv', ids: { simkl: 9004 } }, { type: 'movie', ids: { simkl: 9005 } }];
+        // Only a mismatched kind → the first match is used (advisory type).
+        if (imdb === 'ttmismatch') return [{ type: 'movie', ids: { simkl: 9006 } }];
+        return []; // no match
       }
-      if (path === '/tv/324126') return { tv: { certification: 'TV-PG' } };
-      if (path === '/movies/12345') return { movie: { certification: 'R' } };
+      if (path === '/tv/324126') return { title: 'A Show', certification: 'TV-PG' };
+      if (path === '/movies/12345') return { title: 'A Movie', certification: 'R' };
+      if (path === '/tv/9002') return { title: 'Show', certification: 'TV-14' };
+      if (path === '/anime/9003') return { title: 'Anime', certification: 'TV-MA' };
+      if (path === '/movies/9005') return { title: 'Movie', certification: 'PG-13' };
+      if (path === '/movies/9006') return { title: 'Mismatch', certification: 'R' };
       throw new Error(`unexpected path ${path}`);
     };
     const profile = { keys: { simkl_client_id: 'cid' }, simkl_auth: { access_token: 'tok' } };
     try {
-      // Series → /search/id → /tv/{id}?extended=full → media.tv.certification.
+      // Basic call sequence + paths: series → /tv/{id}, movie → /movies/{id}.
       let out = await ageSources.simklCerts(profile, 'series', ['tttv', 'ttmovie']);
       assert.deepStrictEqual(calls.map((c) => c.path), ['/search/id', '/tv/324126', '/search/id', '/movies/12345'], 'call sequence + paths');
       assert.deepStrictEqual(calls[0].extra, { imdb: 'tttv' }, 'search/id carries the imdb param');
       assert.deepStrictEqual(calls[1].extra, { extended: 'full' }, 'media GET carries extended=full');
-      assert.deepStrictEqual(out.get('tttv'), 'TV-PG', 'series certification parsed');
-      assert.deepStrictEqual(out.get('ttmovie'), 'R', 'movie certification parsed');
+      assert.deepStrictEqual(out.get('tttv'), 'TV-PG', 'series certification parsed (top-level)');
+      assert.deepStrictEqual(out.get('ttmovie'), 'R', 'movie certification parsed (top-level)');
+      // Kind preference: a series request prefers the 'show' match over the movie.
+      calls.length = 0;
+      out = await ageSources.simklCerts(profile, 'series', ['ttshow']);
+      assert.deepStrictEqual(calls.map((c) => c.path), ['/search/id', '/tv/9002'], 'series prefers the show kind → /tv');
+      assert.deepStrictEqual(out.get('ttshow'), 'TV-14', 'series cert from /tv (top-level)');
+      // Anime type string → /anime endpoint.
+      calls.length = 0;
+      out = await ageSources.simklCerts(profile, 'series', ['ttanime']);
+      assert.deepStrictEqual(calls.map((c) => c.path), ['/search/id', '/anime/9003'], 'anime type → /anime endpoint');
+      assert.deepStrictEqual(out.get('ttanime'), 'TV-MA', 'anime cert from /anime (top-level)');
+      // Kind preference: a movie request prefers the 'movie' match over the tv.
+      calls.length = 0;
+      out = await ageSources.simklCerts(profile, 'movie', ['ttmov']);
+      assert.deepStrictEqual(calls.map((c) => c.path), ['/search/id', '/movies/9005'], 'movie prefers the movie kind → /movies');
+      assert.deepStrictEqual(out.get('ttmov'), 'PG-13', 'movie cert from /movies (top-level)');
+      // Mismatched kind only → the first match is used (advisory type).
+      calls.length = 0;
+      out = await ageSources.simklCerts(profile, 'series', ['ttmismatch']);
+      assert.deepStrictEqual(calls.map((c) => c.path), ['/search/id', '/movies/9006'], 'mismatched kind → first match');
+      assert.deepStrictEqual(out.get('ttmismatch'), 'R', 'mismatched kind cert still parsed');
       // No match → null (no answer for that title), no throw.
       out = await ageSources.simklCerts(profile, 'series', ['ttnone']);
       assert.deepStrictEqual(out.get('ttnone'), null, 'no match → null');

@@ -75,23 +75,38 @@ async function tmdbRatings(profile, type, titles, log = console) {
 }
 
 // Simkl certification (step 4a). Simkl is keyed by its own ids, but it exposes
-// an IMDb search endpoint: `GET /search/id?imdb=tt…` returns the Simkl id (the
-// first match's `ids.simkl` + `type`, where type 1 = movie, 2 = tv). That Simkl
-// id then resolves to the media's certification via `GET /tv/{id}` or
-// `GET /movies/{id}?extended=full` → `media.tv.certification` /
-// `media.movie.certification`. Verified live by the reviewer on 126 shows
-// (Perfect Strangers → TV-PG, Terminator 3 → R).
+// an IMDb search endpoint: `GET /search/id?imdb=tt…` returns an ARRAY of
+// matches, each `{ type: 'tv' | 'show' | 'anime' | 'movie', ids: { simkl: N } }`
+// (type is a STRING). The Simkl id then resolves to the media's certification
+// via `GET /tv/{id}?extended=full`, `GET /anime/{id}?extended=full` or
+// `GET /movies/{id}?extended=full` → `{ title, certification }` (certification
+// at the TOP LEVEL, no .tv/.movie wrapper). Verified live in the AGE-1 live
+// review.
 const SIMKL_BATCH_CAP = 20; // cap: at most 20 titles per call
 
-// First usable match from a Simkl /search/id body. Movies come first, then tv —
-// the chain's type is advisory only; we take the first id Simkl returned.
-function firstSimklMatch(search) {
-  if (!search || typeof search !== 'object') return null;
-  const movies = Array.isArray(search.movies) ? search.movies : [];
-  const tv = Array.isArray(search.tv) ? search.tv : [];
-  const match = movies[0] || tv[0];
-  if (!match || !match.ids || match.ids.simkl == null) return null;
-  return match;
+// The Simkl type strings that map to each media endpoint.
+const SIMKL_TV_TYPES = ['tv', 'show', 'anime'];
+const SIMKL_MOVIE_TYPES = ['movie'];
+
+// First usable match from a Simkl /search/id body (an array). Prefer the match
+// whose type string fits the requested chain type (series → tv/show/anime,
+// movie → movie); else the first match with a Simkl id. The chain's type is
+// advisory — a mismatched kind still yields an id, just not the preferred one.
+function firstSimklMatch(search, type) {
+  if (!Array.isArray(search)) return null;
+  const usable = search.filter((m) => m && m.ids && m.ids.simkl != null);
+  if (!usable.length) return null;
+  const wanted = type === 'series' ? SIMKL_TV_TYPES : SIMKL_MOVIE_TYPES;
+  return usable.find((m) => wanted.includes(m.type)) || usable[0];
+}
+
+// The media endpoint for a Simkl match's type string: 'tv'/'show' → /tv,
+// 'anime' → /anime, 'movie' → /movies; anything else → /tv.
+function simklMediaPath(match) {
+  const id = match.ids.simkl;
+  if (match.type === 'anime') return `/anime/${id}`;
+  if (match.type === 'movie') return `/movies/${id}`;
+  return `/tv/${id}`;
 }
 
 // Simkl certification (step 4a). `imdbIds` are the chain's IMDb ids. No Simkl
@@ -105,12 +120,10 @@ async function simklCerts(profile, type, imdbIds, log = console) {
   for (const imdb of imdbIds.slice(0, SIMKL_BATCH_CAP)) {
     try {
       const search = await simkl.authedGet(profile, '/search/id', { imdb });
-      const match = firstSimklMatch(search);
+      const match = firstSimklMatch(search, type);
       if (!match) { out.set(imdb, null); continue; }
-      const simklId = match.ids.simkl;
-      const isTv = match.type === 2;
-      const media = await simkl.authedGet(profile, isTv ? `/tv/${simklId}` : `/movies/${simklId}`, { extended: 'full' });
-      const cert = (isTv ? media.tv : media.movie)?.certification;
+      const media = await simkl.authedGet(profile, simklMediaPath(match), { extended: 'full' });
+      const cert = media?.certification;
       out.set(imdb, cert || null);
     } catch (err) {
       log.warn?.(`[age-verify] simklCerts ${imdb} failed: ${err.message}`);
