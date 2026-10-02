@@ -34,6 +34,9 @@ const LIMITS = {
   // 10-GET/s Simkl budget). One server-wide fetch/day, so pace it gently.
   simkl_cdn: { minIntervalMs: 1000 },
   mdblist: { minIntervalMs: 250, dailyCap: 1000 },
+  // TVDB v4 (AGE-1): country certifications for the TV-14 chain. Free tier is
+  // ~5 req/s — pace just under it.
+  tvdb: { minIntervalMs: 200 },
   jikan: { minIntervalMs: 1050, breaker: { threshold: 5, cooldownMs: 60000 } },
   anilist: { minIntervalMs: 2000, breaker: { threshold: 5, cooldownMs: 60000 } },
   groq: { minIntervalMs: 2100 },

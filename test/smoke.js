@@ -3716,6 +3716,73 @@ ok('calibrated A2: incremental greedy is fast (425 rows, listSize 50)', () => {
     }
     assert.ok(rejected, 'decide must reject when the LLM step throws');
   });
+
+  // ---- AGE-1: TVDB client (seams) ----
+  const tvdb = require('../src/services/tvdb');
+  const settings = require('../src/settings');
+
+  okAsync('AGE-1 V1: mediaCerts maps country codes to ratings', async () => {
+    const origFetch = global.fetch;
+    global.fetch = (url) => {
+      const u = String(url);
+      if (u.includes('/search')) {
+        const id = new URL(u).searchParams.get('externalId');
+        if (id === 'tt123') {
+          return Promise.resolve({ ok: true, json: () => Promise.resolve({ data: [{ id: 12345, type: 3 }] }) });
+        }
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ data: [] }) });
+      }
+      if (u.includes('/series/12345')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ data: { ratings: [
+          { country: { iso_3166_1: 'US' }, rating: 'TV-14' },
+          { country: { iso_3166_1: 'AU' }, rating: 'M' },
+          { country: { iso_3166_1: 'GB' }, rating: '12' },
+        ] } }) });
+      }
+      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
+    };
+    settings.updateSettings({ keys: { tvdb_api_key: 'test-key' } });
+    try {
+      const out = await tvdb.mediaCerts(['tt123', 'tt456'], 'series');
+      assert.deepStrictEqual(out.get('tt123'), { usa: 'TV-14', aus: 'M', gbr: '12' });
+      assert.deepStrictEqual(out.get('tt456'), {}); // no match
+    } finally {
+      global.fetch = origFetch;
+      settings.updateSettings({ keys: { tvdb_api_key: '' } });
+    }
+  });
+
+  okAsync('AGE-1 V2: mediaCerts — no key → empty; network error → empty object, logged', async () => {
+    const origFetch = global.fetch;
+    // No key → empty Map, logged.
+    settings.updateSettings({ keys: { tvdb_api_key: '' } });
+    delete process.env.TVDB_API_KEY;
+    let out = await tvdb.mediaCerts(['tt123'], 'series');
+    assert.ok(out instanceof Map && out.size === 0);
+    // Network error → empty object for the title, logged, no throw.
+    global.fetch = () => Promise.reject(new Error('network down'));
+    settings.updateSettings({ keys: { tvdb_api_key: 'test-key' } });
+    try {
+      out = await tvdb.mediaCerts(['tt123'], 'series');
+      assert.deepStrictEqual(out.get('tt123'), {});
+    } finally {
+      global.fetch = origFetch;
+      settings.updateSettings({ keys: { tvdb_api_key: '' } });
+    }
+  });
+
+  okAsync('AGE-1 V3: tvdbKey — Server Config first, then process env', async () => {
+    // Server Config key takes precedence.
+    settings.updateSettings({ keys: { tvdb_api_key: 'config-key' } });
+    process.env.TVDB_API_KEY = 'env-key';
+    assert.strictEqual(tvdb.tvdbKey(), 'config-key');
+    // Env fallback when no Server Config key.
+    settings.updateSettings({ keys: { tvdb_api_key: '' } });
+    assert.strictEqual(tvdb.tvdbKey(), 'env-key');
+    // Neither → empty.
+    delete process.env.TVDB_API_KEY;
+    assert.strictEqual(tvdb.tvdbKey(), '');
+  });
 }
 
 // ---- HTTP surface ----

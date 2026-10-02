@@ -795,11 +795,12 @@ function renderServerConfig(data) {
       </div>
     </details>
 
-    <details open><summary>API keys — TMDB, MDBList, RPDB</summary>
+    <details open><summary>API keys — TMDB, MDBList, RPDB, TVDB</summary>
       <div class="cols" style="margin-top:6px">
         <div><label>TMDB <span class="muted">(required)</span></label>${keyRowS('tmdb', 'tmdb_api_key', keys.tmdb_api_key)}</div>
         <div><label>MDBList</label>${keyRowS('mdblist', 'mdblist_api_key', keys.mdblist_api_key)}</div>
         <div><label>RPDB</label>${keyRowS('rpdb', 'rpdb_api_key', keys.rpdb_api_key)}</div>
+        <div><label>TVDB <span class="muted">(optional — TV-14 age chain)</span></label>${keyRowS('tvdb', 'tvdb_api_key', keys.tvdb_api_key)}</div>
       </div>
     </details>
 
@@ -855,7 +856,7 @@ function collectSettings() {
       custom_name: val('custom_name'), custom_uri: val('custom_uri'), custom_api_key: val('custom_api_key'),
       groq_api_key: val('groq_api_key'), groq_api_key_backup: val('groq_api_key_backup'),
     },
-    keys: { tmdb_api_key: val('tmdb_api_key'), mdblist_api_key: val('mdblist_api_key'), rpdb_api_key: val('rpdb_api_key') },
+    keys: { tmdb_api_key: val('tmdb_api_key'), mdblist_api_key: val('mdblist_api_key'), rpdb_api_key: val('rpdb_api_key'), tvdb_api_key: val('tvdb_api_key') },
     engines,
   };
 }
