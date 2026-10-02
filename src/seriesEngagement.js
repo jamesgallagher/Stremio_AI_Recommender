@@ -56,16 +56,6 @@ const DEFAULTS = {
 const RUNG_WEIGHTS = DEFAULTS.weights;
 const RATING_WEIGHTS = DEFAULTS.rating_weights;
 
-// Rung → seed eligibility before any rating override (spec §2.3).
-const RUNG_SEED = {
-  finished: true,
-  committed: true,
-  engaged: true,
-  tried: false,
-  sampled_left: false,
-  sampling: false,
-};
-
 // Rungs that count as "engaged or better" (seed-eligible by rung, binge-eligible).
 const ENGAGED_PLUS = new Set(['engaged', 'committed', 'finished']);
 
@@ -166,7 +156,6 @@ function ladderFor(profileId, { now = Date.now(), kind, cfg = {} } = {}) {
 module.exports = {
   DEFAULTS,
   RUNG_WEIGHTS,
-  RUNG_SEED,
   RATING_WEIGHTS,
   ratingWeight,
   rungOf,

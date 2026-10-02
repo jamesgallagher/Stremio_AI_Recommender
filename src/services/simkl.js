@@ -300,7 +300,7 @@ function parseWatchedItems(items, type) {
 const BULK_GAP_MS = 300000; // 5 minutes
 
 function parseSeriesProgress(item, section) {
-  const media = item.show || item.anime || (section === 'anime' ? item.anime : item.show);
+  const media = item.show || item.anime;
   if (!media?.ids) return null;
   const simklId = media.ids.simkl;
   if (simklId == null) return null;
@@ -323,7 +323,7 @@ function parseSeriesProgress(item, section) {
     if (!isBulk) realStamps.push(stamps[i]);
   }
 
-  const firstWatchedAt = item.last_watched_at ? Date.parse(item.last_watched_at) : null;
+  const lastWatchedAt = item.last_watched_at ? Date.parse(item.last_watched_at) : null;
   const firstRealAt = realStamps.length ? realStamps[0] : null;
   const lastRealAt = realStamps.length ? realStamps[realStamps.length - 1] : null;
 
@@ -347,7 +347,7 @@ function parseSeriesProgress(item, section) {
     watched_eps: item.watched_episodes_count || 0,
     total_eps: item.total_episodes_count > 0 ? item.total_episodes_count : null,
     not_aired_eps: item.not_aired_episodes_count ?? null,
-    last_watched_at: firstWatchedAt,
+    last_watched_at: lastWatchedAt,
     first_watched_at: stamps.length ? stamps[0] : null,
     first_real_at: firstRealAt,
     last_real_at: lastRealAt,

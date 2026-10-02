@@ -133,7 +133,7 @@ function init() {
       title         TEXT,
       year          INTEGER,
       status        TEXT,
-      watched_eps   INTEGER,
+      watched_eps   INTEGER NOT NULL DEFAULT 0,
       total_eps     INTEGER,            -- null when Simkl reports 0
       not_aired_eps INTEGER,
       last_watched_at  INTEGER,         -- ms; the item's last_watched_at
@@ -143,6 +143,7 @@ function init() {
       stamps        INTEGER,            -- total episode stamps
       real_stamps   INTEGER,            -- non-bulk stamps
       eps_per_week  REAL,               -- real-stamp speed, null when <4 real
+      updated_at    INTEGER NOT NULL,   -- ms; set on every upsert
       PRIMARY KEY (profile_id, simkl_id)
     );
     CREATE INDEX IF NOT EXISTS ix_series_progress_profile ON series_progress (profile_id);
@@ -479,9 +480,9 @@ function upsertSeriesProgress(profileId, rows) {
       profile_id, simkl_id, kind, imdb_id, tmdb_id, title, year, status,
       watched_eps, total_eps, not_aired_eps,
       last_watched_at, first_watched_at, first_real_at, last_real_at,
-      stamps, real_stamps, eps_per_week
+      stamps, real_stamps, eps_per_week, updated_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(profile_id, simkl_id) DO UPDATE SET
       kind          = excluded.kind,
       imdb_id       = excluded.imdb_id,
@@ -498,7 +499,8 @@ function upsertSeriesProgress(profileId, rows) {
       last_real_at     = excluded.last_real_at,
       stamps        = excluded.stamps,
       real_stamps   = excluded.real_stamps,
-      eps_per_week  = excluded.eps_per_week
+      eps_per_week  = excluded.eps_per_week,
+      updated_at    = excluded.updated_at
   `);
   const tx = conn.prepare('BEGIN'); const commit = conn.prepare('COMMIT'); const rollback = conn.prepare('ROLLBACK');
   tx.run();
@@ -510,7 +512,7 @@ function upsertSeriesProgress(profileId, rows) {
         profileId, r.simkl_id, r.kind, r.imdb_id, r.tmdb_id, r.title, r.year, r.status,
         r.watched_eps, r.total_eps, r.not_aired_eps,
         r.last_watched_at, r.first_watched_at, r.first_real_at, r.last_real_at,
-        r.stamps, r.real_stamps, r.eps_per_week,
+        r.stamps, r.real_stamps, r.eps_per_week, Date.now(),
       );
       n++;
     }
