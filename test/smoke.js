@@ -5964,6 +5964,29 @@ async function httpTests() {
     console.log('  ✓ T3.1 U6: no _undoT/6000 auto-refresh left in the served index.html');
   }
 
+  // AGE-2 T10: the portal offers exactly the four tiers (in order), default 10,
+  // with the single chain explainer (the old "one year above" line is gone).
+  {
+    const body = await (await fetch(`${BASE}/configure/`)).text();
+    // the four tier options, in order
+    const opts = ['10+ (TV-PG / PG)', '12+ (PG, UK 12)', 'TV-14 (14+, AU M)', '15+ (MA 15+)'];
+    const idx = opts.map((l) => body.indexOf(l));
+    assert.ok(idx.every((i) => i >= 0), 'all four tier options present');
+    assert.ok(idx[0] < idx[1] && idx[1] < idx[2] && idx[2] < idx[3], 'tier options in order');
+    // the retired options (5/6/8/13 and the old 15+ label) are gone
+    assert.ok(!body.includes('5+ (~G, young kids)'), '5+ gone');
+    assert.ok(!body.includes('13+ (~PG-13)'), '13+ gone');
+    assert.ok(!body.includes('15+ (~M)'), 'old 15+ label gone');
+    // default when the checkbox is first ticked is 10 (was 8)
+    assert.ok(body.includes('age_limit || 10'), 'default 10');
+    assert.ok(!body.includes('age_limit || 8'), 'old default 8 gone');
+    // the single chain explainer is present
+    assert.ok(body.includes('Each title is checked in order: always-blocked ratings first'), 'chain explainer present');
+    // the old "judged one year above the limit" line is gone
+    assert.ok(!body.includes('judged one year above'), 'old "one year above" explainer gone');
+    console.log('  ✓ AGE-2 T10: portal offers exactly the four tiers (default 10) + chain explainer');
+  }
+
   console.log(`\nAll checks passed (${passed} unit + 59 async/http).`);
   process.exit(0);
 }

@@ -400,11 +400,10 @@ function render(profiles) {
                 <input type="checkbox" data-filter="age_limit_on" ${p.filters.age_limit > 0 ? 'checked' : ''} onchange="const s=this.closest('.row').querySelector('[data-filter=age_limit]'); s.disabled=!this.checked; s.style.display=this.checked?'':'none'"> Limit to age
               </label>
               <select data-filter="age_limit" style="width:auto;flex:1;${p.filters.age_limit > 0 ? '' : 'display:none'}" ${p.filters.age_limit > 0 ? '' : 'disabled'}>
-                ${[[5,'5+ (~G, young kids)'],[6,'6+'],[8,'8+ (~PG)'],[10,'10+'],[12,'12+'],[13,'13+ (~PG-13)'],[14,'TV-14 (14+, AU M)'],[15,'15+ (~M)']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.age_limit || 8) ? 'selected' : ''}>${l}</option>`).join('')}
+                ${[[10,'10+ (TV-PG / PG)'],[12,'12+ (PG, UK 12)'],[14,'TV-14 (14+, AU M)'],[15,'15+ (MA 15+)']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.age_limit || 10) ? 'selected' : ''}>${l}</option>`).join('')}
               </select>
             </div>
-            <div class="muted" style="font-size:11px;margin-top:3px">At build time an AI pass removes anything unsuitable for this age (anime also gets its MAL band), judged one year above the limit because classification brackets are coarse. A cheap band re-check runs again at serve time. Requires the Groq/LLM key.</div>
-            ${p.filters.age_limit === 14 ? '<div class="muted" style="font-size:11px;margin-top:3px">TV-14: Common Sense age decides first (14 or under); without one, AU then US ratings (up to TV-14 / PG-13 / AU M). R 18+ and adult titles are always blocked.</div>' : ''}
+            <div class="muted" style="font-size:11px;margin-top:3px">Each title is checked in order: always-blocked ratings first, then the Common Sense Media age (must be at or under the limit), then the Australian rating, then US, then TVDB/MDBList/other countries; only if nothing has a rating does the AI judge it.</div>
             ${p.filters.age_limit > 0 && !p.keys_set.groq_api_key ? '<div style="color:var(--err);font-size:12px;margin-top:4px">⚠ Age limit is on but no LLM is configured — set a Custom LLM or Groq key in Server Config, or rebuilds fail.</div>' : ''}
           </div>
         </div>

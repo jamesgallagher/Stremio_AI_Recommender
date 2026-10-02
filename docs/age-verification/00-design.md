@@ -209,3 +209,15 @@ After AGE-1 ships, **Ciara can move to TV-14 immediately**: her Genesis shows an
 - Simkl step 4a: a batch certification lookup by IMDb id is out of scope for AGE-1 — the seam returns no answer and the chain continues to MDBList; a real Simkl source lands later.
 - The portal offers **TV-14 (14+, AU M)** as age 14 with a one-line explainer; Server Config carries the TVDB key row (optional — the chain degrades without it).
 - Tests: R1–R3 and C1–C4 (smoke, pure), I1–I7 (integration, every network seam stubbed), U1 (the portal option + key row + saving `age_limit: 14`).
+
+## 9. AGE-2 build notes
+
+- All four tiers (10+, 12+, TV-14, 15+) now run the same multi-source chain; the legacy "LLM judges at age+1" path is removed from every gate (ageGatePool, applyExtraAgeGate, handleSearch, passesAgeBand, Marquee compileEnvelope/hardFilter).
+- `tiers.js` holds the four-tier table (mandate B1 lists, normalised); `tierFor` rounds 1–11→10, 12–13→12, 14→14, 15+→15; `usesChain` is true for every positive limit.
+- `ratings.js` replaces the fixed TV-14 foreign table with an age-based one (GB/IE/NZ/CA minimum ages; allow if ≤ the tier's foreignMaxAge).
+- Marquee Cinema's envelope uses the tier's `discoverCeilingAU` (M for 10+/12+, MA 15+ for TV-14/15+) and the tier's hard floor; the legacy `judgementAge`/`auCeilingFor` path is gone.
+- `config.js` migrates stored `age_limit` to a tier on load (11→10, 13→12, 16+→15, 1–9→10) and rounds incoming values in `updateProfile`; never loosens.
+- `catalogs.js`: "Anime TV-14" band + min_profile_age → 14 (matches its name); Trending Kids keeps band 12.
+- The portal offers exactly 10+/12+/TV-14/15+ (default 10 when first enabled) with a single chain explainer; the TV-14-only explainer and the "judged one year above" line are removed.
+- Simkl step 4a now parses the real response shapes (`/search/id` type string; `/tv|/movies` top-level `certification`).
+- Tests T1–T10 (smoke): tier table, foreign identity, chain per tier, MAL band, no legacy path, fail-closed, Marquee ceiling/floor, migration, catalog bands, portal.
