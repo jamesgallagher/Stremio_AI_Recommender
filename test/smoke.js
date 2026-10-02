@@ -771,8 +771,9 @@ ok('recommendationStore: SH-01 passesAgeBand — stored verdict re-check (AGE-2)
   }
   // Adult profile (no age limit): always true.
   assert.strictEqual(rs.passesAgeBand(row('no-verdict'), { age_limit: 0 }), true);
-  // A row with no type or tmdb_id → kept (fail-open), even for a kids profile.
-  assert.strictEqual(rs.passesAgeBand({ certification: 'MA 15+' }, { age_limit: 10 }), true);
+  // A row with no type or tmdb_id but a raw cert → judged against the tier (AGE-2 fallback).
+  assert.strictEqual(rs.passesAgeBand({ certification: 'MA 15+' }, { age_limit: 10 }), false, 'MA 15+ raw cert blocked at 10');
+  assert.strictEqual(rs.passesAgeBand({ certification: 'PG' }, { age_limit: 10 }), true, 'PG raw cert allowed at 10');
   // A stored block verdict → rejected at the tier's age limit; a stored allow
   // → kept; the verdict is per-tier (an age10 verdict is not seen at age12).
   const now = Date.now();
@@ -785,6 +786,30 @@ ok('recommendationStore: SH-01 passesAgeBand — stored verdict re-check (AGE-2)
     assert.strictEqual(rs.passesAgeBand(row('age2-blocked-1'), { age_limit: 12 }), true, 'age10 verdict not seen at 12');
   } finally {
     db.get().prepare("DELETE FROM age_verdicts WHERE tmdb_id IN ('age2-blocked-1', 'age2-allowed-1')").run();
+  }
+});
+
+ok('recommendationStore: T12 passesAgeBand fallback — no stored verdict, judge the row\'s own classification', () => {
+  const rs = require('../src/recommendationStore');
+  const ageStore = require('../src/ageVerification/store');
+  const db = require('../src/db');
+  const now = Date.now();
+  // (a) A stored 'block' verdict wins over an allowed cert.
+  ageStore.recordVerdict('movie', 't12-block', 'age10', 'block', 'us', 'R', now);
+  try {
+    assert.strictEqual(rs.passesAgeBand({ type: 'movie', tmdb_id: 't12-block', age_classification: 'PG' }, { age_limit: 10 }), false, 'stored block wins over allowed cert');
+    // (b) No verdict + age_classification 'PG-13' → false at 10+, true at TV-14.
+    assert.strictEqual(rs.passesAgeBand({ age_classification: 'PG-13' }, { age_limit: 10 }), false, 'PG-13 (13) > malMaxAge 10');
+    assert.strictEqual(rs.passesAgeBand({ age_classification: 'PG-13' }, { age_limit: 14 }), true, 'PG-13 (13) <= malMaxAge 14');
+    // (c) No verdict + certification 'csm:15' → false at TV-14 (csmMaxAge 14).
+    assert.strictEqual(rs.passesAgeBand({ type: 'movie', tmdb_id: 't12-csm', certification: 'csm:15' }, { age_limit: 14 }), false, 'csm:15 > csmMaxAge 14');
+    assert.strictEqual(rs.passesAgeBand({ type: 'movie', tmdb_id: 't12-csm', certification: 'csm:12' }, { age_limit: 14 }), true, 'csm:12 <= csmMaxAge 14');
+    // (d) No verdict + certification 'MA 15+' (raw) → false at 10+ (classify → block).
+    assert.strictEqual(rs.passesAgeBand({ type: 'movie', tmdb_id: 't12-raw', certification: 'MA 15+' }, { age_limit: 10 }), false, 'MA 15+ raw cert blocked at 10');
+    // (e) No verdict + nothing → true (fail-open).
+    assert.strictEqual(rs.passesAgeBand({ type: 'movie', tmdb_id: 't12-none' }, { age_limit: 10 }), true, 'no classification → kept');
+  } finally {
+    db.get().prepare("DELETE FROM age_verdicts WHERE tmdb_id = 't12-block'").run();
   }
 });
 

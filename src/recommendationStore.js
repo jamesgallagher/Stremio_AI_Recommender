@@ -617,25 +617,36 @@ function certMinAge(cert) {
 }
 
 // PURE: does a stored row satisfy the profile's age BAND? For an age-limited
-// profile a title whose classification maps to a minimum age above the
-// judgement age (age_limit + 1) is rejected; everything passes for an
-// unlimited (adult) profile, and an unrated title (min age null) is never "too
-// old". This is the cheap cert/MAL re-check selectServe already ran inline —
-// extracted so the Companion's "entire recommendations list" view can reuse it,
-// keeping that view vetted-only for a kids profile even though it isn't
-// genre-balanced or size-limited. NOT a substitute for the build-time LLM gate
-// (the pool is already LLM-vetted); this is the same lowered-limit safety net.
+// profile the serve-time re-check first reads the stored verdict (no network);
+// if no verdict exists, it judges the row's own stored classification against
+// the tier (MAL band, certification stamp, or raw cert). An unrated/unknown
+// row is never "too old" (fail-open). This is the cheap cert/MAL safety net
+// selectServe and the Companion's "entire list" view share. NOT a substitute
+// for the build-time chain gate (the pool is already chain-vetted).
 function passesAgeBand(row, filters = {}) {
-  const limit = filters.age_limit || 0;
-  if (limit <= 0) return true;                       // adults: unchanged, always true
-  // AGE-2: every positive age limit is a chain tier — the serve-time re-check
-  // reads the stored verdict without network (A7). No legacy cert/MAL path
-  // remains (mandate B3). An unrated/unknown row (no type or tmdb_id) stays
-  // kept (fail-open), exactly as before.
   const ageVerify = require('./ageVerification');
-  const tier = ageVerify.tierFor({ age_limit: limit });
-  if (!row.type || !row.tmdb_id) return true;        // unrated/unknown stays kept (fail-open)
-  return ageVerify.passesStored(row.type, row.tmdb_id, tier.id);
+  const tier = ageVerify.tierFor(filters);
+  if (!tier) return true;                           // no limit: unchanged
+  // 1. A stored verdict for THIS tier wins.
+  if (row.type && row.tmdb_id) {
+    const v = require('./ageVerification/store').getVerdict(row.type, row.tmdb_id, tier.id);
+    if (v) return v.verdict === 'allow';
+  }
+  // 2. No verdict: judge the row's OWN stored classification against the tier (no network).
+  //    a) MAL band in age_classification: reuse certMinAge() (G 0, PG 8, PG-13 13, R 17, R+ 17)
+  //       → block if minAge > tier.malMaxAge.
+  const mal = certMinAge(row.age_classification);
+  if (mal !== null && mal > tier.malMaxAge) return false;
+  //    b) certification: either an AGE stamp '<source>:<rating>' or a raw cert (Marquee rows).
+  const raw = row.certification ? String(row.certification) : null;
+  if (raw) {
+    const [src, rest] = raw.includes(':') ? raw.split(/:(.*)/s) : [null, raw];
+    if (src === 'csm') { const n = parseInt(rest, 10); if (Number.isFinite(n) && n > tier.csmMaxAge) return false; }
+    else if (src === 'llm') { if (rest === 'no') return false; }
+    else if (require('./ageVerification/ratings').classify(rest, row.type || 'movie', tier) === 'block') return false;
+  }
+  // 3. Unknown stays KEPT (unchanged rule).
+  return true;
 }
 
 // Round-robin across primary_genre buckets: take the strongest remaining title

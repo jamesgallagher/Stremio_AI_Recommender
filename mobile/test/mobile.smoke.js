@@ -906,7 +906,7 @@ async function unitTests() {
 
   await ok('settings: GET returns editable filters + genres + catalog_only, hides the age gate', () => {
     const p = config.addProfile('SetGet');
-    config.updateProfile(p.id, { filters: { min_rating: 7, age_limit: 8 } });
+    config.updateProfile(p.id, { filters: { min_rating: 7, age_limit: 10 } });
     const res = fakeRes();
     handlers.settingsGetHandler({ profile: config.getProfile(p.id) }, res);
     assert.strictEqual(res.body.filters.min_rating, 7);
@@ -917,7 +917,7 @@ async function unitTests() {
 
   await ok('settings: POST whitelists — writes filters + pref, the age gate is immutable', () => {
     const p = config.addProfile('SetPost');
-    config.updateProfile(p.id, { filters: { age_limit: 8 } }); // an age-limited (kids) profile
+    config.updateProfile(p.id, { filters: { age_limit: 10 } }); // an age-limited (kids) profile
     const res = fakeRes();
     handlers.settingsPostHandler({
       profile: config.getProfile(p.id),
@@ -928,7 +928,7 @@ async function unitTests() {
     assert.strictEqual(after.filters.min_rating, 7.5);        // written
     assert.strictEqual(after.filters.list_size, 30);          // written
     assert.strictEqual(after.companion.catalog_only, false);  // written
-    assert.strictEqual(after.filters.age_limit, 8, 'age gate untouched by the Companion');
+    assert.strictEqual(after.filters.age_limit, 10, 'age gate untouched by the Companion');
     assert.ok(!('age_limit' in res.body.filters), 'response never echoes the age gate');
   });
 
@@ -938,7 +938,7 @@ async function unitTests() {
     assert.ok(handlers.COMPANION_FILTERS.includes('engine_movie'));
     assert.ok(handlers.COMPANION_FILTERS.includes('engine_series'));
     const p = config.addProfile('SetEngine');
-    config.updateProfile(p.id, { filters: { age_limit: 8 } }); // an age-limited profile
+    config.updateProfile(p.id, { filters: { age_limit: 10 } }); // an age-limited profile
     const res = fakeRes();
     handlers.settingsPostHandler({
       profile: config.getProfile(p.id),
@@ -948,7 +948,7 @@ async function unitTests() {
     const after = config.getProfile(p.id);
     assert.strictEqual(after.filters.engine_movie, 'genesis');  // forwarded + written
     assert.strictEqual(after.filters.engine_series, 'genesis');
-    assert.strictEqual(after.filters.age_limit, 8, 'age gate untouched by the Companion');
+    assert.strictEqual(after.filters.age_limit, 10, 'age gate untouched by the Companion');
     assert.strictEqual(res.body.filters.engine_movie, 'genesis'); // echoed back to the phone
   });
 
@@ -1026,7 +1026,7 @@ async function unitTests() {
   });
 
   await ok('catalogs: list is age-filtered — 13+ catalog hidden for a kids profile, shown for adults', () => {
-    const kid = config.addProfile('CatKid'); config.updateProfile(kid.id, { filters: { age_limit: 8 } });
+    const kid = config.addProfile('CatKid'); config.updateProfile(kid.id, { filters: { age_limit: 10 } });
     const adult = config.addProfile('CatAdult');
     const hasAnime = (prof) => { const r = fakeRes(); handlers.settingsGetHandler({ profile: config.getProfile(prof.id) }, r); return r.body.catalogs.some((c) => c.id === 'trakt-anime-teen-series'); };
     assert.strictEqual(hasAnime(kid), false);  // Anime TV-14 (13+) hidden from an 8+ profile
@@ -1034,7 +1034,7 @@ async function unitTests() {
   });
 
   await ok('catalogs: POST persists toggles; an over-band toggle is refused (age-appropriate only)', () => {
-    const kid = config.addProfile('CatSave'); config.updateProfile(kid.id, { filters: { age_limit: 8 } });
+    const kid = config.addProfile('CatSave'); config.updateProfile(kid.id, { filters: { age_limit: 10 } });
     const res = fakeRes();
     handlers.settingsPostHandler({
       profile: config.getProfile(kid.id),
@@ -1044,7 +1044,7 @@ async function unitTests() {
     const after = config.getProfile(kid.id);
     assert.strictEqual(after.catalogs['mdb-popular-movies'], true);            // allowed toggle written
     assert.strictEqual(after.catalogs['trakt-anime-teen-series'], undefined);  // over-band toggle dropped
-    assert.strictEqual(after.filters.age_limit, 8, 'age gate untouched by catalog save');
+    assert.strictEqual(after.filters.age_limit, 10, 'age gate untouched by catalog save');
   });
 
   // ---- CP-02: catalog preview (Mobile Companion) ----
@@ -1083,7 +1083,7 @@ async function unitTests() {
   });
 
   await ok('preview: an over-band extra on a kids profile -> 404 with NO age reason leaked', () => {
-    const kid = config.addProfile('PvKid'); config.updateProfile(kid.id, { filters: { age_limit: 8 } });
+    const kid = config.addProfile('PvKid'); config.updateProfile(kid.id, { filters: { age_limit: 10 } });
     const res = fakeRes();
     handlers.catalogPreviewHandler({ profile: config.getProfile(kid.id), params: { catalogId: 'trakt-anime-teen-series' } }, res); // 13+
     assert.strictEqual(res.statusCode, 404);
@@ -1421,7 +1421,7 @@ async function httpTests() {
     console.log('  ✓ settings require a session');
 
     const email = uniqEmail(); const p = seedProfile('S5 User', email);
-    config.updateProfile(p.id, { filters: { age_limit: 8 } }); // a kids profile, set in the backend
+    config.updateProfile(p.id, { filters: { age_limit: 10 } }); // a kids profile, set in the backend
     const cookie = await sessionCookieFor(email);
 
     const getBody = await (await fetch(`${BASE}/mobile/api/settings`, { headers: { Cookie: cookie } })).json();
@@ -1436,7 +1436,7 @@ async function httpTests() {
     });
     assert.strictEqual(postRes.status, 200);
     const after = config.getProfile(p.id);
-    assert.strictEqual(after.filters.age_limit, 8, 'age gate is immutable over HTTP');
+    assert.strictEqual(after.filters.age_limit, 10, 'age gate is immutable over HTTP');
     assert.strictEqual(after.filters.min_rating, 7.5);
     assert.strictEqual(after.companion.catalog_only, false);
     console.log('  ✓ settings: GET hides the age gate; POST writes filters/pref but the age gate is immutable');
@@ -1446,7 +1446,7 @@ async function httpTests() {
     assert.strictEqual(recBody.view, 'all');
     console.log('  ✓ recs: default view follows the saved catalog_only pref over HTTP');
 
-    // Catalogs tab: GET is age-filtered (this is the age_limit-8 profile from
+    // Catalogs tab: GET is age-filtered (this is the age_limit-10 profile from
     // above), POST persists a toggle.
     const getBody2 = await (await fetch(`${BASE}/mobile/api/settings`, { headers: { Cookie: cookie } })).json();
     assert.ok(Array.isArray(getBody2.catalogs) && getBody2.catalogs.length > 0);
@@ -1460,7 +1460,7 @@ async function httpTests() {
     console.log('  ✓ catalogs: GET age-filtered; POST persists a toggle over HTTP');
 
     // CP-02: catalog preview is session-scoped (no :id in the path) and age-gated.
-    // p is the age_limit-8 kids profile from above.
+    // p is the age_limit-10 kids profile from above.
     assert.strictEqual((await fetch(`${BASE}/mobile/api/catalogs/ai-recs-movies/preview`)).status, 401); // no cookie -> guard
     const pvAi = await fetch(`${BASE}/mobile/api/catalogs/ai-recs-movies/preview`, { headers: { Cookie: cookie } });
     assert.strictEqual(pvAi.status, 200);
