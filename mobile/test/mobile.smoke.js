@@ -832,6 +832,34 @@ async function unitTests() {
     recommendationStore.deleteForProfile(pid);
   });
 
+  // K16 (spec §16): the companion catalog mirrors the Stremio serve — for a
+  // Marquee profile with a stored taste target, the first `display_count` rows of
+  // the companion catalog are exactly the serveRecommendations ids.
+  await ok('K16: companion catalog first display_count == serveRecommendations for a Marquee profile with a target', () => {
+    const serveCalibration = require('../../src/serveCalibration');
+    const settings = require('../../src/settings');
+    const pid = 'k16-cat-' + Date.now();
+    try {
+      settings.updateSettings({ engines: { marquee: true } }); // SC-07: enable Marquee
+      // 30 pool rows: 10 per genre, interleaved affinities.
+      const affByGenre = { 'Action': [100, 96, 92, 88, 84, 80, 76, 72, 68, 64], 'Drama': [99, 95, 91, 87, 83, 79, 75, 71, 67, 63], 'Comedy': [98, 94, 90, 86, 82, 78, 74, 70, 66, 62] };
+      const rows = [];
+      for (const g of Object.keys(affByGenre)) affByGenre[g].forEach((aff, i) => rows.push(mkCand({ tmdb_id: g + '-' + i, imdb_id: 'tt' + g + '-' + i, title: 'T' + g + '-' + i, affinity: aff, primary_genre: g, genres: g })));
+      recommendationStore.upsertCandidates(pid, rows);
+      serveCalibration.setTarget(pid, 'movie', 'marquee', { Action: 0.5, Drama: 0.3, Comedy: 0.2 }, 30, Date.now());
+      const profile = { id: pid, filters: { engine_movie: 'marquee', list_size: 5, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 }, companion: { catalog_only: true } };
+      const res = fakeRes();
+      handlers.recommendationsHandler({ query: { type: 'movie' }, profile }, res);
+      assert.strictEqual(res.body.view, 'catalog');
+      const serve = recommendationStore.serveRecommendations(profile, 'movie', { limit: 5 }).map((m) => m.id);
+      assert.deepStrictEqual(res.body.items.slice(0, res.body.display_count).map((r) => r.id), serve, 'companion catalog mirrors Stremio');
+    } finally {
+      settings.updateSettings({ engines: { marquee: false } });
+      recommendationStore.deleteForProfile(pid);
+      serveCalibration.deleteForProfile(pid);
+    }
+  });
+
   await ok('recs: default view follows companion.catalog_only; explicit ?view overrides it', () => {
     const pid = 'rec5-pref-' + Date.now();
     recommendationStore.upsertCandidates(pid, [mkCand({ tmdb_id: '301', imdb_id: 'tt301', title: 'P' })]);

@@ -3898,6 +3898,171 @@ async function main() {
     }
   });
 
+  // ── Calibrated serving (spec §16): one serve entry point; Marquee serves calibrated ──
+  // A pool row for the serve tests: a single-genre movie with a known affinity.
+  // (rec_count/popularity/poster are bound by upsertCandidates, so they must be set.)
+  const mkPoolRow = (tmdbId, genre, affinity) => ({
+    type: 'movie', tmdb_id: tmdbId, imdb_id: 'tt' + tmdbId, title: 'T' + tmdbId,
+    year: 2020, primary_genre: genre, genres: genre, affinity, vote_average: 7,
+    rec_count: 1, popularity: 1, poster: null,
+  });
+
+  await it('K13: prefix stability (C3) + dispatch (calibrated / round-robin fallbacks)', async () => {
+    const mqCfg = require('../src/engines/marquee/config');
+    const p = config.addProfile('INT-MQK13');
+    try {
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      settings.updateSettings({ engines: { marquee: true } }); // SC-07: enable Marquee
+      // 40 pool rows: 10 per genre, affinities interleaved (all distinct).
+      const affByGenre = {
+        'Action': [100, 96, 92, 88, 84, 80, 76, 72, 68, 64],
+        'Drama': [99, 95, 91, 87, 83, 79, 75, 71, 67, 63],
+        'Comedy': [98, 94, 90, 86, 82, 78, 74, 70, 66, 62],
+        'Science Fiction': [97, 93, 89, 85, 81, 77, 73, 69, 65, 61],
+      };
+      const rows = [];
+      for (const g of Object.keys(affByGenre)) affByGenre[g].forEach((aff, i) => rows.push(mkPoolRow(g + '-' + i, g, aff)));
+      rs.upsertCandidates(p.id, rows);
+      const stored = rs.getRecommended(p.id, { type: 'movie', limit: 100000 });
+      const target = { Action: 0.4, Drama: 0.3, Comedy: 0.2, 'Science Fiction': 0.1 };
+      serveCalibration.setTarget(p.id, 'movie', 'marquee', target, 40, Date.now());
+      const profile = config.getProfile(p.id);
+
+      // Prefix stability (C3): every limit is a strict prefix of the full ordering.
+      const full = rs.selectServeFor(profile, 'movie', stored, { limit: stored.length });
+      for (const n of [5, 10, 20, 37, 60]) {
+        assert.deepStrictEqual(rs.selectServeFor(profile, 'movie', stored, { limit: n }), full.slice(0, n), `prefix stability for n=${n}`);
+      }
+
+      // Dispatch: calibrated for a Marquee profile with a stored target.
+      const nowYear = new Date().getFullYear();
+      const passed = rs.filterServable(stored, profile.filters, { nowYear }).sort((a, b) => {
+        const sa = a.affinity || 0, sb = b.affinity || 0;
+        if (sb !== sa) return sb - sa;
+        return String(a.tmdb_id) < String(b.tmdb_id) ? -1 : 1;
+      });
+      const pTarget = serveCalibration.applyExclusions(target, profile.filters.excluded_genres || []);
+      const opts = mqCfg.resolveConfig(settings.getSettings()).serve;
+      const camelOpts = {};
+      for (const [k, v] of Object.entries(opts)) camelOpts[k.replace(/_([a-z])/g, (_, c) => c.toUpperCase())] = v;
+      const expectedCalibrated = serveCalibration.calibratedOrder(passed, pTarget, { listSize: rs.listSizeFor(profile), ...camelOpts }).slice(0, 20);
+      assert.deepStrictEqual(rs.selectServeFor(profile, 'movie', stored, { limit: 20 }), expectedCalibrated, 'calibrated for Marquee with target');
+
+      // Round-robin fallbacks (C6) — the existing genre rotation, logged once.
+      const expectedRR = rs.balanceByGenre(passed, 20);
+      // (a) Genesis — a non-calibrated engine.
+      config.updateProfile(p.id, { filters: { engine_movie: 'genesis' } });
+      assert.deepStrictEqual(rs.selectServeFor(config.getProfile(p.id), 'movie', stored, { limit: 20 }), expectedRR, 'round-robin for Genesis');
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee' } });
+      // (b) No stored target.
+      serveCalibration.deleteForProfile(p.id);
+      assert.deepStrictEqual(rs.selectServeFor(config.getProfile(p.id), 'movie', stored, { limit: 20 }), expectedRR, 'round-robin when no target');
+      // (c) Engine id mismatch (a target stored by another engine).
+      serveCalibration.setTarget(p.id, 'movie', 'genesis', target, 40, Date.now());
+      assert.deepStrictEqual(rs.selectServeFor(config.getProfile(p.id), 'movie', stored, { limit: 20 }), expectedRR, 'round-robin when engine_id mismatched');
+      serveCalibration.setTarget(p.id, 'movie', 'marquee', target, 40, Date.now());
+      // (d) Tier-2 strategy 'round_robin' (the admin override).
+      settings.updateSettings({ marquee: { serve: { strategy: 'round_robin' } } });
+      assert.deepStrictEqual(rs.selectServeFor(config.getProfile(p.id), 'movie', stored, { limit: 20 }), expectedRR, 'round-robin when strategy round_robin');
+      settings.updateSettings({ marquee: {} });
+      // (e) calibratedOrder throws — serving must never fail because of calibration.
+      const origCal = serveCalibration.calibratedOrder;
+      serveCalibration.calibratedOrder = () => { throw new Error('boom'); };
+      try {
+        assert.deepStrictEqual(rs.selectServeFor(config.getProfile(p.id), 'movie', stored, { limit: 20 }), expectedRR, 'round-robin when calibratedOrder throws');
+      } finally {
+        serveCalibration.calibratedOrder = origCal;
+      }
+    } finally {
+      settings.updateSettings({ engines: { marquee: false }, marquee: {} });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); serveCalibration.deleteForProfile(p.id);
+    }
+  });
+
+  await it('K14: excluded genres at serve — a target genre excluded is never served, the rest renormalise', async () => {
+    const p = config.addProfile('INT-MQK14');
+    try {
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', list_size: 20, min_rating: 0, excluded_genres: ['Drama'], max_age_years: 0, age_limit: 0 } });
+      settings.updateSettings({ engines: { marquee: true } });
+      // 30 pool rows: 10 Action, 10 Drama, 10 Comedy.
+      const rows = [];
+      for (let i = 0; i < 10; i++) rows.push(mkPoolRow('a' + i, 'Action', 100 - i));
+      for (let i = 0; i < 10; i++) rows.push(mkPoolRow('d' + i, 'Drama', 99 - i));
+      for (let i = 0; i < 10; i++) rows.push(mkPoolRow('c' + i, 'Comedy', 98 - i));
+      rs.upsertCandidates(p.id, rows);
+      const stored = rs.getRecommended(p.id, { type: 'movie', limit: 100000 });
+      const target = { Action: 0.4, Drama: 0.4, Comedy: 0.2 };
+      serveCalibration.setTarget(p.id, 'movie', 'marquee', target, 30, Date.now());
+      const profile = config.getProfile(p.id);
+      const served = rs.selectServeFor(profile, 'movie', stored, { limit: 20 });
+      assert.ok(served.every((r) => r.primary_genre !== 'Drama'), 'no Drama served');
+      assert.ok(served.some((r) => r.primary_genre === 'Action'), 'Action served');
+      assert.ok(served.some((r) => r.primary_genre === 'Comedy'), 'Comedy served');
+      // applyExclusions renormalises the remaining genres to sum 1.
+      const pTarget = serveCalibration.applyExclusions(target, ['Drama']);
+      assert.ok(Math.abs(pTarget.Action - 0.4 / 0.6) < 1e-9, 'Action renormalised to 0.4/0.6');
+      assert.ok(Math.abs(pTarget.Comedy - 0.2 / 0.6) < 1e-9, 'Comedy renormalised to 0.2/0.6');
+      assert.ok(!('Drama' in pTarget), 'Drama removed from the target');
+    } finally {
+      settings.updateSettings({ engines: { marquee: false } });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); serveCalibration.deleteForProfile(p.id);
+    }
+  });
+
+  await it('K15: serveRecommendations (catalog) and the portal View return the same first list_size as selectServeFor', async () => {
+    const p = config.addProfile('INT-MQK15');
+    try {
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', list_size: 10, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      settings.updateSettings({ engines: { marquee: true } });
+      // 30 pool rows: 10 per genre.
+      const affByGenre = { 'Action': [100, 96, 92, 88, 84, 80, 76, 72, 68, 64], 'Drama': [99, 95, 91, 87, 83, 79, 75, 71, 67, 63], 'Comedy': [98, 94, 90, 86, 82, 78, 74, 70, 66, 62] };
+      const rows = [];
+      for (const g of Object.keys(affByGenre)) affByGenre[g].forEach((aff, i) => rows.push(mkPoolRow(g + '-' + i, g, aff)));
+      rs.upsertCandidates(p.id, rows);
+      const stored = rs.getRecommended(p.id, { type: 'movie', limit: 100000 });
+      const target = { Action: 0.5, Drama: 0.3, Comedy: 0.2 };
+      serveCalibration.setTarget(p.id, 'movie', 'marquee', target, 30, Date.now());
+      const profile = config.getProfile(p.id);
+      const listSize = rs.listSizeFor(profile);
+      // Direct selectServeFor (the one entry point).
+      const direct = rs.selectServeFor(profile, 'movie', stored, { limit: listSize });
+      // Catalog (serveRecommendations — the Stremio serve surface).
+      const catalog = rs.serveRecommendations(profile, 'movie', { record: false });
+      // Portal View (the portal.js code path: selectServeFor over getRecommended).
+      const portal = rs.selectServeFor(profile, 'movie', rs.getRecommended(p.id, { type: 'movie', limit: 100000 }), { limit: listSize });
+      assert.deepStrictEqual(catalog.map((m) => m.id), direct.map((r) => r.imdb_id), 'serveRecommendations matches selectServeFor');
+      assert.deepStrictEqual(portal.map((r) => r.imdb_id), direct.map((r) => r.imdb_id), 'portal View matches selectServeFor');
+    } finally {
+      settings.updateSettings({ engines: { marquee: false } });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); serveCalibration.deleteForProfile(p.id);
+    }
+  });
+
+  await it('K17: selectServe (old) output is unchanged — filter + balanceByGenre (regression guard)', async () => {
+    const nowYear = new Date().getFullYear();
+    // A fixture exercising the rating floor, excluded genres, movies-only recency,
+    // and the no-imdb_id drop — the same logic selectServe has always run.
+    const rows = [
+      { type: 'movie', tmdb_id: '1', imdb_id: 'tt1', title: 'A', year: nowYear - 5, primary_genre: 'Action', genres: 'Action', affinity: 10, vote_average: 8, imdb_rating: 8 },
+      { type: 'movie', tmdb_id: '2', imdb_id: 'tt2', title: 'B', year: nowYear - 5, primary_genre: 'Drama', genres: 'Drama', affinity: 9, vote_average: 7, imdb_rating: 7 },
+      { type: 'movie', tmdb_id: '3', imdb_id: 'tt3', title: 'C', year: nowYear - 20, primary_genre: 'Comedy', genres: 'Comedy', affinity: 8, vote_average: 7, imdb_rating: 7 },
+      { type: 'movie', tmdb_id: '4', imdb_id: null, title: 'D', year: nowYear - 5, primary_genre: 'Action', genres: 'Action', affinity: 7, vote_average: 8, imdb_rating: 8 },
+      { type: 'movie', tmdb_id: '5', imdb_id: 'tt5', title: 'E', year: nowYear - 5, primary_genre: 'Action', genres: 'Action', affinity: 6, vote_average: 5, imdb_rating: 5 },
+      { type: 'movie', tmdb_id: '6', imdb_id: 'tt6', title: 'F', year: nowYear - 5, primary_genre: 'Comedy', genres: 'Comedy', affinity: 5, vote_average: 8, imdb_rating: 8 },
+    ];
+    const filters = { min_rating: 6, excluded_genres: ['Drama'], max_age_years: 10, age_limit: 0 };
+    // Reference: the ORIGINAL selectServe logic (filter + balanceByGenre), inlined.
+    const reference = rs.balanceByGenre(rs.filterServable(rows, filters, { nowYear }), 10);
+    assert.deepStrictEqual(rs.selectServe(rows, filters, { nowYear, limit: 10 }), reference, 'selectServe unchanged');
+    const ids = reference.map((r) => r.tmdb_id);
+    assert.ok(ids.includes('1'), 'A kept');
+    assert.ok(!ids.includes('2'), 'B excluded (Drama)');
+    assert.ok(!ids.includes('3'), 'C excluded (too old)');
+    assert.ok(!ids.includes('4'), 'D excluded (no imdb_id)');
+    assert.ok(!ids.includes('5'), 'E excluded (below rating floor)');
+    assert.ok(ids.includes('6'), 'F kept');
+  });
+
   // ── Marquee m2 engagement: finished = liked, abandoned before halfway = not ──
   const mqEngagement = require('../src/engines/marquee/engagement');
   const DAYMS = 24 * 3600e3;

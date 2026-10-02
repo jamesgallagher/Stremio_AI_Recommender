@@ -31,6 +31,8 @@ const tasteFeedback = require('./tasteFeedback');
 // candidate logic (computeAffinity / selectStrong) + parameters (HALF_LIFE_DAYS /
 // PER_TITLE_CAP) so existing imports and tests resolve them from their old home.
 const genesis = require('./engines/genesis');
+// Calibrated serving (spec §16): the pure helpers + the per-profile taste target store.
+const serveCalibration = require('./serveCalibration');
 
 const SERVE_LIMIT = 100;    // max titles in a served, genre-balanced catalog
 const DAY_MS = 24 * 3600e3;
@@ -640,15 +642,15 @@ function balanceByGenre(rows, limit = SERVE_LIMIT) {
   return out;
 }
 
-// PURE serve-time selection over stored pool rows. Applies USER PREFERENCES
-// (rating floor, excluded genres, recency) + a cheap age-band re-check, then
-// balances across genres. Exported for testing. Nothing here touches the network.
-function selectServe(rows, filters = {}, { nowYear = new Date().getFullYear(), limit = SERVE_LIMIT } = {}) {
+// PURE serve-time filter over stored pool rows: applies the user's serve-time
+// preferences (rating floor, excluded genres, movies-only recency) + a cheap
+// age-band re-check. Exported for testing. Nothing here touches the network.
+function filterServable(rows, filters = {}, { nowYear = new Date().getFullYear() } = {}) {
   const minRating = filters.min_rating || 0;
   const excluded = new Set(filters.excluded_genres || []);
   const maxAge = filters.max_age_years || 0;
 
-  const passed = (rows || []).filter((r) => {
+  return (rows || []).filter((r) => {
     if (!r.imdb_id) return false;                                             // not servable
     // Rating floor: judged against the IMDb rating shown on the poster (via
     // MDBList) when we have it, falling back to TMDB's rating only for titles
@@ -663,7 +665,69 @@ function selectServe(rows, filters = {}, { nowYear = new Date().getFullYear(), l
     if (!passesAgeBand(r, filters)) return false;                            // lowered-limit safety net (adult profile: always true)
     return true;
   });
-  return balanceByGenre(passed, limit);
+}
+
+// PURE serve-time selection over stored pool rows. Applies USER PREFERENCES
+// (rating floor, excluded genres, recency) + a cheap age-band re-check, then
+// balances across genres. Exported for testing. Nothing here touches the network.
+function selectServe(rows, filters = {}, { nowYear = new Date().getFullYear(), limit = SERVE_LIMIT } = {}) {
+  return balanceByGenre(filterServable(rows, filters, { nowYear }), limit);
+}
+
+// Convert a snake_case serve config (config.js DEFAULTS.serve) to the camelCase
+// opts calibratedOrder expects (window_factor → windowFactor, kl_alpha →
+// klAlpha, wildcard_slots → wildcardSlots, wildcard_max_share →
+// wildcardMaxShare, wildcard_position → wildcardPosition).
+const camelServeOpts = (o) => {
+  if (!o || typeof o !== 'object') return {};
+  const out = {};
+  for (const [k, v] of Object.entries(o)) out[k.replace(/_([a-z])/g, (_, c) => c.toUpperCase())] = v;
+  return out;
+};
+
+// One serve entry point (spec §16, C7): every serve surface (Stremio catalogs,
+// the portal View, the companion) takes a prefix of the SAME calibrated full
+// ordering, so the served list for any limit is `order.slice(0, limit)` (C3).
+// For a Marquee profile with a stored taste target, the served genre mix is
+// calibrated to that taste (Steck, RecSys 2018); otherwise — Genesis, Glass, no
+// target, engine id mismatch, strategy 'round_robin', or any calibration
+// failure — it falls back to the existing strict genre rotation (C6). Serving
+// must never fail because of calibration. `selectServe` stays exported and
+// unchanged for the regression guard (K17).
+function selectServeFor(profile, type, rows, { limit = SERVE_LIMIT } = {}) {
+  const nowYear = new Date().getFullYear();
+  // Filter, then sort by affinity DESC (ties by tmdb_id) — the calibrated order
+  // expects the pool already sorted by score descending (C9).
+  const passed = filterServable(rows, profile?.filters || {}, { nowYear })
+    .sort((a, b) => {
+      const sa = a.affinity || 0, sb = b.affinity || 0;
+      if (sb !== sa) return sb - sa;
+      return String(a.tmdb_id) < String(b.tmdb_id) ? -1 : 1;
+    });
+  const engine = require('./engines').resolveFor(profile, type); // lazy (avoids a require cycle)
+  const opts = engine.serveOptions ? engine.serveOptions(settings.getSettings()) : null;
+  const t = serveCalibration.getTarget(profile.id, type);
+  const p = t ? serveCalibration.applyExclusions(t.target, (profile?.filters || {}).excluded_genres) : null;
+  const calibrated =
+    engine.capabilities.serveOrder === 'calibrated' &&
+    opts && opts.strategy === 'calibrated' &&
+    t && t.engine_id === engine.id &&
+    p && Object.keys(p).length > 0;
+  if (!calibrated) {
+    // A calibrated engine that can't serve calibrated (no target / mismatched /
+    // empty) is logged once per serve (C6, ids only); a non-calibrated engine
+    // (Genesis/Glass) or a deliberate 'round_robin' strategy is not.
+    if (engine.capabilities.serveOrder === 'calibrated' && !(opts && opts.strategy === 'round_robin')) {
+      console.warn(`[serve] ${profile.id}/${type}: no usable calibrated target — serving genre-balanced`);
+    }
+    return balanceByGenre(passed, limit);
+  }
+  try {
+    return serveCalibration.calibratedOrder(passed, p, { listSize: listSizeFor(profile), ...camelServeOpts(opts) }).slice(0, limit);
+  } catch (err) {
+    console.warn(`[serve] ${profile.id}/${type}: calibrated serving failed (${err.message}) — serving genre-balanced`);
+    return balanceByGenre(passed, limit);
+  }
 }
 
 // The user's configured "List size (per catalog)" filter — the number of titles
@@ -691,7 +755,7 @@ function listSizeFor(profile) {
 function serveRecommendations(profile, type, { limit, record = true } = {}) {
   init();
   const rows = getRecommended(profile.id, { type, limit: 100000 });
-  const picked = selectServe(rows, profile.filters || {}, { limit: limit ?? listSizeFor(profile) });
+  const picked = selectServeFor(profile, type, rows, { limit: limit ?? listSizeFor(profile) });
   if (record) recordImpressions(profile.id, picked);
   return picked.map((r) => ({
     id: r.imdb_id,
@@ -869,6 +933,8 @@ module.exports = {
   removeDontRecommend,
   deleteForProfile,
   selectServe,
+  filterServable,
+  selectServeFor,
   balanceByGenre,
   certMinAge,
   passesAgeBand,

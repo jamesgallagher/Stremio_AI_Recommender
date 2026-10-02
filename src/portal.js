@@ -16,6 +16,7 @@ const simkl = require('./services/simkl');
 const traktImport = require('./services/traktImport');
 const watchedStore = require('./watchedStore');
 const recommendationStore = require('./recommendationStore');
+const serveCalibration = require('./serveCalibration');
 const dontRecommend = require('./dontRecommend');
 const markWatched = require('./markWatched');
 const trainer = require('./trainer');
@@ -260,7 +261,7 @@ router.put('/profiles/:id', (req, res) => {
 router.delete('/profiles/:id', (req, res) => {
   if (!config.removeProfile(req.params.id)) return res.status(404).json({ error: 'Profile not found' });
   simklFlows.delete(req.params.id);
-  try { watchedStore.deleteForProfile(req.params.id); recommendationStore.deleteForProfile(req.params.id); tasteFeedback.deleteForProfile(req.params.id); } catch (err) { console.warn(`[store] cleanup failed for ${req.params.id}: ${err.message}`); }
+  try { watchedStore.deleteForProfile(req.params.id); recommendationStore.deleteForProfile(req.params.id); tasteFeedback.deleteForProfile(req.params.id); serveCalibration.deleteForProfile(req.params.id); } catch (err) { console.warn(`[store] cleanup failed for ${req.params.id}: ${err.message}`); }
   res.json({ ok: true });
 });
 
@@ -496,9 +497,9 @@ router.get('/profiles/:id/recommend', (req, res) => {
   // (the ME-10 backtest: ~70% of a Genesis pool), so the old raw view listed
   // films the user would never be shown. Read-only: no impressions recorded.
   const listSize = recommendationStore.listSizeFor(profile);
-  const served = (type) => recommendationStore.selectServe(
+  const served = (type) => recommendationStore.selectServeFor(
+    profile, type,
     recommendationStore.getRecommended(profile.id, { type, limit: 100000 }),
-    profile.filters || {},
     { limit: listSize },
   );
   res.json({

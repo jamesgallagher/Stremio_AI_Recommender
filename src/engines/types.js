@@ -25,7 +25,9 @@
  * @property {boolean} providesRankScore   // must be true in v1 (drives order + genre-balance, I6)
  * @property {boolean} preResolved         // true → candidates already carry imdb_id + poster + genres,
  *                                         //   so the pipeline skips the TMDB resolve step
- * @property {'affinity'|'preserve'} serveOrder  // v1: always 'affinity' (mostly latent)
+ * @property {'affinity'|'calibrated'} serveOrder  // 'calibrated' (spec §16): the served genre
+ *                                                  //   mix is calibrated to the profile's taste
+ *                                                  //   (Marquee); 'affinity' engines serve genre-balanced
  * @property {boolean} unrestricted        // true = "all ages"/fully open, NO age classification;
  *                                         //   available ONLY to profiles with age_limit === 0 (I7).
  *                                         //   The NSFW/porn blacklist stays absolute regardless.

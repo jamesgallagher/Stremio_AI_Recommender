@@ -174,8 +174,13 @@ module.exports = {
   capabilities: {
     providesRankScore: true,
     preResolved: true,         // ME-06 carries imdb_id/poster/genres → the pipeline skips its own resolve (§5.5)
-    serveOrder: 'affinity',
+    serveOrder: 'calibrated',  // spec §16: the served genre mix is calibrated to the profile's taste
     unrestricted: false,       // I7: age-GATED, safe for any profile via the shared age gate
+  },
+  // Calibrated serving (spec §16, C8): the serve-time tunables, read from the
+  // resolved Marquee config (Tier-1 defaults + Tier-2 settings.marquee.serve).
+  serveOptions(settings) {
+    return marqueeConfig.resolveConfig(settings).serve;
   },
   // MDBList + a local LLM are OPTIONAL (they degrade: no IMDb ratings / no
   // brief / no fit) — deliberately NOT listed, exactly Glass's two checks.

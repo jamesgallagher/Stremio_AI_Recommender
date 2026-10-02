@@ -114,10 +114,10 @@ async function watchlistRemoveHandler(req, res) {
 const POOL_LIMIT = 500;      // hard cap when reading the whole pool for a type
 // Catalog view carries the served list PLUS a hidden on-deck bench, so removing
 // a title can promote the next one ("one in, one out, from the top of the
-// bench") with no round-trip. The bench is a slice of the SAME genre-balanced
-// selection Stremio serves — selectServe(N) is a strict prefix of
-// selectServe(N + k) — so the first `display_count` rows ARE the Stremio
-// catalog, and the extra rows are just the promotion buffer.
+// bench") with no round-trip. The bench is a slice of the SAME calibrated or
+// genre-balanced selection Stremio serves — selectServeFor(N) is a strict
+// prefix of selectServeFor(N + k) — so the first `display_count` rows ARE the
+// Stremio catalog, and the extra rows are just the promotion buffer.
 const CATALOG_BENCH = 40;
 
 // PURE: map a `recommended` pool row -> the mobile Rec DTO. Exported for tests.
@@ -144,10 +144,11 @@ function toRecDTO(row) {
 // are the bench.
 // view=all: the whole ranked recommendation list ("entire recommendations list").
 //
-// BOTH views run the SAME pipeline — selectServe (the identical filters + genre
-// balance Stremio serves), watched-pruned — differing only in the size cap. That
-// guarantees the catalog is ALWAYS the exact first `display_count` of the entire
-// list (they share one order and one filter set), so the two never disagree.
+// BOTH views run the SAME pipeline — selectServeFor (the identical filters +
+// calibrated or genre-balanced selection Stremio serves), watched-pruned —
+// differing only in the size cap. That guarantees the catalog is ALWAYS the
+// exact first `display_count` of the entire list (they share one order and one
+// filter set), so the two never disagree.
 function recommendationsHandler(req, res) {
   const type = TYPES.includes(req.query && req.query.type) ? req.query.type : 'movie';
   const profile = req.profile;
@@ -161,10 +162,11 @@ function recommendationsHandler(req, res) {
   const rows = recommendationStore.getRecommended(profile.id, { type, limit: POOL_LIMIT });
   const displayCount = recommendationStore.listSizeFor(profile);
   // Catalog fetches list_size + a promotion bench; the entire-list view fetches
-  // the whole ranked pool. selectServe(N) is a strict prefix of selectServe(∞),
-  // so the catalog is exactly the first `display_count` of the entire list.
+  // the whole ranked pool. selectServeFor(N) is a strict prefix of
+  // selectServeFor(∞), so the catalog is exactly the first `display_count` of
+  // the entire list.
   const limit = view === 'all' ? rows.length : displayCount + CATALOG_BENCH;
-  const picked = recommendationStore.selectServe(rows, filters, { limit });
+  const picked = recommendationStore.selectServeFor(profile, type, rows, { limit });
   // Watched-prune like the addon does (the pool excludes watched at build; this
   // catches titles watched since) so the phone mirrors the Stremio row exactly.
   const watchedImdb = watchedStore.watchedIdSets(profile.id).imdb;
