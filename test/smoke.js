@@ -3850,6 +3850,32 @@ ok('calibrated A2: incremental greedy is fast (425 rows, listSize 50)', () => {
     assert.strictEqual(ageVerify.passesStored('series', '999'), true);  // absent → fail-open
   });
 
+  okAsync('AGE-1 C4: passesStored — the card matrix over stored verdicts', async () => {
+    const now = Date.now();
+    // csm:15 → block → false
+    ageStore.recordVerdict('movie', 'c4-1', 'block', 'csm', '15', now);
+    assert.strictEqual(ageVerify.passesStored('movie', 'c4-1', now), false);
+    // csm:14 → allow → true
+    ageStore.recordVerdict('movie', 'c4-2', 'allow', 'csm', '14', now);
+    assert.strictEqual(ageVerify.passesStored('movie', 'c4-2', now), true);
+    // au:MA15+ → block → false
+    ageStore.recordVerdict('movie', 'c4-3', 'block', 'au', 'MA15+', now);
+    assert.strictEqual(ageVerify.passesStored('movie', 'c4-3', now), false);
+    // au:M → allow → true
+    ageStore.recordVerdict('movie', 'c4-4', 'allow', 'au', 'M', now);
+    assert.strictEqual(ageVerify.passesStored('movie', 'c4-4', now), true);
+    // llm:no → block → false
+    ageStore.recordVerdict('movie', 'c4-5', 'block', 'llm', 'no', now);
+    assert.strictEqual(ageVerify.passesStored('movie', 'c4-5', now), false);
+    // llm:ok → allow → true
+    ageStore.recordVerdict('movie', 'c4-6', 'allow', 'llm', 'ok', now);
+    assert.strictEqual(ageVerify.passesStored('movie', 'c4-6', now), true);
+    // null (no stored verdict) → true (fail-open)
+    assert.strictEqual(ageVerify.passesStored('movie', 'c4-none', now), true);
+    // The card's "garbage" string case cannot occur: the serve-time re-check
+    // reads the verdict store (valid verdicts only), not a raw certification string.
+  });
+
   ok('AGE-1 S3: buildSources returns the six seams', () => {
     const src = ageSources.buildSources({});
     assert.strictEqual(typeof src.tmdbRatings, 'function');
@@ -3860,7 +3886,7 @@ ok('calibrated A2: incremental greedy is fast (425 rows, listSize 50)', () => {
     assert.strictEqual(typeof src.llmGate, 'function');
   });
 
-  okAsync('AGE-1 C4: llmGate — tier wording + cache key; omitted stays unknown', async () => {
+  okAsync('AGE-1 S4: llmGate — tier wording + cache key; omitted stays unknown', async () => {
     // Stub groq.ageGate to record its arguments and write verdicts to the cache.
     const origAgeGate = groq.ageGate;
     let captured = {};
