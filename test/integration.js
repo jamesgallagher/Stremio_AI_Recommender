@@ -6225,6 +6225,29 @@ async function main() {
     assert.deepStrictEqual(legacy13.hardFilter({ ...base, certAU: null, certUS: null }), { ok: false, reason: 'cert_unknown' });
   });
 
+  // ── U1. Portal: the TV-14 option + the TVDB key row + saving age_limit 14 ──
+  await it('U1. Portal: TV-14 (14+, AU M) option (value 14) + TVDB key row; saving age_limit 14 stores 14', async () => {
+    const fs = require('fs');
+    const path = require('path');
+    const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
+
+    // (a) the age select offers TV-14 (14+, AU M) as value 14, between 13 and 15
+    assert.ok(
+      html.includes("[[5,'5+ (~G, young kids)'],[6,'6+'],[8,'8+ (~PG)'],[10,'10+'],[12,'12+'],[13,'13+ (~PG-13)'],[14,'TV-14 (14+, AU M)'],[15,'15+ (~M)']"),
+      'index.html offers the age options 5,6,8,10,12,13,14,15 in order with TV-14 (14+, AU M) at 14');
+    // the muted explainer appears when 14 is selected
+    assert.ok(html.includes('TV-14: Common Sense age decides first (14 or under)'), 'TV-14 explainer present');
+
+    // (b) the TVDB key row in Server Config
+    assert.ok(html.includes("keyRowS('tvdb', 'tvdb_api_key', keys.tvdb_api_key)"), 'TVDB key row present in Server Config');
+
+    // (c) saving age_limit 14 stores 14
+    const p = config.addProfile('INT-U1');
+    config.updateProfile(p.id, { filters: { age_limit: 14 } });
+    assert.strictEqual(config.getProfile(p.id).filters.age_limit, 14, 'age_limit 14 is stored');
+    config.removeProfile(p.id);
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();
