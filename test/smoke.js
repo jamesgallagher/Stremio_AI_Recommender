@@ -4496,6 +4496,71 @@ ok('calibrated A2: incremental greedy is fast (425 rows, listSize 50)', () => {
   });
 }
 
+// ---- TV-1: parseSeriesProgress (pure) ----
+ok('TV-1 P1: parseSeriesProgress — counts, kind, ids, stamps, bulk rule, eps_per_week', () => {
+  const { parseSeriesProgress } = require('../src/services/simkl');
+  const mk = (over) => ({
+    show: { ids: { simkl: 101, tmdb: 201, imdb: 'tt100' }, title: 'Test Show', year: 2020 },
+    watched_episodes_count: 5, total_episodes_count: 20, not_aired_episodes_count: 5,
+    last_watched_at: '2026-01-10T00:00:00Z', status: 'watching',
+    seasons: [], ...over,
+  });
+  // (a) No seasons → zeros/nulls.
+  const r0 = parseSeriesProgress(mk(), 'shows');
+  assert.strictEqual(r0.simkl_id, 101);
+  assert.strictEqual(r0.kind, 'show');
+  assert.strictEqual(r0.tmdb_id, '201');
+  assert.strictEqual(r0.imdb_id, 'tt100');
+  assert.strictEqual(r0.watched_eps, 5);
+  assert.strictEqual(r0.total_eps, 20);
+  assert.strictEqual(r0.not_aired_eps, 5);
+  assert.strictEqual(r0.stamps, 0);
+  assert.strictEqual(r0.real_stamps, 0);
+  assert.strictEqual(r0.eps_per_week, null);
+  assert.strictEqual(r0.first_real_at, null);
+  // (b) Two identical stamps + one 2 min later → all 3 bulk.
+  const r1 = parseSeriesProgress(mk({ seasons: [{ episodes: [{ watched_at: '2026-01-01T00:00:00Z' }, { watched_at: '2026-01-01T00:00:00Z' }, { watched_at: '2026-01-01T00:02:00Z' }] }] }), 'shows');
+  assert.strictEqual(r1.stamps, 3);
+  assert.strictEqual(r1.real_stamps, 0, 'all bulk');
+  assert.strictEqual(r1.eps_per_week, null);
+  // (c) Stamps 40 min apart → real.
+  const r2 = parseSeriesProgress(mk({ seasons: [{ episodes: [{ watched_at: '2026-01-01T00:00:00Z' }, { watched_at: '2026-01-01T00:40:00Z' }] }] }), 'shows');
+  assert.strictEqual(r2.stamps, 2);
+  assert.strictEqual(r2.real_stamps, 2, '40 min gap → real');
+  // (d) eps_per_week with ≥ 4 real stamps.
+  const r3 = parseSeriesProgress(mk({ seasons: [{ episodes: [{ watched_at: '2026-01-01T00:00:00Z' }, { watched_at: '2026-01-02T00:00:00Z' }, { watched_at: '2026-01-03T00:00:00Z' }, { watched_at: '2026-01-04T00:00:00Z' }] }] }), 'shows');
+  assert.strictEqual(r3.real_stamps, 4);
+  assert.ok(r3.eps_per_week > 0, 'eps_per_week computed');
+  // (e) eps_per_week null with 3 real stamps.
+  const r4 = parseSeriesProgress(mk({ seasons: [{ episodes: [{ watched_at: '2026-01-01T00:00:00Z' }, { watched_at: '2026-01-02T00:00:00Z' }, { watched_at: '2026-01-03T00:00:00Z' }] }] }), 'shows');
+  assert.strictEqual(r4.real_stamps, 3);
+  assert.strictEqual(r4.eps_per_week, null, '3 real stamps → null');
+  // (f) total_episodes_count: 0 → total_eps: null.
+  const r5 = parseSeriesProgress(mk({ total_episodes_count: 0 }), 'shows');
+  assert.strictEqual(r5.total_eps, null);
+  // (g) Anime section → kind 'anime'.
+  const r6 = parseSeriesProgress(mk({ anime: mk().show, show: null }), 'anime');
+  assert.strictEqual(r6.kind, 'anime');
+});
+
+ok('TV-1 P2: parseSeriesProgress — bulk boundary (exactly 300000 ms)', () => {
+  const { parseSeriesProgress } = require('../src/services/simkl');
+  const mk = (seasons) => ({
+    show: { ids: { simkl: 1, tmdb: 2, imdb: 'tt1' }, title: 'T', year: 2020 },
+    watched_episodes_count: 2, total_episodes_count: 10, not_aired_episodes_count: 0,
+    last_watched_at: '2026-01-01T00:00:00Z', status: 'watching', seasons,
+  });
+  // Exactly 300000 ms gap → real.
+  const r1 = parseSeriesProgress(mk([{ episodes: [{ watched_at: '2026-01-01T00:00:00Z' }, { watched_at: '2026-01-01T00:05:00Z' }] }]), 'shows');
+  assert.strictEqual(r1.real_stamps, 2, 'exactly 5 min → both real');
+  // 299999 ms gap → bulk.
+  const r2 = parseSeriesProgress(mk([{ episodes: [{ watched_at: '2026-01-01T00:00:00Z' }, { watched_at: '2026-01-01T00:04:59.999Z' }] }]), 'shows');
+  assert.strictEqual(r2.real_stamps, 0, '4 min 59.999 s → both bulk');
+  // Single stamp → real.
+  const r3 = parseSeriesProgress(mk([{ episodes: [{ watched_at: '2026-01-01T00:00:00Z' }] }]), 'shows');
+  assert.strictEqual(r3.real_stamps, 1, 'single stamp → real');
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');
