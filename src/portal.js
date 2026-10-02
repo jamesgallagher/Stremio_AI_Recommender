@@ -314,16 +314,23 @@ async function testMdblist(profile) {
 
 const TESTERS = { tmdb: testTmdb, groq: testGroq, rpdb: testRpdb, mdblist: testMdblist };
 
-// TVDB v4 (AGE-1): validate the TVDB key with a known-title search. Optional —
-// it only feeds the TV-14 age chain's country-certification fallback.
+// TVDB v4 (AGE-1): validate the TVDB key by logging in (POST /v4/login). The
+// key is exchanged for a token — a 200 with a token means the key is valid.
+// Optional — it only feeds the TV-14 age chain's country-certification fallback.
 async function testTvdb(profile) {
   const key = profile.keys.tvdb_api_key;
   if (!key) return { ok: false, error: 'TVDB key not set (optional — TV-14 age chain)' };
   try {
-    const res = await fetch('https://api.thetvdb.com/b4/search?externalId=tt0111161', {
-      headers: { Authorization: `Bearer ${key}` },
+    const res = await fetch('https://api4.thetvdb.com/v4/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apikey: key }),
     });
-    if (res.ok) return { ok: true, detail: 'TVDB key valid' };
+    if (res.ok) {
+      const data = await res.json().catch(() => null);
+      if (data?.data?.token) return { ok: true, detail: 'TVDB key valid' };
+      return { ok: false, error: 'TVDB login returned no token' };
+    }
     return { ok: false, error: `Invalid TVDB key (${res.status})` };
   } catch (err) {
     return { ok: false, error: `TVDB test failed: ${err.message}` };

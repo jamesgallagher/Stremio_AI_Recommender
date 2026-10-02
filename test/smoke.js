@@ -3724,54 +3724,115 @@ ok('calibrated A2: incremental greedy is fast (425 rows, listSize 50)', () => {
   const tvdb = require('../src/services/tvdb');
   const settings = require('../src/settings');
 
-  okAsync('AGE-1 V1: mediaCerts maps country codes to ratings', async () => {
-    const origFetch = global.fetch;
-    global.fetch = (url) => {
-      const u = String(url);
-      if (u.includes('/search')) {
-        const id = new URL(u).searchParams.get('externalId');
-        if (id === 'tt123') {
-          return Promise.resolve({ ok: true, json: () => Promise.resolve({ data: [{ id: 12345, type: 3 }] }) });
-        }
-        return Promise.resolve({ ok: true, json: () => Promise.resolve({ data: [] }) });
-      }
-      if (u.includes('/series/12345')) {
-        return Promise.resolve({ ok: true, json: () => Promise.resolve({ data: { ratings: [
-          { country: { iso_3166_1: 'US' }, rating: 'TV-14' },
-          { country: { iso_3166_1: 'AU' }, rating: 'M' },
-          { country: { iso_3166_1: 'GB' }, rating: '12' },
-        ] } }) });
-      }
-      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
-    };
-    settings.updateSettings({ keys: { tvdb_api_key: 'test-key' } });
-    try {
-      const out = await tvdb.mediaCerts(['tt123', 'tt456'], 'series');
-      assert.deepStrictEqual(out.get('tt123'), { usa: 'TV-14', aus: 'M', gbr: '12' });
-      assert.deepStrictEqual(out.get('tt456'), {}); // no match
-    } finally {
-      global.fetch = origFetch;
-      settings.updateSettings({ keys: { tvdb_api_key: '' } });
+  // T2 (F2): the real TVDB v4 client at the fetch level. A fresh fetch seam +
+  // call log per sub-case isolates T2 from the parallel global-fetch stubs of the
+  // other AGE-1 async tests (which run in parallel via Promise.all).
+  okAsync('AGE-1 T2: TVDB v4 — login, token reuse, 401 re-login, remoteid, extended parse, no-key', async () => {
+    let calls = [];
+    function installStub(handler) {
+      calls = [];
+      tvdb.setTvdbFetch((url, opts) => {
+        const u = String(url);
+        const rec = { method: (opts && opts.method) || 'GET', url: u, body: opts && opts.body, auth: opts && opts.headers && opts.headers.Authorization };
+        calls.push(rec);
+        return handler(u, rec);
+      });
     }
-  });
+    const loginCount = () => calls.filter((c) => c.method === 'POST' && c.url.includes('/v4/login')).length;
+    const seriesExt = () => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: { contentRatings: [
+      { name: 'PG', country: 'aus' }, { name: 'TV-14', country: 'usa' }, { name: '12', country: 'deu' },
+    ] } }) });
 
-  okAsync('AGE-1 V2: mediaCerts — no key → empty; network error → empty object, logged', async () => {
-    const origFetch = global.fetch;
-    // No key → empty Map, logged.
+    // --- A: no key → empty Map, ZERO fetch calls ---
     settings.updateSettings({ keys: { tvdb_api_key: '' } });
     delete process.env.TVDB_API_KEY;
+    tvdb.clearToken();
+    installStub(() => Promise.resolve({ ok: true, json: () => Promise.resolve({}) }));
     let out = await tvdb.mediaCerts(['tt123'], 'series');
-    assert.ok(out instanceof Map && out.size === 0);
-    // Network error → empty object for the title, logged, no throw.
-    global.fetch = () => Promise.reject(new Error('network down'));
+    assert.ok(out instanceof Map && out.size === 0, 'no key → empty Map');
+    assert.strictEqual(calls.length, 0, 'no key → zero fetch calls');
+
+    // --- B: login POST → remoteid GET → series extended GET; Bearer token header; parse ---
     settings.updateSettings({ keys: { tvdb_api_key: 'test-key' } });
-    try {
-      out = await tvdb.mediaCerts(['tt123'], 'series');
-      assert.deepStrictEqual(out.get('tt123'), {});
-    } finally {
-      global.fetch = origFetch;
-      settings.updateSettings({ keys: { tvdb_api_key: '' } });
-    }
+    tvdb.clearToken();
+    installStub((u) => {
+      if (u.includes('/v4/login')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: { token: 'tok' } }) });
+      if (u.includes('/v4/search/remoteid/ttseries')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: [{ series: { id: 324126 } }] }) });
+      if (u.includes('/v4/series/324126/extended')) return seriesExt();
+      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
+    });
+    out = await tvdb.mediaCerts(['ttseries'], 'series');
+    assert.strictEqual(loginCount(), 1, 'exactly one login');
+    assert.strictEqual(calls[0].method, 'POST');
+    assert.ok(calls[0].url.includes('/v4/login'), 'call 0 is the login POST');
+    assert.deepStrictEqual(JSON.parse(calls[0].body), { apikey: 'test-key' }, 'login body carries the key');
+    assert.strictEqual(calls[1].method, 'GET');
+    assert.ok(calls[1].url.includes('/v4/search/remoteid/ttseries'), 'call 1 is the remoteid GET');
+    assert.strictEqual(calls[1].auth, 'Bearer tok', 'remoteid carries the token (not the key)');
+    assert.strictEqual(calls[2].method, 'GET');
+    assert.ok(calls[2].url.includes('/v4/series/324126/extended'), 'call 2 is the series extended GET');
+    assert.ok(calls[2].url.includes('short=true'), 'series extended carries short=true');
+    assert.strictEqual(calls[2].auth, 'Bearer tok', 'series extended carries the token');
+    assert.deepStrictEqual(out.get('ttseries'), { aus: 'PG', usa: 'TV-14' }, 'parse keeps only the six chain countries (deu dropped)');
+
+    // --- C: a second mediaCerts reuses the token (no second login) ---
+    installStub((u) => {
+      if (u.includes('/v4/search/remoteid/ttseries')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: [{ series: { id: 324126 } }] }) });
+      if (u.includes('/v4/series/324126/extended')) return seriesExt();
+      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
+    });
+    out = await tvdb.mediaCerts(['ttseries'], 'series');
+    assert.strictEqual(loginCount(), 0, 'second mediaCerts reuses the token — no login');
+    assert.deepStrictEqual(out.get('ttseries'), { aus: 'PG', usa: 'TV-14' });
+
+    // --- D: a 401 on a data GET → exactly one re-login, then retry ---
+    tvdb.clearToken();
+    let remoteid401 = 0;
+    installStub((u) => {
+      if (u.includes('/v4/login')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: { token: 'tok' } }) });
+      if (u.includes('/v4/search/remoteid/tt401')) {
+        remoteid401 += 1;
+        if (remoteid401 === 1) return Promise.resolve({ ok: false, status: 401, json: () => Promise.resolve({}) });
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: [{ series: { id: 324126 } }] }) });
+      }
+      if (u.includes('/v4/series/324126/extended')) return seriesExt();
+      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
+    });
+    out = await tvdb.mediaCerts(['tt401'], 'series');
+    assert.strictEqual(loginCount(), 2, 'initial login + exactly one re-login after the 401');
+    assert.strictEqual(remoteid401, 2, 'remoteid retried once after the 401');
+    assert.deepStrictEqual(out.get('tt401'), { aus: 'PG', usa: 'TV-14' });
+
+    // --- E: a movie match uses /movies/{id}/extended ---
+    tvdb.clearToken();
+    installStub((u) => {
+      if (u.includes('/v4/login')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: { token: 'tok' } }) });
+      if (u.includes('/v4/search/remoteid/ttmovie')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: [{ movie: { id: 12345 } }] }) });
+      if (u.includes('/v4/movies/12345/extended')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: { contentRatings: [
+        { name: '12', country: 'esp' }, { name: 'PG-13', country: 'usa' },
+      ] } }) });
+      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
+    });
+    out = await tvdb.mediaCerts(['ttmovie'], 'movie');
+    const movieExt = calls.find((c) => c.url.includes('/v4/movies/12345/extended'));
+    assert.ok(movieExt, 'movie match uses /movies/{id}/extended');
+    assert.ok(movieExt.url.includes('short=true'), 'movie extended carries short=true');
+    assert.deepStrictEqual(out.get('ttmovie'), { usa: 'PG-13' }, 'movie parse keeps only the six chain countries (esp dropped)');
+
+    // --- F: network error on login → empty object for the title, logged, no throw ---
+    settings.updateSettings({ keys: { tvdb_api_key: 'test-key' } });
+    tvdb.clearToken();
+    tvdb.setTvdbFetch(() => Promise.reject(new Error('network down')));
+    const warnings = [];
+    out = await tvdb.mediaCerts(['tt123'], 'series', { warn: (m) => warnings.push(m) });
+    assert.deepStrictEqual(out.get('tt123'), {}, 'login failure → empty object for the title');
+    assert.ok(warnings.some((w) => w.includes('TVDB login failed')), 'login failure logged');
+
+    // Restore: no key, no env, no token, global fetch untouched.
+    settings.updateSettings({ keys: { tvdb_api_key: '' } });
+    delete process.env.TVDB_API_KEY;
+    tvdb.clearToken();
+    tvdb.setTvdbFetch(global.fetch);
   });
 
   okAsync('AGE-1 V3: tvdbKey — Server Config first, then process env', async () => {
