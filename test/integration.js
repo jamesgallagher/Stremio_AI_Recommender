@@ -73,9 +73,16 @@ function fakeRes() {
 function offlineAnimeMap() {
   animeMap._setIndex({ at: Date.now(), etag: 'itest', byImdb: {}, byTmdb: {} });
 }
-// The persistent LLM verdict cache key ageGatePool's ACB pass reads:
-//   `${type}:${judgementAge}:${tmdb_id}`   (judgementAge = age_limit + 1)
-const verdictKey = (type, judgeAge, tmdbId) => `${type}:${judgeAge}:${tmdbId}`;
+// The persistent LLM verdict cache key the chain's LLM step (step 5) reads:
+//   `${type}:${tier.llm.cacheKey}:${tmdb_id}`
+// where tier.llm.cacheKey is age10/age12/tv14/age15 — the tier the age_limit
+// rounds to (AGE-2: every positive limit runs the chain; the legacy
+// "judged at age_limit + 1" wording is gone).
+const verdictKey = (type, ageLimit, tmdbId) => {
+  const n = ageLimit || 0;
+  const cacheKey = n >= 15 ? 'age15' : n >= 14 ? 'tv14' : n >= 12 ? 'age12' : 'age10';
+  return `${type}:${cacheKey}:${tmdbId}`;
+};
 
 async function main() {
   console.log('integration (engine abstraction, end to end):');
@@ -120,16 +127,16 @@ async function main() {
     settings.updateSettings({ engines: { fake: true } });
     offlineAnimeMap();
     const p = config.addProfile('INT-B');
-    config.updateProfile(p.id, { filters: { age_limit: 8, engine_movie: 'fake', engine_series: 'fake' } }); // judged at 9
-    // Seed the ACB verdict cache so the LLM pass is offline: *-1 unsuitable, rest OK.
+    config.updateProfile(p.id, { filters: { age_limit: 8, engine_movie: 'fake', engine_series: 'fake' } }); // AGE-2: 8 → the 10+ tier
+    // Seed the chain's LLM-step verdict cache so the LLM pass is offline: *-1 unsuitable, rest OK.
     const prev = store.loadAgeVerdicts();
     store.saveAgeVerdicts({
-      [verdictKey('movie', 9, 'fake-movie-1')]: false,
-      [verdictKey('movie', 9, 'fake-movie-2')]: true,
-      [verdictKey('movie', 9, 'fake-movie-3')]: true,
-      [verdictKey('series', 9, 'fake-series-1')]: false,
-      [verdictKey('series', 9, 'fake-series-2')]: true,
-      [verdictKey('series', 9, 'fake-series-3')]: true,
+      [verdictKey('movie', 8, 'fake-movie-1')]: false,
+      [verdictKey('movie', 8, 'fake-movie-2')]: true,
+      [verdictKey('movie', 8, 'fake-movie-3')]: true,
+      [verdictKey('series', 8, 'fake-series-1')]: false,
+      [verdictKey('series', 8, 'fake-series-2')]: true,
+      [verdictKey('series', 8, 'fake-series-3')]: true,
     });
     try {
       await rs.buildPool(config.getProfile(p.id), quiet);
@@ -257,9 +264,9 @@ async function main() {
     settings.updateSettings({ engines: { nohist: true } });
     offlineAnimeMap();
     const p = config.addProfile('INT-F');
-    config.updateProfile(p.id, { filters: { age_limit: 8, engine_movie: 'nohist', engine_series: 'nohist' } }); // judged at 9
+    config.updateProfile(p.id, { filters: { age_limit: 8, engine_movie: 'nohist', engine_series: 'nohist' } }); // AGE-2: 8 → the 10+ tier
     const prev = store.loadAgeVerdicts();
-    store.saveAgeVerdicts({ [verdictKey('movie', 9, 'nh-movie-1')]: false, [verdictKey('series', 9, 'nh-series-1')]: false });
+    store.saveAgeVerdicts({ [verdictKey('movie', 8, 'nh-movie-1')]: false, [verdictKey('series', 8, 'nh-series-1')]: false });
     try {
       const r = await rs.buildPool(config.getProfile(p.id), quiet);
       // Finding 2: a 0-seed engine that STORED rows is a real build — not skipped,
@@ -442,17 +449,17 @@ async function main() {
     settings.updateSettings({ engines: { fake: true } });
     offlineAnimeMap();
     const p = config.addProfile('INT-I');
-    config.updateProfile(p.id, { filters: { age_limit: 8, engine_movie: 'fake', engine_series: 'fake' } }); // judged at 9
+    config.updateProfile(p.id, { filters: { age_limit: 8, engine_movie: 'fake', engine_series: 'fake' } }); // AGE-2: 8 → the 10+ tier
     const prev = store.loadAgeVerdicts();
     store.saveAgeVerdicts({
-      [verdictKey('movie', 9, 'fake-movie-1')]: false, // over-band -> gated out of the pool
-      [verdictKey('movie', 9, 'fake-movie-2')]: true,
-      [verdictKey('movie', 9, 'fake-movie-3')]: true,
+      [verdictKey('movie', 8, 'fake-movie-1')]: false, // over-band -> gated out of the pool
+      [verdictKey('movie', 8, 'fake-movie-2')]: true,
+      [verdictKey('movie', 8, 'fake-movie-3')]: true,
       // Series build also runs (engine_series: fake) — seed its verdicts too so the
-      // ACB pass stays offline; all pass (this test only asserts on the movie list).
-      [verdictKey('series', 9, 'fake-series-1')]: true,
-      [verdictKey('series', 9, 'fake-series-2')]: true,
-      [verdictKey('series', 9, 'fake-series-3')]: true,
+      // LLM step stays offline; all pass (this test only asserts on the movie list).
+      [verdictKey('series', 8, 'fake-series-1')]: true,
+      [verdictKey('series', 8, 'fake-series-2')]: true,
+      [verdictKey('series', 8, 'fake-series-3')]: true,
     });
     try {
       await rs.buildPool(config.getProfile(p.id), quiet);
@@ -849,15 +856,15 @@ async function main() {
     stubTmdb();
     offlineAnimeMap();
     const p = config.addProfile('INT-S');
-    config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { age_limit: 8, engine_movie: 'glass', engine_series: 'glass' } }); // judged at 9
+    config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { age_limit: 8, engine_movie: 'glass', engine_series: 'glass' } }); // AGE-2: 8 → the 10+ tier
     const prev = store.loadAgeVerdicts();
     try {
       seedGlassFixtures(p.id);
-      // ACB verdict cache: veto tmdb 401 for a 9-year-old; everything else OK. The
+      // Chain LLM-step verdict cache: veto tmdb 401 for the 10+ tier; everything else OK. The
       // age gate — NOT the engine — is the authority (I1), proven over a Glass pool.
       store.saveAgeVerdicts({
-        [verdictKey('movie', 9, '301')]: true, [verdictKey('movie', 9, '302')]: true,
-        [verdictKey('movie', 9, '401')]: false, [verdictKey('movie', 9, '402')]: true,
+        [verdictKey('movie', 8, '301')]: true, [verdictKey('movie', 8, '302')]: true,
+        [verdictKey('movie', 8, '401')]: false, [verdictKey('movie', 8, '402')]: true,
       });
       await rs.buildPool(config.getProfile(p.id), quiet);
       const pool = rs.getRecommended(p.id, { type: 'movie', limit: 100 }).map((x) => x.tmdb_id);
@@ -2892,9 +2899,12 @@ async function main() {
       });
       const ids = scored.map((x) => x.tmdb_id);
       assert.ok(!ids.includes('h1'), 'NOT_YET dropped (kids)');
-      assert.ok(!ids.includes('h2'), 'kids unknown cert dropped');
-      assert.ok(!ids.includes('h3'), 'kids M@10 dropped');
-      assert.ok(!ids.includes('h4'), 'kids unknown cert dropped');
+      // AGE-2: the hard filter is the tier's hard floor only — unknown cert
+      // passes (fail open) and M is below the tier-10 floor (MA15+/AV15+/R18+/
+      // X18+/RC), so both are kept; verify() decides after the build.
+      assert.ok(ids.includes('h2'), 'kids unknown cert kept (fail open)');
+      assert.ok(ids.includes('h3'), 'kids M@10 kept (below the tier-10 hard floor)');
+      assert.ok(ids.includes('h4'), 'kids unknown cert kept (fail open)');
     }
     // Adult profile (age_limit 0): unknown cert is kept (fail open).
     {
@@ -3183,15 +3193,15 @@ async function main() {
     });
     const prev = store.loadAgeVerdicts();
     try {
-      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { age_limit: 8, engine_movie: 'marquee', engine_series: 'genesis' } });
+      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { age_limit: 8, engine_movie: 'marquee', engine_series: 'genesis' } }); // AGE-2: 8 → the 10+ tier
       watchedStore.upsertMany(p.id, [
         { simkl_id: 1, type: 'movie', imdb_id: 'ttmqi1w', tmdb_id: 'mqi1w', title: 'Watched', year: 2024, watched_at: '2026-05-01T00:00:00Z' },
       ]);
-      // Verdict cache (judgementAge = 8 + 1 = 9): veto mqi1b, keep the other two.
+      // Chain LLM-step verdict cache: veto mqi1b, keep the other two.
       store.saveAgeVerdicts({
-        [verdictKey('movie', 9, 'mqi1a')]: true,
-        [verdictKey('movie', 9, 'mqi1b')]: false,
-        [verdictKey('movie', 9, 'mqi1c')]: true,
+        [verdictKey('movie', 8, 'mqi1a')]: true,
+        [verdictKey('movie', 8, 'mqi1b')]: false,
+        [verdictKey('movie', 8, 'mqi1c')]: true,
       });
       settings.updateSettings({ engines: { marquee: true } });
       await rs.buildPool(config.getProfile(p.id), quiet);
@@ -3296,11 +3306,16 @@ async function main() {
       config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { ...filters, engine_movie: 'marquee', engine_series: 'genesis' } });
       const seeds = ['mqe1', 'mqe2', 'mqe3', 'mqe4', 'mqe5'];
       watchedStore.upsertMany(p.id, seeds.map((s, i) => ({ simkl_id: i + 1, type: 'movie', imdb_id: 'tt' + s, tmdb_id: s, title: 'Seed ' + s, year: 2024, watched_at: '2026-05-01T00:00:00Z' })));
-      // The 20 passers (n1–n4 per seed): verdict true for each (judgementAge = 10 + 1 = 11).
+      // The 20 passers (n1–n4 per seed): verdict true for each (AGE-2: age_limit 10 → the 10+ tier).
+      // AGE-2: the chain's LLM step (step 5) is reached by the other candidates that
+      // survive the Marquee hard filter (n5/n6/n8/n10 per seed), so seed them vetoed
+      // (false) to keep the chain hermetic (no LLM call). n7/n9/n11/n12 are dropped
+      // by the Marquee hard filter (adult / NOT_YET / hard floor) before the chain.
       const passers = [];
       for (const s of seeds) for (const n of ['1', '2', '3', '4']) passers.push(s + n);
+      const allN = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'];
       const verdicts = {};
-      for (const id of passers) verdicts[verdictKey('movie', 11, id)] = true;
+      for (const s of seeds) for (const n of allN) verdicts[verdictKey('movie', 10, s + n)] = passers.includes(s + n);
       store.saveAgeVerdicts(verdicts);
       settings.updateSettings({ engines: { marquee: true } });
       await rs.buildPool(config.getProfile(p.id), quiet);
@@ -3436,7 +3451,7 @@ async function main() {
     const groq = require('../src/services/groq');
     offlineAnimeMap();
     const p = config.addProfile('INT-SH01-GATE');
-    config.updateProfile(p.id, { filters: { age_limit: 8 } }); // judged at 9
+    config.updateProfile(p.id, { filters: { age_limit: 8 } }); // AGE-2: 8 → the 10+ tier
     const captured = [];
     const origAgeGate = groq.ageGate;
     groq.ageGate = async (type, judgeAge, items) => { captured.push({ type, items }); return new Set(); };
@@ -5927,12 +5942,16 @@ async function main() {
     }
   });
 
-  // ── I1. Identity (A1): non-14 tiers never call verify; groq.ageGate gets (type, limit+1, …) with no opts ──
-  await it('I1. Identity (A1): non-14 tiers use the legacy LLM path, never the chain', async () => {
+  // ── I1. Identity (AGE-2): every positive tier runs the chain; groq.ageGate gets (type, tier.llm.age, …, { tier }) ──
+  await it('I1. Identity (AGE-2): every positive age limit runs the chain, groq.ageGate gets the tier wording + opts.tier', async () => {
     const ageVerify = require('../src/ageVerification');
     const groq = require('../src/services/groq');
     const dispose = engines._register(fake);
     settings.updateSettings({ engines: { fake: true } });
+    // Clear the verdict store for the fake candidates so the chain's LLM step is
+    // reached (earlier tests at tier 10 stored verdicts for these tmdb_ids, which
+    // would otherwise answer from the cache and skip the LLM step).
+    require('../src/db').get().prepare('DELETE FROM age_verdicts WHERE tmdb_id LIKE ?').run('fake-%');
 
     let verifyCalls = [];
     const origVerify = ageVerify.verify;
@@ -5947,33 +5966,44 @@ async function main() {
 
     const p = config.addProfile('INT-I1');
     try {
+      // AGE-2 rounding: 5,8,10 → tier 10; 12,13 → tier 12; 15 → tier 15.
+      // `expected` maps each limit to its tier's LLM age (what groq.ageGate sees).
+      const expected = { 5: 10, 8: 10, 10: 10, 12: 12, 13: 12, 15: 15 };
       for (const limit of [5, 8, 10, 12, 13, 15]) {
+        verifyCalls.length = 0;
+        ageGateCalls.length = 0;
         config.updateProfile(p.id, { filters: { age_limit: limit, engine_movie: 'fake', engine_series: 'fake' } });
         const profile = config.getProfile(p.id);
         await rs.buildPool(profile, quiet);
-        // verify must never be called for non-14 tiers
-        assert.strictEqual(verifyCalls.length, 0, `verify called for limit ${limit}`);
-        // groq.ageGate must be called with (type, limit+1, …) and no opts
-        const callsForLimit = ageGateCalls.filter((c) => c.age === limit + 1);
-        for (const c of callsForLimit) {
-          assert.strictEqual(c.opts, undefined, `opts should be undefined for limit ${limit}`);
+        // verify must be called for EVERY positive tier (mandate B3: no legacy path)
+        assert.ok(verifyCalls.length > 0, `verify not called for limit ${limit}`);
+        // groq.ageGate must be called with (type, tier.llm.age, …, { tier }) — the
+        // tier's own age (not limit+1), and opts.tier set.
+        const tierAge = expected[limit];
+        assert.ok(ageGateCalls.length > 0, `groq.ageGate not called for limit ${limit}`);
+        for (const c of ageGateCalls) {
+          assert.strictEqual(c.age, tierAge, `groq.ageGate age for limit ${limit}`);
+          assert.ok(c.opts && c.opts.tier, `opts.tier set for limit ${limit}`);
+          assert.strictEqual(c.opts.tier.llm.age, tierAge, `opts.tier.llm.age for limit ${limit}`);
         }
-        // passesAgeBand: legacy path (no chain)
+        // passesAgeBand: the serve-time re-check reads the stored verdict. No
+        // verdict is stored (the LLM spy vetoes nothing), so an unrated/unknown
+        // row stays kept (fail-open).
         const row = { type: 'movie', tmdb_id: 'fake-movie-1', age_classification: null, certification: null };
         assert.strictEqual(rs.passesAgeBand(row, { age_limit: limit }), true, `passesAgeBand for limit ${limit}`);
       }
-      // Marquee Cinema's compileEnvelope for limits 10 and 13: legacy ceiling
+      // Marquee Cinema's compileEnvelope for limits 10 and 13: per-tier ceiling.
       const marquee = require('../src/engines/marquee/filters');
       const genreMap = { 18: 'Drama', 27: 'Horror' };
       const env10 = marquee.compileEnvelope({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 10 }, { nowYear: 2026, genreMap });
       const env13 = marquee.compileEnvelope({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 13 }, { nowYear: 2026, genreMap });
-      // Legacy ceiling: auCeilingFor(judgementAge) — age 11 → 'PG', age 14 → 'PG'
-      assert.strictEqual(env10.discoverParams()['certification.lte'], 'PG');
-      assert.strictEqual(env13.discoverParams()['certification.lte'], 'PG');
-      // Legacy hard filter: unknown cert → cert_unknown
+      // AGE-2 per-tier ceiling: 10+ → M (tier 10), 13 → M (tier 12).
+      assert.strictEqual(env10.discoverParams()['certification.lte'], 'M');
+      assert.strictEqual(env13.discoverParams()['certification.lte'], 'M');
+      // AGE-2 hard filter: unknown cert passes (fail open).
       const base = { imdb_id: 'tt', imdb_rating: 8, vote_average: 8, vote_count: 5000, year: 2020, genres: ['Drama'], availability: 'AVAILABLE' };
-      assert.deepStrictEqual(env10.hardFilter({ ...base, certAU: null, certUS: null }), { ok: false, reason: 'cert_unknown' });
-      assert.deepStrictEqual(env13.hardFilter({ ...base, certAU: null, certUS: null }), { ok: false, reason: 'cert_unknown' });
+      assert.deepStrictEqual(env10.hardFilter({ ...base, certAU: null, certUS: null }), { ok: true });
+      assert.deepStrictEqual(env13.hardFilter({ ...base, certAU: null, certUS: null }), { ok: true });
     } finally {
       ageVerify.verify = origVerify;
       groq.ageGate = origAgeGate;
@@ -6063,8 +6093,8 @@ async function main() {
     assert.ok(verdictStore.getVerdict('movie', '500', tier.id, now), 'fresh LLM verdict is readable');
   });
 
-  // ── I4. Catalogs at TV-14: Watch Later → chain; banded → legacy ─────────────
-  await it('I4. Catalogs at TV-14: Watch Later uses the chain; banded catalogs use the legacy path', async () => {
+  // ── I4. Catalogs at TV-14: Watch Later and banded catalogs both use the chain ─
+  await it('I4. Catalogs at TV-14: Watch Later and banded catalogs both use the chain (AGE-2)', async () => {
     const ageVerify = require('../src/ageVerification');
     const groq = require('../src/services/groq');
     const rebuild = require('../src/rebuild');
@@ -6103,17 +6133,13 @@ async function main() {
       assert.ok(verifyCalls.length > 0, 'verify was called for Watch Later (TV-14 chain)');
       assert.strictEqual(out.length, 2, 'all titles kept (all allow)');
 
-      // Banded catalog (Trending Kids, band 12) → effective limit = min(12, 14) = 12 → legacy
+      // Banded catalog (Trending Kids, band 12) → effective limit = min(12, 14) = 12 →
+      // the chain (AGE-2: every positive limit is a chain tier; the legacy LLM path
+      // is gone). The verify spy intercepts the chain, so groq.ageGate is not called.
       verifyCalls = [];
       const trendingDef = { type: 'movie', id: 'trending-kids', name: 'Trending Kids', source: 'simkl_trending', age_band: 12 };
       await rebuild.applyExtraAgeGate(profile, trendingDef, metas, quiet);
-      assert.strictEqual(verifyCalls.length, 0, 'verify NOT called for banded catalog (legacy path)');
-      // groq.ageGate was called with age = 13 (12 + 1)
-      const legacyCalls = ageGateCalls.filter((c) => c.age === 13);
-      assert.ok(legacyCalls.length > 0, 'groq.ageGate called with age 13 for band 12');
-      for (const c of legacyCalls) {
-        assert.strictEqual(c.opts, undefined, 'no opts for legacy path');
-      }
+      assert.ok(verifyCalls.length > 0, 'verify called for banded catalog (AGE-2: band 12 → the chain, tier 12)');
     } finally {
       ageVerify.verify = origVerify;
       groq.ageGate = origAgeGate;
@@ -6218,11 +6244,11 @@ async function main() {
     assert.deepStrictEqual(env.hardFilter({ ...base, certAU: 'M', certUS: null }), { ok: true });
     assert.deepStrictEqual(env.hardFilter({ ...base, certAU: null, certUS: 'R' }), { ok: true });
 
-    // Legacy tiers (10, 13) are UNCHANGED: unknown cert → cert_unknown
-    const legacy10 = marquee.compileEnvelope({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 10 }, { nowYear: 2026, genreMap });
-    assert.deepStrictEqual(legacy10.hardFilter({ ...base, certAU: null, certUS: null }), { ok: false, reason: 'cert_unknown' });
-    const legacy13 = marquee.compileEnvelope({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 13 }, { nowYear: 2026, genreMap });
-    assert.deepStrictEqual(legacy13.hardFilter({ ...base, certAU: null, certUS: null }), { ok: false, reason: 'cert_unknown' });
+    // AGE-2: tiers 10 and 13 (→ tier 12) are chain tiers — unknown cert passes (fail open).
+    const tier10 = marquee.compileEnvelope({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 10 }, { nowYear: 2026, genreMap });
+    assert.deepStrictEqual(tier10.hardFilter({ ...base, certAU: null, certUS: null }), { ok: true });
+    const tier13 = marquee.compileEnvelope({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 13 }, { nowYear: 2026, genreMap });
+    assert.deepStrictEqual(tier13.hardFilter({ ...base, certAU: null, certUS: null }), { ok: true });
   });
 
   // ── U1. Portal: the TV-14 option + the TVDB key row + saving age_limit 14 ──
@@ -6231,12 +6257,12 @@ async function main() {
     const path = require('path');
     const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
 
-    // (a) the age select offers TV-14 (14+, AU M) as value 14, between 13 and 15
+    // (a) AGE-2: the age select offers exactly 10+, 12+, TV-14, 15+ (5, 6, 8, 13 removed)
     assert.ok(
-      html.includes("[[5,'5+ (~G, young kids)'],[6,'6+'],[8,'8+ (~PG)'],[10,'10+'],[12,'12+'],[13,'13+ (~PG-13)'],[14,'TV-14 (14+, AU M)'],[15,'15+ (~M)']"),
-      'index.html offers the age options 5,6,8,10,12,13,14,15 in order with TV-14 (14+, AU M) at 14');
-    // the muted explainer appears when 14 is selected
-    assert.ok(html.includes('TV-14: Common Sense age decides first (14 or under)'), 'TV-14 explainer present');
+      html.includes("[[10,'10+ (TV-PG / PG)'],[12,'12+ (PG, UK 12)'],[14,'TV-14 (14+, AU M)'],[15,'15+ (MA 15+)']"),
+      'index.html offers the AGE-2 age options 10+, 12+, TV-14 (14+, AU M), 15+ (MA 15+)');
+    // the single muted chain explainer (AGE-2: one explainer for every tier)
+    assert.ok(html.includes('Common Sense Media age'), 'chain explainer present');
 
     // (b) the TVDB key row in Server Config
     assert.ok(html.includes("keyRowS('tvdb', 'tvdb_api_key', keys.tvdb_api_key)"), 'TVDB key row present in Server Config');

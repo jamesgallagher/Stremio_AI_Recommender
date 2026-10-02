@@ -53,9 +53,9 @@ const EXTRA_CATALOGS = [
   { id: 'mdb-kids-movies', type: 'movie', name: 'Trending Kids Movies', source: 'mdblist', user: 'tvgeniekodi', slug: 'trending-kids-movies', min_imdb: 6, sort: 'tmdbpopular', target: 50, age_band: 12 },
   { id: 'mdb-kids-series', type: 'series', name: 'Trending Kids TV', source: 'mdblist', user: 'tvgeniekodi', slug: 'trending-kids-tv-shows', min_imdb: 6, sort: 'tmdbpopular', target: 50, age_band: 12 },
   // Anime TV-14 — snoak/trending-anime-shows on MDBList (v6 decision, not the
-  // doc's AniList). min_profile_age 13 HIDES it below the band; age_band 13 GATES
-  // it always (→ judged at TV-14). ID kept for manifest stability.
-  { id: 'trakt-anime-teen-series', type: 'series', name: 'Anime TV-14', source: 'mdblist', user: 'snoak', slug: 'trending-anime-shows', min_imdb: 6, sort: 'tmdbpopular', target: 50, min_profile_age: 13, age_band: 13 },
+  // doc's AniList). min_profile_age 14 HIDES it below the band; age_band 14
+  // GATES it always (→ the TV-14 tier). ID kept for manifest stability.
+  { id: 'trakt-anime-teen-series', type: 'series', name: 'Anime TV-14', source: 'mdblist', user: 'snoak', slug: 'trending-anime-shows', min_imdb: 6, sort: 'tmdbpopular', target: 50, min_profile_age: 14, age_band: 14 },
 ];
 
 const byId = new Map(EXTRA_CATALOGS.map((d) => [d.id, d]));
@@ -71,11 +71,12 @@ function isEnabled(profile, def) {
 }
 
 // Is this catalog's rating band within the profile's age limit? A catalog
-// marked min_profile_age 13 (TV-14) is hidden from a profile limited to 8.
-// No age limit = adult profile = everything available.
+// marked min_profile_age 14 (TV-14) is hidden from a profile limited below 14
+// (10+/12+). No age limit = adult profile = everything available.
 //
-// Note this lines up with judgementAge(): a 13+ profile is judged at 14, so a
-// TV-14 catalog and the gate reviewing it agree on the bar.
+// Note this lines up with the AGE-2 tiers: a TV-14 catalog's band (14) is one
+// of the four tiers, so the catalog floor and the gate reviewing it agree on
+// the bar.
 function ageAppropriate(profile, def) {
   const floor = def.min_profile_age || 0;
   if (!floor) return true;
