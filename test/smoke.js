@@ -27,6 +27,19 @@ function ok(name, fn) {
   passed++;
   console.log(`  ✓ ${name}`);
 }
+// Async unit tests (e.g. the AGE-1 decision chain): the promise is collected and
+// awaited at the top of the HTTP section, so a failure still fails the run and the
+// pass count lands in `passed`.
+const asyncPending = [];
+function okAsync(name, fn) {
+  asyncPending.push(new Promise((resolve, reject) => {
+    Promise.resolve(fn()).then(() => {
+      passed++;
+      console.log(`  ✓ ${name}`);
+      resolve();
+    }, reject);
+  }));
+}
 
 console.log('unit:');
 
@@ -3516,6 +3529,7 @@ ok('calibrated A2: incremental greedy is fast (425 rows, listSize 50)', () => {
   const ratings = require('../src/ageVerification/ratings');
   const tiers = require('../src/ageVerification/tiers');
   const tier = tiers.TIERS[14];
+  const chain = require('../src/ageVerification/chain');
 
   ok('AGE-1 R1: normalizeRating / classify', () => {
     // 'MA 15+' normalises to 'MA15+' → block (series and film)
@@ -3560,6 +3574,148 @@ ok('calibrated A2: incremental greedy is fast (425 rows, listSize 50)', () => {
     assert.strictEqual(ratings.classifyLoose('TV-14', tier), 'allow');
     assert.strictEqual(ratings.classifyLoose('XYZ', tier), null);
   });
+
+  // ---- AGE-1: decision chain (pure, seams) ----
+  okAsync('AGE-1 C1: chain order — first step that answers wins', async () => {
+    const log = { warn: () => {} };
+    const empty = () => new Map();
+    function run(title, stubs) {
+      const sources = {
+        tmdbRatings: stubs.tmdbRatings || empty,
+        csmAges: stubs.csmAges || empty,
+        tvdbRatings: stubs.tvdbRatings || empty,
+        simklCerts: stubs.simklCerts || empty,
+        mdblistCerts: stubs.mdblistCerts || empty,
+        llmGate: stubs.llmGate || empty,
+      };
+      return chain.decide([title], 'series', tier, sources, log);
+    }
+    // adult flag → hard floor (rating 'adult')
+    let r = await run({ key: 'k1', imdb_id: 'tt1', adult: true }, {});
+    assert.deepStrictEqual(r.get('k1'), { verdict: 'block', source: 'hard-floor', rating: 'adult' });
+    // AU R18+ beats CSM 14 (hard floor is step 0)
+    r = await run({ key: 'k2', imdb_id: 'tt2' }, {
+      tmdbRatings: () => new Map([['k2', { AU: 'R18+' }]]),
+      csmAges: () => new Map([['tt2', 14]]),
+    });
+    assert.deepStrictEqual(r.get('k2'), { verdict: 'block', source: 'hard-floor', rating: 'R18+' });
+    // CSM 14 beats AU MA15+ (CSM is step 1, before AU)
+    r = await run({ key: 'k3', imdb_id: 'tt3' }, {
+      tmdbRatings: () => new Map([['k3', { AU: 'MA15+' }]]),
+      csmAges: () => new Map([['tt3', 14]]),
+    });
+    assert.deepStrictEqual(r.get('k3'), { verdict: 'allow', source: 'csm', rating: '14' });
+    // CSM 15 beats AU PG (CSM block wins over AU allow)
+    r = await run({ key: 'k4', imdb_id: 'tt4' }, {
+      tmdbRatings: () => new Map([['k4', { AU: 'PG' }]]),
+      csmAges: () => new Map([['tt4', 15]]),
+    });
+    assert.deepStrictEqual(r.get('k4'), { verdict: 'block', source: 'csm', rating: '15' });
+    // no CSM, AU M → allow/au
+    r = await run({ key: 'k5', imdb_id: 'tt5' }, { tmdbRatings: () => new Map([['k5', { AU: 'M' }]]) });
+    assert.deepStrictEqual(r.get('k5'), { verdict: 'allow', source: 'au', rating: 'M' });
+    // no CSM, AU MA15+ → block/au
+    r = await run({ key: 'k6', imdb_id: 'tt6' }, { tmdbRatings: () => new Map([['k6', { AU: 'MA15+' }]]) });
+    assert.deepStrictEqual(r.get('k6'), { verdict: 'block', source: 'au', rating: 'MA15+' });
+    // no CSM/AU, US TV-14 → allow/us
+    r = await run({ key: 'k7', imdb_id: 'tt7' }, { tmdbRatings: () => new Map([['k7', { US: 'TV-14' }]]) });
+    assert.deepStrictEqual(r.get('k7'), { verdict: 'allow', source: 'us', rating: 'TV-14' });
+    // no TMDB AU/US, TVDB aus PG → allow/tvdb-au
+    r = await run({ key: 'k8', imdb_id: 'tt8' }, { tvdbRatings: () => new Map([['tt8', { aus: 'PG' }]]) });
+    assert.deepStrictEqual(r.get('k8'), { verdict: 'allow', source: 'tvdb-au', rating: 'PG' });
+    // everything before empty, Simkl TV-PG → allow/simkl
+    r = await run({ key: 'k9', imdb_id: 'tt9' }, { simklCerts: () => new Map([['tt9', 'TV-PG']]) });
+    assert.deepStrictEqual(r.get('k9'), { verdict: 'allow', source: 'simkl', rating: 'TV-PG' });
+    // everything before empty, MDBList '15' → block/mdblist
+    r = await run({ key: 'k10', imdb_id: 'tt10' }, { mdblistCerts: () => new Map([['tt10', '15']]) });
+    assert.deepStrictEqual(r.get('k10'), { verdict: 'block', source: 'mdblist', rating: '15' });
+    // everything before empty, TMDB GB 12 → allow/tmdb-gb
+    r = await run({ key: 'k11', imdb_id: 'tt11' }, { tmdbRatings: () => new Map([['k11', { GB: '12' }]]) });
+    assert.deepStrictEqual(r.get('k11'), { verdict: 'allow', source: 'tmdb-gb', rating: '12' });
+    // everything empty → LLM: true→allow, false→block, omitted→unknown
+    r = await run({ key: 'k12', imdb_id: 'tt12' }, { llmGate: () => new Map([['k12', true]]) });
+    assert.deepStrictEqual(r.get('k12'), { verdict: 'allow', source: 'llm', rating: 'ok' });
+    r = await run({ key: 'k13', imdb_id: 'tt13' }, { llmGate: () => new Map([['k13', false]]) });
+    assert.deepStrictEqual(r.get('k13'), { verdict: 'block', source: 'llm', rating: 'no' });
+    r = await run({ key: 'k14', imdb_id: 'tt14' }, { llmGate: () => new Map() });
+    assert.deepStrictEqual(r.get('k14'), { verdict: 'unknown', source: 'llm', rating: null });
+  });
+
+  okAsync('AGE-1 C2: source economy (once per step, only undecided; TVDB once per title; LLM last)', async () => {
+    const log = { warn: () => {} };
+    const titles = [
+      { key: 'k1', imdb_id: 'tt1' }, // decided at CSM (14)
+      { key: 'k2', imdb_id: 'tt2' }, // decided at AU (M)
+      { key: 'k3', imdb_id: 'tt3' }, // undecided through to LLM
+    ];
+    const calls = { tmdb: [], csm: [], tvdb: [], simkl: [], mdb: [], llm: [] };
+    const sources = {
+      tmdbRatings: (type, ts) => { calls.tmdb.push(ts.map((t) => t.key)); return new Map([['k2', { AU: 'M' }]]); },
+      csmAges: (type, ids) => { calls.csm.push(ids.slice()); return new Map([['tt1', 14]]); },
+      tvdbRatings: (type, ids) => { calls.tvdb.push(ids.slice()); return new Map(); },
+      simklCerts: (type, ids) => { calls.simkl.push(ids.slice()); return new Map(); },
+      mdblistCerts: (type, ids) => { calls.mdb.push(ids.slice()); return new Map(); },
+      llmGate: (type, tier_, ts) => { calls.llm.push(ts.map((t) => t.key)); return new Map([['k3', true]]); },
+    };
+    const r = await chain.decide(titles, 'series', tier, sources, log);
+    assert.deepStrictEqual(r.get('k1'), { verdict: 'allow', source: 'csm', rating: '14' });
+    assert.deepStrictEqual(r.get('k2'), { verdict: 'allow', source: 'au', rating: 'M' });
+    assert.deepStrictEqual(r.get('k3'), { verdict: 'allow', source: 'llm', rating: 'ok' });
+    // TMDB fetched once for the whole set (step 0).
+    assert.strictEqual(calls.tmdb.length, 1);
+    assert.deepStrictEqual(calls.tmdb[0], ['k1', 'k2', 'k3']);
+    // CSM called once with the undecided after step 0 (all three).
+    assert.strictEqual(calls.csm.length, 1);
+    assert.deepStrictEqual(calls.csm[0], ['tt1', 'tt2', 'tt3']);
+    // TVDB fetched once for tt3 (k2 has TMDB AU so it is never fetched); steps
+    // 2, 3 and 4c share the cache → exactly one call.
+    assert.strictEqual(calls.tvdb.length, 1);
+    assert.deepStrictEqual(calls.tvdb[0], ['tt3']);
+    // Simkl and MDBList called once each, only with the still-undecided tt3.
+    assert.strictEqual(calls.simkl.length, 1);
+    assert.deepStrictEqual(calls.simkl[0], ['tt3']);
+    assert.strictEqual(calls.mdb.length, 1);
+    assert.deepStrictEqual(calls.mdb[0], ['tt3']);
+    // LLM called once, only with the title that reached it (k3).
+    assert.strictEqual(calls.llm.length, 1);
+    assert.deepStrictEqual(calls.llm[0], ['k3']);
+  });
+
+  okAsync('AGE-1 C3: source failures (continue + logged; LLM fails closed)', async () => {
+    const warnings = [];
+    const log = { warn: (m) => warnings.push(m) };
+    const titles = [{ key: 'k1', imdb_id: 'tt1' }];
+    // A failing CSM and TVDB give no answer from those steps; the chain continues to LLM.
+    const sources = {
+      tmdbRatings: () => new Map(),
+      csmAges: () => { throw new Error('MDBList CSM down'); },
+      tvdbRatings: () => { throw new Error('TVDB down'); },
+      simklCerts: () => new Map(),
+      mdblistCerts: () => new Map(),
+      llmGate: () => new Map([['k1', true]]),
+    };
+    const r = await chain.decide(titles, 'series', tier, sources, log);
+    assert.deepStrictEqual(r.get('k1'), { verdict: 'allow', source: 'llm', rating: 'ok' });
+    assert.ok(warnings.some((w) => w.includes('csm')), 'CSM failure logged');
+    assert.ok(warnings.some((w) => w.includes('tvdb')), 'TVDB failure logged');
+    // The LLM step fails closed: its error propagates (decide rejects).
+    const sources2 = {
+      tmdbRatings: () => new Map(),
+      csmAges: () => new Map(),
+      tvdbRatings: () => new Map(),
+      simklCerts: () => new Map(),
+      mdblistCerts: () => new Map(),
+      llmGate: () => { throw new Error('Groq down'); },
+    };
+    let rejected = false;
+    try {
+      await chain.decide(titles, 'series', tier, sources2, log);
+    } catch (e) {
+      rejected = true;
+      assert.ok(e.message.includes('Groq down'));
+    }
+    assert.ok(rejected, 'decide must reject when the LLM step throws');
+  });
 }
 
 // ---- HTTP surface ----
@@ -3568,6 +3724,8 @@ require('../src/server');
 const BASE = `http://localhost:${process.env.PORT}`;
 
 async function httpTests() {
+  // Await any async unit tests (AGE-1 decision chain) before the HTTP surface.
+  await Promise.all(asyncPending);
   // The migrateFromProfiles unit test above seeds the GLOBAL settings with
   // JAMES-* lookup keys. Now that the addon reads GLOBAL keys, clear them so the
   // addon-serve tests start from a known "no keys" baseline (tests that need a
