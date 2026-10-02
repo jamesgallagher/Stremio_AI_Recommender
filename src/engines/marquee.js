@@ -38,6 +38,7 @@ const shape = require('./marquee/shape');
 const simklCache = require('./marquee/simklCache');
 const engagement = require('./marquee/engagement');
 const recommendationStore = require('../recommendationStore');
+const serveCalibration = require('../serveCalibration');
 
 // Test-only seam (ME-09): a process-wide injection for the Tier-2 rebuild
 // path, which runs generate() inside buildRecommendations — where the ctx has
@@ -141,6 +142,21 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
   if (ctx.stats) ctx.stats.kept = final.length;
   const st = ctx.stats || {};
   log.log(`[marquee] ${profile.name}: seeds ${st.seeds ?? 0} → raw ${st.raw ?? 0} → strong ${st.strong ?? 0} → scored ${st.scored ?? 0} → stored ${final.length} (llm fit: ${fitOn ? 'on' : 'off'}, brief: ${brief ? 'on' : 'off'}, abandoned: ${abandoned.size})`);
+
+  // Calibrated serving (spec §16, C4): store the per-profile taste target at
+  // build time (only when the build produced films) so serving stays
+  // instant/local/network-free. A failure here NEVER fails the build (C6).
+  if (final.length > 0) {
+    try {
+      const gt = taste.genreTarget(profile.id, cfg, { nowMs });
+      serveCalibration.setTarget(profile.id, 'movie', 'marquee', gt.target, gt.filmCount, nowMs);
+      const top = Object.entries(gt.target).slice(0, 3).map(([g, v]) => `${g} ${(v * 100).toFixed(0)}%`);
+      log.log(`[marquee] ${profile.name}: serve target from ${gt.filmCount} films — top: ${top.join(', ')}${Object.keys(gt.target).length > 3 ? ' …' : ''}`);
+    } catch (err) {
+      log.warn(`[marquee] ${profile.name}: serve target failed: ${err.message}`);
+    }
+  }
+
   onProgress(100, `Marquee: ${final.length} movie(s)`);
   return final;
 }
@@ -158,8 +174,13 @@ module.exports = {
   capabilities: {
     providesRankScore: true,
     preResolved: true,         // ME-06 carries imdb_id/poster/genres → the pipeline skips its own resolve (§5.5)
-    serveOrder: 'affinity',
+    serveOrder: 'calibrated',  // spec §16: the served genre mix is calibrated to the profile's taste
     unrestricted: false,       // I7: age-GATED, safe for any profile via the shared age gate
+  },
+  // Calibrated serving (spec §16, C8): the serve-time tunables, read from the
+  // resolved Marquee config (Tier-1 defaults + Tier-2 settings.marquee.serve).
+  serveOptions(settings) {
+    return marqueeConfig.resolveConfig(settings).serve;
   },
   // MDBList + a local LLM are OPTIONAL (they degrade: no IMDb ratings / no
   // brief / no fit) — deliberately NOT listed, exactly Glass's two checks.

@@ -3790,6 +3790,331 @@ async function main() {
     assert.ok(out.includes('marquee truncated (pre-score rank 512/900)'), 'Marquee fate shown');
   });
 
+  // ── Calibrated serving (spec §16): the taste target — build-time computation + storage ──
+  const serveCalibration = require('../src/serveCalibration');
+
+  await it('K10: genreTarget — ignored excluded, rated ≤4 excluded, Loved floored, meta genres else primary_genre', async () => {
+    const taste = require('../src/engines/marquee/taste');
+    const profileId = 'p-k10';
+    const nowMs = Date.parse('2026-06-01T00:00:00Z');
+    const day = 86400000;
+    const recent = new Date(nowMs).toISOString();
+    const oldLoved = new Date(nowMs - 1080 * day).toISOString();
+    glassMeta._clear();
+    watchedStore.upsertMany(profileId, [
+      { simkl_id: 1, type: 'movie', imdb_id: 'ttk10a', tmdb_id: '1', title: 'A', year: 2020, watched_at: recent },
+      { simkl_id: 2, type: 'movie', imdb_id: 'ttk10b', tmdb_id: '2', title: 'B', year: 2020, watched_at: recent },
+      { simkl_id: 3, type: 'movie', imdb_id: 'ttk10c', tmdb_id: '3', title: 'C', year: 2020, watched_at: recent },
+      { simkl_id: 4, type: 'movie', imdb_id: 'ttk10d', tmdb_id: '4', title: 'D', year: 2020, watched_at: oldLoved },
+      { simkl_id: 5, type: 'movie', imdb_id: 'ttk10e', tmdb_id: '5', title: 'E', year: 2020, watched_at: recent },
+    ]);
+    // primary_genre on the watched rows (the enrichment step normally fills this).
+    const db = require('../src/db');
+    db.get().prepare('UPDATE watched SET primary_genre = ? WHERE profile_id = ? AND tmdb_id = ?').run('Horror', profileId, '1');
+    db.get().prepare('UPDATE watched SET primary_genre = ? WHERE profile_id = ? AND tmdb_id = ?').run('Horror', profileId, '2');
+    db.get().prepare('UPDATE watched SET primary_genre = ? WHERE profile_id = ? AND tmdb_id = ?').run('Sci-Fi', profileId, '3');
+    db.get().prepare('UPDATE watched SET primary_genre = ? WHERE profile_id = ? AND tmdb_id = ?').run('Comedy', profileId, '4');
+    db.get().prepare('UPDATE watched SET primary_genre = ? WHERE profile_id = ? AND tmdb_id = ?').run('Documentary', profileId, '5');
+    // Cached deep-meta for A (Action/Drama) and D (Comedy); E has none → primary_genre.
+    glassMeta.put('movie', '1', { genres: ['Action', 'Drama'] });
+    glassMeta.put('movie', '4', { genres: ['Comedy'] });
+    const ratings = new Map([['2', 3], ['4', 10]]);
+    const ignored = new Set(['3']);
+    const { target, filmCount } = taste.genreTarget(profileId, mqCfgResolved, { nowMs, ratings, ignored });
+    assert.strictEqual(filmCount, 3, 'A, D, E counted (B rated ≤4 and C ignored excluded)');
+    assert.ok(!('Horror' in target), 'B (rated 3) excluded');
+    assert.ok(!('Sci-Fi' in target), 'C (ignored) excluded');
+    assert.ok('Action' in target && 'Drama' in target, 'A uses cached meta genres (not its primary_genre Horror)');
+    assert.ok('Documentary' in target, 'E uses primary_genre when no cached meta');
+    // D is old (days 1080 → decay ≈ 0.113); the Loved floor lifts it to 0.5, so
+    // weight = 3.0 × 0.5 = 1.5 (without the floor it would be 3.0 × 0.113 ≈ 0.339).
+    // Total = 0.5 + 0.5 + 1.5 + 1.0 = 3.5 → Comedy share = 1.5/3.5.
+    assert.ok(Math.abs(target.Comedy - 1.5 / 3.5) < 1e-6, 'Loved decay floored (Comedy share = 1.5/3.5)');
+    watchedStore.deleteForProfile(profileId);
+    glassMeta._clear();
+  });
+
+  await it('K11: generate stores the serve target (engine_id marquee, film_count > 0); empty build does not store', async () => {
+    const p1 = config.addProfile('INT-MQK11A');
+    try {
+      config.updateProfile(p1.id, { simkl_auth: { access_token: 'x' }, filters: { vote_count_floor: 100 } });
+      watchedStore.upsertMany(p1.id, [{ simkl_id: 1, type: 'movie', imdb_id: 'ttk11a', tmdb_id: 'es1', title: 'Seed', year: 2024, watched_at: '2026-05-01T00:00:00Z' }]);
+      require('../src/db').get().prepare('UPDATE watched SET primary_genre = ? WHERE profile_id = ? AND tmdb_id = ?').run('Action', p1.id, 'es1');
+      const ctx1 = {
+        tmdbKey: 'k', mdblistKey: '', settings: {}, filters: { vote_count_floor: 100 }, log: quiet,
+        nowMs: Date.parse('2026-06-01T00:00:00Z'),
+        watchedIds: watchedStore.watchedIdSets(p1.id), dont: new Set(), stats: {}, marqueeChain: [],
+        marqueeFetchers: { ...mqSeam({ recs: () => [mqItem('k11c1')] }), syncRatings: async () => ({ skipped: 'test' }), pullProgress: async () => [] },
+      };
+      const out1 = await marqueeEngine.generate(config.getProfile(p1.id), 'movie', ctx1);
+      assert.ok(out1.length > 0, 'non-empty build');
+      const t1 = serveCalibration.getTarget(p1.id, 'movie');
+      assert.ok(t1, 'target stored');
+      assert.strictEqual(t1.engine_id, 'marquee', 'engine_id marquee');
+      assert.ok(t1.film_count > 0, 'film_count > 0');
+    } finally {
+      config.removeProfile(p1.id); watchedStore.deleteForProfile(p1.id); rs.deleteForProfile(p1.id); serveCalibration.deleteForProfile(p1.id);
+    }
+    // Empty build (no watched history) → no target stored.
+    const p2 = config.addProfile('INT-MQK11B');
+    try {
+      config.updateProfile(p2.id, { simkl_auth: { access_token: 'x' }, filters: { vote_count_floor: 100 } });
+      const ctx2 = {
+        tmdbKey: 'k', mdblistKey: '', settings: {}, filters: { vote_count_floor: 100 }, log: quiet,
+        nowMs: Date.parse('2026-06-01T00:00:00Z'),
+        watchedIds: watchedStore.watchedIdSets(p2.id), dont: new Set(), stats: {}, marqueeChain: [],
+        marqueeFetchers: { ...mqSeam(), syncRatings: async () => ({ skipped: 'test' }), pullProgress: async () => [] },
+      };
+      const out2 = await marqueeEngine.generate(config.getProfile(p2.id), 'movie', ctx2);
+      assert.ok(out2.length === 0, 'empty build');
+      assert.strictEqual(serveCalibration.getTarget(p2.id, 'movie'), null, 'empty build does not store a target');
+    } finally {
+      config.removeProfile(p2.id); watchedStore.deleteForProfile(p2.id); rs.deleteForProfile(p2.id); serveCalibration.deleteForProfile(p2.id);
+    }
+  });
+
+  await it('K12: a setTarget failure never fails the build', async () => {
+    const p = config.addProfile('INT-MQK12');
+    try {
+      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { vote_count_floor: 100 } });
+      watchedStore.upsertMany(p.id, [{ simkl_id: 1, type: 'movie', imdb_id: 'ttk12', tmdb_id: 'es12', title: 'Seed', year: 2024, watched_at: '2026-05-01T00:00:00Z' }]);
+      require('../src/db').get().prepare('UPDATE watched SET primary_genre = ? WHERE profile_id = ? AND tmdb_id = ?').run('Action', p.id, 'es12');
+      const ctx = {
+        tmdbKey: 'k', mdblistKey: '', settings: {}, filters: { vote_count_floor: 100 }, log: quiet,
+        nowMs: Date.parse('2026-06-01T00:00:00Z'),
+        watchedIds: watchedStore.watchedIdSets(p.id), dont: new Set(), stats: {}, marqueeChain: [],
+        marqueeFetchers: { ...mqSeam({ recs: () => [mqItem('k12c1')] }), syncRatings: async () => ({ skipped: 'test' }), pullProgress: async () => [] },
+      };
+      const origSetTarget = serveCalibration.setTarget;
+      serveCalibration.setTarget = () => { throw new Error('db down'); };
+      try {
+        const out = await marqueeEngine.generate(config.getProfile(p.id), 'movie', ctx);
+        assert.ok(out.length > 0, 'build succeeded despite setTarget failure');
+      } finally {
+        serveCalibration.setTarget = origSetTarget;
+      }
+    } finally {
+      config.removeProfile(p.id); watchedStore.deleteForProfile(p.id); rs.deleteForProfile(p.id); serveCalibration.deleteForProfile(p.id);
+    }
+  });
+
+  // ── Calibrated serving (spec §16): one serve entry point; Marquee serves calibrated ──
+  // A pool row for the serve tests: a single-genre movie with a known affinity.
+  // (rec_count/popularity/poster are bound by upsertCandidates, so they must be set.)
+  const mkPoolRow = (tmdbId, genre, affinity) => ({
+    type: 'movie', tmdb_id: tmdbId, imdb_id: 'tt' + tmdbId, title: 'T' + tmdbId,
+    year: 2020, primary_genre: genre, genres: genre, affinity, vote_average: 7,
+    rec_count: 1, popularity: 1, poster: null,
+  });
+
+  await it('K13: prefix stability (C3) + dispatch (calibrated / round-robin fallbacks)', async () => {
+    const mqCfg = require('../src/engines/marquee/config');
+    const p = config.addProfile('INT-MQK13');
+    try {
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      settings.updateSettings({ engines: { marquee: true } }); // SC-07: enable Marquee
+      // 40 pool rows: 10 per genre, affinities interleaved (all distinct).
+      const affByGenre = {
+        'Action': [100, 96, 92, 88, 84, 80, 76, 72, 68, 64],
+        'Drama': [99, 95, 91, 87, 83, 79, 75, 71, 67, 63],
+        'Comedy': [98, 94, 90, 86, 82, 78, 74, 70, 66, 62],
+        'Science Fiction': [97, 93, 89, 85, 81, 77, 73, 69, 65, 61],
+      };
+      const rows = [];
+      for (const g of Object.keys(affByGenre)) affByGenre[g].forEach((aff, i) => rows.push(mkPoolRow(g + '-' + i, g, aff)));
+      rs.upsertCandidates(p.id, rows);
+      const stored = rs.getRecommended(p.id, { type: 'movie', limit: 100000 });
+      const target = { Action: 0.4, Drama: 0.3, Comedy: 0.2, 'Science Fiction': 0.1 };
+      serveCalibration.setTarget(p.id, 'movie', 'marquee', target, 40, Date.now());
+      const profile = config.getProfile(p.id);
+
+      // Prefix stability (C3): every limit is a strict prefix of the full ordering.
+      const full = rs.selectServeFor(profile, 'movie', stored, { limit: stored.length });
+      for (const n of [5, 10, 20, 37, 60]) {
+        assert.deepStrictEqual(rs.selectServeFor(profile, 'movie', stored, { limit: n }), full.slice(0, n), `prefix stability for n=${n}`);
+      }
+
+      // Dispatch: calibrated for a Marquee profile with a stored target.
+      const nowYear = new Date().getFullYear();
+      const passed = rs.filterServable(stored, profile.filters, { nowYear }).sort((a, b) => {
+        const sa = a.affinity || 0, sb = b.affinity || 0;
+        if (sb !== sa) return sb - sa;
+        return String(a.tmdb_id) < String(b.tmdb_id) ? -1 : 1;
+      });
+      const pTarget = serveCalibration.applyExclusions(target, profile.filters.excluded_genres || []);
+      const opts = mqCfg.resolveConfig(settings.getSettings()).serve;
+      const camelOpts = {};
+      for (const [k, v] of Object.entries(opts)) camelOpts[k.replace(/_([a-z])/g, (_, c) => c.toUpperCase())] = v;
+      const expectedCalibrated = serveCalibration.calibratedOrder(passed, pTarget, { listSize: rs.listSizeFor(profile), ...camelOpts }).slice(0, 20);
+      assert.deepStrictEqual(rs.selectServeFor(profile, 'movie', stored, { limit: 20 }), expectedCalibrated, 'calibrated for Marquee with target');
+
+      // Round-robin fallbacks (C6) — the existing genre rotation, logged once.
+      const expectedRR = rs.balanceByGenre(passed, 20);
+      // (a) Genesis — a non-calibrated engine.
+      config.updateProfile(p.id, { filters: { engine_movie: 'genesis' } });
+      assert.deepStrictEqual(rs.selectServeFor(config.getProfile(p.id), 'movie', stored, { limit: 20 }), expectedRR, 'round-robin for Genesis');
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee' } });
+      // (b) No stored target.
+      serveCalibration.deleteForProfile(p.id);
+      assert.deepStrictEqual(rs.selectServeFor(config.getProfile(p.id), 'movie', stored, { limit: 20 }), expectedRR, 'round-robin when no target');
+      // (c) Engine id mismatch (a target stored by another engine).
+      serveCalibration.setTarget(p.id, 'movie', 'genesis', target, 40, Date.now());
+      assert.deepStrictEqual(rs.selectServeFor(config.getProfile(p.id), 'movie', stored, { limit: 20 }), expectedRR, 'round-robin when engine_id mismatched');
+      serveCalibration.setTarget(p.id, 'movie', 'marquee', target, 40, Date.now());
+      // (d) Tier-2 strategy 'round_robin' (the admin override).
+      settings.updateSettings({ marquee: { serve: { strategy: 'round_robin' } } });
+      assert.deepStrictEqual(rs.selectServeFor(config.getProfile(p.id), 'movie', stored, { limit: 20 }), expectedRR, 'round-robin when strategy round_robin');
+      settings.updateSettings({ marquee: {} });
+      // (e) calibratedOrder throws — serving must never fail because of calibration.
+      const origCal = serveCalibration.calibratedOrder;
+      serveCalibration.calibratedOrder = () => { throw new Error('boom'); };
+      try {
+        assert.deepStrictEqual(rs.selectServeFor(config.getProfile(p.id), 'movie', stored, { limit: 20 }), expectedRR, 'round-robin when calibratedOrder throws');
+      } finally {
+        serveCalibration.calibratedOrder = origCal;
+      }
+    } finally {
+      settings.updateSettings({ engines: { marquee: false }, marquee: {} });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); serveCalibration.deleteForProfile(p.id);
+    }
+  });
+
+  await it('K14: excluded genres at serve — a target genre excluded is never served, the rest renormalise', async () => {
+    const p = config.addProfile('INT-MQK14');
+    try {
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', list_size: 20, min_rating: 0, excluded_genres: ['Drama'], max_age_years: 0, age_limit: 0 } });
+      settings.updateSettings({ engines: { marquee: true } });
+      // 30 pool rows: 10 Action, 10 Drama, 10 Comedy.
+      const rows = [];
+      for (let i = 0; i < 10; i++) rows.push(mkPoolRow('a' + i, 'Action', 100 - i));
+      for (let i = 0; i < 10; i++) rows.push(mkPoolRow('d' + i, 'Drama', 99 - i));
+      for (let i = 0; i < 10; i++) rows.push(mkPoolRow('c' + i, 'Comedy', 98 - i));
+      rs.upsertCandidates(p.id, rows);
+      const stored = rs.getRecommended(p.id, { type: 'movie', limit: 100000 });
+      const target = { Action: 0.4, Drama: 0.4, Comedy: 0.2 };
+      serveCalibration.setTarget(p.id, 'movie', 'marquee', target, 30, Date.now());
+      const profile = config.getProfile(p.id);
+      const served = rs.selectServeFor(profile, 'movie', stored, { limit: 20 });
+      assert.ok(served.every((r) => r.primary_genre !== 'Drama'), 'no Drama served');
+      assert.ok(served.some((r) => r.primary_genre === 'Action'), 'Action served');
+      assert.ok(served.some((r) => r.primary_genre === 'Comedy'), 'Comedy served');
+      // applyExclusions renormalises the remaining genres to sum 1.
+      const pTarget = serveCalibration.applyExclusions(target, ['Drama']);
+      assert.ok(Math.abs(pTarget.Action - 0.4 / 0.6) < 1e-9, 'Action renormalised to 0.4/0.6');
+      assert.ok(Math.abs(pTarget.Comedy - 0.2 / 0.6) < 1e-9, 'Comedy renormalised to 0.2/0.6');
+      assert.ok(!('Drama' in pTarget), 'Drama removed from the target');
+    } finally {
+      settings.updateSettings({ engines: { marquee: false } });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); serveCalibration.deleteForProfile(p.id);
+    }
+  });
+
+  await it('K15: serveRecommendations (catalog) and the portal View return the same first list_size as selectServeFor', async () => {
+    const p = config.addProfile('INT-MQK15');
+    try {
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', list_size: 10, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      settings.updateSettings({ engines: { marquee: true } });
+      // 30 pool rows: 10 per genre.
+      const affByGenre = { 'Action': [100, 96, 92, 88, 84, 80, 76, 72, 68, 64], 'Drama': [99, 95, 91, 87, 83, 79, 75, 71, 67, 63], 'Comedy': [98, 94, 90, 86, 82, 78, 74, 70, 66, 62] };
+      const rows = [];
+      for (const g of Object.keys(affByGenre)) affByGenre[g].forEach((aff, i) => rows.push(mkPoolRow(g + '-' + i, g, aff)));
+      rs.upsertCandidates(p.id, rows);
+      const stored = rs.getRecommended(p.id, { type: 'movie', limit: 100000 });
+      const target = { Action: 0.5, Drama: 0.3, Comedy: 0.2 };
+      serveCalibration.setTarget(p.id, 'movie', 'marquee', target, 30, Date.now());
+      const profile = config.getProfile(p.id);
+      const listSize = rs.listSizeFor(profile);
+      // Direct selectServeFor (the one entry point).
+      const direct = rs.selectServeFor(profile, 'movie', stored, { limit: listSize });
+      // Catalog (serveRecommendations — the Stremio serve surface).
+      const catalog = rs.serveRecommendations(profile, 'movie', { record: false });
+      // Portal View (the portal.js code path: selectServeFor over getRecommended).
+      const portal = rs.selectServeFor(profile, 'movie', rs.getRecommended(p.id, { type: 'movie', limit: 100000 }), { limit: listSize });
+      assert.deepStrictEqual(catalog.map((m) => m.id), direct.map((r) => r.imdb_id), 'serveRecommendations matches selectServeFor');
+      assert.deepStrictEqual(portal.map((r) => r.imdb_id), direct.map((r) => r.imdb_id), 'portal View matches selectServeFor');
+    } finally {
+      settings.updateSettings({ engines: { marquee: false } });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); serveCalibration.deleteForProfile(p.id);
+    }
+  });
+
+  await it('K17: selectServe (old) output is unchanged — filter + balanceByGenre (regression guard)', async () => {
+    const nowYear = new Date().getFullYear();
+    // A fixture exercising the rating floor, excluded genres, movies-only recency,
+    // and the no-imdb_id drop — the same logic selectServe has always run.
+    const rows = [
+      { type: 'movie', tmdb_id: '1', imdb_id: 'tt1', title: 'A', year: nowYear - 5, primary_genre: 'Action', genres: 'Action', affinity: 10, vote_average: 8, imdb_rating: 8 },
+      { type: 'movie', tmdb_id: '2', imdb_id: 'tt2', title: 'B', year: nowYear - 5, primary_genre: 'Drama', genres: 'Drama', affinity: 9, vote_average: 7, imdb_rating: 7 },
+      { type: 'movie', tmdb_id: '3', imdb_id: 'tt3', title: 'C', year: nowYear - 20, primary_genre: 'Comedy', genres: 'Comedy', affinity: 8, vote_average: 7, imdb_rating: 7 },
+      { type: 'movie', tmdb_id: '4', imdb_id: null, title: 'D', year: nowYear - 5, primary_genre: 'Action', genres: 'Action', affinity: 7, vote_average: 8, imdb_rating: 8 },
+      { type: 'movie', tmdb_id: '5', imdb_id: 'tt5', title: 'E', year: nowYear - 5, primary_genre: 'Action', genres: 'Action', affinity: 6, vote_average: 5, imdb_rating: 5 },
+      { type: 'movie', tmdb_id: '6', imdb_id: 'tt6', title: 'F', year: nowYear - 5, primary_genre: 'Comedy', genres: 'Comedy', affinity: 5, vote_average: 8, imdb_rating: 8 },
+    ];
+    const filters = { min_rating: 6, excluded_genres: ['Drama'], max_age_years: 10, age_limit: 0 };
+    // Reference: the ORIGINAL selectServe logic (filter + balanceByGenre), inlined.
+    const reference = rs.balanceByGenre(rs.filterServable(rows, filters, { nowYear }), 10);
+    assert.deepStrictEqual(rs.selectServe(rows, filters, { nowYear, limit: 10 }), reference, 'selectServe unchanged');
+    const ids = reference.map((r) => r.tmdb_id);
+    assert.ok(ids.includes('1'), 'A kept');
+    assert.ok(!ids.includes('2'), 'B excluded (Drama)');
+    assert.ok(!ids.includes('3'), 'C excluded (too old)');
+    assert.ok(!ids.includes('4'), 'D excluded (no imdb_id)');
+    assert.ok(!ids.includes('5'), 'E excluded (below rating floor)');
+    assert.ok(ids.includes('6'), 'F kept');
+  });
+
+  await it('K18: bench serveStrategies — three strategies, fields present, pure_score top20Share = 20', async () => {
+    const bench = require('../src/bench/engineBench');
+    const mqCfg = require('../src/engines/marquee/config');
+    const p = config.addProfile('INT-MQK18');
+    try {
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      settings.updateSettings({ engines: { marquee: true } });
+      // 40 pool rows: 10 per genre (all filter-passing), affinities interleaved.
+      const affByGenre = {
+        'Action': [100, 96, 92, 88, 84, 80, 76, 72, 68, 64],
+        'Drama': [99, 95, 91, 87, 83, 79, 75, 71, 67, 63],
+        'Comedy': [98, 94, 90, 86, 82, 78, 74, 70, 66, 62],
+        'Science Fiction': [97, 93, 89, 85, 81, 77, 73, 69, 65, 61],
+      };
+      const rows = [];
+      for (const g of Object.keys(affByGenre)) affByGenre[g].forEach((aff, i) => rows.push(mkPoolRow(g + '-' + i, g, aff)));
+      rs.upsertCandidates(p.id, rows);
+      serveCalibration.setTarget(p.id, 'movie', 'marquee', { Action: 0.4, Drama: 0.3, Comedy: 0.2, 'Science Fiction': 0.1 }, 40, Date.now());
+      const profile = config.getProfile(p.id);
+      const stored = rs.getRecommended(p.id, { type: 'movie', limit: 100000 });
+
+      const strategies = bench.serveStrategyMetrics(stored, profile, profile.filters, {
+        selectServe: rs.selectServe,
+        selectServeFor: rs.selectServeFor,
+        filterServable: rs.filterServable,
+        serveCalibration,
+        // a few holdout targets (the bench drives this against the real holdout).
+        targets: [stored[0].tmdb_id, stored[1].tmdb_id, stored[2].tmdb_id],
+        reachable: null,
+        serveOptions: mqCfg.resolveConfig(settings.getSettings()).serve,
+      });
+
+      // Three strategies, in order.
+      assert.deepStrictEqual(Object.keys(strategies), ['round_robin', 'calibrated', 'pure_score']);
+      // Each strategy carries the §6 fields.
+      for (const s of Object.values(strategies)) {
+        assert.ok(typeof s.hitAt20 === 'number', 'hitAt20 present');
+        assert.ok(s.hitAt20Reachable === null || typeof s.hitAt20Reachable === 'number', 'hitAt20Reachable present');
+        assert.ok(s.kl === null || typeof s.kl === 'number', 'kl present');
+        assert.ok(typeof s.top20Share === 'number', 'top20Share present');
+        assert.ok(s.meanRank === null || typeof s.meanRank === 'number', 'meanRank present');
+        assert.ok('worstRank' in s, 'worstRank present');
+        assert.ok('wildcard' in s, 'wildcard present');
+      }
+      // pure_score serves the top 20 by score → all 20 are in the top-20 scores.
+      assert.strictEqual(strategies.pure_score.top20Share, 20, 'pure_score top20Share = 20');
+    } finally {
+      settings.updateSettings({ engines: { marquee: false }, marquee: {} });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); serveCalibration.deleteForProfile(p.id);
+    }
+  });
+
   // ── Marquee m2 engagement: finished = liked, abandoned before halfway = not ──
   const mqEngagement = require('../src/engines/marquee/engagement');
   const DAYMS = 24 * 3600e3;

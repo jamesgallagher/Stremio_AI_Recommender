@@ -110,6 +110,13 @@ const DEFAULTS = {
   store_cap: 300,      // the stored slice is capped at this
   min_supply: 150,     // shortfall target floor
   supply_factor: 6,    // shortfall target = max(min_supply, listSize × supply_factor)
+
+  // ── Calibrated serving (spec §16) ──
+  // Calibrated serving (spec §16): the served genre mix matches the profile's taste,
+  // built from the highest-scored films in a quality window. 'round_robin' = the old
+  // strict genre rotation.
+  serve: { strategy: 'calibrated', lambda: 0.5, window_factor: 3, kl_alpha: 0.01,
+           wildcard_slots: 0, wildcard_max_share: 0.05, wildcard_position: 6 },
 };
 
 // Resolve the EFFECTIVE Marquee config for a build: Tier-1 defaults with a

@@ -20,6 +20,7 @@ const tasteFeedback = require('../../tasteFeedback');
 const simklCache = require('./simklCache');
 const llmCache = require('./llmCache');
 const llm = require('../../services/llm');
+const serveCalibration = require('../../serveCalibration');
 
 const DAY_MS = 24 * 3600e3;
 
@@ -145,6 +146,44 @@ function seedsFor(profileId, cfg, { nowMs, ratings, ignored } = {}) {
   const pinnedSet = new Set(pinned.map((s) => s.tmdb_id));
   const rest = order.filter((s) => !pinnedSet.has(s.tmdb_id));
   return [...pinned, ...rest].slice(0, cfg.seed_cap ?? 40);
+}
+
+// The per-profile taste TARGET for calibrated serving (spec §16, C4): built from
+// the profile's watched movies using the SAME signals as the taste model — the
+// rating weight (excluding the negative 1–4 band), the Loved(10) decay floor,
+// the recency blend, and the ignored set — so the served genre mix matches the
+// person's own taste mix. For each watched movie with a tmdb_id that is not
+// ignored: weight = (ratingWeight ?? feedback.watched) × blendedWeight(days,
+// half-lives, horizon blend), with a Loved(10) decay floor; genres come from the
+// cached deep-meta when present else the watched primary_genre. Returns
+// { target: {genre: share}, filmCount }. Serving stays instant/local/network-free
+// (the target is stored at build time, read at serve time).
+function genreTarget(profileId, cfg, { nowMs = Date.now(), ratings, ignored } = {}) {
+  const ratingsMap = ratings || simklCache.getRatingsMap(profileId);
+  const ignoredSet = ignored || tasteFeedback.ignoredSet(profileId, 'movie');
+  const hl = glassConfig.halfLivesFor(cfg, 'movie');
+  const blend = cfg.horizon_blend;
+  const base = cfg.feedback?.watched ?? 1;
+  const rows = watchedStore.getWatched(profileId, { type: 'movie' }).filter((w) => w.tmdb_id);
+  const films = [];
+  for (const w of rows) {
+    const id = String(w.tmdb_id);
+    if (ignoredSet.has(id)) continue; // ignored films never steer taste
+    const r = ratingsMap.get(id);
+    const rw = ratingWeight(r, cfg);
+    if (rw != null && rw <= 0) continue; // rated ≤ 4 → negative → excluded
+    const ts = w.watched_at ? Date.parse(w.watched_at) : NaN;
+    const days = Number.isNaN(ts) ? 0 : Math.max(0, (nowMs - ts) / DAY_MS);
+    let decay = glassTasteModel.blendedWeight(days, hl, blend);
+    if (r === 10) decay = Math.max(decay, cfg.loved?.decay_floor ?? 0.5); // Loved decay floor
+    const weight = (rw != null ? rw : base) * decay;
+    const meta = metaStore.get('movie', id);
+    let genres = meta?.genres;
+    if (!genres || !genres.length) genres = w.primary_genre ? [w.primary_genre] : [];
+    if (!genres.length) continue;
+    films.push({ genres, weight });
+  }
+  return { target: serveCalibration.computeTarget(films), filmCount: films.length };
 }
 
 // The rating-weighted taste model (spec §4.3 + Trainer T2): top up watched
@@ -299,6 +338,7 @@ module.exports = {
   buildEvents,
   seedOrder,
   seedsFor,
+  genreTarget,
   buildTaste,
   historyHash,
   buildBriefPrompt,
