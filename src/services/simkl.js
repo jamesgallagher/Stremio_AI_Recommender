@@ -257,8 +257,11 @@ function parseMovieSummary(body) {
 // Full/delta watched read for one type ('movies' | 'shows' | 'anime'), status
 // 'completed'. Pass dateFrom (ISO) for Phase-2 delta syncs; omit for the
 // Phase-1 initial pull. Always sequential per type (Simkl asks not to hammer).
-async function getAllItems(profile, type, { status = 'completed', dateFrom } = {}) {
-  const extra = dateFrom ? { date_from: dateFrom } : {};
+// `episodes: true` adds `extended=full&episode_watched_at=yes` (shows/anime only).
+async function getAllItems(profile, type, { status = 'completed', dateFrom, episodes = false } = {}) {
+  const extra = {};
+  if (dateFrom) extra.date_from = dateFrom;
+  if (episodes) { extra.extended = 'full'; extra.episode_watched_at = 'yes'; }
   const body = await authedGet(profile, `/sync/all-items/${type}/${status}`, extra);
   if (Array.isArray(body)) return body;
   // Combined all-items responses key by section; single-type still returns an
@@ -285,6 +288,81 @@ function parseWatchedItem(item, type) {
 
 function parseWatchedItems(items, type) {
   return (Array.isArray(items) ? items : []).map((it) => parseWatchedItem(it, type)).filter(Boolean);
+}
+
+// ---- series progress (TV-1) ----
+// One all-items entry from the 'shows' or 'anime' section → a progress row,
+// or null (no ids / no simkl id). Pure: no network, no DB.
+//
+// Bulk rule: a stamp is BULK if the gap to its previous OR next sorted stamp
+// is < BULK_GAP_MS (5 min). Identical stamps are bulk. A gap of exactly
+// BULK_GAP_MS is real. Speed (eps_per_week) uses real stamps only (V4).
+const BULK_GAP_MS = 300000; // 5 minutes
+
+function parseSeriesProgress(item, section) {
+  const media = item.show || item.anime;
+  if (!media?.ids) return null;
+  const simklId = media.ids.simkl;
+  if (simklId == null) return null;
+
+  const kind = section === 'anime' ? 'anime' : 'show';
+  const stamps = [];
+  for (const season of (item.seasons || [])) {
+    for (const ep of (season.episodes || [])) {
+      if (ep.watched_at) stamps.push(Date.parse(ep.watched_at));
+    }
+  }
+  stamps.sort((a, b) => a - b);
+
+  // Classify each stamp as bulk or real.
+  const realStamps = [];
+  for (let i = 0; i < stamps.length; i++) {
+    let isBulk = false;
+    if (i > 0 && stamps[i] - stamps[i - 1] < BULK_GAP_MS) isBulk = true;
+    if (i < stamps.length - 1 && stamps[i + 1] - stamps[i] < BULK_GAP_MS) isBulk = true;
+    if (!isBulk) realStamps.push(stamps[i]);
+  }
+
+  const lastWatchedAt = item.last_watched_at ? Date.parse(item.last_watched_at) : null;
+  const firstRealAt = realStamps.length ? realStamps[0] : null;
+  const lastRealAt = realStamps.length ? realStamps[realStamps.length - 1] : null;
+
+  // Speed: real stamps only, ≥ 4 required. eps_per_week = real_stamps / max(1,
+  // span in weeks) — the span is measured in 7-day units (7 * 86400e3 ms), so a
+  // show watched over 2 weeks at 4 real eps is 2 eps/week.
+  let epsPerWeek = null;
+  if (realStamps.length >= 4) {
+    const spanWeeks = (lastRealAt - firstRealAt) / (7 * 86400e3);
+    epsPerWeek = realStamps.length / Math.max(1, spanWeeks);
+  }
+
+  return {
+    simkl_id: simklId,
+    kind,
+    imdb_id: media.ids.imdb || null,
+    tmdb_id: media.ids.tmdb ? String(media.ids.tmdb) : null,
+    title: media.title || null,
+    year: media.year || null,
+    status: item.status || null,
+    watched_eps: item.watched_episodes_count || 0,
+    total_eps: item.total_episodes_count > 0 ? item.total_episodes_count : null,
+    not_aired_eps: item.not_aired_episodes_count ?? null,
+    last_watched_at: lastWatchedAt,
+    first_watched_at: stamps.length ? stamps[0] : null,
+    first_real_at: firstRealAt,
+    last_real_at: lastRealAt,
+    stamps: stamps.length,
+    real_stamps: realStamps.length,
+    eps_per_week: epsPerWeek,
+  };
+}
+
+// Map an all-items section (shows | anime) into progress rows, dropping entries
+// parseSeriesProgress can't use (no ids / no simkl id). Pure.
+function parseSeriesProgressItems(items, section) {
+  return (Array.isArray(items) ? items : [])
+    .map((it) => parseSeriesProgress(it, section))
+    .filter(Boolean);
 }
 
 // ---- recent watched history (debug view) ----
@@ -461,6 +539,9 @@ module.exports = {
   removeFromPlanToWatch,
   parseWatchedItem,
   parseWatchedItems,
+  parseSeriesProgress,
+  parseSeriesProgressItems,
+  BULK_GAP_MS,
   withParams,
   USER_AGENT,
   APP_NAME,

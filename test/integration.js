@@ -6364,6 +6364,559 @@ async function main() {
     }
   });
 
+  // ── O. Marquee TV TV-1: series progress store + one-time backfill ──────────
+  // The per-show progress store (series_progress) and the sync wiring: a one-time
+  // backfill fills it from a full shows+anime pull, steady-state syncs delta-pull
+  // with episodes, and deleteForProfile clears both new tables. Simkl is stubbed
+  // (no network); the pure parseSeriesProgress is exercised through the real
+  // sync path.
+  const simklStub = (fixtures) => {
+    const calls = [];
+    const origAll = simkl.getAllItems;
+    const origAct = simkl.getActivities;
+    simkl.getAllItems = async (_profile, type, opts = {}) => {
+      calls.push({ type, status: opts.status, dateFrom: opts.dateFrom, episodes: !!opts.episodes });
+      return fixtures[`${type}:${opts.status}`] || [];
+    };
+    simkl.getActivities = async () => fixtures.__activities;
+    return {
+      calls,
+      restore() { simkl.getAllItems = origAll; simkl.getActivities = origAct; },
+    };
+  };
+  // A Simkl all-items show/anime entry with per-episode stamps.
+  const seriesItem = (simklId, section, { title, year, status, watched, total, notAired, lastWatchedAt, stamps }) => {
+    const media = { ids: { simkl: simklId, imdb: `tt${simklId}`, tmdb: String(simklId) }, title, year };
+    return {
+      [section]: media,
+      status,
+      watched_episodes_count: watched,
+      total_episodes_count: total,
+      not_aired_episodes_count: notAired,
+      last_watched_at: lastWatchedAt,
+      seasons: [{ episodes: stamps.map((t) => ({ watched_at: t })) }],
+    };
+  };
+  const showA = seriesItem(100, 'show', { title: 'Show A', year: 2020, status: 'completed', watched: 4, total: 10, notAired: 0, lastWatchedAt: '2026-01-15T00:00:00Z', stamps: ['2026-01-01T00:00:00Z', '2026-01-05T00:00:00Z', '2026-01-10T00:00:00Z', '2026-01-15T00:00:00Z'] });
+  const showB = seriesItem(200, 'show', { title: 'Show B', year: 2021, status: 'watching', watched: 2, total: 20, notAired: 5, lastWatchedAt: '2026-02-01T00:00:00Z', stamps: ['2026-02-01T00:00:00Z', '2026-02-01T00:00:00Z'] });
+  const animeC = seriesItem(300, 'anime', { title: 'Anime C', year: 2022, status: 'completed', watched: 1, total: 12, notAired: 0, lastWatchedAt: '2026-03-01T00:00:00Z', stamps: ['2026-03-01T00:00:00Z'] });
+  const movieX = { movie: { ids: { simkl: 500, imdb: 'tt500', tmdb: '500' }, title: 'Movie X', year: 2020 }, last_watched_at: '2026-01-01T00:00:00Z' };
+
+  await it('O1. upsertSeriesProgress + getSeriesProgress round-trip, kind filter, refresh (I1)', async () => {
+    const p = config.addProfile('INT-O1');
+    try {
+      const rowA = { simkl_id: 100, kind: 'show', imdb_id: 'tt100', tmdb_id: '100', title: 'Show A', year: 2020, status: 'completed', watched_eps: 4, total_eps: 10, not_aired_eps: 0, last_watched_at: Date.parse('2026-01-15T00:00:00Z'), first_watched_at: Date.parse('2026-01-01T00:00:00Z'), first_real_at: Date.parse('2026-01-01T00:00:00Z'), last_real_at: Date.parse('2026-01-15T00:00:00Z'), stamps: 4, real_stamps: 4, eps_per_week: 2 };
+      const rowC = { simkl_id: 300, kind: 'anime', imdb_id: 'tt300', tmdb_id: '300', title: 'Anime C', year: 2022, status: 'completed', watched_eps: 1, total_eps: 12, not_aired_eps: 0, last_watched_at: Date.parse('2026-03-01T00:00:00Z'), first_watched_at: Date.parse('2026-03-01T00:00:00Z'), first_real_at: Date.parse('2026-03-01T00:00:00Z'), last_real_at: Date.parse('2026-03-01T00:00:00Z'), stamps: 1, real_stamps: 1, eps_per_week: null };
+      assert.strictEqual(watchedStore.upsertSeriesProgress(p.id, [rowA, rowC]), 2);
+      let rows = watchedStore.getSeriesProgress(p.id);
+      assert.strictEqual(rows.length, 2);
+      // kind filter
+      const shows = watchedStore.getSeriesProgress(p.id, { kind: 'show' });
+      assert.strictEqual(shows.length, 1);
+      assert.strictEqual(shows[0].simkl_id, 100);
+      const anime = watchedStore.getSeriesProgress(p.id, { kind: 'anime' });
+      assert.strictEqual(anime.length, 1);
+      assert.strictEqual(anime[0].simkl_id, 300);
+      // refresh: re-upsert show A with more watched eps — same row, not a duplicate
+      const rowA2 = { ...rowA, watched_eps: 8, eps_per_week: 3 };
+      assert.strictEqual(watchedStore.upsertSeriesProgress(p.id, [rowA2]), 1);
+      rows = watchedStore.getSeriesProgress(p.id);
+      assert.strictEqual(rows.length, 2); // still 2 (upsert, not insert)
+      const a = rows.find((r) => r.simkl_id === 100);
+      assert.strictEqual(a.watched_eps, 8);
+      assert.strictEqual(a.eps_per_week, 3);
+    } finally {
+      config.removeProfile(p.id); watchedStore.deleteForProfile(p.id);
+    }
+  });
+
+  await it('O2. one-time backfill fills series_progress + sets marker, skips shows/anime delta (I2)', async () => {
+    const p = config.addProfile('INT-O2');
+    config.updateProfile(p.id, { keys: { simkl_client_id: 'cid' }, simkl_auth: { access_token: 'tok' } });
+    const profile = config.getProfile(p.id);
+    const fixtures = {
+      __activities: { all: '2026-01-01T00:00:00Z' },
+      'shows:completed': [showA],
+      'shows:watching': [showB],
+      'anime:completed': [animeC],
+      'anime:watching': [],
+      'movies:completed': [movieX],
+    };
+    const stub = simklStub(fixtures);
+    try {
+      const r = await watchedStore.syncFromSimkl(profile, quiet);
+      assert.strictEqual(r.skipped, false);
+      // Backfill made 4 shows/anime GETs (no dateFrom, episodes true).
+      const backfillCalls = stub.calls.filter((c) => (c.type === 'shows' || c.type === 'anime') && !c.dateFrom);
+      assert.strictEqual(backfillCalls.length, 4);
+      assert.ok(backfillCalls.every((c) => c.episodes), 'backfill pulls carry episodes');
+      // The main loop skipped shows/anime (already backfilled) — only movies pulled.
+      const mainShowsAnime = stub.calls.filter((c) => (c.type === 'shows' || c.type === 'anime') && c.dateFrom);
+      assert.strictEqual(mainShowsAnime.length, 0, 'shows/anime delta skipped in the backfill run');
+      const movieCall = stub.calls.find((c) => c.type === 'movies');
+      assert.ok(movieCall, 'movies pulled');
+      assert.strictEqual(movieCall.episodes, false, 'movies pull has no episodes');
+      // series_progress filled from the backfill (3 rows).
+      const rows = watchedStore.getSeriesProgress(p.id);
+      assert.strictEqual(rows.length, 3);
+      const a = rows.find((r) => r.simkl_id === 100);
+      assert.strictEqual(a.kind, 'show');
+      assert.strictEqual(a.watched_eps, 4);
+      assert.strictEqual(a.real_stamps, 4);
+      assert.strictEqual(a.eps_per_week, 2);
+      const b = rows.find((r) => r.simkl_id === 200);
+      assert.strictEqual(b.real_stamps, 0, 'identical stamps are bulk');
+      assert.strictEqual(b.eps_per_week, null);
+      const c = rows.find((r) => r.simkl_id === 300);
+      assert.strictEqual(c.kind, 'anime');
+      // Marker set.
+      assert.ok(watchedStore.getSeriesProgressSync(p.id), 'backfill marker set');
+      // The watched table also got the shows/anime rows from the backfill.
+      const watched = watchedStore.getWatched(p.id, { type: 'series' });
+      assert.strictEqual(watched.length, 3);
+    } finally {
+      stub.restore();
+      config.removeProfile(p.id); watchedStore.deleteForProfile(p.id);
+    }
+  });
+
+  await it('O3. steady-state sync: marker present → no backfill, shows/anime delta with episodes (I3)', async () => {
+    const p = config.addProfile('INT-O3');
+    config.updateProfile(p.id, { keys: { simkl_client_id: 'cid' }, simkl_auth: { access_token: 'tok' } });
+    const profile = config.getProfile(p.id);
+    // Pre-set the backfill marker + a sync cursor (a prior backfill already ran).
+    watchedStore.setSeriesProgressSync(p.id);
+    watchedStore.setSyncState(p.id, '2026-01-01T00:00:00Z');
+    const fixtures = {
+      __activities: { all: '2026-01-02T00:00:00Z' }, // changed → no early return
+      'shows:completed': [showA],
+      'shows:watching': [showB],
+      'anime:completed': [animeC],
+      'anime:watching': [],
+      'movies:completed': [movieX],
+    };
+    const stub = simklStub(fixtures);
+    try {
+      await watchedStore.syncFromSimkl(profile, quiet);
+      // No backfill: no shows/anime pull WITHOUT dateFrom.
+      const backfillCalls = stub.calls.filter((c) => (c.type === 'shows' || c.type === 'anime') && !c.dateFrom);
+      assert.strictEqual(backfillCalls.length, 0, 'no backfill when the marker is present');
+      // Shows/anime delta pulls happened WITH dateFrom + episodes.
+      const deltaShowsAnime = stub.calls.filter((c) => (c.type === 'shows' || c.type === 'anime'));
+      assert.strictEqual(deltaShowsAnime.length, 4);
+      assert.ok(deltaShowsAnime.every((c) => c.dateFrom === '2026-01-01T00:00:00Z' && c.episodes), 'delta pulls carry dateFrom + episodes');
+      // series_progress rows upserted from the delta pulls.
+      const rows = watchedStore.getSeriesProgress(p.id);
+      assert.strictEqual(rows.length, 3);
+      // Marker NOT re-set: backfilled_at unchanged (still the pre-set value).
+      const sync = watchedStore.getSeriesProgressSync(p.id);
+      assert.ok(sync, 'marker still present');
+    } finally {
+      stub.restore();
+      config.removeProfile(p.id); watchedStore.deleteForProfile(p.id);
+    }
+  });
+
+  await it('O4. deleteForProfile clears series_progress + series_progress_sync (I4)', async () => {
+    const p = config.addProfile('INT-O4');
+    config.updateProfile(p.id, { keys: { simkl_client_id: 'cid' }, simkl_auth: { access_token: 'tok' } });
+    const profile = config.getProfile(p.id);
+    const fixtures = {
+      __activities: { all: '2026-01-01T00:00:00Z' },
+      'shows:completed': [showA],
+      'shows:watching': [showB],
+      'anime:completed': [animeC],
+      'anime:watching': [],
+      'movies:completed': [movieX],
+    };
+    const stub = simklStub(fixtures);
+    try {
+      await watchedStore.syncFromSimkl(profile, quiet); // backfill runs
+      assert.strictEqual(watchedStore.getSeriesProgress(p.id).length, 3);
+      assert.ok(watchedStore.getSeriesProgressSync(p.id));
+      watchedStore.deleteForProfile(p.id);
+      assert.strictEqual(watchedStore.getSeriesProgress(p.id).length, 0, 'series_progress cleared');
+      assert.strictEqual(watchedStore.getSeriesProgressSync(p.id), null, 'series_progress_sync cleared');
+    } finally {
+      stub.restore();
+      config.removeProfile(p.id); watchedStore.deleteForProfile(p.id);
+    }
+  });
+
+  await it('O5. ladderFor — reads series_progress, joins taste_ratings (type=series) by tmdb_id (I5)', async () => {
+    const seriesEngagement = require('../src/seriesEngagement');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const p = config.addProfile('INT-O5');
+    const now = Date.parse('2026-06-01T00:00:00Z');
+    const DAY = 86400e3;
+    try {
+      const rowA = { simkl_id: 100, kind: 'show', imdb_id: 'tt100', tmdb_id: '100', title: 'Show A', year: 2020, status: 'watching', watched_eps: 6, total_eps: 20, not_aired_eps: 0, last_watched_at: now - 10 * DAY, first_watched_at: now - 30 * DAY, first_real_at: now - 30 * DAY, last_real_at: now - 10 * DAY, stamps: 3, real_stamps: 3, eps_per_week: null };
+      const rowB = { simkl_id: 200, kind: 'show', imdb_id: 'tt200', tmdb_id: '200', title: 'Show B', year: 2021, status: 'watching', watched_eps: 24, total_eps: 50, not_aired_eps: 0, last_watched_at: now - 5 * DAY, first_watched_at: now - 40 * DAY, first_real_at: now - 40 * DAY, last_real_at: now - 5 * DAY, stamps: 4, real_stamps: 4, eps_per_week: 5 };
+      const rowC = { simkl_id: 300, kind: 'anime', imdb_id: 'tt300', tmdb_id: null, title: 'Anime C', year: 2022, status: 'watching', watched_eps: 2, total_eps: 12, not_aired_eps: 0, last_watched_at: now - 1 * DAY, first_watched_at: now - 1 * DAY, first_real_at: now - 1 * DAY, last_real_at: now - 1 * DAY, stamps: 1, real_stamps: 1, eps_per_week: null };
+      assert.strictEqual(watchedStore.upsertSeriesProgress(p.id, [rowA, rowB, rowC]), 3);
+      // Show ratings (type='series'), keyed by tmdb_id.
+      tasteFeedback.upsertRating(p.id, { type: 'series', tmdb_id: '100', rating: 10 });
+      tasteFeedback.upsertRating(p.id, { type: 'series', tmdb_id: '200', rating: 4 });
+      tasteFeedback.upsertRating(p.id, { type: 'series', tmdb_id: '999', rating: 9 }); // a show NOT in series_progress
+      const out = seriesEngagement.ladderFor(p.id, { now });
+      assert.strictEqual(out.size, 3, 'three shows');
+      // 100: engaged, rated 10 → weight 3.0 (rating overrides the rung weight).
+      const a = out.get(100);
+      assert.strictEqual(a.row.simkl_id, 100);
+      assert.strictEqual(a.rung, 'engaged');
+      assert.strictEqual(a.weight, 3.0, 'rated 10 overrides the rung weight');
+      assert.strictEqual(a.rated, true);
+      // 200: committed, rated 4 → weight -1.2.
+      const b = out.get(200);
+      assert.strictEqual(b.rung, 'committed');
+      assert.strictEqual(b.weight, -1.2, 'rated 4 overrides the rung weight');
+      assert.strictEqual(b.rated, true);
+      // 300: no tmdb_id → unrated → rung weight (sampling → 0.3).
+      const c = out.get(300);
+      assert.strictEqual(c.rung, 'sampling');
+      assert.strictEqual(c.weight, 0.3, 'unrated → rung weight');
+      assert.strictEqual(c.rated, false);
+      // kind filter.
+      const shows = seriesEngagement.ladderFor(p.id, { now, kind: 'show' });
+      assert.strictEqual(shows.size, 2, 'kind=show → 2 rows');
+      assert.ok(shows.has(100) && shows.has(200));
+      const anime = seriesEngagement.ladderFor(p.id, { now, kind: 'anime' });
+      assert.strictEqual(anime.size, 1, 'kind=anime → 1 row');
+      assert.ok(anime.has(300));
+    } finally {
+      config.removeProfile(p.id); watchedStore.deleteForProfile(p.id); tasteFeedback.deleteForProfile(p.id);
+    }
+  });
+
+  // ── TV-1 (plan §6): the series backtest — pickSeriesTargets, removeSeriesHoldout,
+  //    runBench --type series, and the report table (bench + db in scope from ME-10) ──
+  await it('TV-1 B1: pickSeriesTargets — most recently STARTED Engaged+ shows; too few throws', async () => {
+    const DAY = 86400e3;
+    const base = Date.parse('2026-06-01T00:00:00Z');
+    const mk = (i, opts = {}) => ({
+      simkl_id: i, kind: 'show', imdb_id: 'tt' + i, tmdb_id: 's' + i, title: 'Show ' + i, year: 2020,
+      status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0,
+      last_watched_at: base + i * DAY, first_watched_at: base + i * DAY,
+      first_real_at: base + i * DAY, last_real_at: base + i * DAY,
+      stamps: 10, real_stamps: 10, eps_per_week: null, ...opts,
+    });
+    // 20 qualifying rows (holdout 10 needs 10+10); most recent 10 by first_real_at.
+    const rows = Array.from({ length: 20 }, (_, i) => mk(i + 1));
+    assert.deepStrictEqual(bench.pickSeriesTargets(rows, 10),
+      ['s20', 's19', 's18', 's17', 's16', 's15', 's14', 's13', 's12', 's11'], 'most recently started 10');
+    // Exclusions: non-show kind, null first_real_at (bulk-only), null tmdb_id (no dedupe key),
+    // and a tried show (watched_eps < engaged_min_eps). 24 qualifying + 4 excluded.
+    const mixed = [
+      mk(1, { kind: 'anime' }),
+      mk(2, { first_real_at: null }),
+      mk(3, { tmdb_id: null }),
+      mk(4, { watched_eps: 4 }),
+      ...Array.from({ length: 24 }, (_, i) => mk(100 + i)),
+    ];
+    const sel = bench.pickSeriesTargets(mixed, 10);
+    assert.strictEqual(sel.length, 10);
+    assert.ok(!sel.includes('s1'), 'anime kind excluded');
+    assert.ok(!sel.includes('s2'), 'null first_real_at excluded');
+    assert.ok(!sel.includes('s4'), 'tried (below Engaged) excluded');
+    // 15 qualifying < 10+10 → throws.
+    assert.throws(() => bench.pickSeriesTargets(rows.slice(0, 15), 10), /not enough series history/);
+  });
+
+  await it('TV-1 B2: removeSeriesHoldout — held-out shows leave series_progress + series ratings/ignores', async () => {
+    const tasteFeedback = require('../src/tasteFeedback');
+    const p = config.addProfile('INT-TV1-B2');
+    const DAY = 86400e3;
+    const base = Date.parse('2026-06-01T00:00:00Z');
+    const mk = (i) => ({
+      simkl_id: i, kind: 'show', imdb_id: 'tt' + i, tmdb_id: 'h' + i, title: 'Hold ' + i, year: 2020,
+      status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0,
+      last_watched_at: base + i * DAY, first_watched_at: base + i * DAY,
+      first_real_at: base + i * DAY, last_real_at: base + i * DAY,
+      stamps: 10, real_stamps: 10, eps_per_week: null,
+    });
+    try {
+      watchedStore.upsertSeriesProgress(p.id, Array.from({ length: 12 }, (_, i) => mk(i + 1)));
+      tasteFeedback.upsertRating(p.id, { type: 'series', tmdb_id: 'h1', rating: 9 });
+      tasteFeedback.upsertRating(p.id, { type: 'series', tmdb_id: 'h2', rating: 5 });
+      const conn = db.get();
+      conn.prepare('INSERT INTO taste_ignore (profile_id, type, simkl_id, tmdb_id, imdb_id, at) VALUES (?, ?, ?, ?, ?, ?)').run(p.id, 'series', 3, 'h3', 'tt3', Date.now());
+      rs.upsertCandidates(p.id, [{ type: 'series', tmdb_id: 'h4', imdb_id: 'tt4', title: 'H4', year: 2020, genres: 'Drama', primary_genre: 'Drama', vote_average: 7, vote_count: 3000, affinity: 5, rankScore: 5, popularity: 4, rec_count: 1, poster: null }]);
+      const holdout = ['h1', 'h2', 'h3', 'h4'];
+      bench.removeSeriesHoldout(p.id, holdout, { db });
+      const remainingIds = new Set(watchedStore.getSeriesProgress(p.id, { kind: 'show' }).map((r) => r.tmdb_id));
+      for (const t of holdout) assert.ok(!remainingIds.has(t), 'series_progress row removed: ' + t);
+      for (const t of holdout) {
+        assert.ok(!conn.prepare("SELECT tmdb_id FROM taste_ratings WHERE profile_id = ? AND type = 'series' AND tmdb_id = ?").get(p.id, t), 'no taste_ratings row: ' + t);
+        assert.ok(!conn.prepare("SELECT tmdb_id FROM taste_ignore WHERE profile_id = ? AND type = 'series' AND tmdb_id = ?").get(p.id, t), 'no taste_ignore row: ' + t);
+      }
+      assert.ok(!conn.prepare("SELECT tmdb_id FROM recommended WHERE profile_id = ? AND type = 'series' AND tmdb_id = ?").get(p.id, 'h4'), 'recommended series row removed');
+      assert.ok(remainingIds.has('h5'), 'non-held-out row survives');
+    } finally {
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id); tasteFeedback.deleteForProfile(p.id);
+    }
+  });
+
+  await it('TV-1 B3: runBench --type series — hermetic, no leakage, all held-out targets hit', async () => {
+    const pipeline = require('../src/engines/pipeline');
+    const p = config.addProfile('INT-TV1-B3');
+    const DAY = 86400e3;
+    const base = Date.parse('2026-06-01T00:00:00Z');
+    const mk = (i) => ({
+      simkl_id: i, kind: 'show', imdb_id: 'tt' + i, tmdb_id: 'tv' + i, title: 'TV ' + i, year: 2020,
+      status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0,
+      last_watched_at: base + i * DAY, first_watched_at: base + i * DAY,
+      first_real_at: base + i * DAY, last_real_at: base + i * DAY,
+      stamps: 10, real_stamps: 10, eps_per_week: null,
+    });
+    let stubTargets = [];
+    const dispose = engines._register({
+      id: 'bench-stub', name: 'Bench stub', supportedTypes: ['series'],
+      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+      requirements: () => ({ ok: true, missing: [] }),
+      generate: async () => stubTargets.map((t) => ({
+        type: 'series', tmdb_id: t, imdb_id: 'ttstub' + t, title: 'Target ' + t, year: 2020,
+        genres: 'Action', primary_genre: 'Action', vote_average: 8, vote_count: 5000,
+        affinity: 10, rankScore: 10, popularity: 5, poster: null,
+      })),
+    });
+    try {
+      config.updateProfile(p.id, { filters: {} });
+      watchedStore.upsertSeriesProgress(p.id, Array.from({ length: 20 }, (_, i) => mk(i + 1)));
+      // The 10 most recently started shows (tv20..tv11) are the holdout.
+      stubTargets = Array.from({ length: 10 }, (_, i) => 'tv' + (20 - i));
+      const results = await bench.runBench({
+        profile: config.getProfile(p.id), engineIds: ['bench-stub'], holdout: 10, type: 'series',
+        deps: { engines, pipeline, rs, watchedStore, db, settings, selectServe: rs.selectServe, log: quiet },
+      });
+      assert.strictEqual(results.engines['bench-stub'].metrics.hitAt20, 10, 'the stub returns every held-out target → all hit');
+      // Leakage: no target survives in the series progress rows.
+      const remainingIds = new Set(watchedStore.getSeriesProgress(p.id, { kind: 'show' }).map((r) => r.tmdb_id));
+      for (const t of stubTargets) assert.ok(!remainingIds.has(t), 'no target in series_progress: ' + t);
+      // Non-held-out rows survive.
+      assert.ok(remainingIds.has('tv10'), 'non-held-out row survives');
+    } finally {
+      dispose();
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id);
+    }
+  });
+
+  await it('TV-1 B4: renderTable — stable output for a fixed series results object', async () => {
+    const results = {
+      profile: 'TVProfile', holdout: 10,
+      targets: [{ tmdb_id: 'tv1', title: 'Show One' }, { tmdb_id: 'tv2', title: 'Show Two' }],
+      engines: {
+        genesis: { metrics: { hitAt20: 1, hitAt20Fraction: 0.1, recallAt100: 0.2, meanRankOfHits: 5, filterPass: 0.8, trendingShareAt20: null, stored: 100, buildSeconds: 1.5 }, hitTargets: ['tv1'] },
+      },
+    };
+    const out1 = bench.renderTable(results);
+    const out2 = bench.renderTable(results);
+    assert.strictEqual(out1, out2, 'stable output for a fixed results object');
+    assert.ok(out1.includes('TVProfile'), 'profile name');
+    assert.ok(out1.includes('genesis'), 'genesis row');
+    assert.ok(out1.includes('Show One'), 'target title');
+    assert.ok(out1.includes('Show Two'), 'second target title');
+  });
+
+  // ── TV-1 review round 2 (S1): the series holdout must leave `watched`,
+  //    `pending_watched` and `dont_recommend` too — otherwise the pipeline
+  //    excludes every held-out target as "already watched" (the real-data bug:
+  //    hit@20 0/10). The leakage check must also cover the watched id sets. ──
+  await it('TV-1 S1: removeSeriesHoldout clears watched/pending_watched/dont_recommend; runBench hits all 10; leakage check covers watched sets', async () => {
+    const p = config.addProfile('INT-TV1-S1');
+    const DAY = 86400e3;
+    const base = Date.parse('2026-06-01T00:00:00Z');
+    const mk = (i) => ({
+      simkl_id: i, kind: 'show', imdb_id: 'tt' + i, tmdb_id: 's1' + i, title: 'Show ' + i, year: 2020,
+      status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0,
+      last_watched_at: base + i * DAY, first_watched_at: base + i * DAY,
+      first_real_at: base + i * DAY, last_real_at: base + i * DAY,
+      stamps: 10, real_stamps: 10, eps_per_week: null,
+    });
+    // The 10 most recently started (s120..s111) are the holdout.
+    const targetIds = Array.from({ length: 10 }, (_, i) => 's1' + (20 - i));
+    // Seed the full fixture: 20 qualifying series_progress rows + the 10 targets
+    // in watched (type series), pending_watched and dont_recommend — what real
+    // data has for a show you started. upsertMany runs once (so its
+    // clearSupersededPending fires before the pending rows are added), then the
+    // pending_watched rows are added and survive.
+    const seedFixture = () => {
+      watchedStore.upsertSeriesProgress(p.id, Array.from({ length: 20 }, (_, i) => mk(i + 1)));
+      watchedStore.upsertMany(p.id, targetIds.map((t) => {
+        const n = Number(t.slice(2));
+        return { simkl_id: 1000 + n, type: 'series', imdb_id: 'tts' + n, tmdb_id: t, title: 'Show ' + n, year: 2020, watched_at: base + n * DAY };
+      }));
+      for (const t of targetIds) watchedStore.addPendingWatched(p.id, { type: 'series', tmdbId: t });
+      for (const t of targetIds) rs.addDontRecommend(p.id, 'series', t, 'user');
+    };
+    const pipeline = require('../src/engines/pipeline');
+    let stubTargets = targetIds.slice();
+    const dispose = engines._register({
+      id: 'bench-stub-s1', name: 'Bench stub S1', supportedTypes: ['series'],
+      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+      requirements: () => ({ ok: true, missing: [] }),
+      generate: async () => stubTargets.map((t) => ({
+        type: 'series', tmdb_id: t, imdb_id: 'tts' + t.slice(2), title: 'Show ' + t.slice(2), year: 2020,
+        genres: 'Action', primary_genre: 'Action', vote_average: 8, vote_count: 5000,
+        affinity: 10, rankScore: 10, popularity: 5, poster: null,
+      })),
+    });
+    try {
+      // 1. removeSeriesHoldout must clear every table + the watched id sets.
+      seedFixture();
+      bench.removeSeriesHoldout(p.id, targetIds, { db });
+      const conn = db.get();
+      for (const t of targetIds) {
+        assert.ok(!conn.prepare('SELECT tmdb_id FROM watched WHERE profile_id = ? AND type = ? AND tmdb_id = ?').get(p.id, 'series', t), 'watched row removed: ' + t);
+        assert.ok(!conn.prepare('SELECT tmdb_id FROM series_progress WHERE profile_id = ? AND tmdb_id = ?').get(p.id, t), 'series_progress row removed: ' + t);
+        assert.ok(!conn.prepare('SELECT tmdb_id FROM pending_watched WHERE profile_id = ? AND tmdb_id = ?').get(p.id, t), 'pending_watched row removed: ' + t);
+        assert.ok(!conn.prepare('SELECT tmdb_id FROM dont_recommend WHERE profile_id = ? AND tmdb_id = ?').get(p.id, t), 'dont_recommend row removed: ' + t);
+      }
+      const sets = watchedStore.watchedIdSets(p.id);
+      for (const t of targetIds) assert.ok(!sets.tmdb.has(t), 'no target in watched id sets: ' + t);
+
+      // 2. runBench --type series with a stub engine recommending exactly the 10
+      //    targets → hitAt20 === 10 (the targets are no longer "already watched").
+      seedFixture();
+      config.updateProfile(p.id, { filters: {} });
+      const results = await bench.runBench({
+        profile: config.getProfile(p.id), engineIds: ['bench-stub-s1'], holdout: 10, type: 'series',
+        deps: { engines, pipeline, rs, watchedStore, db, settings, selectServe: rs.selectServe, log: quiet },
+      });
+      assert.strictEqual(results.engines['bench-stub-s1'].metrics.hitAt20, 10, 'the stub returns every held-out target → all hit');
+
+      // 3. the leakage check throws if a target survives in the watched id sets —
+      //    replicate the OLD (buggy) removeSeriesHoldout that only cleared
+      //    series_progress, so the watched rows survive.
+      seedFixture();
+      const oldRemoveSeriesHoldout = (pid, ids, opts) => {
+        const c = opts.db.get();
+        const inList = ids.map(() => '?').join(',');
+        c.prepare('DELETE FROM series_progress WHERE profile_id = ? AND tmdb_id IN (' + inList + ')').run(pid, ...ids);
+      };
+      let threw = false;
+      try {
+        await bench.runBench({
+          profile: config.getProfile(p.id), engineIds: ['bench-stub-s1'], holdout: 10, type: 'series',
+          deps: { engines, pipeline, rs, watchedStore, db, settings, selectServe: rs.selectServe, log: quiet, removeSeriesHoldout: oldRemoveSeriesHoldout },
+        });
+      } catch (err) {
+        threw = /leakage: target still in watched set/.test(err.message);
+      }
+      assert.ok(threw, 'leakage check throws when a target survives in the watched id sets');
+    } finally {
+      dispose();
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id);
+    }
+  });
+
+  // ── TV-1 review round 2 (S2): the reachability + serve-strategy sections are
+  //    movie-only (card §2.4) — not run, and not printed, for series. ──
+  await it('TV-1 S2: reachability is movie-only — never called for series; table omits hit@20r + [unreachable:]', async () => {
+    const pipeline = require('../src/engines/pipeline');
+    const DAY = 86400e3;
+    const base = Date.parse('2026-06-01T00:00:00Z');
+    const mk = (i) => ({
+      simkl_id: i, kind: 'show', imdb_id: 'tt' + i, tmdb_id: 's2' + i, title: 'Show ' + i, year: 2020,
+      status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0,
+      last_watched_at: base + i * DAY, first_watched_at: base + i * DAY,
+      first_real_at: base + i * DAY, last_real_at: base + i * DAY,
+      stamps: 10, real_stamps: 10, eps_per_week: null,
+    });
+    // SERIES: the reachability spy must never be called.
+    let seriesReachCalled = 0;
+    const seriesReachability = async () => { seriesReachCalled++; return new Map(); };
+    const stubSeriesTargets = Array.from({ length: 10 }, (_, i) => 's2' + (20 - i));
+    const disposeSeries = engines._register({
+      id: 'bench-stub-s2', name: 'Bench stub S2', supportedTypes: ['series'],
+      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+      requirements: () => ({ ok: true, missing: [] }),
+      generate: async () => stubSeriesTargets.map((t) => ({
+        type: 'series', tmdb_id: t, imdb_id: 'tts' + t.slice(2), title: 'Show ' + t.slice(2), year: 2020,
+        genres: 'Action', primary_genre: 'Action', vote_average: 8, vote_count: 5000,
+        affinity: 10, rankScore: 10, popularity: 5, poster: null,
+      })),
+    });
+    const pSeries = config.addProfile('INT-TV1-S2-series');
+    try {
+      watchedStore.upsertSeriesProgress(pSeries.id, Array.from({ length: 20 }, (_, i) => mk(i + 1)));
+      config.updateProfile(pSeries.id, { filters: {} });
+      const seriesResults = await bench.runBench({
+        profile: config.getProfile(pSeries.id), engineIds: ['bench-stub-s2'], holdout: 10, type: 'series',
+        deps: { engines, pipeline, rs, watchedStore, db, settings, selectServe: rs.selectServe, log: quiet, reachability: seriesReachability },
+      });
+      assert.strictEqual(seriesReachCalled, 0, 'reachability must NOT run for series');
+      const seriesTable = bench.renderTable(seriesResults);
+      assert.ok(!/hit@20r/.test(seriesTable), 'no hit@20r column for series');
+      assert.ok(!/\[unreachable:/.test(seriesTable), 'no [unreachable: labels for series');
+    } finally {
+      disposeSeries();
+      config.removeProfile(pSeries.id); rs.deleteForProfile(pSeries.id); watchedStore.deleteForProfile(pSeries.id);
+    }
+    // MOVIE: reachability still runs (unchanged).
+    let movieReachCalled = 0;
+    const movieReachability = async () => { movieReachCalled++; return new Map(); };
+    const movieTargets = Array.from({ length: 30 }, (_, i) => 'm' + (i + 1));
+    const stubMovieTargets = movieTargets.slice();
+    const disposeMovie = engines._register({
+      id: 'bench-stub-movie', name: 'Bench stub movie', supportedTypes: ['movie'],
+      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+      requirements: () => ({ ok: true, missing: [] }),
+      generate: async () => stubMovieTargets.map((t) => ({
+        type: 'movie', tmdb_id: t, imdb_id: 'ttm' + t.slice(1), title: 'Movie ' + t.slice(1), year: 2020,
+        genres: 'Action', primary_genre: 'Action', vote_average: 8, vote_count: 5000,
+        affinity: 10, rankScore: 10, popularity: 5, poster: null,
+      })),
+    });
+    const pMovie = config.addProfile('INT-TV1-S2-movie');
+    try {
+      watchedStore.upsertMany(pMovie.id, movieTargets.map((t) => ({
+        simkl_id: 2000 + Number(t.slice(1)), type: 'movie', imdb_id: 'ttm' + t.slice(1), tmdb_id: t, title: 'Movie ' + t.slice(1), year: 2020, watched_at: base + Number(t.slice(1)) * DAY,
+      })));
+      config.updateProfile(pMovie.id, { filters: {} });
+      await bench.runBench({
+        profile: config.getProfile(pMovie.id), engineIds: ['bench-stub-movie'], holdout: 10, type: 'movie',
+        deps: { engines, pipeline, rs, watchedStore, db, settings, selectServe: rs.selectServe, log: quiet, reachability: movieReachability },
+      });
+      assert.strictEqual(movieReachCalled, 1, 'reachability still runs for movie');
+    } finally {
+      disposeMovie();
+      config.removeProfile(pMovie.id); rs.deleteForProfile(pMovie.id); watchedStore.deleteForProfile(pMovie.id);
+    }
+  });
+
+  await it('TV-1 S4: series-ladder.js footer (weight+binge)×recency×active, rung counts, real% column, watched/aired', async () => {
+    const { execFileSync } = require('child_process');
+    const path = require('path');
+    const p = config.addProfile('INT-TV1-S4');
+    const DAY = 86400e3;
+    const base = Date.parse('2026-06-01T00:00:00Z');
+    try {
+      watchedStore.upsertSeriesProgress(p.id, [
+        { simkl_id: 1, kind: 'show', imdb_id: 'tt1', tmdb_id: 's41', title: 'Show A', year: 2020,
+          status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 5,
+          last_watched_at: base + 10 * DAY, first_watched_at: base + 1 * DAY,
+          first_real_at: base + 1 * DAY, last_real_at: base + 10 * DAY,
+          stamps: 10, real_stamps: 4, eps_per_week: null },
+        { simkl_id: 2, kind: 'show', imdb_id: 'tt2', tmdb_id: 's42', title: 'Show B', year: 2020,
+          status: 'ended', watched_eps: 5, total_eps: 10, not_aired_eps: 0,
+          last_watched_at: base + 5 * DAY, first_watched_at: base + 2 * DAY,
+          first_real_at: base + 2 * DAY, last_real_at: base + 5 * DAY,
+          stamps: 5, real_stamps: 5, eps_per_week: null },
+      ]);
+      const out = execFileSync(process.execPath, ['--experimental-sqlite', 'scripts/series-ladder.js', 'INT-TV1-S4'], {
+        encoding: 'utf8',
+        env: { ...process.env, DATA_DIR: process.env.DATA_DIR },
+        cwd: path.join(__dirname, '..'),
+      });
+      assert.ok(out.includes('(weight + binge) × recency × active'), 'footer shows (weight + binge) × recency × active');
+      assert.ok(out.includes('Rung counts:'), 'rung-count summary present');
+      assert.ok(out.includes('real%'), 'real-stamp % column present');
+      assert.ok(out.includes('10/15'), 'eps column shows watched/aired (10 watched / 15 aired)');
+    } finally {
+      config.removeProfile(p.id); watchedStore.deleteForProfile(p.id);
+    }
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();

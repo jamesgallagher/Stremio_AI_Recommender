@@ -118,6 +118,43 @@ function init() {
       pushed_at  INTEGER NOT NULL,
       PRIMARY KEY (profile_id, imdb_id)
     );
+
+    -- Marquee TV TV-1: per-show progress, parsed from Simkl all-items episode
+    -- stamps (simkl.parseSeriesProgress). The engagement ladder's input. Bulk
+    -- vs real stamp counts and eps_per_week are stored so the ladder is pure
+    -- (no re-parsing). kind keeps 'show' vs 'anime' distinct (both Simkl
+    -- sections collapse to type 'series' in the watched store).
+    CREATE TABLE IF NOT EXISTS series_progress (
+      profile_id    TEXT    NOT NULL,
+      simkl_id      INTEGER NOT NULL,
+      kind          TEXT    NOT NULL,   -- 'show' | 'anime'
+      imdb_id       TEXT,
+      tmdb_id       TEXT,
+      title         TEXT,
+      year          INTEGER,
+      status        TEXT,
+      watched_eps   INTEGER NOT NULL DEFAULT 0,
+      total_eps     INTEGER,            -- null when Simkl reports 0
+      not_aired_eps INTEGER,
+      last_watched_at  INTEGER,         -- ms; the item's last_watched_at
+      first_watched_at INTEGER,         -- ms; earliest episode stamp (bulk or real)
+      first_real_at    INTEGER,         -- ms; earliest REAL (non-bulk) stamp
+      last_real_at     INTEGER,         -- ms; latest REAL (non-bulk) stamp
+      stamps        INTEGER,            -- total episode stamps
+      real_stamps   INTEGER,            -- non-bulk stamps
+      eps_per_week  REAL,               -- real-stamp speed, null when <4 real
+      updated_at    INTEGER NOT NULL,   -- ms; set on every upsert
+      PRIMARY KEY (profile_id, simkl_id)
+    );
+    CREATE INDEX IF NOT EXISTS ix_series_progress_profile ON series_progress (profile_id);
+
+    -- One-time backfill marker: set the first time a profile's series_progress
+    -- is filled from a full (no date_from) shows+anime pull. Steady-state syncs
+    -- then only delta-pull (V2: no new Simkl requests beyond the backfill).
+    CREATE TABLE IF NOT EXISTS series_progress_sync (
+      profile_id    TEXT PRIMARY KEY,
+      backfilled_at INTEGER
+    );
   `);
   ready = true;
 }
@@ -430,6 +467,85 @@ function listUnmatched(profileId) {
   return db.get().prepare('SELECT * FROM scrobble_unmatched WHERE profile_id = ? ORDER BY last_tried DESC').all(profileId);
 }
 
+// Marquee TV TV-1: upsert per-show progress rows (from simkl.parseSeriesProgress).
+// One synchronous transaction; replaces ALL columns per (profile_id, simkl_id),
+// so a re-sync refreshes the row (watched_eps, stamps, eps_per_week) rather than
+// preserving stale values. Returns the number upserted.
+function upsertSeriesProgress(profileId, rows) {
+  init();
+  if (!rows.length) return 0;
+  const conn = db.get();
+  const stmt = conn.prepare(`
+    INSERT INTO series_progress (
+      profile_id, simkl_id, kind, imdb_id, tmdb_id, title, year, status,
+      watched_eps, total_eps, not_aired_eps,
+      last_watched_at, first_watched_at, first_real_at, last_real_at,
+      stamps, real_stamps, eps_per_week, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(profile_id, simkl_id) DO UPDATE SET
+      kind          = excluded.kind,
+      imdb_id       = excluded.imdb_id,
+      tmdb_id       = excluded.tmdb_id,
+      title         = excluded.title,
+      year          = excluded.year,
+      status        = excluded.status,
+      watched_eps   = excluded.watched_eps,
+      total_eps     = excluded.total_eps,
+      not_aired_eps = excluded.not_aired_eps,
+      last_watched_at  = excluded.last_watched_at,
+      first_watched_at = excluded.first_watched_at,
+      first_real_at    = excluded.first_real_at,
+      last_real_at     = excluded.last_real_at,
+      stamps        = excluded.stamps,
+      real_stamps   = excluded.real_stamps,
+      eps_per_week  = excluded.eps_per_week,
+      updated_at    = excluded.updated_at
+  `);
+  const tx = conn.prepare('BEGIN'); const commit = conn.prepare('COMMIT'); const rollback = conn.prepare('ROLLBACK');
+  tx.run();
+  try {
+    let n = 0;
+    for (const r of rows) {
+      if (r.simkl_id == null) continue; // primary key — Simkl always provides it
+      stmt.run(
+        profileId, r.simkl_id, r.kind, r.imdb_id, r.tmdb_id, r.title, r.year, r.status,
+        r.watched_eps, r.total_eps, r.not_aired_eps,
+        r.last_watched_at, r.first_watched_at, r.first_real_at, r.last_real_at,
+        r.stamps, r.real_stamps, r.eps_per_week, Date.now(),
+      );
+      n++;
+    }
+    commit.run();
+    return n;
+  } catch (err) { rollback.run(); throw err; }
+}
+
+// Per-show progress rows for a profile, optionally filtered by kind
+// ('show' | 'anime'). The engagement ladder's input (see seriesEngagement).
+function getSeriesProgress(profileId, { kind } = {}) {
+  init();
+  const conn = db.get();
+  const rows = kind
+    ? conn.prepare('SELECT * FROM series_progress WHERE profile_id = ? AND kind = ?').all(profileId, kind)
+    : conn.prepare('SELECT * FROM series_progress WHERE profile_id = ?').all(profileId);
+  return rows;
+}
+
+// One-time backfill marker (see the series_progress_sync table comment).
+function getSeriesProgressSync(profileId) {
+  init();
+  return db.get().prepare('SELECT * FROM series_progress_sync WHERE profile_id = ?').get(profileId) || null;
+}
+
+function setSeriesProgressSync(profileId) {
+  init();
+  db.get().prepare(`
+    INSERT INTO series_progress_sync (profile_id, backfilled_at) VALUES (?, ?)
+    ON CONFLICT(profile_id) DO UPDATE SET backfilled_at = excluded.backfilled_at
+  `).run(profileId, Date.now());
+}
+
 function deleteForProfile(profileId) {
   init();
   db.get().prepare('DELETE FROM scrobble_pushed_episodes WHERE profile_id = ?').run(profileId);
@@ -439,6 +555,8 @@ function deleteForProfile(profileId) {
   db.get().prepare('DELETE FROM pending_watched WHERE profile_id = ?').run(profileId);
   db.get().prepare('DELETE FROM unwatched_block WHERE profile_id = ?').run(profileId);
   db.get().prepare('DELETE FROM scrobble_unmatched WHERE profile_id = ?').run(profileId);
+  db.get().prepare('DELETE FROM series_progress WHERE profile_id = ?').run(profileId);
+  db.get().prepare('DELETE FROM series_progress_sync WHERE profile_id = ?').run(profileId);
 }
 
 // ---- ingest enrichment: fill primary_genre + age_classification ----
@@ -524,6 +642,26 @@ async function syncFromSimkl(profile, log = console, { force = false } = {}) {
   if (!profile.keys.simkl_client_id || !profile.simkl_auth?.access_token) {
     return { skipped: true, reason: 'Simkl not connected' };
   }
+
+  // Marquee TV TV-1 one-time backfill (V2: the ONLY new Simkl traffic). Before
+  // the activities gate, if this profile has no series_progress_sync marker,
+  // pull shows+anime (completed+watching) WITHOUT date_from with episodes — a
+  // full pull, so every show's episode stamps land. Upsert both the watched
+  // rows and the series_progress rows, then set the marker. In this run the
+  // shows/anime delta pulls are skipped (already fully pulled above).
+  let backfilled = false;
+  if (!getSeriesProgressSync(profile.id)) {
+    for (const section of ['shows', 'anime']) { // sequential per Simkl's rules
+      for (const status of ['completed', 'watching']) {
+        const items = await simkl.getAllItems(profile, section, { status, episodes: true });
+        upsertMany(profile.id, simkl.parseWatchedItems(items, section));
+        upsertSeriesProgress(profile.id, simkl.parseSeriesProgressItems(items, section));
+      }
+    }
+    setSeriesProgressSync(profile.id);
+    backfilled = true;
+  }
+
   const activities = await simkl.getActivities(profile);
   const all = activities?.all || null;
   const prev = getSyncState(profile.id);
@@ -542,17 +680,21 @@ async function syncFromSimkl(profile, log = console, { force = false } = {}) {
   // watching be recommended back (it was absent from the watched de-dupe set).
   const STATUSES = { movies: ['completed'], shows: ['completed', 'watching'], anime: ['completed', 'watching'] };
   for (const type of ['movies', 'shows', 'anime']) { // sequential per Simkl's rules
+    // TV-1: shows/anime were fully pulled by the one-time backfill this run.
+    if (backfilled && (type === 'shows' || type === 'anime')) { breakdown[type] = 0; continue; }
     let n = 0;
     for (const status of STATUSES[type]) {
-      const items = await simkl.getAllItems(profile, type, { status, dateFrom });
+      const episodes = (type === 'shows' || type === 'anime'); // shows/anime carry episode stamps
+      const items = await simkl.getAllItems(profile, type, { status, dateFrom, episodes });
       const parsed = simkl.parseWatchedItems(items, type);
       upserted += upsertMany(profile.id, parsed);
       n += parsed.length;
+      if (episodes) upsertSeriesProgress(profile.id, simkl.parseSeriesProgressItems(items, type));
     }
     breakdown[type] = n;
   }
   setSyncState(profile.id, all);
-  log.log(`[simkl] ${profile.name}: watched sync ${dateFrom ? 'delta' : 'initial'} — movies ${breakdown.movies}, shows ${breakdown.shows}, anime ${breakdown.anime} (total in store: ${countWatched(profile.id)})`);
+  log.log(`[simkl] ${profile.name}: watched sync ${dateFrom ? 'delta' : 'initial'} — movies ${breakdown.movies}, shows ${breakdown.shows}, anime ${breakdown.anime}${backfilled ? ' (series backfill)' : ''} (total in store: ${countWatched(profile.id)})`);
   return { skipped: false, upserted, breakdown, total: countWatched(profile.id) };
 }
 
@@ -578,6 +720,10 @@ module.exports = {
   clearUnmatched,
   listUnmatched,
   newestWatchedMs,
+  upsertSeriesProgress,
+  getSeriesProgress,
+  getSeriesProgressSync,
+  setSeriesProgressSync,
   deleteForProfile,
   getSyncState,
   setSyncState,
