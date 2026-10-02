@@ -4971,6 +4971,7 @@ async function httpTests() {
     assert.ok(body.includes('data-tab="trainer"'));
     assert.ok(body.includes('trainer-ui.js'));
     assert.ok(body.includes('--love'));
+    assert.ok(body.includes('data-filter="min_year"') && body.includes("[2020,'2020 onwards']") && body.includes("[1980,'1980 onwards'],[0,'No limit']") && !body.includes('data-filter="max_age_years"'), 'portal Released filter offers decades (2020..1980, No limit)');
     assert.ok(body.includes("onclick=\"switchTab(this,'trainer')\">Ratings</button>") && !body.includes('>Trainer</button>'), 'the tab is labelled Ratings (UI rename)');
     assert.ok(body.includes('color: var(--star-empty)') && body.includes('--star-empty: #6b7184'), 'empty stars use the --star-empty token (contrast tidy-up)');
     console.log('  ✓ trainer portal UI: trainer-ui.js served + tab wiring in index.html');

@@ -131,14 +131,14 @@
           </div>
 
           <div class="field">
-            <label for="set-recency">Recency <span class="muted">(movies only)</span></label>
-            <select id="set-recency" data-filter="max_age_years">
+            <label for="set-recency">Released <span class="muted">(movies only)</span></label>
+            <select id="set-recency" data-filter="min_year">
+              <option value="2020">2020 onwards</option>
+              <option value="2010">2010 onwards</option>
+              <option value="2000">2000 onwards</option>
+              <option value="1990">1990 onwards</option>
+              <option value="1980">1980 onwards</option>
               <option value="0">No limit</option>
-              <option value="1">Last 1 year</option>
-              <option value="2">Last 2 years</option>
-              <option value="5">Last 5 years</option>
-              <option value="10">Last 10 years</option>
-              <option value="20">Last 20 years</option>
             </select>
           </div>
 

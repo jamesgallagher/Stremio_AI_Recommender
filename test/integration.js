@@ -3264,7 +3264,8 @@ async function main() {
 
   await it('ME-09: end-to-end filter guarantee — exactly list_size passers reach the served list', async () => {
     offlineAnimeMap();
-    const filters = { min_rating: 7, max_age_years: 10, age_limit: 10, excluded_genres: ['Horror'], list_size: 20 };
+    // min_year 2016 (the old 10-year window in 2026): the year-2010 candidate must still fail the floor.
+    const filters = { min_rating: 7, min_year: 2016, age_limit: 10, excluded_genres: ['Horror'], list_size: 20 };
     const deepMeta = (id) => {
       const n = Number(id.slice(4));
       switch (n) {
@@ -4979,6 +4980,57 @@ async function main() {
       simkl.addToHistory = origAdd;
       watchedStore.deleteForProfile(profile.id);
     }
+  });
+
+  await it('Decade filter: recency helper maths (min_year, window equivalence, migration, validation)', () => {
+    const recency = require('../src/recency');
+    assert.deepStrictEqual(recency.DECADE_CHOICES, [2020, 2010, 2000, 1990, 1980]);
+    assert.strictEqual(recency.minYearOf({ min_year: 2010 }, 2026), 2010);
+    assert.strictEqual(recency.minYearOf({ min_year: 0 }, 2026), 0);
+    assert.strictEqual(recency.minYearOf({ max_age_years: 10 }, 2026), 2016, 'unmigrated legacy window still works');
+    assert.strictEqual(recency.minYearOf({ min_year: 2000, max_age_years: 1 }, 2026), 2000, 'min_year wins');
+    assert.strictEqual(recency.maxAgeOf({ min_year: 2020 }, 2026), 6, '2020 onwards = a 6-year window in 2026');
+    assert.strictEqual(recency.maxAgeOf({}, 2026), 0);
+    for (const [ma, dec] of [[0, 0], [1, 2020], [2, 2020], [5, 2020], [10, 2010], [20, 2000]]) assert.strictEqual(recency.decadeFromMaxAge(ma, 2026), dec, ma + 'y -> ' + dec);
+    assert.strictEqual(recency.normalizeMinYear('2010', 2026), 2010);
+    assert.strictEqual(recency.normalizeMinYear(1850, 2026), 0);
+    assert.strictEqual(recency.normalizeMinYear(2030, 2026), 0);
+    assert.strictEqual(recency.normalizeMinYear('junk', 2026), 0);
+  });
+
+  await it('Decade filter: profiles migrate to the never-stricter decade; updateProfile saves min_year (and converts a stale max_age_years)', () => {
+    const recency = require('../src/recency');
+    const p = config.addProfile('INT-DECADE');
+    try {
+      assert.strictEqual(config.getProfile(p.id).filters.min_year, 0, 'new profiles default to no limit');
+      config.updateProfile(p.id, { filters: { max_age_years: 10 } });
+      let f = config.getProfile(p.id).filters;
+      assert.strictEqual(f.min_year, recency.decadeFromMaxAge(10)); assert.strictEqual(f.max_age_years, 0);
+      config.updateProfile(p.id, { filters: { min_year: 1990 } });
+      f = config.getProfile(p.id).filters;
+      assert.strictEqual(f.min_year, 1990); assert.strictEqual(f.max_age_years, 0);
+      config.updateProfile(p.id, { filters: { min_year: 0 } });
+      assert.strictEqual(config.getProfile(p.id).filters.min_year, 0);
+      const raw = store.loadProfiles();
+      const row = raw.profiles.find((x) => x.id === p.id);
+      delete row.filters.min_year; row.filters.max_age_years = 20;
+      store.saveProfiles(raw);
+      f = config.getProfile(p.id).filters;
+      assert.strictEqual(f.min_year, recency.decadeFromMaxAge(20), '20-year window -> its decade'); assert.strictEqual(f.max_age_years, 0);
+    } finally { config.removeProfile(p.id); }
+  });
+
+  await it('Decade filter: the serve filter drops movies before min_year (movies only, series untouched)', () => {
+    const rows = [
+      { imdb_id: 'tta', type: 'movie', year: 2019, genres: 'Drama', affinity: 1 },
+      { imdb_id: 'ttb', type: 'movie', year: 2020, genres: 'Drama', affinity: 1 },
+      { imdb_id: 'ttc', type: 'series', year: 1995, genres: 'Drama', affinity: 1 },
+      { imdb_id: 'ttd', type: 'movie', year: null, genres: 'Drama', affinity: 1 },
+    ];
+    const ids = (f) => rs.filterServable(rows, f).map((r) => r.imdb_id).sort();
+    assert.deepStrictEqual(ids({ min_year: 2020 }), ['ttb', 'ttc', 'ttd'], '2019 movie dropped; series + unknown year kept');
+    assert.deepStrictEqual(ids({ min_year: 0 }), ['tta', 'ttb', 'ttc', 'ttd']);
+    assert.deepStrictEqual(ids({ max_age_years: 7 }), ids({ min_year: new Date().getFullYear() - 7 }), 'legacy window = its min_year');
   });
 
   await it('Tidy-up: pruneSupersededVersions drops ONLY this engine\'s older-version rows', () => {

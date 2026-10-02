@@ -11,6 +11,7 @@
 const metaStore = require('../glass/metaStore');
 const glassScoring = require('../glass/scoring');
 const features = require('./features');
+const recency = require('../../recency');
 const tmdb = require('../../services/tmdb');
 const mdblist = require('../../services/mdblist');
 const animeMap = require('../../services/animeMap');
@@ -133,7 +134,7 @@ async function scoreCandidates(profile, ctx, candidates, {
       consensus: features.consensus(cand.sources, cand.seeds),
       // m2: Genesis's recency-weighted seed agreement, normalised per build.
       seed_affinity: maxSeedAff > 0 ? Math.min(1, features.seedAffinityRaw(cand) / maxSeedAff) : 0,
-      freshness: features.freshness(meta.year, { nowYear, maxAgeYears: filters.max_age_years || 0, defaultWindow: cfg.freshness_default_window, floor: cfg.freshness_floor }),
+      freshness: features.freshness(meta.year, { nowYear, maxAgeYears: recency.maxAgeOf(filters, nowYear), defaultWindow: cfg.freshness_default_window, floor: cfg.freshness_floor }),
     };
     // llm_fit is always absent here (P4 adds it); trending_eff is absent when
     // no trending list existed (spec §4.5.6). Renormalize keeps ratios.

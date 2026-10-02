@@ -11,6 +11,7 @@
 // Every network call is behind an injectable fetcher; the defaults are the live
 // functions bound to ctx.tmdbKey / profile.
 const crypto = require('crypto');
+const recency = require('../../recency');
 const tmdb = require('../../services/tmdb');
 const llm = require('../../services/llm');
 const watchedStore = require('../../watchedStore');
@@ -211,7 +212,7 @@ async function gatherSuggestions(profile, ctx, cfg, { brief, briefHash, chain, f
   const filters = ctx.filters || {};
   const filterKey = JSON.stringify({
     min_rating: filters.min_rating || 0,
-    max_age_years: filters.max_age_years || 0,
+    min_year: recency.minYearOf(filters, nowYear),
     excluded_genres: (filters.excluded_genres || []).slice().sort(),
     age_limit: filters.age_limit || 0,
   });
@@ -226,7 +227,7 @@ async function gatherSuggestions(profile, ctx, cfg, { brief, briefHash, chain, f
 
   const prompt = buildSuggestPrompt({
     brief,
-    minYear: (filters.max_age_years || 0) > 0 ? nowYear - filters.max_age_years : null,
+    minYear: recency.minYearOf(filters, nowYear) || null,
     minRating: filters.min_rating || 0,
     excludedGenres: filters.excluded_genres || [],
     avoidRecent: recent,
