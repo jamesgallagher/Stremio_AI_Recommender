@@ -340,3 +340,15 @@ TV-1 (v7.29.0-beta) builds the data foundation only — the per-show progress st
 - **`scripts/bench-engines.js`** — `--type movie|series` flag; a series run defaults to the Genesis baseline engine unless `--engines` is given.
 - **`scripts/series-ladder.js`** (new) — a read-only debug script: prints the engagement ladder for every show in a profile's `series_progress` (rung, weight, recency, active-now, binge, seed eligibility, value, plus the raw progress and a per-rung count summary).
 - **Tests:** `test/smoke.js` P1–P6 (ladder + parse, pure) and `test/integration.js` I1–I5 (store/sync/backfill + `ladderFor`), B1–B4 (series backtest) and S1–S2 (holdout leaves watched/pending_watched/dont_recommend; reachability movie-only).
+
+## 11. TV-2 build notes
+
+TV-2 (v7.30.0-beta) builds the Marquee TV engine core — the orchestrator, the TV meta + Simkl show-recs caches, the pure filters/taste/sources/scoring, and the registry registration. No LLM yet (TV-3). It ships **GLOBALLY DISABLED**: registered but off via the `engines.isEnabled` default, so nothing users can see changes until an admin enables it (M1).
+
+- **`src/engines/marqueeTv.js`** (new) — the descriptor (`id 'marquee-tv'`, series-only, `preResolved`) + the `generate` orchestrator: ladder → taste model + seeds → gather T1/T2/T3/T5/T6 → merge pool → subtract watched/dont → pre-score + cut → TV meta + IMDb ratings → hard filter → score → emit pre-resolved candidates. Every network call goes through the `ctx.marqueeTvFetchers` seam (M6).
+- **`src/engines/marqueeTv/config.js`** (new) — `ALGORITHM_VERSION 'marquee-tv-t1'`, the §3 DEFAULTS, and `resolveConfig`.
+- **`src/engines/marqueeTv/{meta,simklRecs,filters,taste,sources,scoring}.js`** (new) — the TV meta cache (§5.1–5.2), the Simkl show-recs cache (§5.3), the pure filters (§4.1–4.4), the taste/seeds (§4.5), the sources + pre-score (§4.6/§5.4), and the scoring (§4.7).
+- **`src/engines/index.js`** — `marquee-tv` added to the REGISTRY (one line + require); non-Genesis engines default OFF, so it is dark until an admin enables it (M1).
+- **`src/services/tmdb.js`** (additive) — `discoverTv` (`GET discover/tv`) + `tvDetailsFull` (append `credits,keywords,external_ids,content_ratings`).
+- **`src/bench/engineBench.js`, `scripts/bench-engines.js`** — the series bench runs `marquee-tv` alongside Genesis (E2); the series report file name (C3); `removeSeriesHoldout` also clears `pending_watched` by IMDb id (C5).
+- **Tests:** `test/smoke.js` F1–F9 (pure); `test/integration.js` N1–N3 (adapters, fetch-level), E1 (orchestrator end-to-end + registry dark), E2 (series bench runs both engines).

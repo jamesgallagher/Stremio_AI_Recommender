@@ -7304,6 +7304,80 @@ async function main() {
     }
   });
 
+  // ── TV-2 E2: the series bench runs marquee-tv alongside genesis ──
+  // The reviewer's backtest is `bench-engines.js <profile> --type series
+  // --engines genesis,marquee-tv`. E2 proves that plumbing hermetically: a temp
+  // DB with series history (no watched series rows, so genesis returns [] with
+  // no network), the REAL genesis + marquee-tv engines through runBench, with
+  // marquee-tv's network fetchers stubbed via the ctx.marqueeTvFetchers seam.
+  // Both engines must complete and report metrics.
+  await it('TV-2 E2: series bench runs marquee-tv + genesis — both engines report', async () => {
+    const pipeline = require('../src/engines/pipeline');
+    const p = config.addProfile('INT-TV2-E2');
+    const nowMs = Date.parse('2026-10-02T00:00:00Z');
+    const DAY = 86400e3;
+    // 11 qualifying series_progress rows (holdout 1 needs 1+10). No watched
+    // series rows → genesis's seed list is empty → it returns [] with no network.
+    const mk = (i) => ({
+      simkl_id: i, kind: 'show', imdb_id: 'tt' + i, tmdb_id: 'e2' + i, title: 'Show ' + i, year: 2020,
+      status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0,
+      last_watched_at: nowMs - i * DAY, first_watched_at: nowMs - i * DAY,
+      first_real_at: nowMs - i * DAY, last_real_at: nowMs - i * DAY,
+      stamps: 10, real_stamps: 10, eps_per_week: null,
+    });
+    const rows = Array.from({ length: 11 }, (_, i) => mk(i + 1));
+
+    // Stub fetchers for marquee-tv (M6 seam): one Simkl rec, everything else empty.
+    const tvMeta = (apiKey, ids) => {
+      const m = new Map();
+      for (const id of ids) {
+        m.set(id, { tmdb_id: id, imdb_id: 'tt' + id, type: 'series', title: 'Show ' + id, year: 2024, genres: ['Drama'], keywords: [], tvType: 'Scripted', status: 'Returning Series', vote_average: 8, vote_count: 1000, popularity: 5, certAU: null, certUS: null, first_air_date: '2024-01-01', last_air_date: '2026-01-01', number_of_episodes: 20, number_of_seasons: 1 });
+      }
+      return m;
+    };
+    const simklRecs = async () => [{ tmdb_id: 'e2good1', imdb_id: 'tte2good1', title: 'Good Show', year: 2024 }];
+    const tmdbRecs = () => [];
+    const discover = () => [];
+    const trending = () => [];
+    const imdbRatings = () => new Map();
+
+    // The pipeline's else branch (genesis is not preResolved) calls tmdb.getGenreMap
+    // even with zero candidates — stub it so the bench stays hermetic.
+    const realGetGenreMap = tmdb.getGenreMap;
+    tmdb.getGenreMap = async () => ({ 18: 'Drama', 10000: 'Action' });
+    try {
+      config.updateProfile(p.id, {
+        filters: { engine_series: 'marquee-tv', excluded_genres: ['Horror'], min_year: 2010, min_rating: 7, vote_count_floor: 50, age_limit: 0 },
+        keys: { tmdb_api_key: 'itest-tmdb' },
+        simkl_auth: { access_token: 'tok' },
+      });
+      watchedStore.upsertSeriesProgress(p.id, rows);
+      const results = await bench.runBench({
+        profile: config.getProfile(p.id),
+        engineIds: ['genesis', 'marquee-tv'],
+        holdout: 1,
+        type: 'series',
+        deps: {
+          engines, pipeline, rs, watchedStore, db, settings,
+          selectServe: rs.selectServe, log: quiet,
+          ctxExtras: { marqueeTvFetchers: { tvMeta, simklRecs, tmdbRecs, discover, trending, imdbRatings } },
+        },
+      });
+      // Both engines report.
+      assert.ok(results.engines.genesis, 'genesis reported');
+      assert.ok(results.engines['marquee-tv'], 'marquee-tv reported');
+      // genesis: no watched series → 0 stored.
+      assert.strictEqual(results.engines.genesis.metrics.stored, 0, 'genesis stored 0 (no watched series)');
+      // marquee-tv: its stub Simkl rec is stored (pre-resolved, pre-filtered).
+      assert.ok(results.engines['marquee-tv'].metrics.stored >= 1, 'marquee-tv stored its candidate');
+    } finally {
+      tmdb.getGenreMap = realGetGenreMap;
+      config.removeProfile(p.id);
+      rs.deleteForProfile(p.id);
+      watchedStore.deleteForProfile(p.id);
+    }
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();
