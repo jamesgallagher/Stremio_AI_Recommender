@@ -6588,6 +6588,135 @@ async function main() {
     }
   });
 
+  // ── TV-1 (plan §6): the series backtest — pickSeriesTargets, removeSeriesHoldout,
+  //    runBench --type series, and the report table (bench + db in scope from ME-10) ──
+  await it('TV-1 B1: pickSeriesTargets — most recently STARTED Engaged+ shows; too few throws', async () => {
+    const DAY = 86400e3;
+    const base = Date.parse('2026-06-01T00:00:00Z');
+    const mk = (i, opts = {}) => ({
+      simkl_id: i, kind: 'show', imdb_id: 'tt' + i, tmdb_id: 's' + i, title: 'Show ' + i, year: 2020,
+      status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0,
+      last_watched_at: base + i * DAY, first_watched_at: base + i * DAY,
+      first_real_at: base + i * DAY, last_real_at: base + i * DAY,
+      stamps: 10, real_stamps: 10, eps_per_week: null, ...opts,
+    });
+    // 20 qualifying rows (holdout 10 needs 10+10); most recent 10 by first_real_at.
+    const rows = Array.from({ length: 20 }, (_, i) => mk(i + 1));
+    assert.deepStrictEqual(bench.pickSeriesTargets(rows, 10),
+      ['s20', 's19', 's18', 's17', 's16', 's15', 's14', 's13', 's12', 's11'], 'most recently started 10');
+    // Exclusions: non-show kind, null first_real_at (bulk-only), null tmdb_id (no dedupe key),
+    // and a tried show (watched_eps < engaged_min_eps). 24 qualifying + 4 excluded.
+    const mixed = [
+      mk(1, { kind: 'anime' }),
+      mk(2, { first_real_at: null }),
+      mk(3, { tmdb_id: null }),
+      mk(4, { watched_eps: 4 }),
+      ...Array.from({ length: 24 }, (_, i) => mk(100 + i)),
+    ];
+    const sel = bench.pickSeriesTargets(mixed, 10);
+    assert.strictEqual(sel.length, 10);
+    assert.ok(!sel.includes('s1'), 'anime kind excluded');
+    assert.ok(!sel.includes('s2'), 'null first_real_at excluded');
+    assert.ok(!sel.includes('s4'), 'tried (below Engaged) excluded');
+    // 15 qualifying < 10+10 → throws.
+    assert.throws(() => bench.pickSeriesTargets(rows.slice(0, 15), 10), /not enough series history/);
+  });
+
+  await it('TV-1 B2: removeSeriesHoldout — held-out shows leave series_progress + series ratings/ignores', async () => {
+    const tasteFeedback = require('../src/tasteFeedback');
+    const p = config.addProfile('INT-TV1-B2');
+    const DAY = 86400e3;
+    const base = Date.parse('2026-06-01T00:00:00Z');
+    const mk = (i) => ({
+      simkl_id: i, kind: 'show', imdb_id: 'tt' + i, tmdb_id: 'h' + i, title: 'Hold ' + i, year: 2020,
+      status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0,
+      last_watched_at: base + i * DAY, first_watched_at: base + i * DAY,
+      first_real_at: base + i * DAY, last_real_at: base + i * DAY,
+      stamps: 10, real_stamps: 10, eps_per_week: null,
+    });
+    try {
+      watchedStore.upsertSeriesProgress(p.id, Array.from({ length: 12 }, (_, i) => mk(i + 1)));
+      tasteFeedback.upsertRating(p.id, { type: 'series', tmdb_id: 'h1', rating: 9 });
+      tasteFeedback.upsertRating(p.id, { type: 'series', tmdb_id: 'h2', rating: 5 });
+      const conn = db.get();
+      conn.prepare('INSERT INTO taste_ignore (profile_id, type, simkl_id, tmdb_id, imdb_id, at) VALUES (?, ?, ?, ?, ?, ?)').run(p.id, 'series', 3, 'h3', 'tt3', Date.now());
+      rs.upsertCandidates(p.id, [{ type: 'series', tmdb_id: 'h4', imdb_id: 'tt4', title: 'H4', year: 2020, genres: 'Drama', primary_genre: 'Drama', vote_average: 7, vote_count: 3000, affinity: 5, rankScore: 5, popularity: 4, rec_count: 1, poster: null }]);
+      const holdout = ['h1', 'h2', 'h3', 'h4'];
+      bench.removeSeriesHoldout(p.id, holdout, { db });
+      const remainingIds = new Set(watchedStore.getSeriesProgress(p.id, { kind: 'show' }).map((r) => r.tmdb_id));
+      for (const t of holdout) assert.ok(!remainingIds.has(t), 'series_progress row removed: ' + t);
+      for (const t of holdout) {
+        assert.ok(!conn.prepare("SELECT tmdb_id FROM taste_ratings WHERE profile_id = ? AND type = 'series' AND tmdb_id = ?").get(p.id, t), 'no taste_ratings row: ' + t);
+        assert.ok(!conn.prepare("SELECT tmdb_id FROM taste_ignore WHERE profile_id = ? AND type = 'series' AND tmdb_id = ?").get(p.id, t), 'no taste_ignore row: ' + t);
+      }
+      assert.ok(!conn.prepare("SELECT tmdb_id FROM recommended WHERE profile_id = ? AND type = 'series' AND tmdb_id = ?").get(p.id, 'h4'), 'recommended series row removed');
+      assert.ok(remainingIds.has('h5'), 'non-held-out row survives');
+    } finally {
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id); tasteFeedback.deleteForProfile(p.id);
+    }
+  });
+
+  await it('TV-1 B3: runBench --type series — hermetic, no leakage, all held-out targets hit', async () => {
+    const pipeline = require('../src/engines/pipeline');
+    const p = config.addProfile('INT-TV1-B3');
+    const DAY = 86400e3;
+    const base = Date.parse('2026-06-01T00:00:00Z');
+    const mk = (i) => ({
+      simkl_id: i, kind: 'show', imdb_id: 'tt' + i, tmdb_id: 'tv' + i, title: 'TV ' + i, year: 2020,
+      status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0,
+      last_watched_at: base + i * DAY, first_watched_at: base + i * DAY,
+      first_real_at: base + i * DAY, last_real_at: base + i * DAY,
+      stamps: 10, real_stamps: 10, eps_per_week: null,
+    });
+    let stubTargets = [];
+    const dispose = engines._register({
+      id: 'bench-stub', name: 'Bench stub', supportedTypes: ['series'],
+      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+      requirements: () => ({ ok: true, missing: [] }),
+      generate: async () => stubTargets.map((t) => ({
+        type: 'series', tmdb_id: t, imdb_id: 'ttstub' + t, title: 'Target ' + t, year: 2020,
+        genres: 'Action', primary_genre: 'Action', vote_average: 8, vote_count: 5000,
+        affinity: 10, rankScore: 10, popularity: 5, poster: null,
+      })),
+    });
+    try {
+      config.updateProfile(p.id, { filters: {} });
+      watchedStore.upsertSeriesProgress(p.id, Array.from({ length: 20 }, (_, i) => mk(i + 1)));
+      // The 10 most recently started shows (tv20..tv11) are the holdout.
+      stubTargets = Array.from({ length: 10 }, (_, i) => 'tv' + (20 - i));
+      const results = await bench.runBench({
+        profile: config.getProfile(p.id), engineIds: ['bench-stub'], holdout: 10, type: 'series',
+        deps: { engines, pipeline, rs, watchedStore, db, settings, selectServe: rs.selectServe, log: quiet },
+      });
+      assert.strictEqual(results.engines['bench-stub'].metrics.hitAt20, 10, 'the stub returns every held-out target → all hit');
+      // Leakage: no target survives in the series progress rows.
+      const remainingIds = new Set(watchedStore.getSeriesProgress(p.id, { kind: 'show' }).map((r) => r.tmdb_id));
+      for (const t of stubTargets) assert.ok(!remainingIds.has(t), 'no target in series_progress: ' + t);
+      // Non-held-out rows survive.
+      assert.ok(remainingIds.has('tv10'), 'non-held-out row survives');
+    } finally {
+      dispose();
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id);
+    }
+  });
+
+  await it('TV-1 B4: renderTable — stable output for a fixed series results object', async () => {
+    const results = {
+      profile: 'TVProfile', holdout: 10,
+      targets: [{ tmdb_id: 'tv1', title: 'Show One' }, { tmdb_id: 'tv2', title: 'Show Two' }],
+      engines: {
+        genesis: { metrics: { hitAt20: 1, hitAt20Fraction: 0.1, recallAt100: 0.2, meanRankOfHits: 5, filterPass: 0.8, trendingShareAt20: null, stored: 100, buildSeconds: 1.5 }, hitTargets: ['tv1'] },
+      },
+    };
+    const out1 = bench.renderTable(results);
+    const out2 = bench.renderTable(results);
+    assert.strictEqual(out1, out2, 'stable output for a fixed results object');
+    assert.ok(out1.includes('TVProfile'), 'profile name');
+    assert.ok(out1.includes('genesis'), 'genesis row');
+    assert.ok(out1.includes('Show One'), 'target title');
+    assert.ok(out1.includes('Show Two'), 'second target title');
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();

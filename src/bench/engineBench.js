@@ -33,6 +33,32 @@ const pickTargets = (watched, holdout) => {
   return targets;
 };
 
+// TV-1 (plan §6): the series holdout — the most recently STARTED shows that
+// reached at least Engaged, using REAL (non-bulk) first-episode timestamps only
+// (first_real_at). Bulk-imported shows carry their import time, so ordering them
+// by time is meaningless. `seriesRows` is watchedStore.getSeriesProgress
+// (kind='show'); returns tmdb_ids (the pool's dedupe key). Fewer than
+// holdout + 10 qualifying shows → "not enough series history".
+const pickSeriesTargets = (seriesRows, holdout) => {
+  const { rungOf, DEFAULTS } = require('../seriesEngagement');
+  const eligible = (row) => {
+    if (row.kind !== 'show') return false;
+    if (row.first_real_at == null) return false; // bulk-only → no real start
+    if (row.tmdb_id == null) return false; // no dedupe key
+    const rung = rungOf(row, DEFAULTS);
+    return rung === 'engaged' || rung === 'committed' || rung === 'finished';
+  };
+  const qualifying = (seriesRows || []).filter(eligible);
+  if (qualifying.length < holdout + 10) {
+    throw new Error('not enough series history (' + qualifying.length + ' qualifying shows, need ' + (holdout + 10) + ')');
+  }
+  // Most recently started (first_real_at DESC), take holdout.
+  return qualifying
+    .sort((a, b) => (b.first_real_at - a.first_real_at))
+    .slice(0, holdout)
+    .map((r) => r.tmdb_id);
+};
+
 // Parse a pool row's score_components (stored as a JSON string by upsertCandidates,
 // or a plain object when a test passes one) into an object, or null.
 function parseComps(sc) {
@@ -273,6 +299,29 @@ function removeHoldout(profileId, targetIds, { db, noCache = false }) {
   }
 }
 
+// TV-1 (plan §6): delete the SERIES holdout from the BENCH copy so it cannot
+// leak into the build. The series history lives in series_progress (the
+// ladder's input) — removing a held-out show's row means the build never sees
+// its episodes. Alongside: the profile's whole series recommended pool, and
+// the series taste ratings + ignores (a held-out show rating would otherwise
+// steer Marquee TV's taste). `noCache` also clears the Marquee LLM cache.
+// Pure SQL on the injected db handle.
+function removeSeriesHoldout(profileId, targetIds, { db, noCache = false }) {
+  const conn = db.get();
+  const inList = targetIds.map(() => '?').join(',');
+  conn.prepare('DELETE FROM series_progress WHERE profile_id = ? AND tmdb_id IN (' + inList + ')').run(profileId, ...targetIds);
+  conn.prepare('DELETE FROM recommended WHERE profile_id = ? AND type = ?').run(profileId, 'series');
+  if (tableExists(conn, 'taste_ratings')) {
+    conn.prepare("DELETE FROM taste_ratings WHERE profile_id = ? AND type = 'series' AND tmdb_id IN (" + inList + ")").run(profileId, ...targetIds);
+  }
+  if (tableExists(conn, 'taste_ignore')) {
+    conn.prepare("DELETE FROM taste_ignore WHERE profile_id = ? AND type = 'series' AND tmdb_id IN (" + inList + ")").run(profileId, ...targetIds);
+  }
+  if (noCache && tableExists(conn, 'marquee_llm_cache')) {
+    conn.prepare("DELETE FROM marquee_llm_cache WHERE profile_id = ? AND kind IN ('brief','fit','suggest')").run(profileId);
+  }
+}
+
 function tableExists(conn, name) {
   const row = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
   return !!row;
@@ -380,27 +429,44 @@ async function assessReachability(targetIds, filters, { metaFor, imdbRatingFor =
 // measures RANKING quality, not age safety), time the build, and compute the
 // exact metrics against the holdout. Returns the structured result object that
 // renderTable / the --json writer consume.
-async function runBench({ profile, engineIds, holdout, serveOptsOverride = null, deps }) {
+async function runBench({ profile, engineIds, holdout, type = 'movie', serveOptsOverride = null, deps }) {
   const {
     engines, pipeline, rs, watchedStore, db, settings, selectServe,
     selectServeFor, filterServable, serveCalibration, listSizeFor = null,
     log = console, now = Date.now, noCache = false, ctxExtras = {}, reachability = null,
   } = deps;
 
-  const watched = watchedStore.getWatched(profile.id, { type: 'movie' });
-  const targetIds = pickTargets(watched, holdout);
-  const targets = targetIds.map((id) => {
-    const row = watched.find((r) => r.tmdb_id === id);
-    return { tmdb_id: id, title: row ? row.title : id };
-  });
-
-  // Delete the holdout from the bench copy so it cannot leak into the build.
-  removeHoldout(profile.id, targetIds, { db, noCache });
-
-  // Leakage check (spec §5.3): no target may survive in the watched id sets.
-  const sets = watchedStore.watchedIdSets(profile.id);
-  for (const t of targetIds) {
-    if (sets.tmdb.has(t)) throw new Error('leakage: target still in watched set: ' + t);
+  let targetIds, targets;
+  if (type === 'series') {
+    // TV-1 (plan §6): the series holdout is the most recently STARTED shows that
+    // reached at least Engaged (real first-episode timestamps only). Build from
+    // history minus those shows.
+    const seriesRows = watchedStore.getSeriesProgress(profile.id, { kind: 'show' });
+    targetIds = pickSeriesTargets(seriesRows, holdout);
+    targets = targetIds.map((id) => {
+      const row = seriesRows.find((r) => r.tmdb_id === id);
+      return { tmdb_id: id, title: row ? row.title : id };
+    });
+    removeSeriesHoldout(profile.id, targetIds, { db, noCache });
+    // Leakage check: no target may survive in the series progress rows.
+    const remainingIds = new Set(watchedStore.getSeriesProgress(profile.id, { kind: 'show' }).map((r) => r.tmdb_id));
+    for (const t of targetIds) {
+      if (remainingIds.has(t)) throw new Error('leakage: target still in series_progress: ' + t);
+    }
+  } else {
+    const watched = watchedStore.getWatched(profile.id, { type: 'movie' });
+    targetIds = pickTargets(watched, holdout);
+    targets = targetIds.map((id) => {
+      const row = watched.find((r) => r.tmdb_id === id);
+      return { tmdb_id: id, title: row ? row.title : id };
+    });
+    // Delete the holdout from the bench copy so it cannot leak into the build.
+    removeHoldout(profile.id, targetIds, { db, noCache });
+    // Leakage check (spec §5.3): no target may survive in the watched id sets.
+    const sets = watchedStore.watchedIdSets(profile.id);
+    for (const t of targetIds) {
+      if (sets.tmdb.has(t)) throw new Error('leakage: target still in watched set: ' + t);
+    }
   }
 
   // m2: which targets could be served at all (null when no seam is given).
@@ -426,7 +492,7 @@ async function runBench({ profile, engineIds, holdout, serveOptsOverride = null,
       continue;
     }
 
-    rs.clearType(profile.id, 'movie');
+    rs.clearType(profile.id, type);
     const ctx = {
       tmdbKey: settings.keyFor(profile, 'tmdb_api_key'),
       mdblistKey: settings.keyFor(profile, 'mdblist_api_key'),
@@ -439,10 +505,10 @@ async function runBench({ profile, engineIds, holdout, serveOptsOverride = null,
       ...ctxExtras,
     };
     const t0 = now();
-    await pipeline.runEngineBuild(profile, 'movie', engine, ctx, () => {});
+    await pipeline.runEngineBuild(profile, type, engine, ctx, () => {});
     const buildSeconds = (now() - t0) / 1000;
 
-    const rows = rs.getRecommended(profile.id, { type: 'movie', limit: 100000 });
+    const rows = rs.getRecommended(profile.id, { type, limit: 100000 });
     if (id === 'marquee') { marqueeRows = rows; marqueeEngine = engine; }
     const m = metrics(rows, targetIds, profile.filters || {}, { selectServe, stored: rows.length, buildSeconds, reachable: reachableSet });
     // Which targets did this engine actually hit in the top-20 served?
@@ -467,10 +533,11 @@ async function runBench({ profile, engineIds, holdout, serveOptsOverride = null,
   }
 
   // §6: Marquee serve-strategy comparison (round-robin vs calibrated vs pure
-  // score) on the SAME stored rows + SAME stored target. Marquee only, and only
-  // when the serve-strategy deps are injected (the bench script provides them;
-  // hermetic callers that don't need the comparison pass only `selectServe`).
-  if (marqueeRows && marqueeEngine && serveCalibration && selectServeFor && filterServable) {
+  // score) on the SAME stored rows + SAME stored target. Marquee only, movie
+  // only (the calibrated serving target is a movie concept), and only when the
+  // serve-strategy deps are injected (the bench script provides them; hermetic
+  // callers that don't need the comparison pass only `selectServe`).
+  if (type === 'movie' && marqueeRows && marqueeEngine && serveCalibration && selectServeFor && filterServable) {
     const serveOptions = marqueeEngine.serveOptions ? marqueeEngine.serveOptions(settings.getSettings()) : null;
     results.engines.marquee.serveStrategies = serveStrategyMetrics(marqueeRows, profile, profile.filters || {}, {
       selectServe, selectServeFor, filterServable, serveCalibration,
@@ -532,4 +599,4 @@ function renderTable(results) {
   return lines.join('\n');
 }
 
-module.exports = { pickTargets, metrics, renderTable, runBench, removeHoldout, snapshotStore, applyMarqueeConfig, parseComps, assessReachability, serveStrategyMetrics, renderServeTable };
+module.exports = { pickTargets, pickSeriesTargets, metrics, renderTable, runBench, removeHoldout, removeSeriesHoldout, snapshotStore, applyMarqueeConfig, parseComps, assessReachability, serveStrategyMetrics, renderServeTable };

@@ -37,20 +37,24 @@ const fs = require('fs');
 const REPO_ROOT = path.join(__dirname, '..');
 const USAGE =
   'Usage: node --experimental-sqlite scripts/bench-engines.js <profileName>\n'
-  + '  [--holdout 10] [--engines genesis,glass,marquee] [--no-cache] [--json] [--keep]\n'
+  + '  [--type movie|series] [--holdout 10] [--engines genesis,glass,marquee] [--no-cache] [--json] [--keep]\n'
   + "  [--serve-opts '<json>']\n"
   + "  [--marquee-config '<json>']\n"
   + 'Expect several minutes per profile on a cold cache (Marquee\'s LLM fit dominates).\n'
+  + '  --type: movie (default) or series. A series run holds out the most recently STARTED\n'
+  + '  shows that reached at least Engaged (real first-episode timestamps only) and defaults to\n'
+  + "  the Genesis baseline engine unless --engines is given.\n"
   + "  --serve-opts: a JSON object of serve-config overrides (snake_case, e.g. '{\"window_factor\":4}')\n"
   + "  --marquee-config: a JSON object of Marquee config sections (e.g. '{\"agreement\":{\"genre_blend\":0}}'),\n"
   + '  merged section-wise into the SNAPSHOT\'s settings.json only — the live settings are never written.';
 
 function parseArgs(argv) {
-  const a = { profile: null, holdout: 10, engines: ['genesis', 'glass', 'marquee'], noCache: false, json: false, keep: false, serveOpts: null, marqueeConfig: null, help: false };
+  const a = { profile: null, holdout: 10, type: 'movie', engines: ['genesis', 'glass', 'marquee'], enginesSet: false, noCache: false, json: false, keep: false, serveOpts: null, marqueeConfig: null, help: false };
   for (let i = 0; i < argv.length; i++) {
     const x = argv[i];
     if (x === '--holdout') a.holdout = Number(argv[++i]);
-    else if (x === '--engines') a.engines = String(argv[++i]).split(',').map((s) => s.trim()).filter(Boolean);
+    else if (x === '--type') a.type = String(argv[++i]);
+    else if (x === '--engines') { a.engines = String(argv[++i]).split(',').map((s) => s.trim()).filter(Boolean); a.enginesSet = true; }
     else if (x === '--no-cache') a.noCache = true;
     else if (x === '--json') a.json = true;
     else if (x === '--keep') a.keep = true;
@@ -89,6 +93,10 @@ async function main() {
   if (a.help) { console.log(USAGE); return; }
   if (!a.profile) { console.error('profileName is required'); console.error(USAGE); process.exit(2); }
   if (!Number.isFinite(a.holdout) || a.holdout < 1) { console.error('--holdout must be a positive integer'); process.exit(2); }
+  if (a.type !== 'movie' && a.type !== 'series') { console.error('--type must be movie or series'); process.exit(2); }
+  // TV-1 (plan §6): the series baseline is Genesis — default the engine set to
+  // ['genesis'] for a series run unless --engines was given explicitly.
+  if (a.type === 'series' && !a.enginesSet) a.engines = ['genesis'];
 
   const liveDir = process.env.DATA_DIR || path.join(REPO_ROOT, 'data');
   const bench = require('../src/bench/engineBench');
@@ -125,7 +133,7 @@ async function main() {
   let results;
   try {
     results = await bench.runBench({
-      profile, engineIds: a.engines, holdout: a.holdout, serveOptsOverride: a.serveOpts,
+      profile, engineIds: a.engines, holdout: a.holdout, type: a.type, serveOptsOverride: a.serveOpts,
       deps: {
         engines, pipeline, rs, watchedStore, db, settings,
         selectServe: rs.selectServe, selectServeFor: rs.selectServeFor, filterServable: rs.filterServable,
