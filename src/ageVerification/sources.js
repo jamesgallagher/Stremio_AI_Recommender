@@ -7,6 +7,7 @@ const settings = require('../settings');
 const mdblist = require('../services/mdblist');
 const tvdb = require('../services/tvdb');
 const groq = require('../services/groq');
+const simkl = require('../services/simkl');
 const governor = require('../services/governor');
 const store = require('../store');
 
@@ -73,11 +74,50 @@ async function tmdbRatings(profile, type, titles, log = console) {
   return out;
 }
 
-// Simkl certification (step 4a). Simkl is a watch tracker keyed by its own ids,
-// not by IMDb — a batch certification lookup by IMDb id is out of scope for
-// AGE-1. Return no answer so the chain continues to the next step (MDBList).
-function simklCerts() {
-  return Promise.resolve(new Map());
+// Simkl certification (step 4a). Simkl is keyed by its own ids, but it exposes
+// an IMDb search endpoint: `GET /search/id?imdb=tt…` returns the Simkl id (the
+// first match's `ids.simkl` + `type`, where type 1 = movie, 2 = tv). That Simkl
+// id then resolves to the media's certification via `GET /tv/{id}` or
+// `GET /movies/{id}?extended=full` → `media.tv.certification` /
+// `media.movie.certification`. Verified live by the reviewer on 126 shows
+// (Perfect Strangers → TV-PG, Terminator 3 → R).
+const SIMKL_BATCH_CAP = 20; // cap: at most 20 titles per call
+
+// First usable match from a Simkl /search/id body. Movies come first, then tv —
+// the chain's type is advisory only; we take the first id Simkl returned.
+function firstSimklMatch(search) {
+  if (!search || typeof search !== 'object') return null;
+  const movies = Array.isArray(search.movies) ? search.movies : [];
+  const tv = Array.isArray(search.tv) ? search.tv : [];
+  const match = movies[0] || tv[0];
+  if (!match || !match.ids || match.ids.simkl == null) return null;
+  return match;
+}
+
+// Simkl certification (step 4a). `imdbIds` are the chain's IMDb ids. No Simkl
+// connection → an empty Map (no answer from this step). A per-title failure
+// yields null (no answer for that title) — never a throw.
+async function simklCerts(profile, type, imdbIds, log = console) {
+  const out = new Map();
+  const clientId = profile?.keys?.simkl_client_id;
+  const token = profile?.simkl_auth?.access_token;
+  if (!clientId || !token) return out; // no Simkl connection → no answer
+  for (const imdb of imdbIds.slice(0, SIMKL_BATCH_CAP)) {
+    try {
+      const search = await simkl.authedGet(profile, '/search/id', { imdb });
+      const match = firstSimklMatch(search);
+      if (!match) { out.set(imdb, null); continue; }
+      const simklId = match.ids.simkl;
+      const isTv = match.type === 2;
+      const media = await simkl.authedGet(profile, isTv ? `/tv/${simklId}` : `/movies/${simklId}`, { extended: 'full' });
+      const cert = (isTv ? media.tv : media.movie)?.certification;
+      out.set(imdb, cert || null);
+    } catch (err) {
+      log.warn?.(`[age-verify] simklCerts ${imdb} failed: ${err.message}`);
+      out.set(imdb, null);
+    }
+  }
+  return out;
 }
 
 // The LLM gate (step 5). The chain's seam expects Map<key, true|false> where
@@ -116,7 +156,7 @@ function buildSources(profile, log = console) {
       return key ? mdblist.commonSenseAges(key, type, imdbIds, log) : Promise.resolve(new Map());
     },
     tvdbRatings: (type, imdbIds) => tvdb.mediaCerts(imdbIds, type, log),
-    simklCerts: (type, imdbIds) => simklCerts(),
+    simklCerts: (type, imdbIds) => simklCerts(profile, type, imdbIds, log),
     mdblistCerts: (type, imdbIds) => {
       const key = mdbKey();
       return key ? mdblist.mediaCerts(key, type, imdbIds, log) : Promise.resolve(new Map());
@@ -125,4 +165,4 @@ function buildSources(profile, log = console) {
   };
 }
 
-module.exports = { buildSources, tmdbRatings, llmGate, setTmdbFetch };
+module.exports = { buildSources, tmdbRatings, simklCerts, llmGate, setTmdbFetch };

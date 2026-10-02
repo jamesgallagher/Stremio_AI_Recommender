@@ -4077,6 +4077,53 @@ ok('calibrated A2: incremental greedy is fast (425 rows, listSize 50)', () => {
       settings.updateSettings({ keys: { tmdb_api_key: '' } });
     }
   });
+
+  // ---- AGE-1 T4: simklCerts fetch-level (F5) — the /search/id → /tv|/movies
+  // call sequence and paths, the certification parse, the 20-title cap, and the
+  // no-auth → empty Map. Monkey-patches simkl.authedGet (isolated from the
+  // parallel global-fetch stubs of the other AGE-1 async tests). ----
+  okAsync('AGE-1 T4: simklCerts — /search/id → /tv|/movies parse; 20-title cap; no auth → empty', async () => {
+    const simkl = require('../src/services/simkl');
+    const calls = [];
+    const origAuthedGet = simkl.authedGet;
+    simkl.authedGet = async (profile, path, extra = {}) => {
+      calls.push({ path, extra });
+      if (path === '/search/id') {
+        const imdb = extra.imdb;
+        if (imdb === 'tttv') return { tv: [{ ids: { simkl: 324126 }, type: 2 }] };
+        if (imdb === 'ttmovie') return { movies: [{ ids: { simkl: 12345 }, type: 1 }] };
+        return { movies: [], tv: [] }; // no match
+      }
+      if (path === '/tv/324126') return { tv: { certification: 'TV-PG' } };
+      if (path === '/movies/12345') return { movie: { certification: 'R' } };
+      throw new Error(`unexpected path ${path}`);
+    };
+    const profile = { keys: { simkl_client_id: 'cid' }, simkl_auth: { access_token: 'tok' } };
+    try {
+      // Series → /search/id → /tv/{id}?extended=full → media.tv.certification.
+      let out = await ageSources.simklCerts(profile, 'series', ['tttv', 'ttmovie']);
+      assert.deepStrictEqual(calls.map((c) => c.path), ['/search/id', '/tv/324126', '/search/id', '/movies/12345'], 'call sequence + paths');
+      assert.deepStrictEqual(calls[0].extra, { imdb: 'tttv' }, 'search/id carries the imdb param');
+      assert.deepStrictEqual(calls[1].extra, { extended: 'full' }, 'media GET carries extended=full');
+      assert.deepStrictEqual(out.get('tttv'), 'TV-PG', 'series certification parsed');
+      assert.deepStrictEqual(out.get('ttmovie'), 'R', 'movie certification parsed');
+      // No match → null (no answer for that title), no throw.
+      out = await ageSources.simklCerts(profile, 'series', ['ttnone']);
+      assert.deepStrictEqual(out.get('ttnone'), null, 'no match → null');
+      // 20-title cap: only the first 20 titles are queried.
+      calls.length = 0;
+      const many = Array.from({ length: 25 }, (_, i) => `tt${i}`);
+      out = await ageSources.simklCerts(profile, 'series', many);
+      assert.strictEqual(calls.filter((c) => c.path === '/search/id').length, 20, 'only 20 titles queried');
+      // No Simkl connection → empty Map, zero authedGet calls.
+      calls.length = 0;
+      out = await ageSources.simklCerts({}, 'series', ['tttv']);
+      assert.ok(out instanceof Map && out.size === 0, 'no auth → empty Map');
+      assert.strictEqual(calls.length, 0, 'no auth → zero authedGet calls');
+    } finally {
+      simkl.authedGet = origAuthedGet;
+    }
+  });
 }
 
 // ---- HTTP surface ----
