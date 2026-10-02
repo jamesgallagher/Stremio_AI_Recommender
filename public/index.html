@@ -385,9 +385,9 @@ function render(profiles) {
               ${[[0,'No minimum'],[250,'250+'],[500,'500+'],[1000,'1,000+'],[2500,'2,500+'],[5000,'5,000+']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.vote_count_floor ?? 1000) ? 'selected' : ''}>${l}</option>`).join('')}
             </select>
             <div class="muted" style="font-size:11px;margin-top:3px">Titles with fewer TMDB votes than this are <b>never stored</b> in your recommendations (a high rating on a handful of votes is meaningless) — they can return later if they gain votes. Series use ⅕ of this (TV vote counts run far lower). Enforced when the pool is built, so a change applies on the next rebuild.</div></div>
-          <div><label>Released within</label>
-            <select data-filter="max_age_years">
-              ${[[1,'1 year'],[2,'2 years'],[5,'5 years'],[10,'10 years'],[20,'20 years'],[0,'No limit']].map(([v,l]) => `<option value="${v}" ${v === p.filters.max_age_years ? 'selected' : ''}>${l}</option>`).join('')}
+          <div><label>Released</label>
+            <select data-filter="min_year">
+              ${[[2020,'2020 onwards'],[2010,'2010 onwards'],[2000,'2000 onwards'],[1990,'1990 onwards'],[1980,'1980 onwards'],[0,'No limit']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.min_year || 0) ? 'selected' : ''}>${l}</option>`).join('')}
             </select>
             <div class="muted" style="font-size:11px;margin-top:3px">*Applied to movies only — a recency cut-off would wrongly drop long-running series.</div></div>
           <div><label>List size (per catalog)</label>
@@ -1036,7 +1036,7 @@ async function saveFilters(id) {
   const filters = {
     min_rating: parseFloat(card.querySelector('[data-filter=min_rating]').value),
     vote_count_floor: parseInt(card.querySelector('[data-filter=vote_count_floor]').value, 10),
-    max_age_years: parseInt(card.querySelector('[data-filter=max_age_years]').value, 10),
+    min_year: parseInt(card.querySelector('[data-filter=min_year]').value, 10),
     list_size: parseInt(card.querySelector('[data-filter=list_size]').value, 10),
     age_limit: ageOn ? parseInt(card.querySelector('[data-filter=age_limit]').value, 10) : 0,
     excluded_genres: [...card.querySelectorAll('.genres input:checked')].map(i => i.value),

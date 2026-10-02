@@ -694,7 +694,7 @@
       const f = data.filters || {};
       fillEngines(data);
       setSelect(setEls.minRating, f.min_rating != null ? f.min_rating : 0);
-      setSelect(setEls.recency, f.max_age_years != null ? f.max_age_years : 0);
+      setSelect(setEls.recency, f.min_year != null ? f.min_year : 0);
       setSelect(setEls.listSize, f.list_size != null ? f.list_size : 20);
       setSelect(setEls.voteFloor, f.vote_count_floor != null ? f.vote_count_floor : 1000);
       setEls.titleDecay.checked = !!f.title_decay_enabled;
@@ -713,7 +713,7 @@
       engine_movie: setEls.engineMovie.value,
       engine_series: setEls.engineSeries.value,
       min_rating: parseFloat(setEls.minRating.value),
-      max_age_years: parseInt(setEls.recency.value, 10),
+      min_year: parseInt(setEls.recency.value, 10),
       list_size: parseInt(setEls.listSize.value, 10),
       vote_count_floor: parseInt(setEls.voteFloor.value, 10),
       excluded_genres: [...setEls.genres.querySelectorAll('input:checked')].map((i) => i.value),

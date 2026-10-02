@@ -12,6 +12,7 @@
 // floor (the serve rule has no vote floor and no cert knowledge for movies).
 const tmdb = require('../../services/tmdb');
 const certs = require('../../certs');
+const recency = require('../../recency');
 
 // Re-export the shared cert table for convenience (ME-01).
 const {
@@ -37,7 +38,7 @@ function compileEnvelope(filters, { nowYear, genreMap }) {
   const f = filters || {};
   const voteFloor = tmdb.voteFloor(f, 'movie');
   const minRating = f.min_rating || 0;
-  const maxAge = f.max_age_years || 0;
+  const maxAge = recency.maxAgeOf(f, nowYear); // decade floor → equivalent window (src/recency.js)
   const excluded = new Set(f.excluded_genres || []);
   const kids = (f.age_limit || 0) > 0;
   const judgementAge = judgementAgeOf(f);
