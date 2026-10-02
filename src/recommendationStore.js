@@ -21,6 +21,7 @@ const db = require('./db');
 const certs = require('./certs');
 const settings = require('./settings');
 const tmdb = require('./services/tmdb');
+const recency = require('./recency');
 const animeMap = require('./services/animeMap');
 const watchedStore = require('./watchedStore');
 // Trainer T2 (N8): the taste-feedback store's rebuild trigger (Marquee-only).
@@ -648,7 +649,7 @@ function balanceByGenre(rows, limit = SERVE_LIMIT) {
 function filterServable(rows, filters = {}, { nowYear = new Date().getFullYear() } = {}) {
   const minRating = filters.min_rating || 0;
   const excluded = new Set(filters.excluded_genres || []);
-  const maxAge = filters.max_age_years || 0;
+  const minYear = recency.minYearOf(filters, nowYear); // decade floor (src/recency.js); 0 = none
 
   return (rows || []).filter((r) => {
     if (!r.imdb_id) return false;                                             // not servable
@@ -659,9 +660,9 @@ function filterServable(rows, filters = {}, { nowYear = new Date().getFullYear()
     if (minRating > 0 && shownRating > 0 && shownRating < minRating) return false;
     const genres = (r.genres || '').split(',').filter(Boolean);
     if (genres.some((g) => excluded.has(g))) return false;                    // excluded genre (full list, incl. Anime)
-    // Recency window — MOVIES ONLY. Series run for years from an old first-air
+    // Release-year floor — MOVIES ONLY. Series run for years from an old first-air
     // date, so a recency cut-off would wrongly drop still-running shows.
-    if (maxAge > 0 && r.type === 'movie' && r.year && r.year < nowYear - maxAge) return false;
+    if (minYear > 0 && r.type === 'movie' && r.year && r.year < minYear) return false;
     if (!passesAgeBand(r, filters)) return false;                            // lowered-limit safety net (adult profile: always true)
     return true;
   });

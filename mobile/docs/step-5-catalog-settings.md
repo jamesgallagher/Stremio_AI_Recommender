@@ -75,7 +75,7 @@ The settings screen has two sub-tabs: **Filters** (default) and **Catalogs**.
 
 - `GET /mobile/api/settings` → `{ filters, catalog_only, genres, catalogs }`.
   `filters` is the five editable filters (`min_rating`, `vote_count_floor`,
-  `max_age_years`, `excluded_genres`, `list_size`) — **never** `age_limit`.
+  `min_year`, `excluded_genres`, `list_size`) — **never** `age_limit`.
   `catalogs` is the profile's **age-appropriate** extra catalogs (each `{ id,
   name, type, enabled, source, min_imdb, target, dedupe_watched,
   requirement_met }`), filtered by `catalogs.ageAppropriate` exactly like the

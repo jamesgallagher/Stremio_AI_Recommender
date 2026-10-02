@@ -15,6 +15,7 @@ const crypto = require('crypto');
 const secret = require('./services/crypto');
 const store = require('./store');
 const { EXTRA_CATALOGS } = require('./catalogs');
+const recency = require('./recency');
 
 // RPDB's generic free-tier key — works for everyone, pre-filled on every new
 // profile. Replaceable per profile with a personal (paid-tier) key anytime.
@@ -23,7 +24,8 @@ const DEFAULT_RPDB_KEY = 't0-free-rpdb';
 const DEFAULT_FILTERS = {
   min_rating: 6.0, // IMDb rating floor (0–10); prefers the poster's IMDb rating, TMDB fallback
   vote_count_floor: 1000, // hard build gate on TMDB vote count; series use 1/5 of this
-  max_age_years: 0, // recency window (movies only); 0 = no limit (v4 default: all years)
+  min_year: 0, // release-year floor, movies only: 2020/2010/2000/1990/1980 onwards; 0 = no limit (see src/recency.js)
+  max_age_years: 0, // RETIRED rolling window — migrated to min_year on load; kept 0 for older readers
   excluded_genres: [], // portal genre names, e.g. ["Horror", "Anime"]
   age_limit: 0, // Common Sense age gate; 0 = off. >0 requires MDBList + Groq
   list_size: 20, // displayed titles per catalog (+ an equal-sized hidden bench)
@@ -128,6 +130,14 @@ function applyMigrations(p) {
   if (p.filters.v4_recency_relaxed === undefined) {
     p.filters.max_age_years = 0;
     p.filters.v4_recency_relaxed = true;
+  }
+  // v7.24.1: the recency filter became a decade floor (min_year, "2010 onwards")
+  // instead of a rolling window (max_age_years). Migrate to the decade that never
+  // hides MORE than before (10 years in 2026 → 2010 onwards). Persists on the next
+  // profile write; until then this runs on every load with the same result.
+  if (p.filters.min_year === undefined) {
+    p.filters.min_year = recency.decadeFromMaxAge(p.filters.max_age_years);
+    p.filters.max_age_years = 0;
   }
   // v7: per-type engine selection (see docs/engine-abstraction). Retire the dead
   // single-engine field (the v5 Trakt/AI concept, never actually wired) and add
@@ -261,7 +271,16 @@ function updateProfile(id, patch) {
     if (patch.filters) {
       const f = patch.filters;
       if (f.min_rating !== undefined) profile.filters.min_rating = Math.max(0, Number(f.min_rating) || 0);
-      if (f.max_age_years !== undefined) profile.filters.max_age_years = Math.max(0, parseInt(f.max_age_years, 10) || 0);
+      // Release-year floor (decades). An old client still sending max_age_years is
+      // converted the same way as the load-time migration; min_year wins if both.
+      if (f.max_age_years !== undefined && f.min_year === undefined) {
+        profile.filters.min_year = recency.decadeFromMaxAge(f.max_age_years);
+        profile.filters.max_age_years = 0;
+      }
+      if (f.min_year !== undefined) {
+        profile.filters.min_year = recency.normalizeMinYear(f.min_year);
+        profile.filters.max_age_years = 0;
+      }
       if (Array.isArray(f.excluded_genres)) profile.filters.excluded_genres = f.excluded_genres.map(String);
       if (f.age_limit !== undefined) profile.filters.age_limit = Math.max(0, parseInt(f.age_limit, 10) || 0);
       if (f.list_size !== undefined) profile.filters.list_size = Math.min(50, Math.max(5, parseInt(f.list_size, 10) || 20));

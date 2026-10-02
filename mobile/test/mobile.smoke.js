@@ -893,8 +893,8 @@ async function unitTests() {
   });
 
   await ok('settings: toCompanionFilters exposes the editable filters (incl. title decay + per-type engine), never the age gate', () => {
-    const out = handlers.toCompanionFilters({ min_rating: 6, vote_count_floor: 1000, max_age_years: 5, excluded_genres: ['Horror'], list_size: 20, title_decay_enabled: true, title_decay_days: 30, age_limit: 8, engine_movie: 'genesis', engine_series: 'genesis' });
-    assert.deepStrictEqual(Object.keys(out).sort(), ['engine_movie', 'engine_series', 'excluded_genres', 'list_size', 'max_age_years', 'min_rating', 'title_decay_days', 'title_decay_enabled', 'vote_count_floor']);
+    const out = handlers.toCompanionFilters({ min_rating: 6, vote_count_floor: 1000, min_year: 2010, excluded_genres: ['Horror'], list_size: 20, title_decay_enabled: true, title_decay_days: 30, age_limit: 8, engine_movie: 'genesis', engine_series: 'genesis' });
+    assert.deepStrictEqual(Object.keys(out).sort(), ['engine_movie', 'engine_series', 'excluded_genres', 'list_size', 'min_rating', 'min_year', 'title_decay_days', 'title_decay_enabled', 'vote_count_floor']);
     assert.ok(!('age_limit' in out), 'age gate never exposed');
     assert.strictEqual(out.title_decay_enabled, true);
     assert.strictEqual(out.title_decay_days, 30);
@@ -1243,6 +1243,7 @@ async function httpTests() {
     assert.strictEqual(res.status, 200);
     const html = await res.text();
     assert.ok(html.includes('data-route="trainer"'), 'has the Trainer tabbar button');
+    assert.ok(html.includes('data-filter="min_year"') && html.includes('<option value="2020">2020 onwards</option>') && html.includes('<option value="1980">1980 onwards</option>') && !html.includes('Last 1 year'), 'companion Released filter offers decades');
     assert.ok(html.includes('data-route="trainer" role="tab">Ratings</button>') && !html.includes('>Trainer</button>'), 'the tab is labelled Ratings (UI rename)');
     assert.ok(html.includes('id="view-trainer"'), 'has the Trainer section');
     assert.ok(html.includes('trainer-ui.js'), 'references the shared pure module');
