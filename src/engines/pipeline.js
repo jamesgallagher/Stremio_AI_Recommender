@@ -133,6 +133,11 @@ async function runEngineBuild(profile, type, engine, ctx, onProgress = () => {})
   // 5. Upsert (I4). Stamp imdb_rating_at only when a key was present, so the heal
   //    pass re-checks these rows later once a key is configured.
   store.upsertCandidates(profile.id, servable, { ratingCheckedAt: mdblistKey ? Date.now() : null });
+  // ENG-1: the slice now belongs to this engine — remove other engines' leftovers.
+  if (servable.length) {
+    const others = store.pruneOtherEngines(profile.id, type, engine.id);
+    if (others) log.log(`[rec] ${profile.name}: removed ${others} ${type} row(s) left by another engine`);
+  }
   // 6. Purge any already-stored row now under the vote-count floor (I3) — old
   //    fixed gate, or a raised floor. New sub-floor titles were gated at build.
   const purged = store.purgeBelowVoteFloor(profile.id, filters);

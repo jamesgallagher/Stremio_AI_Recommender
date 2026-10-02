@@ -5350,7 +5350,9 @@ async function main() {
       emit = [row('new1'), row('new2')];
       await pipeline.runEngineBuild(config.getProfile(p.id), 'movie', stub, ctx, () => {});
       const ids = db.get().prepare('SELECT tmdb_id FROM recommended WHERE profile_id = ? ORDER BY tmdb_id').all(p.id).map((r) => r.tmdb_id);
-      assert.deepStrictEqual(ids, ['gen1', 'new1', 'new2'], 'v1 row pruned; genesis row kept');
+      // ENG-1: pruneOtherEngines removes the other engine's (genesis) leftover,
+      // and pruneSupersededVersions removes the older vstub version.
+      assert.deepStrictEqual(ids, ['new1', 'new2'], 'v1 row pruned; other-engine row pruned');
     } finally {
       config.removeProfile(p.id); rs.deleteForProfile(p.id);
     }
@@ -7375,6 +7377,282 @@ async function main() {
       config.removeProfile(p.id);
       rs.deleteForProfile(p.id);
       watchedStore.deleteForProfile(p.id);
+    }
+  });
+
+  // ── ENG-1 J2: the rebuild race — a switch made while a build is running is
+  //    NOT lost (E1). A change while a build is running queues a NEW build that
+  //    runs after it and reads the profile fresh. Must fail on unmodified v7
+  //    (rebuildAfterChange absent) and pass after the fix. ──
+  await it('ENG-1 J2: a switch made while a build is running is not lost (rebuild race)', async () => {
+    // Two stub series engines. stub-a's generate blocks on a deferred so the test
+    // controls when the first build finishes.
+    let stubAEnteredResolve;
+    const stubAEntered = new Promise((res) => { stubAEnteredResolve = res; });
+    let releaseStubA;
+    const stubABlock = new Promise((res) => { releaseStubA = res; });
+    let stubBCalls = 0;
+    const disposeA = engines._register({
+      id: 'stub-a', name: 'Stub A', supportedTypes: ['series'],
+      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+      requirements: () => ({ ok: true, missing: [] }),
+      generate: async (profile, type, ctx) => {
+        stubAEnteredResolve();
+        await stubABlock;
+        if (ctx && ctx.stats) ctx.stats.seeds = 3;
+        return [
+          { type: 'series', tmdb_id: 'stub-a-1', rankScore: 3, imdb_id: 'ttstuba1', title: 'A1', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, popularity: 30, reason: 'A1', recCount: 2 },
+          { type: 'series', tmdb_id: 'stub-a-2', rankScore: 2, imdb_id: 'ttstuba2', title: 'A2', year: 2023, primary_genre: 'Comedy', genres: 'Comedy', vote_average: 7, vote_count: 4000, popularity: 20, reason: 'A2', recCount: 1 },
+          { type: 'series', tmdb_id: 'stub-a-3', rankScore: 1, imdb_id: 'ttstuba3', title: 'A3', year: 2022, primary_genre: 'Action', genres: 'Action', vote_average: 6, vote_count: 3000, popularity: 10, reason: 'A3', recCount: 3 },
+        ];
+      },
+    });
+    const disposeB = engines._register({
+      id: 'stub-b', name: 'Stub B', supportedTypes: ['series'],
+      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+      requirements: () => ({ ok: true, missing: [] }),
+      generate: async (profile, type, ctx) => {
+        stubBCalls++;
+        if (ctx && ctx.stats) ctx.stats.seeds = 3;
+        return [
+          { type: 'series', tmdb_id: 'stub-b-1', rankScore: 3, imdb_id: 'ttstubb1', title: 'B1', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, popularity: 30, reason: 'B1', recCount: 2 },
+          { type: 'series', tmdb_id: 'stub-b-2', rankScore: 2, imdb_id: 'ttstubb2', title: 'B2', year: 2023, primary_genre: 'Comedy', genres: 'Comedy', vote_average: 7, vote_count: 4000, popularity: 20, reason: 'B2', recCount: 1 },
+          { type: 'series', tmdb_id: 'stub-b-3', rankScore: 1, imdb_id: 'ttstubb3', title: 'B3', year: 2022, primary_genre: 'Action', genres: 'Action', vote_average: 6, vote_count: 3000, popularity: 10, reason: 'B3', recCount: 3 },
+        ];
+      },
+    });
+    const p = config.addProfile('INT-ENG1-J2');
+    try {
+      // Enable both engines + set the profile's series engine to stub-a.
+      settings.updateSettings({ engines: { 'stub-a': true, 'stub-b': true } });
+      config.updateProfile(p.id, { filters: { engine_series: 'stub-a', age_limit: 0 } });
+      const profile = config.getProfile(p.id);
+      // Start a build (the routine path) — it enters stub-a.generate and blocks.
+      const firstBuild = rs.ensureBuilt(profile, quiet);
+      await stubAEntered; // wait until stub-a.generate has been entered
+      // While it's blocked, do exactly what the portal does on an engine change:
+      // update the profile (engine_series → stub-b), clear the series slice, and
+      // kick a rebuild that reads the profile fresh when it starts.
+      config.updateProfile(p.id, { filters: { engine_series: 'stub-b' } });
+      rs.clearType(p.id, 'series');
+      const secondBuild = rs.rebuildAfterChange(p.id, quiet);
+      // Release stub-a so the first build finishes.
+      releaseStubA();
+      await Promise.all([firstBuild, secondBuild]);
+      // Assert: stub-b.generate was called; the series slice holds only stub-b's rows.
+      assert.ok(stubBCalls >= 1, 'stub-b.generate was called');
+      const series = rs.getRecommended(p.id, { type: 'series', limit: 100 });
+      assert.strictEqual(series.length, 3, 'series slice has 3 rows');
+      assert.ok(series.every((r) => r.engine_id === 'stub-b'), 'all series rows are engine_id stub-b');
+      assert.ok(!series.some((r) => r.engine_id === 'stub-a'), 'no stub-a row survives');
+    } finally {
+      disposeA(); disposeB();
+      settings.updateSettings({ engines: { 'stub-a': false, 'stub-b': false } });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id);
+    }
+  });
+
+  // ── ENG-1 C1: every engine-change caller uses rebuildAfterChange (not
+  //    ensureBuilt) — the portal PUT, the disable-revert, the Tier-2 Glass/
+  //    Marquee rebuilds, POST .../recommend/build, and the mobile settings save. ──
+  await it('ENG-1 C1: every engine-change caller uses rebuildAfterChange (not ensureBuilt)', async () => {
+    const portalMod = require('../src/portal');
+    const origRebuild = rs.rebuildAfterChange;
+    const origEnsure = rs.ensureBuilt;
+    const jobsMod = require('../src/jobs');
+    const rebuildCalls = [];
+    const ensureCalls = [];
+    // Spy: record WHICH function the caller uses. rebuildAfterChange enqueues a
+    // no-op job (so the response's job snapshot is non-null, as in production)
+    // but runs nothing — C1 cares about the call, not the build result.
+    rs.rebuildAfterChange = (profileId) => {
+      rebuildCalls.push(profileId);
+      return jobsMod.enqueue(profileId, 'recs', async () => ({ skipped: true, reason: 'c1-spy' }), { afterActive: true });
+    };
+    rs.ensureBuilt = (profile) => { ensureCalls.push(profile.id); return Promise.resolve({}); };
+
+    // Drive a portal route directly (no HTTP). req carries the few express
+    // request bits the handlers touch (params, protocol/get for baseUrl).
+    const drivePortal = (method, path, body, params = {}) => {
+      const isMatch = (m) => (Array.isArray(m) ? m.includes(method.toLowerCase()) : !!m[method.toLowerCase()]);
+      const layer = portalMod.router.stack.find((l) => l.route && l.route.path === path && isMatch(l.route.methods));
+      const res = fakeRes();
+      layer.handle({ body, method, params, protocol: 'http', get: () => 'localhost' }, res);
+      return res;
+    };
+    // Drive the portal PUT /settings handler directly.
+    const portalPutSettings = (body) => {
+      const isPut = (m) => (Array.isArray(m) ? m.includes('put') : !!m.put);
+      const layer = portalMod.router.stack.find((l) => l.route && l.route.path === '/settings' && isPut(l.route.methods));
+      const res = fakeRes();
+      layer.handle({ body, method: 'PUT', protocol: 'http', get: () => 'localhost' }, res);
+      return res;
+    };
+
+    // A conformant fake engine for the engine-change scenarios.
+    const dispose = engines._register({
+      id: 'c1-fake', name: 'C1 Fake', supportedTypes: ['movie', 'series'],
+      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+      requirements: () => ({ ok: true, missing: [] }),
+      generate: async () => [],
+    });
+
+    try {
+      settings.updateSettings({ engines: { 'c1-fake': true } });
+
+      // (1) Portal PUT /profiles/:id that changes engine_series.
+      {
+        const p = config.addProfile('INT-ENG1-C1-put');
+        config.updateProfile(p.id, { filters: { engine_series: 'genesis' } });
+        drivePortal('PUT', '/profiles/:id', { filters: { engine_series: 'c1-fake' } }, { id: p.id });
+        assert.ok(rebuildCalls.includes(p.id), 'PUT /profiles/:id (engine change) → rebuildAfterChange');
+        assert.ok(!ensureCalls.includes(p.id), 'PUT /profiles/:id does NOT call ensureBuilt');
+        config.removeProfile(p.id); rs.deleteForProfile(p.id);
+      }
+
+      // (2) POST /profiles/:id/recommend/build — 202 with the same body shape.
+      {
+        const p = config.addProfile('INT-ENG1-C1-build');
+        const res = drivePortal('POST', '/profiles/:id/recommend/build', {}, { id: p.id });
+        assert.ok(rebuildCalls.includes(p.id), 'POST .../recommend/build → rebuildAfterChange');
+        assert.ok(!ensureCalls.includes(p.id), 'POST .../recommend/build does NOT call ensureBuilt');
+        assert.strictEqual(res.statusCode, 202, 'POST .../recommend/build answers 202');
+        assert.strictEqual(res.body.started, true, 'POST .../recommend/build body has started: true');
+        assert.ok(res.body.job !== null, 'POST .../recommend/build body has a job snapshot');
+        config.removeProfile(p.id); rs.deleteForProfile(p.id);
+      }
+
+      // (3) Mobile settings save that changes an engine (companion body carries
+      // the filters flat, not nested under `filters`).
+      {
+        const p = config.addProfile('INT-ENG1-C1-mobile');
+        config.updateProfile(p.id, { filters: { engine_series: 'genesis' } });
+        const res = fakeRes();
+        companion.settingsPostHandler({ profile: config.getProfile(p.id), body: { engine_series: 'c1-fake' } }, res);
+        assert.ok(rebuildCalls.includes(p.id), 'mobile settings save (engine change) → rebuildAfterChange');
+        assert.ok(!ensureCalls.includes(p.id), 'mobile settings save does NOT call ensureBuilt');
+        config.removeProfile(p.id); rs.deleteForProfile(p.id);
+      }
+
+      // (4) Disable revert (revertDisabledEngines) via PUT /settings.
+      {
+        const p = config.addProfile('INT-ENG1-C1-revert');
+        config.updateProfile(p.id, { filters: { engine_series: 'c1-fake' } });
+        portalPutSettings({ engines: { 'c1-fake': false } });
+        assert.ok(rebuildCalls.includes(p.id), 'disable revert → rebuildAfterChange');
+        assert.ok(!ensureCalls.includes(p.id), 'disable revert does NOT call ensureBuilt');
+        config.removeProfile(p.id); rs.deleteForProfile(p.id);
+      }
+
+      // (5) rebuildMarqueeProfiles via PUT /settings (a Tier-2 Marquee config change).
+      {
+        settings.updateSettings({ engines: { marquee: true }, marquee: {} });
+        const p = config.addProfile('INT-ENG1-C1-marquee');
+        config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'marquee' } });
+        portalPutSettings({ marquee: { franchise_cap: 1 } });
+        assert.ok(rebuildCalls.includes(p.id), 'rebuildMarqueeProfiles → rebuildAfterChange');
+        assert.ok(!ensureCalls.includes(p.id), 'rebuildMarqueeProfiles does NOT call ensureBuilt');
+        config.removeProfile(p.id); rs.deleteForProfile(p.id);
+        settings.updateSettings({ engines: { marquee: false }, marquee: {} });
+      }
+
+      // (6) rebuildGlassProfiles via PUT /settings (a Tier-2 Glass config change).
+      {
+        settings.updateSettings({ engines: { glass: true }, glass: {} });
+        const p = config.addProfile('INT-ENG1-C1-glass');
+        config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_series: 'glass' } });
+        portalPutSettings({ glass: { some_key: 1 } });
+        assert.ok(rebuildCalls.includes(p.id), 'rebuildGlassProfiles → rebuildAfterChange');
+        assert.ok(!ensureCalls.includes(p.id), 'rebuildGlassProfiles does NOT call ensureBuilt');
+        config.removeProfile(p.id); rs.deleteForProfile(p.id);
+        settings.updateSettings({ engines: { glass: false }, glass: {} });
+      }
+    } finally {
+      rs.rebuildAfterChange = origRebuild;
+      rs.ensureBuilt = origEnsure;
+      settings.updateSettings({ engines: { 'c1-fake': false, marquee: false, glass: false } });
+      dispose();
+    }
+  });
+
+  // ── ENG-1 P1: pruneOtherEngines + the pipeline — after a successful build,
+  //    the type's slice holds only that build's engine's rows (E2). ──
+  await it('ENG-1 P1: pruneOtherEngines + the pipeline (other-engine leftovers removed)', async () => {
+    const pipeline = require('../src/engines/pipeline');
+    // Stub engine x: 3 series candidates, one of which re-produces a genesis row.
+    const xCands = [
+      { type: 'series', tmdb_id: 'x-1', rankScore: 3, imdb_id: 'ttx1', title: 'X1', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, popularity: 30, reason: 'X1', recCount: 2 },
+      { type: 'series', tmdb_id: 'x-2', rankScore: 2, imdb_id: 'ttx2', title: 'X2', year: 2023, primary_genre: 'Comedy', genres: 'Comedy', vote_average: 7, vote_count: 4000, popularity: 20, reason: 'X2', recCount: 1 },
+      { type: 'series', tmdb_id: 'genesis-repro', rankScore: 1, imdb_id: 'ttgenrepro', title: 'GenRepro', year: 2022, primary_genre: 'Action', genres: 'Action', vote_average: 6, vote_count: 3000, popularity: 10, reason: 'GenRepro', recCount: 3 },
+    ];
+    const p = config.addProfile('INT-ENG1-P1');
+    try {
+      // Seed the movie slice (must be untouched in both scenarios).
+      rs.upsertCandidates(p.id, [
+        { type: 'movie', tmdb_id: 'movie-1', imdb_id: 'ttmovie1', title: 'M1', year: 2020, vote_average: 7, vote_count: 1000, affinity: 0.5, rec_count: 1, engine_id: 'genesis', popularity: 1 },
+      ]);
+
+      // (a) x stores 3 rows → only x rows remain; the re-produced row has engine_id x;
+      //     the log line is printed; the movie slice is untouched.
+      {
+        rs.clearType(p.id, 'series');
+        rs.upsertCandidates(p.id, [
+          { type: 'series', tmdb_id: 'genesis-1', imdb_id: 'ttgen1', title: 'G1', year: 2020, vote_average: 7, vote_count: 1000, affinity: 0.5, rec_count: 1, engine_id: 'genesis', popularity: 1 },
+          { type: 'series', tmdb_id: 'null-1', imdb_id: 'ttnull1', title: 'N1', year: 2020, vote_average: 7, vote_count: 1000, affinity: 0.5, rec_count: 1, engine_id: null, popularity: 1 },
+          { type: 'series', tmdb_id: 'genesis-repro', imdb_id: 'ttgenrepro', title: 'GenRepro', year: 2022, vote_average: 6, vote_count: 3000, affinity: 0.4, rec_count: 1, engine_id: 'genesis', popularity: 1 },
+        ]);
+        const logMessages = [];
+        const log = { log: (m) => logMessages.push(m), warn: () => {}, error: () => {} };
+        const dispose = engines._register({
+          id: 'x', name: 'X Engine', supportedTypes: ['series'],
+          capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+          requirements: () => ({ ok: true, missing: [] }),
+          generate: async (profile, type, ctx) => { if (ctx && ctx.stats) ctx.stats.seeds = 3; return xCands; },
+        });
+        const profile = config.getProfile(p.id);
+        const ctx = { tmdbKey: 'k', mdblistKey: '', settings: {}, filters: profile.filters || {}, log, watchedIds: { tmdb: new Set(), imdb: new Set() }, dont: new Set(), stats: {} };
+        await pipeline.runEngineBuild(profile, 'series', engines.get('x'), ctx, () => {});
+        const series = rs.getRecommended(p.id, { type: 'series', limit: 100 });
+        assert.strictEqual(series.length, 3, 'only x rows remain');
+        assert.ok(series.every((r) => r.engine_id === 'x'), 'all series rows are engine_id x');
+        const repro = series.find((r) => r.tmdb_id === 'genesis-repro');
+        assert.ok(repro, 'the re-produced row exists');
+        assert.strictEqual(repro.engine_id, 'x', 'the re-produced row has engine_id x');
+        assert.ok(logMessages.some((m) => /removed 2 series row\(s\) left by another engine/.test(m)), 'the log line is printed');
+        const movie = rs.getRecommended(p.id, { type: 'movie', limit: 100 });
+        assert.strictEqual(movie.length, 1, 'the movie slice is untouched');
+        assert.strictEqual(movie[0].engine_id, 'genesis', 'the movie row is still genesis');
+        dispose();
+      }
+
+      // (b) x stores 0 rows → nothing is pruned (the genesis/NULL rows remain);
+      //     the movie slice is untouched.
+      {
+        rs.clearType(p.id, 'series');
+        rs.upsertCandidates(p.id, [
+          { type: 'series', tmdb_id: 'genesis-1', imdb_id: 'ttgen1', title: 'G1', year: 2020, vote_average: 7, vote_count: 1000, affinity: 0.5, rec_count: 1, engine_id: 'genesis', popularity: 1 },
+          { type: 'series', tmdb_id: 'null-1', imdb_id: 'ttnull1', title: 'N1', year: 2020, vote_average: 7, vote_count: 1000, affinity: 0.5, rec_count: 1, engine_id: null, popularity: 1 },
+        ]);
+        const logMessages = [];
+        const log = { log: (m) => logMessages.push(m), warn: () => {}, error: () => {} };
+        const dispose = engines._register({
+          id: 'x-empty', name: 'X Empty', supportedTypes: ['series'],
+          capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+          requirements: () => ({ ok: true, missing: [] }),
+          generate: async () => [],
+        });
+        const profile = config.getProfile(p.id);
+        const ctx = { tmdbKey: 'k', mdblistKey: '', settings: {}, filters: profile.filters || {}, log, watchedIds: { tmdb: new Set(), imdb: new Set() }, dont: new Set(), stats: {} };
+        await pipeline.runEngineBuild(profile, 'series', engines.get('x-empty'), ctx, () => {});
+        const series = rs.getRecommended(p.id, { type: 'series', limit: 100 });
+        assert.strictEqual(series.length, 2, 'nothing is pruned (the genesis/NULL rows remain)');
+        assert.ok(!logMessages.some((m) => /left by another engine/.test(m)), 'no prune log line');
+        const movie = rs.getRecommended(p.id, { type: 'movie', limit: 100 });
+        assert.strictEqual(movie.length, 1, 'the movie slice is untouched');
+        dispose();
+      }
+    } finally {
+      config.removeProfile(p.id); rs.deleteForProfile(p.id);
     }
   });
 
