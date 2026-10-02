@@ -489,14 +489,15 @@ async function runBench({ profile, engineIds, holdout, type = 'movie', serveOpts
   }
 
   // m2: which targets could be served at all (null when no seam is given).
+  // Card §2.4: the reachability section is movie-only — not run for series.
   let reach = null;
-  if (typeof reachability === 'function') {
+  if (type === 'movie' && typeof reachability === 'function') {
     try { reach = await reachability(targetIds, profile.filters || {}); } catch (err) { log.warn(`[bench] reachability failed: ${err.message}`); }
   }
   if (reach) for (const t of targets) { const r = reach.get(t.tmdb_id); if (r) { t.reachable = r.reachable; t.unreachableReason = r.reason; } }
   const reachableSet = reach ? new Set([...reach].filter(([, r]) => r.reachable).map(([id]) => id)) : null;
 
-  const results = { profile: profile.name, holdout, targets, engines: {} };
+  const results = { profile: profile.name, holdout, targets, engines: {}, type };
   let marqueeRows = null;   // §6: the Marquee stored rows for the serve-strategy comparison
   let marqueeEngine = null;
   for (const id of engineIds) {
@@ -573,10 +574,13 @@ async function runBench({ profile, engineIds, holdout, type = 'movie', serveOpts
 function renderTable(results) {
   const pad = (s, n) => String(s).padEnd(n);
   const pct = (x) => (x == null ? 'n/a' : (x * 100).toFixed(1) + '%');
-  const head = [
-    pad('engine', 10), pad('hit@20', 8), pad('hit@20r', 9), pad('recall@100', 12), pad('meanRank', 10),
-    pad('filterPass', 12), pad('trending@20', 13), pad('stored', 8), 'build(s)',
-  ].join(' ');
+  // Card §2.4: the reachability + serve-strategy sections are movie-only — not
+  // run, and not printed, for series.
+  const isSeries = results.type === 'series';
+  const headCells = [pad('engine', 10), pad('hit@20', 8)];
+  if (!isSeries) headCells.push(pad('hit@20r', 9));
+  headCells.push(pad('recall@100', 12), pad('meanRank', 10), pad('filterPass', 12), pad('trending@20', 13), pad('stored', 8), 'build(s)');
+  const head = headCells.join(' ');
   const lines = [
     `Profile: ${results.profile}   holdout: ${results.holdout}`,
     head,
@@ -584,17 +588,17 @@ function renderTable(results) {
   ];
   for (const [id, e] of Object.entries(results.engines)) {
     const m = e.metrics;
-    lines.push([
-      pad(id, 10),
-      pad(`${m.hitAt20}/${results.holdout}`, 8),
-      pad(m.hitAt20Reachable == null ? 'n/a' : `${m.hitAt20Reachable}/${m.reachableTargets}`, 9),
+    const cells = [pad(id, 10), pad(`${m.hitAt20}/${results.holdout}`, 8)];
+    if (!isSeries) cells.push(pad(m.hitAt20Reachable == null ? 'n/a' : `${m.hitAt20Reachable}/${m.reachableTargets}`, 9));
+    cells.push(
       pad(pct(m.recallAt100), 12),
       pad(m.meanRankOfHits == null ? '—' : m.meanRankOfHits.toFixed(1), 10),
       pad(pct(m.filterPass), 12),
       pad(pct(m.trendingShareAt20), 13),
       pad(String(m.stored), 8),
       m.buildSeconds.toFixed(1),
-    ].join(' '));
+    );
+    lines.push(cells.join(' '));
   }
   lines.push('');
   lines.push('Targets (which engines hit each, top-20):');
@@ -602,7 +606,7 @@ function renderTable(results) {
     const hitters = Object.entries(results.engines)
       .filter(([, e]) => e.hitTargets.includes(t.tmdb_id))
       .map(([id]) => id);
-    const reach = t.reachable === false ? `  [unreachable: ${t.unreachableReason}]` : '';
+    const reach = !isSeries && t.reachable === false ? `  [unreachable: ${t.unreachableReason}]` : '';
     lines.push(`  ${t.title} (${t.tmdb_id}) — ${hitters.length ? hitters.join(', ') : 'none'}${reach}`);
     // m2: where each engine placed it — "#7 served", "#57", or why it was lost.
     const per = Object.entries(results.engines).map(([id, e]) => {
@@ -614,7 +618,7 @@ function renderTable(results) {
     if (per.length) lines.push(`      ${per.join(' · ')}`);
   }
   lines.push('');
-  lines.push("hit@20r = hits among the targets this profile's filters allow at all (n/a when not assessed).");
+  if (!isSeries) lines.push("hit@20r = hits among the targets this profile's filters allow at all (n/a when not assessed).");
   return lines.join('\n');
 }
 

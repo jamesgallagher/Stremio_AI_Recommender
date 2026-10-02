@@ -6809,6 +6809,81 @@ async function main() {
     }
   });
 
+  // ── TV-1 review round 2 (S2): the reachability + serve-strategy sections are
+  //    movie-only (card §2.4) — not run, and not printed, for series. ──
+  await it('TV-1 S2: reachability is movie-only — never called for series; table omits hit@20r + [unreachable:]', async () => {
+    const pipeline = require('../src/engines/pipeline');
+    const DAY = 86400e3;
+    const base = Date.parse('2026-06-01T00:00:00Z');
+    const mk = (i) => ({
+      simkl_id: i, kind: 'show', imdb_id: 'tt' + i, tmdb_id: 's2' + i, title: 'Show ' + i, year: 2020,
+      status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0,
+      last_watched_at: base + i * DAY, first_watched_at: base + i * DAY,
+      first_real_at: base + i * DAY, last_real_at: base + i * DAY,
+      stamps: 10, real_stamps: 10, eps_per_week: null,
+    });
+    // SERIES: the reachability spy must never be called.
+    let seriesReachCalled = 0;
+    const seriesReachability = async () => { seriesReachCalled++; return new Map(); };
+    const stubSeriesTargets = Array.from({ length: 10 }, (_, i) => 's2' + (20 - i));
+    const disposeSeries = engines._register({
+      id: 'bench-stub-s2', name: 'Bench stub S2', supportedTypes: ['series'],
+      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+      requirements: () => ({ ok: true, missing: [] }),
+      generate: async () => stubSeriesTargets.map((t) => ({
+        type: 'series', tmdb_id: t, imdb_id: 'tts' + t.slice(2), title: 'Show ' + t.slice(2), year: 2020,
+        genres: 'Action', primary_genre: 'Action', vote_average: 8, vote_count: 5000,
+        affinity: 10, rankScore: 10, popularity: 5, poster: null,
+      })),
+    });
+    const pSeries = config.addProfile('INT-TV1-S2-series');
+    try {
+      watchedStore.upsertSeriesProgress(pSeries.id, Array.from({ length: 20 }, (_, i) => mk(i + 1)));
+      config.updateProfile(pSeries.id, { filters: {} });
+      const seriesResults = await bench.runBench({
+        profile: config.getProfile(pSeries.id), engineIds: ['bench-stub-s2'], holdout: 10, type: 'series',
+        deps: { engines, pipeline, rs, watchedStore, db, settings, selectServe: rs.selectServe, log: quiet, reachability: seriesReachability },
+      });
+      assert.strictEqual(seriesReachCalled, 0, 'reachability must NOT run for series');
+      const seriesTable = bench.renderTable(seriesResults);
+      assert.ok(!/hit@20r/.test(seriesTable), 'no hit@20r column for series');
+      assert.ok(!/\[unreachable:/.test(seriesTable), 'no [unreachable: labels for series');
+    } finally {
+      disposeSeries();
+      config.removeProfile(pSeries.id); rs.deleteForProfile(pSeries.id); watchedStore.deleteForProfile(pSeries.id);
+    }
+    // MOVIE: reachability still runs (unchanged).
+    let movieReachCalled = 0;
+    const movieReachability = async () => { movieReachCalled++; return new Map(); };
+    const movieTargets = Array.from({ length: 30 }, (_, i) => 'm' + (i + 1));
+    const stubMovieTargets = movieTargets.slice();
+    const disposeMovie = engines._register({
+      id: 'bench-stub-movie', name: 'Bench stub movie', supportedTypes: ['movie'],
+      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+      requirements: () => ({ ok: true, missing: [] }),
+      generate: async () => stubMovieTargets.map((t) => ({
+        type: 'movie', tmdb_id: t, imdb_id: 'ttm' + t.slice(1), title: 'Movie ' + t.slice(1), year: 2020,
+        genres: 'Action', primary_genre: 'Action', vote_average: 8, vote_count: 5000,
+        affinity: 10, rankScore: 10, popularity: 5, poster: null,
+      })),
+    });
+    const pMovie = config.addProfile('INT-TV1-S2-movie');
+    try {
+      watchedStore.upsertMany(pMovie.id, movieTargets.map((t) => ({
+        simkl_id: 2000 + Number(t.slice(1)), type: 'movie', imdb_id: 'ttm' + t.slice(1), tmdb_id: t, title: 'Movie ' + t.slice(1), year: 2020, watched_at: base + Number(t.slice(1)) * DAY,
+      })));
+      config.updateProfile(pMovie.id, { filters: {} });
+      await bench.runBench({
+        profile: config.getProfile(pMovie.id), engineIds: ['bench-stub-movie'], holdout: 10, type: 'movie',
+        deps: { engines, pipeline, rs, watchedStore, db, settings, selectServe: rs.selectServe, log: quiet, reachability: movieReachability },
+      });
+      assert.strictEqual(movieReachCalled, 1, 'reachability still runs for movie');
+    } finally {
+      disposeMovie();
+      config.removeProfile(pMovie.id); rs.deleteForProfile(pMovie.id); watchedStore.deleteForProfile(pMovie.id);
+    }
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();
