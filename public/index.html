@@ -1483,7 +1483,7 @@ function trainerDraw(id) {
   const now = Date.now();
   const engine = p && ENGINES.find(e => e.id === p.filters.engine_movie);
   const notice = (p && p.filters.engine_movie !== 'marquee')
-    ? `<div class="tr-notice">Ratings still save to Simkl, but this profile's movies come from ${esc(engine ? engine.name : (p.filters.engine_movie || 'another engine'))}, so your ratings won't change its recommendations. Switch the Movies engine to Marquee in Filters.</div>`
+    ? `<div class="tr-notice">Ratings still save to Simkl, but this profile's movies come from ${esc(engine ? engine.name : (p.filters.engine_movie || 'another engine'))}, so your ratings won't change its recommendations. Switch the Movies engine to Marquee Cinema in Filters.</div>`
     : '';
   const rows = d.items.length
     ? d.items.map(item => TrainerUI.rowHtml(item, { canRate, now })).join('')

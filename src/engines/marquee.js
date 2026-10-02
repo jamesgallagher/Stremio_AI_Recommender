@@ -75,7 +75,7 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
   // 0–5: Simkl ratings sync (ME-03) — activities-gated, never throws (MI-3).
   // Skipped when ctx.marqueeSkipSync (P5 backtest seam).
   if (ctx.marqueeSkipSync !== true) {
-    onProgress(0, 'Marquee: syncing Simkl ratings…');
+    onProgress(0, 'Marquee Cinema: syncing Simkl ratings…');
     try { await f.syncRatings(profile, { now: nowMs, log }); }
     catch (err) { log.warn(`[marquee] ratings sync failed: ${err.message}`); }
   }
@@ -91,13 +91,13 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
 
   // 5–20: the rating-weighted taste model + seeds + the cached local-LLM brief
   // (ME-04). Enrichment rides the deepMeta seam (hermetic under a stub).
-  onProgress(5, 'Marquee: building taste model…');
+  onProgress(5, 'Marquee Cinema: building taste model…');
   // Trainer T2 (N5): abandoned films are NEUTRAL — no taste event of any kind —
   // so buildTaste no longer takes the abandoned set. It is still used to drop
   // the films as candidates (ctx.marqueeAbandoned) and in the build log.
   const tasteModel = await taste.buildTaste(profile.id, ctx.tmdbKey, cfg, { nowMs, enrichFetcher: f.deepMeta, log });
   const seeds = taste.seedsFor(profile.id, cfg, { nowMs });
-  onProgress(12, 'Marquee: building taste brief…');
+  onProgress(12, 'Marquee Cinema: building taste brief…');
   const brief = await taste.tasteBrief(profile.id, tasteModel, { chain, chat, cfg, log, now: nowMs });
   const briefHash = brief ? taste.briefHash(brief) : null;
   const fitOn = !!brief && chain.length > 0 && cfg.llm_fit.enabled !== false;
@@ -110,7 +110,7 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
   const envelope = filters.compileEnvelope(ctx.filters || profile.filters || {}, { nowYear, genreMap });
 
   // 20–45: gather candidates S1–S7 (ME-05).
-  onProgress(20, 'Marquee: gathering candidates…');
+  onProgress(20, 'Marquee Cinema: gathering candidates…');
   const { candidates, meta } = await sources.gatherCandidates(profile, ctx, {
     taste: tasteModel, brief, briefHash, seeds, envelope, cfg, genreMap, fetchers: f, chain, log,
     onProgress: (p, l) => onProgress(20 + (p / 100) * 25, l),
@@ -119,21 +119,21 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
   let final = [];
   if (candidates.length) {
     // 45–75: lookup + hard filter + deterministic score (ME-06).
-    onProgress(45, 'Marquee: scoring candidates…');
+    onProgress(45, 'Marquee Cinema: scoring candidates…');
     const { scored, envelopeStats } = await scoring.scoreCandidates(profile, ctx, candidates, {
       taste: tasteModel, envelope, cfg, gatherMeta: meta, fetchers: f, nowYear, nowMs, log,
       onProgress: (p, l) => onProgress(45 + (p / 100) * 30, l),
     });
 
     // 75–95: local-LLM fit (ME-07) — degrades to the P3 output when absent.
-    onProgress(75, 'Marquee: applying LLM fit…');
+    onProgress(75, 'Marquee Cinema: applying LLM fit…');
     const fitScored = await llmFit.applyLlmFit(profile.id, scored, {
       brief, briefHash, cfg, chain, chat, log, now: nowMs,
       onProgress: (p, l) => onProgress(75 + (p / 100) * 20, l),
     });
 
     // 95–100: output shaping (ME-08) — franchise cap, store cap, shortfall log.
-    onProgress(95, 'Marquee: shaping output…');
+    onProgress(95, 'Marquee Cinema: shaping output…');
     final = shape.shapeOutput(fitScored, {
       cfg, listSize: recommendationStore.listSizeFor(profile), envelopeStats, log, profileName: profile.name,
       trace: ctx.marqueeTrace || null, // m2 diagnostics (backtest only)
@@ -157,7 +157,7 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
     }
   }
 
-  onProgress(100, `Marquee: ${final.length} movie(s)`);
+  onProgress(100, `Marquee Cinema: ${final.length} movie(s)`);
   return final;
 }
 
@@ -168,7 +168,7 @@ const DESCRIPTION = "Movies picked from what you've watched and how you rated it
 /** @type {import('./types').Engine} */
 module.exports = {
   id: 'marquee',              // FROZEN slug — persisted in profiles; never reuse/rename
-  name: 'Marquee Engine',
+  name: 'Marquee Cinema',
   description: DESCRIPTION,
   supportedTypes: ['movie'],
   capabilities: {
