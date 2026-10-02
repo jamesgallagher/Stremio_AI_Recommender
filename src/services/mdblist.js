@@ -237,6 +237,25 @@ async function imdbRatings(apiKey, type, imdbIds, log = console) {
   return out;
 }
 
+// AGE-1: MDBList's country-less `certification` for the TV-14 chain's step 4b.
+// Returns Map<imdb, certification string> ('' = no certification). A failed
+// batch yields '' for that chunk (no answer from this step — the chain
+// continues), never a throw.
+async function mediaCerts(apiKey, type, imdbIds, log = console) {
+  const out = new Map();
+  for (let i = 0; i < imdbIds.length; i += BATCH_SIZE) {
+    const chunk = imdbIds.slice(i, i + BATCH_SIZE);
+    try {
+      const infoMap = await mediaInfoBatch(apiKey, type, chunk);
+      for (const id of chunk) out.set(id, infoMap.get(id)?.certification || '');
+    } catch (err) {
+      log.warn?.(`[mdblist] mediaCerts batch failed (${err.message}) — chunk left without a certification`);
+      for (const id of chunk) out.set(id, '');
+    }
+  }
+  return out;
+}
+
 // CP-03: IMDb ratings are near-static — refresh a title's cached rating every
 // two weeks. Env-tunable (IMDB_RATING_TTL_MS) for tests/ops. Shorter than the
 // CSM TTL because a rating can nudge as votes accumulate, but still far off the
@@ -308,5 +327,6 @@ module.exports = {
   parseImdbRating,
   imdbRatings,
   cachedImdbRatings,
+  mediaCerts,
   testKey,
 };

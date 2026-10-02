@@ -35,6 +35,33 @@ Output ONLY the JSON array, no prose.
 Example: [{"id":"tt1234567","ok":true},{"id":"tt7654321","ok":false}]`;
 }
 
+// AGE-1: the TV-14 variant of the age-gate prompt. The first two lines are
+// replaced by the tier's own wording (substituting `{kind}`) — the candidate
+// list and the return contract are identical to buildAgePrompt.
+function buildTierAgePrompt(type, tier, titles) {
+  const kind = type === 'series' ? 'TV series' : 'movies';
+  const lines = titles.map((t) => JSON.stringify({
+    id: t.id,
+    title: t.title,
+    year: t.year || undefined,
+    genres: t.genres && t.genres.length ? t.genres : undefined,
+    certification: t.certification || undefined,
+    overview: t.overview ? String(t.overview).slice(0, 160) : undefined,
+  })).join('\n');
+  const wording = tier.llm.wording.replace('{kind}', kind);
+
+  return `${wording}
+
+Candidates (one JSON object per line):
+${lines}
+
+Return a JSON array with one object PER candidate, each with exactly:
+- "id": the candidate id, copied verbatim (never invent one)
+- "ok": true if suitable, false if not
+Output ONLY the JSON array, no prose.
+Example: [{"id":"tt1234567","ok":true},{"id":"tt7654321","ok":false}]`;
+}
+
 // Pull a JSON array out of a model response. Tolerates fenced JSON,
 // prose-wrapped arrays, and json-mode object wrappers ({"results":[...]}).
 function extractArray(text) {
@@ -87,8 +114,16 @@ const CURATOR_SYSTEM = 'You are a film and television curator with broad knowled
 // verdicts then pre-warm the request-path search cache and vice versa. `id`
 // stays whatever the caller matches its own list on, so the returned veto Set
 // is unaffected.
-async function ageGate(type, ageLimit, titles, log = console) {
+//
+// AGE-1: `opts.tier` (optional) switches the LLM step to a tier's own wording
+// and cache key. Without `opts.tier` the behaviour is byte-identical to before
+// (the legacy age+1 judgement, keyed on the age limit). With it, the cache key
+// is `${type}:${tier.llm.cacheKey}:${id}` (so TV-14 judgements never mix with
+// the legacy age-14/15 caches) and the prompt's first two lines are the tier's
+// wording.
+async function ageGate(type, ageLimit, titles, log = console, opts = {}) {
   if (!titles.length) return new Set();
+  const tier = opts.tier;
 
   // Persistent verdict cache first: a title's suitability at a given age is a
   // stable fact, so a title judged once is never re-sent to the LLM. This is the
@@ -96,7 +131,7 @@ async function ageGate(type, ageLimit, titles, log = console) {
   // candidates and the Groq governor queue grew faster than it drained. Only
   // NEW titles fall through to the LLM below.
   const cache = store.loadAgeVerdicts();
-  const keyOf = (t) => `${type}:${ageLimit}:${t.cacheId ?? t.id}`;
+  const keyOf = (t) => `${type}:${tier ? tier.llm.cacheKey : ageLimit}:${t.cacheId ?? t.id}`;
   const vetoed = new Set();
   const uncached = [];
   let hits = 0;
@@ -117,7 +152,7 @@ async function ageGate(type, ageLimit, titles, log = console) {
   }
 
   const validIds = new Set(uncached.map((t) => t.id));
-  const prompt = buildAgePrompt(type, ageLimit, uncached);
+  const prompt = tier ? buildTierAgePrompt(type, tier, uncached) : buildAgePrompt(type, ageLimit, uncached);
   log.log(`[llm] full age-gate prompt for ${type} (${uncached.length} new, ${hits} cached):\n----- PROMPT START -----\n${prompt}\n----- PROMPT END -----`);
   const minVerdicts = Math.ceil(uncached.length * 0.6);
   const validate = (text) => {
@@ -267,6 +302,7 @@ async function generateCandidates(type, opts = {}, log = console) {
 module.exports = {
   ageGate,
   buildAgePrompt,
+  buildTierAgePrompt,
   parseVerdicts,
   buildGeneratePrompt,
   parseTitles,

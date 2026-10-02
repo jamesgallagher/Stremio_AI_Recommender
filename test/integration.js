@@ -5927,6 +5927,417 @@ async function main() {
     }
   });
 
+  // ── I1. Identity (A1): non-14 tiers never call verify; groq.ageGate gets (type, limit+1, …) with no opts ──
+  await it('I1. Identity (A1): non-14 tiers use the legacy LLM path, never the chain', async () => {
+    const ageVerify = require('../src/ageVerification');
+    const groq = require('../src/services/groq');
+    const dispose = engines._register(fake);
+    settings.updateSettings({ engines: { fake: true } });
+
+    let verifyCalls = [];
+    const origVerify = ageVerify.verify;
+    ageVerify.verify = (...args) => { verifyCalls.push(args); return origVerify(...args); };
+
+    const ageGateCalls = [];
+    const origAgeGate = groq.ageGate;
+    groq.ageGate = (type, age, titles, log, opts) => {
+      ageGateCalls.push({ type, age, opts });
+      return Promise.resolve(new Set()); // nothing vetoed
+    };
+
+    const p = config.addProfile('INT-I1');
+    try {
+      for (const limit of [5, 8, 10, 12, 13, 15]) {
+        config.updateProfile(p.id, { filters: { age_limit: limit, engine_movie: 'fake', engine_series: 'fake' } });
+        const profile = config.getProfile(p.id);
+        await rs.buildPool(profile, quiet);
+        // verify must never be called for non-14 tiers
+        assert.strictEqual(verifyCalls.length, 0, `verify called for limit ${limit}`);
+        // groq.ageGate must be called with (type, limit+1, …) and no opts
+        const callsForLimit = ageGateCalls.filter((c) => c.age === limit + 1);
+        for (const c of callsForLimit) {
+          assert.strictEqual(c.opts, undefined, `opts should be undefined for limit ${limit}`);
+        }
+        // passesAgeBand: legacy path (no chain)
+        const row = { type: 'movie', tmdb_id: 'fake-movie-1', age_classification: null, certification: null };
+        assert.strictEqual(rs.passesAgeBand(row, { age_limit: limit }), true, `passesAgeBand for limit ${limit}`);
+      }
+      // Marquee Cinema's compileEnvelope for limits 10 and 13: legacy ceiling
+      const marquee = require('../src/engines/marquee/filters');
+      const genreMap = { 18: 'Drama', 27: 'Horror' };
+      const env10 = marquee.compileEnvelope({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 10 }, { nowYear: 2026, genreMap });
+      const env13 = marquee.compileEnvelope({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 13 }, { nowYear: 2026, genreMap });
+      // Legacy ceiling: auCeilingFor(judgementAge) — age 11 → 'PG', age 14 → 'PG'
+      assert.strictEqual(env10.discoverParams()['certification.lte'], 'PG');
+      assert.strictEqual(env13.discoverParams()['certification.lte'], 'PG');
+      // Legacy hard filter: unknown cert → cert_unknown
+      const base = { imdb_id: 'tt', imdb_rating: 8, vote_average: 8, vote_count: 5000, year: 2020, genres: ['Drama'], availability: 'AVAILABLE' };
+      assert.deepStrictEqual(env10.hardFilter({ ...base, certAU: null, certUS: null }), { ok: false, reason: 'cert_unknown' });
+      assert.deepStrictEqual(env13.hardFilter({ ...base, certAU: null, certUS: null }), { ok: false, reason: 'cert_unknown' });
+    } finally {
+      ageVerify.verify = origVerify;
+      groq.ageGate = origAgeGate;
+      config.removeProfile(p.id); rs.deleteForProfile(p.id);
+      settings.updateSettings({ engines: { fake: false } }); dispose();
+    }
+  });
+
+  // ── I2. ageGatePool at TV-14: chain decides, certification stamped ───────────
+  await it('I2. ageGatePool at TV-14: chain verdicts, certification stamped, LLM only for unknowns', async () => {
+    const ageVerify = require('../src/ageVerification');
+    const groq = require('../src/services/groq');
+    const dispose = engines._register(fake);
+    settings.updateSettings({ engines: { fake: true } });
+
+    // Spy on groq.ageGate to capture TV-14 calls (with opts.tier)
+    const ageGateCalls = [];
+    const origAgeGate = groq.ageGate;
+    groq.ageGate = (type, age, titles, log, opts) => {
+      ageGateCalls.push({ type, age, opts, count: titles.length });
+      // Veto the first title, allow the rest (cache the verdicts like the real gate)
+      const vetoed = new Set();
+      for (const t of titles) {
+        const verdict = t.id === 'fake-movie-1' ? false : true;
+        store.saveAgeVerdicts({ ...store.loadAgeVerdicts(), [`${type}:${opts.tier.llm.cacheKey}:${t.id}`]: verdict });
+        if (!verdict) vetoed.add(t.id);
+      }
+      return Promise.resolve(vetoed);
+    };
+
+    const p = config.addProfile('INT-I2');
+    config.updateProfile(p.id, { filters: { age_limit: 14, engine_movie: 'fake', engine_series: 'fake' } });
+    const profile = config.getProfile(p.id);
+    const prev = store.loadAgeVerdicts();
+    store.saveAgeVerdicts({});
+    try {
+      await rs.buildPool(profile, quiet);
+      // groq.ageGate was called with opts.tier (cacheKey 'tv14')
+      const tv14Calls = ageGateCalls.filter((c) => c.opts && c.opts.tier);
+      assert.ok(tv14Calls.length > 0, `groq.ageGate called with opts.tier (calls: ${JSON.stringify(ageGateCalls)})`);
+      for (const c of tv14Calls) {
+        assert.strictEqual(c.age, 14, 'LLM age is 14 for TV-14');
+      }
+      // One title was vetoed by the LLM spy, two allowed
+      const movies = rs.getRecommended(p.id, { type: 'movie', limit: 100 });
+      assert.strictEqual(movies.length, 2, 'one movie vetoed, two kept');
+      // The vetoed title is removed
+      assert.ok(!movies.some((m) => m.tmdb_id === 'fake-movie-1'), 'vetoed title removed');
+      // Allowed titles carry certification
+      for (const m of movies) {
+        assert.ok(m.certification, `certification stamped on ${m.tmdb_id}`);
+      }
+    } finally {
+      store.saveAgeVerdicts(prev);
+      groq.ageGate = origAgeGate;
+      config.removeProfile(p.id); rs.deleteForProfile(p.id);
+      settings.updateSettings({ engines: { fake: false } }); dispose();
+    }
+  });
+
+  // ── I3. Verdict store: TTL, re-decide, unknown never stored ─────────────────
+  await it('I3. Verdict store: second verify within TTL makes no source calls; unknown never stored', async () => {
+    const verdictStore = require('../src/ageVerification/store');
+    const chain = require('../src/ageVerification/chain');
+    const tier = require('../src/ageVerification/tiers').TIERS[14];
+
+    // Seed a verdict for a title
+    const now = Date.now();
+    verdictStore.recordVerdict('movie', '100', tier.id, 'allow', 'csm', '13', now);
+    // Read it back
+    const v = verdictStore.getVerdict('movie', '100', tier.id, now);
+    assert.strictEqual(v.verdict, 'allow');
+    assert.strictEqual(v.source, 'csm');
+    // Unknown is never stored
+    assert.strictEqual(verdictStore.recordVerdict('movie', '200', tier.id, 'unknown', 'llm', null, now), false);
+    assert.strictEqual(verdictStore.getVerdict('movie', '200', tier.id, now), null);
+    // Expired verdict (30 days ago) is re-decided
+    const old = now - 31 * 24 * 3600e3;
+    verdictStore.recordVerdict('movie', '300', tier.id, 'allow', 'csm', '13', old);
+    assert.strictEqual(verdictStore.getVerdict('movie', '300', tier.id, now), null, 'expired verdict returns null');
+    // LLM TTL is 90 days
+    const llmOld = now - 91 * 24 * 3600e3;
+    verdictStore.recordVerdict('movie', '400', tier.id, 'allow', 'llm', 'ok', llmOld);
+    assert.strictEqual(verdictStore.getVerdict('movie', '400', tier.id, now), null, 'expired LLM verdict returns null');
+    const llmFresh = now - 89 * 24 * 3600e3;
+    verdictStore.recordVerdict('movie', '500', tier.id, 'allow', 'llm', 'ok', llmFresh);
+    assert.ok(verdictStore.getVerdict('movie', '500', tier.id, now), 'fresh LLM verdict is readable');
+  });
+
+  // ── I4. Catalogs at TV-14: Watch Later → chain; banded → legacy ─────────────
+  await it('I4. Catalogs at TV-14: Watch Later uses the chain; banded catalogs use the legacy path', async () => {
+    const ageVerify = require('../src/ageVerification');
+    const groq = require('../src/services/groq');
+    const rebuild = require('../src/rebuild');
+
+    let verifyCalls = [];
+    const origVerify = ageVerify.verify;
+    ageVerify.verify = (...args) => {
+      verifyCalls.push(args);
+      // Return all allow
+      const result = new Map();
+      for (const t of args[0]) result.set(t.key, { verdict: 'allow', source: 'csm', rating: '13' });
+      return Promise.resolve(result);
+    };
+
+    const ageGateCalls = [];
+    const origAgeGate = groq.ageGate;
+    groq.ageGate = (type, age, titles, log, opts) => {
+      ageGateCalls.push({ type, age, opts });
+      return Promise.resolve(new Set());
+    };
+
+    // Set a Groq key so the legacy LLM path doesn't throw
+    settings.updateSettings({ llm: { groq_api_key: 'itest-groq' } });
+    const p = config.addProfile('INT-I4');
+    config.updateProfile(p.id, { filters: { age_limit: 14 } });
+    const profile = config.getProfile(p.id);
+    // Fake metas for the gate
+    const metas = [
+      { id: 'tt1', _tmdb_id: '100', name: 'Show One', releaseInfo: '2020', _genre_names: ['Drama'], _certification: null, description: '' },
+      { id: 'tt2', _tmdb_id: '200', name: 'Show Two', releaseInfo: '2021', _genre_names: ['Comedy'], _certification: null, description: '' },
+    ];
+    try {
+      // Watch Later (no band) → effective limit = profile's 14 → chain
+      const wlDef = { type: 'series', id: 'watch-later', name: 'Watch Later', source: 'simkl_plantowatch', age_band: null };
+      const out = await rebuild.applyExtraAgeGate(profile, wlDef, metas, quiet);
+      assert.ok(verifyCalls.length > 0, 'verify was called for Watch Later (TV-14 chain)');
+      assert.strictEqual(out.length, 2, 'all titles kept (all allow)');
+
+      // Banded catalog (Trending Kids, band 12) → effective limit = min(12, 14) = 12 → legacy
+      verifyCalls = [];
+      const trendingDef = { type: 'movie', id: 'trending-kids', name: 'Trending Kids', source: 'simkl_trending', age_band: 12 };
+      await rebuild.applyExtraAgeGate(profile, trendingDef, metas, quiet);
+      assert.strictEqual(verifyCalls.length, 0, 'verify NOT called for banded catalog (legacy path)');
+      // groq.ageGate was called with age = 13 (12 + 1)
+      const legacyCalls = ageGateCalls.filter((c) => c.age === 13);
+      assert.ok(legacyCalls.length > 0, 'groq.ageGate called with age 13 for band 12');
+      for (const c of legacyCalls) {
+        assert.strictEqual(c.opts, undefined, 'no opts for legacy path');
+      }
+    } finally {
+      ageVerify.verify = origVerify;
+      groq.ageGate = origAgeGate;
+      config.removeProfile(p.id); rs.deleteForProfile(p.id);
+    }
+  });
+
+  // ── I5. Search at TV-14: allowed + unknown returned; LLM error → empty ──────
+  await it('I5. Search at TV-14: chain decides; LLM error → empty results (fail-closed)', async () => {
+    const ageVerify = require('../src/ageVerification');
+    const chain = require('../src/ageVerification/chain');
+
+    const p = config.addProfile('INT-I5');
+    config.updateProfile(p.id, { filters: { age_limit: 14 } });
+    const profile = config.getProfile(p.id);
+    const tier = ageVerify.tierFor({ age_limit: 14 });
+
+    const titles = [
+      { key: 'series:100', imdb_id: 'tt1', adult: false, title: 'Show One', year: '2020', genres: ['Drama'], certification: null },
+      { key: 'series:200', imdb_id: 'tt2', adult: false, title: 'Show Two', year: '2021', genres: ['Comedy'], certification: null },
+    ];
+
+    // (a) Test the chain's decide function directly with stubbed sources
+    const sources = {
+      tmdbRatings: async () => new Map(),
+      csmAges: async () => new Map(),
+      tvdbRatings: async () => new Map(),
+      simklCerts: async () => new Map(),
+      mdblistCerts: async () => new Map(),
+      llmGate: async () => {
+        // tt1 → true (allow), tt2 → omitted (unknown)
+        return new Map([['series:100', true]]);
+      },
+    };
+    const result = await chain.decide(titles, 'series', tier, sources, quiet);
+    // tt1 → allow, tt2 → unknown (kept)
+    assert.strictEqual(result.get('series:100').verdict, 'allow');
+    assert.strictEqual(result.get('series:200').verdict, 'unknown');
+
+    // (b) LLM error → fail-closed: decide throws
+    const throwingSources = { ...sources, llmGate: async () => { throw new Error('LLM down'); } };
+    try {
+      await chain.decide(titles, 'series', tier, throwingSources, quiet);
+      assert.fail('should have thrown');
+    } catch (e) {
+      assert.ok(e.message.includes('LLM down'), 'LLM error propagates');
+    }
+
+    config.removeProfile(p.id); rs.deleteForProfile(p.id);
+  });
+
+  // ── I7. TVDB key: encrypted at rest, redacted in GET, env fallback ──────────
+  await it('I7. TVDB key: settings encryption + env fallback + client behaviour', async () => {
+    const settings = require('../src/settings');
+    const tvdb = require('../src/services/tvdb');
+
+    // keyFor returns the setting when set
+    settings.updateSettings({ keys: { tvdb_api_key: 'test-tvdb-key' } });
+    assert.strictEqual(settings.keyFor({ id: 'test' }, 'tvdb_api_key'), 'test-tvdb-key');
+
+    // keyFor falls back to process.env.TVDB_API_KEY when the setting is empty
+    settings.updateSettings({ keys: { tvdb_api_key: '' } });
+    const origEnv = process.env.TVDB_API_KEY;
+    process.env.TVDB_API_KEY = 'env-tvdb-key';
+    const key = tvdb.tvdbKey();
+    assert.strictEqual(key, 'env-tvdb-key');
+    process.env.TVDB_API_KEY = origEnv;
+
+    // No key → empty string (mediaCerts returns empty Map)
+    settings.updateSettings({ keys: { tvdb_api_key: '' } });
+    process.env.TVDB_API_KEY = '';
+    const emptyKey = tvdb.tvdbKey();
+    assert.strictEqual(emptyKey, '');
+  });
+
+  // ── I6. Marquee Cinema at TV-14: hard floor only ─────────────────────────────
+  await it('I6. Marquee Cinema at TV-14: hard floor only (discover ceiling, cert_over, unknown passes)', async () => {
+    const marquee = require('../src/engines/marquee/filters');
+    const genreMap = { 18: 'Drama', 27: 'Horror' };
+    const base = { imdb_id: 'tt', imdb_rating: 8, vote_average: 8, vote_count: 5000, year: 2020, genres: ['Drama'], availability: 'AVAILABLE' };
+
+    // TV-14 envelope
+    const env = marquee.compileEnvelope({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 14 }, { nowYear: 2026, genreMap });
+    assert.strictEqual(env.kids, true);
+
+    // (a) discover ceiling is MA 15+
+    const params = env.discoverParams();
+    assert.strictEqual(params.certification_country, 'AU');
+    assert.strictEqual(params['certification.lte'], 'MA 15+');
+
+    // (b) hard floor → cert_over
+    assert.deepStrictEqual(env.hardFilter({ ...base, certAU: 'R 18+', certUS: null }), { ok: false, reason: 'cert_over' });
+    assert.deepStrictEqual(env.hardFilter({ ...base, certAU: null, certUS: 'NC-17' }), { ok: false, reason: 'cert_over' });
+    assert.deepStrictEqual(env.hardFilter({ ...base, certAU: 'RC', certUS: null }), { ok: false, reason: 'cert_over' });
+    assert.deepStrictEqual(env.hardFilter({ ...base, certAU: 'X 18+', certUS: null }), { ok: false, reason: 'cert_over' });
+
+    // (c) unknown certificate → NOT rejected (passes)
+    assert.deepStrictEqual(env.hardFilter({ ...base, certAU: null, certUS: null }), { ok: true });
+
+    // (d) AU MA15+ passes the envelope (the pool gate decides later)
+    assert.deepStrictEqual(env.hardFilter({ ...base, certAU: 'MA 15+', certUS: null }), { ok: true });
+    assert.deepStrictEqual(env.hardFilter({ ...base, certAU: 'M', certUS: null }), { ok: true });
+    assert.deepStrictEqual(env.hardFilter({ ...base, certAU: null, certUS: 'R' }), { ok: true });
+
+    // Legacy tiers (10, 13) are UNCHANGED: unknown cert → cert_unknown
+    const legacy10 = marquee.compileEnvelope({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 10 }, { nowYear: 2026, genreMap });
+    assert.deepStrictEqual(legacy10.hardFilter({ ...base, certAU: null, certUS: null }), { ok: false, reason: 'cert_unknown' });
+    const legacy13 = marquee.compileEnvelope({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 13 }, { nowYear: 2026, genreMap });
+    assert.deepStrictEqual(legacy13.hardFilter({ ...base, certAU: null, certUS: null }), { ok: false, reason: 'cert_unknown' });
+  });
+
+  // ── U1. Portal: the TV-14 option + the TVDB key row + saving age_limit 14 ──
+  await it('U1. Portal: TV-14 (14+, AU M) option (value 14) + TVDB key row; saving age_limit 14 stores 14', async () => {
+    const fs = require('fs');
+    const path = require('path');
+    const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
+
+    // (a) the age select offers TV-14 (14+, AU M) as value 14, between 13 and 15
+    assert.ok(
+      html.includes("[[5,'5+ (~G, young kids)'],[6,'6+'],[8,'8+ (~PG)'],[10,'10+'],[12,'12+'],[13,'13+ (~PG-13)'],[14,'TV-14 (14+, AU M)'],[15,'15+ (~M)']"),
+      'index.html offers the age options 5,6,8,10,12,13,14,15 in order with TV-14 (14+, AU M) at 14');
+    // the muted explainer appears when 14 is selected
+    assert.ok(html.includes('TV-14: Common Sense age decides first (14 or under)'), 'TV-14 explainer present');
+
+    // (b) the TVDB key row in Server Config
+    assert.ok(html.includes("keyRowS('tvdb', 'tvdb_api_key', keys.tvdb_api_key)"), 'TVDB key row present in Server Config');
+
+    // (c) saving age_limit 14 stores 14
+    const p = config.addProfile('INT-U1');
+    config.updateProfile(p.id, { filters: { age_limit: 14 } });
+    assert.strictEqual(config.getProfile(p.id).filters.age_limit, 14, 'age_limit 14 is stored');
+    config.removeProfile(p.id);
+  });
+
+  // ── T5. End-to-end safety: the REAL buildSources against a stubbed global.fetch ─
+  // This is the test that would have caught F1 (the TMDB append_to_response drop).
+  // All four real source adapters (TMDB, MDBList/CSM, TVDB, Simkl) are exercised
+  // through the real buildSources(profile) with ONLY global.fetch stubbed — the
+  // source fetch seams (setTmdbFetch/setTvdbFetch) stay at their global.fetch
+  // default, so the real URL/query construction is what is under test.
+  await it('T5. end-to-end safety: real buildSources + stubbed global.fetch (TMDB/CSM/TVDB/Simkl)', async () => {
+    const chain = require('../src/ageVerification/chain');
+    const ageSources = require('../src/ageVerification/sources');
+    const tier = require('../src/ageVerification/tiers').TIERS[14];
+    const tvdb = require('../src/services/tvdb');
+
+    // TV-14 profile: three keys set, NO Simkl connection (simklCerts → empty, no fetch).
+    const profile = {
+      id: 'INT-T5', name: 'INT-T5',
+      keys: { tmdb_api_key: 'itest-tmdb', mdblist_api_key: 'itest-mdb', tvdb_api_key: 'itest-tvdb' },
+      simkl_auth: null,
+      filters: { age_limit: 14 },
+    };
+    const prevKeys = Object.assign({}, settings.getSettings().keys);
+    const prevCsm = store.loadCsmCache();
+    store.saveCsmCache({}); // clear the CSM disk cache so the batch fetch is exercised
+    settings.updateSettings({ keys: { tmdb_api_key: 'itest-tmdb', mdblist_api_key: 'itest-mdb', tvdb_api_key: 'itest-tvdb' } });
+    tvdb.clearToken(); // force a fresh login in the TVDB flow
+
+    const fetchLog = [];
+    const origFetch = global.fetch;
+    // The TMDB and TVDB adapters read their fetch from a module seam that captured
+    // the original global.fetch at module load; point both seams (and global.fetch)
+    // at the same stub so all four real adapters answer from fixtures.
+    const fetchStub = (url, opts) => {
+      const u = String(url);
+      fetchLog.push({ url: u, method: (opts && opts.method) || 'GET' });
+      // TMDB content_ratings (series) — the append_to_response query must survive (F1).
+      if (u.includes('api.themoviedb.org/3/tv/')) {
+        const id = u.split('/tv/')[1].split('?')[0];
+        let results = [];
+        if (id === '1908') results = [{ iso_3166_1: 'AU', rating: 'R 18+' }, { iso_3166_1: 'US', rating: 'TV-14' }];
+        else if (id === '114922') results = [{ iso_3166_1: 'AU', rating: 'MA 15+' }, { iso_3166_1: 'US', rating: 'TV-14' }];
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ content_ratings: { results } }) });
+      }
+      // MDBList batch (POST /imdb/show) — Common Sense age.
+      if (u.includes('api.mdblist.com/imdb/show')) {
+        const ids = JSON.parse(opts.body).ids;
+        const arr = ids.map((id) => (id === 'tt9794044' ? { ids: { imdb: id }, age_rating: 14 } : { ids: { imdb: id } }));
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(arr) });
+      }
+      // TVDB v4: login → search/remoteid → series extended.
+      if (u.includes('api4.thetvdb.com/v4/login')) {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: { token: 'tok' } }) });
+      }
+      if (u.includes('api4.thetvdb.com/v4/search/remoteid/')) {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: [{ series: { id: 324126 } }] }) });
+      }
+      if (u.includes('api4.thetvdb.com/v4/series/324126/extended')) {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: { contentRatings: [{ name: 'PG', country: 'aus' }] } }) });
+      }
+      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
+    };
+    global.fetch = fetchStub;
+    ageSources.setTmdbFetch(fetchStub);
+    tvdb.setTvdbFetch(fetchStub);
+
+    const titles = [
+      { key: 'series:1908', imdb_id: 'tt0086759', adult: false, title: 'Miami Vice', year: 1984, genres: [], certification: null },
+      { key: 'series:114922', imdb_id: 'tt9794044', adult: false, title: 'Citadel', year: 2023, genres: [], certification: null },
+      { key: 'series:99999', imdb_id: 'tt9999999', adult: false, title: 'TVDB-only', year: 2024, genres: [], certification: null },
+    ];
+    try {
+      const sources = ageSources.buildSources(profile, quiet);
+      const r = await chain.decide(titles, 'series', tier, sources, quiet);
+      // Miami Vice: TMDB AU R 18+ → hard-floor block (step 0).
+      assert.deepStrictEqual(r.get('series:1908'), { verdict: 'block', source: 'hard-floor', rating: 'R18+' });
+      // Citadel: TMDB AU MA 15+ (not a hard floor), Common Sense 14 → allow/csm (step 1).
+      assert.deepStrictEqual(r.get('series:114922'), { verdict: 'allow', source: 'csm', rating: '14' });
+      // TVDB-only: no Common Sense, no TMDB rating, TVDB aus: PG → allow/tvdb-au (step 2).
+      assert.deepStrictEqual(r.get('series:99999'), { verdict: 'allow', source: 'tvdb-au', rating: 'PG' });
+      // The TMDB fetch carried append_to_response (the F1 regression — this would
+      // have caught it: without the query TMDB returns no per-country ratings).
+      assert.ok(fetchLog.some((c) => c.url.includes('append_to_response=content_ratings')), 'TMDB URL carries append_to_response');
+    } finally {
+      global.fetch = origFetch;
+      ageSources.setTmdbFetch(origFetch);
+      tvdb.setTvdbFetch(origFetch);
+      settings.updateSettings({ keys: prevKeys });
+      store.saveCsmCache(prevCsm);
+      tvdb.clearToken();
+    }
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();

@@ -314,6 +314,29 @@ async function testMdblist(profile) {
 
 const TESTERS = { tmdb: testTmdb, groq: testGroq, rpdb: testRpdb, mdblist: testMdblist };
 
+// TVDB v4 (AGE-1): validate the TVDB key by logging in (POST /v4/login). The
+// key is exchanged for a token — a 200 with a token means the key is valid.
+// Optional — it only feeds the TV-14 age chain's country-certification fallback.
+async function testTvdb(profile) {
+  const key = profile.keys.tvdb_api_key;
+  if (!key) return { ok: false, error: 'TVDB key not set (optional — TV-14 age chain)' };
+  try {
+    const res = await fetch('https://api4.thetvdb.com/v4/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apikey: key }),
+    });
+    if (res.ok) {
+      const data = await res.json().catch(() => null);
+      if (data?.data?.token) return { ok: true, detail: 'TVDB key valid' };
+      return { ok: false, error: 'TVDB login returned no token' };
+    }
+    return { ok: false, error: `Invalid TVDB key (${res.status})` };
+  } catch (err) {
+    return { ok: false, error: `TVDB test failed: ${err.message}` };
+  }
+}
+
 router.post('/profiles/:id/test/:service', async (req, res) => {
   const profile = config.getProfile(req.params.id);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
@@ -801,11 +824,14 @@ router.get('/profiles/:id/scrobble/unmatched', (req, res) => {
 
 // ---- Server Config (global settings, v6) ----
 
-// Full values returned for portal pre-fill (same policy as the profile API).
+// Values returned for portal pre-fill (same policy as the profile API). The
+// TVDB key (A6) is a pasted third-party secret — redact it in the GET so the
+// raw key is never echoed back (the portal pre-fills a masked value).
 router.get('/settings', (req, res) => {
   const s = settings.getSettings();
+  const out = s ? { ...s, keys: { ...s.keys, tvdb_api_key: redactKey(s.keys.tvdb_api_key) } } : null;
   res.json({
-    settings: s, // null = never set up
+    settings: out, // null = never set up
     complete: settings.isComplete(s),
     locked: settings.settingsLocked(),
   });
@@ -868,7 +894,16 @@ router.put('/settings', (req, res) => {
   try {
     const patch = {};
     if (req.body.llm && typeof req.body.llm === 'object') patch.llm = req.body.llm;
-    if (req.body.keys && typeof req.body.keys === 'object') patch.keys = req.body.keys;
+    if (req.body.keys && typeof req.body.keys === 'object') {
+      patch.keys = { ...req.body.keys };
+      // A6: the TVDB key is redacted in the GET (masked in the portal form). A
+      // save that echoes the mask back (or null) means "unchanged" — keep the
+      // stored value so a masked value never overwrites the real key.
+      const tvdb = req.body.keys.tvdb_api_key;
+      if (tvdb === null || (typeof tvdb === 'string' && (tvdb === '••••' || /^.{4}….{4}$/.test(tvdb)))) {
+        delete patch.keys.tvdb_api_key;
+      }
+    }
     // SC-07: admin engine enable/disable map. Validate against the registry —
     // keep only known ids, coerce to bool, and FORCE Genesis on (it can never be
     // disabled; a body asking to is silently corrected). Unknown ids are dropped
@@ -926,7 +961,7 @@ router.put('/settings', (req, res) => {
 
 // Test one global lookup key by reusing the per-profile testers (they only read
 // `.keys`). Key comes from the request body so an unsaved value can be tested.
-const SETTINGS_KEY_TESTERS = { tmdb: testTmdb, mdblist: testMdblist, rpdb: testRpdb, groq: testGroq };
+const SETTINGS_KEY_TESTERS = { tmdb: testTmdb, mdblist: testMdblist, rpdb: testRpdb, groq: testGroq, tvdb: testTvdb };
 router.post('/settings/test/:service', async (req, res) => {
   const tester = SETTINGS_KEY_TESTERS[req.params.service];
   if (!tester) return res.status(400).json({ error: 'Unknown service' });

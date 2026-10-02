@@ -27,6 +27,19 @@ function ok(name, fn) {
   passed++;
   console.log(`  ✓ ${name}`);
 }
+// Async unit tests (e.g. the AGE-1 decision chain): the promise is collected and
+// awaited at the top of the HTTP section, so a failure still fails the run and the
+// pass count lands in `passed`.
+const asyncPending = [];
+function okAsync(name, fn) {
+  asyncPending.push(new Promise((resolve, reject) => {
+    Promise.resolve(fn()).then(() => {
+      passed++;
+      console.log(`  ✓ ${name}`);
+      resolve();
+    }, reject);
+  }));
+}
 
 console.log('unit:');
 
@@ -1837,12 +1850,15 @@ ok('marquee envelope: kids cert filtering (MD-3)', () => {
   assert.deepStrictEqual(run(null, 'G'), { ok: true });
   // R 18+ (Infinity) → cert_over
   assert.deepStrictEqual(run('R 18+', null), { ok: false, reason: 'cert_over' });
-  // age_limit 14 (judgement 15): M and MA 15+ kept, R over (T1)
+  // age_limit 14 (TV-14 chain tier): hard floor only — AU R18+/X18+/RC, US NC-17.
+  // M and MA 15+ pass; R passes (not hard floor); R 18+ is blocked.
   const kids14 = marquee.compileEnvelope({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 14 }, { nowYear: 2026, genreMap });
   assert.strictEqual(kids14.judgementAge, 15);
   assert.deepStrictEqual(kids14.hardFilter({ ...base, certAU: 'M', certUS: null }), { ok: true });
   assert.deepStrictEqual(kids14.hardFilter({ ...base, certAU: 'MA 15+', certUS: null }), { ok: true });
-  assert.deepStrictEqual(kids14.hardFilter({ ...base, certAU: null, certUS: 'R' }), { ok: false, reason: 'cert_over' });
+  assert.deepStrictEqual(kids14.hardFilter({ ...base, certAU: null, certUS: 'R' }), { ok: true });
+  assert.deepStrictEqual(kids14.hardFilter({ ...base, certAU: 'R 18+', certUS: null }), { ok: false, reason: 'cert_over' });
+  assert.deepStrictEqual(kids14.hardFilter({ ...base, certAU: null, certUS: 'NC-17' }), { ok: false, reason: 'cert_over' });
   // strictestMinAge('M','PG') === 15 (the prompt's example)
   assert.strictEqual(marquee.strictestMinAge('M', 'PG'), 15);
   // an adult envelope (age_limit 0) ignores certs entirely
@@ -3511,12 +3527,613 @@ ok('calibrated A2: incremental greedy is fast (425 rows, listSize 50)', () => {
   assert.ok(avg < 40, 'avg ' + avg.toFixed(2) + ' ms must be < 40 ms');
 });
 
+// ---- AGE-1: rating tables (pure) ----
+{
+  const ratings = require('../src/ageVerification/ratings');
+  const tiers = require('../src/ageVerification/tiers');
+  const tier = tiers.TIERS[14];
+  const chain = require('../src/ageVerification/chain');
+
+  ok('AGE-1 R1: normalizeRating / classify', () => {
+    // 'MA 15+' normalises to 'MA15+' → block (series and film)
+    assert.strictEqual(ratings.normalizeRating('MA 15+'), 'MA15+');
+    assert.strictEqual(ratings.classify('MA 15+', 'series', tier), 'block');
+    assert.strictEqual(ratings.classify('MA 15+', 'movie', tier), 'block');
+    // TV-Y7-FV → allow (series)
+    assert.strictEqual(ratings.classify('TV-Y7-FV', 'series', tier), 'allow');
+    // M → allow for both
+    assert.strictEqual(ratings.classify('M', 'series', tier), 'allow');
+    assert.strictEqual(ratings.classify('M', 'movie', tier), 'allow');
+    // a PG-13 show → allow (cross-type: PG-13 is a film rating)
+    assert.strictEqual(ratings.classify('PG-13', 'series', tier), 'allow');
+    // a TV-MA film → block (cross-type: TV-MA is a show rating)
+    assert.strictEqual(ratings.classify('TV-MA', 'movie', tier), 'block');
+    // E, NR, Not Rated, '' → null (no rating)
+    assert.strictEqual(ratings.classify('E', 'series', tier), null);
+    assert.strictEqual(ratings.classify('NR', 'movie', tier), null);
+    assert.strictEqual(ratings.classify('Not Rated', 'series', tier), null);
+    assert.strictEqual(ratings.classify('', 'movie', tier), null);
+  });
+
+  ok('AGE-1 R2: classifyForeign', () => {
+    assert.strictEqual(ratings.classifyForeign('GB', '12A', tier), 'allow');
+    assert.strictEqual(ratings.classifyForeign('GB', '15', tier), 'block');
+    assert.strictEqual(ratings.classifyForeign('IE', '15A', tier), 'block');
+    assert.strictEqual(ratings.classifyForeign('NZ', 'M', tier), 'block');
+    assert.strictEqual(ratings.classifyForeign('NZ', 'R13', tier), 'allow');
+    assert.strictEqual(ratings.classifyForeign('CA', '14A', tier), 'allow');
+    assert.strictEqual(ratings.classifyForeign('CA', '18A', tier), 'block');
+    // 3-letter TVDB codes work
+    assert.strictEqual(ratings.classifyForeign('GBR', '12A', tier), 'allow');
+    // DE 12 → null (not a listed country)
+    assert.strictEqual(ratings.classifyForeign('DE', '12', tier), null);
+  });
+
+  ok('AGE-1 R3: classifyLoose', () => {
+    assert.strictEqual(ratings.classifyLoose('15', tier), 'block');
+    assert.strictEqual(ratings.classifyLoose('12', tier), 'allow');
+    assert.strictEqual(ratings.classifyLoose('M18', tier), 'block');
+    assert.strictEqual(ratings.classifyLoose('NC16', tier), 'block');
+    assert.strictEqual(ratings.classifyLoose('TV-14', tier), 'allow');
+    assert.strictEqual(ratings.classifyLoose('XYZ', tier), null);
+  });
+
+  // ---- AGE-1: decision chain (pure, seams) ----
+  okAsync('AGE-1 C1: chain order — first step that answers wins', async () => {
+    const log = { warn: () => {} };
+    const empty = () => new Map();
+    function run(title, stubs) {
+      const sources = {
+        tmdbRatings: stubs.tmdbRatings || empty,
+        csmAges: stubs.csmAges || empty,
+        tvdbRatings: stubs.tvdbRatings || empty,
+        simklCerts: stubs.simklCerts || empty,
+        mdblistCerts: stubs.mdblistCerts || empty,
+        llmGate: stubs.llmGate || empty,
+      };
+      return chain.decide([title], 'series', tier, sources, log);
+    }
+    // adult flag → hard floor (rating 'adult')
+    let r = await run({ key: 'k1', imdb_id: 'tt1', adult: true }, {});
+    assert.deepStrictEqual(r.get('k1'), { verdict: 'block', source: 'hard-floor', rating: 'adult' });
+    // AU R18+ beats CSM 14 (hard floor is step 0)
+    r = await run({ key: 'k2', imdb_id: 'tt2' }, {
+      tmdbRatings: () => new Map([['k2', { AU: 'R18+' }]]),
+      csmAges: () => new Map([['tt2', 14]]),
+    });
+    assert.deepStrictEqual(r.get('k2'), { verdict: 'block', source: 'hard-floor', rating: 'R18+' });
+    // CSM 14 beats AU MA15+ (CSM is step 1, before AU)
+    r = await run({ key: 'k3', imdb_id: 'tt3' }, {
+      tmdbRatings: () => new Map([['k3', { AU: 'MA15+' }]]),
+      csmAges: () => new Map([['tt3', 14]]),
+    });
+    assert.deepStrictEqual(r.get('k3'), { verdict: 'allow', source: 'csm', rating: '14' });
+    // CSM 15 beats AU PG (CSM block wins over AU allow)
+    r = await run({ key: 'k4', imdb_id: 'tt4' }, {
+      tmdbRatings: () => new Map([['k4', { AU: 'PG' }]]),
+      csmAges: () => new Map([['tt4', 15]]),
+    });
+    assert.deepStrictEqual(r.get('k4'), { verdict: 'block', source: 'csm', rating: '15' });
+    // no CSM, AU M → allow/au
+    r = await run({ key: 'k5', imdb_id: 'tt5' }, { tmdbRatings: () => new Map([['k5', { AU: 'M' }]]) });
+    assert.deepStrictEqual(r.get('k5'), { verdict: 'allow', source: 'au', rating: 'M' });
+    // no CSM, AU MA15+ → block/au
+    r = await run({ key: 'k6', imdb_id: 'tt6' }, { tmdbRatings: () => new Map([['k6', { AU: 'MA15+' }]]) });
+    assert.deepStrictEqual(r.get('k6'), { verdict: 'block', source: 'au', rating: 'MA15+' });
+    // no CSM/AU, US TV-14 → allow/us
+    r = await run({ key: 'k7', imdb_id: 'tt7' }, { tmdbRatings: () => new Map([['k7', { US: 'TV-14' }]]) });
+    assert.deepStrictEqual(r.get('k7'), { verdict: 'allow', source: 'us', rating: 'TV-14' });
+    // no TMDB AU/US, TVDB aus PG → allow/tvdb-au
+    r = await run({ key: 'k8', imdb_id: 'tt8' }, { tvdbRatings: () => new Map([['tt8', { aus: 'PG' }]]) });
+    assert.deepStrictEqual(r.get('k8'), { verdict: 'allow', source: 'tvdb-au', rating: 'PG' });
+    // everything before empty, Simkl TV-PG → allow/simkl
+    r = await run({ key: 'k9', imdb_id: 'tt9' }, { simklCerts: () => new Map([['tt9', 'TV-PG']]) });
+    assert.deepStrictEqual(r.get('k9'), { verdict: 'allow', source: 'simkl', rating: 'TV-PG' });
+    // everything before empty, MDBList '15' → block/mdblist
+    r = await run({ key: 'k10', imdb_id: 'tt10' }, { mdblistCerts: () => new Map([['tt10', '15']]) });
+    assert.deepStrictEqual(r.get('k10'), { verdict: 'block', source: 'mdblist', rating: '15' });
+    // everything before empty, TMDB GB 12 → allow/tmdb-gb
+    r = await run({ key: 'k11', imdb_id: 'tt11' }, { tmdbRatings: () => new Map([['k11', { GB: '12' }]]) });
+    assert.deepStrictEqual(r.get('k11'), { verdict: 'allow', source: 'tmdb-gb', rating: '12' });
+    // everything empty → LLM: true→allow, false→block, omitted→unknown
+    r = await run({ key: 'k12', imdb_id: 'tt12' }, { llmGate: () => new Map([['k12', true]]) });
+    assert.deepStrictEqual(r.get('k12'), { verdict: 'allow', source: 'llm', rating: 'ok' });
+    r = await run({ key: 'k13', imdb_id: 'tt13' }, { llmGate: () => new Map([['k13', false]]) });
+    assert.deepStrictEqual(r.get('k13'), { verdict: 'block', source: 'llm', rating: 'no' });
+    r = await run({ key: 'k14', imdb_id: 'tt14' }, { llmGate: () => new Map() });
+    assert.deepStrictEqual(r.get('k14'), { verdict: 'unknown', source: 'llm', rating: null });
+  });
+
+  okAsync('AGE-1 C2: source economy (once per step, only undecided; TVDB once per title; LLM last)', async () => {
+    const log = { warn: () => {} };
+    const titles = [
+      { key: 'k1', imdb_id: 'tt1' }, // decided at CSM (14)
+      { key: 'k2', imdb_id: 'tt2' }, // decided at AU (M)
+      { key: 'k3', imdb_id: 'tt3' }, // undecided through to LLM
+    ];
+    const calls = { tmdb: [], csm: [], tvdb: [], simkl: [], mdb: [], llm: [] };
+    const sources = {
+      tmdbRatings: (type, ts) => { calls.tmdb.push(ts.map((t) => t.key)); return new Map([['k2', { AU: 'M' }]]); },
+      csmAges: (type, ids) => { calls.csm.push(ids.slice()); return new Map([['tt1', 14]]); },
+      tvdbRatings: (type, ids) => { calls.tvdb.push(ids.slice()); return new Map(); },
+      simklCerts: (type, ids) => { calls.simkl.push(ids.slice()); return new Map(); },
+      mdblistCerts: (type, ids) => { calls.mdb.push(ids.slice()); return new Map(); },
+      llmGate: (type, tier_, ts) => { calls.llm.push(ts.map((t) => t.key)); return new Map([['k3', true]]); },
+    };
+    const r = await chain.decide(titles, 'series', tier, sources, log);
+    assert.deepStrictEqual(r.get('k1'), { verdict: 'allow', source: 'csm', rating: '14' });
+    assert.deepStrictEqual(r.get('k2'), { verdict: 'allow', source: 'au', rating: 'M' });
+    assert.deepStrictEqual(r.get('k3'), { verdict: 'allow', source: 'llm', rating: 'ok' });
+    // TMDB fetched once for the whole set (step 0).
+    assert.strictEqual(calls.tmdb.length, 1);
+    assert.deepStrictEqual(calls.tmdb[0], ['k1', 'k2', 'k3']);
+    // CSM called once with the undecided after step 0 (all three).
+    assert.strictEqual(calls.csm.length, 1);
+    assert.deepStrictEqual(calls.csm[0], ['tt1', 'tt2', 'tt3']);
+    // TVDB fetched once for tt3 (k2 has TMDB AU so it is never fetched); steps
+    // 2, 3 and 4c share the cache → exactly one call.
+    assert.strictEqual(calls.tvdb.length, 1);
+    assert.deepStrictEqual(calls.tvdb[0], ['tt3']);
+    // Simkl and MDBList called once each, only with the still-undecided tt3.
+    assert.strictEqual(calls.simkl.length, 1);
+    assert.deepStrictEqual(calls.simkl[0], ['tt3']);
+    assert.strictEqual(calls.mdb.length, 1);
+    assert.deepStrictEqual(calls.mdb[0], ['tt3']);
+    // LLM called once, only with the title that reached it (k3).
+    assert.strictEqual(calls.llm.length, 1);
+    assert.deepStrictEqual(calls.llm[0], ['k3']);
+  });
+
+  okAsync('AGE-1 C3: source failures (continue + logged; LLM fails closed)', async () => {
+    const warnings = [];
+    const log = { warn: (m) => warnings.push(m) };
+    const titles = [{ key: 'k1', imdb_id: 'tt1' }];
+    // A failing CSM and TVDB give no answer from those steps; the chain continues to LLM.
+    const sources = {
+      tmdbRatings: () => new Map(),
+      csmAges: () => { throw new Error('MDBList CSM down'); },
+      tvdbRatings: () => { throw new Error('TVDB down'); },
+      simklCerts: () => new Map(),
+      mdblistCerts: () => new Map(),
+      llmGate: () => new Map([['k1', true]]),
+    };
+    const r = await chain.decide(titles, 'series', tier, sources, log);
+    assert.deepStrictEqual(r.get('k1'), { verdict: 'allow', source: 'llm', rating: 'ok' });
+    assert.ok(warnings.some((w) => w.includes('csm')), 'CSM failure logged');
+    assert.ok(warnings.some((w) => w.includes('tvdb')), 'TVDB failure logged');
+    // The LLM step fails closed: its error propagates (decide rejects).
+    const sources2 = {
+      tmdbRatings: () => new Map(),
+      csmAges: () => new Map(),
+      tvdbRatings: () => new Map(),
+      simklCerts: () => new Map(),
+      mdblistCerts: () => new Map(),
+      llmGate: () => { throw new Error('Groq down'); },
+    };
+    let rejected = false;
+    try {
+      await chain.decide(titles, 'series', tier, sources2, log);
+    } catch (e) {
+      rejected = true;
+      assert.ok(e.message.includes('Groq down'));
+    }
+    assert.ok(rejected, 'decide must reject when the LLM step throws');
+  });
+
+  // ---- AGE-1: TVDB client (seams) ----
+  const tvdb = require('../src/services/tvdb');
+  const settings = require('../src/settings');
+
+  // T2 (F2): the real TVDB v4 client at the fetch level. A fresh fetch seam +
+  // call log per sub-case isolates T2 from the parallel global-fetch stubs of the
+  // other AGE-1 async tests (which run in parallel via Promise.all).
+  okAsync('AGE-1 T2: TVDB v4 — login, token reuse, 401 re-login, remoteid, extended parse, no-key', async () => {
+    let calls = [];
+    function installStub(handler) {
+      calls = [];
+      tvdb.setTvdbFetch((url, opts) => {
+        const u = String(url);
+        const rec = { method: (opts && opts.method) || 'GET', url: u, body: opts && opts.body, auth: opts && opts.headers && opts.headers.Authorization };
+        calls.push(rec);
+        return handler(u, rec);
+      });
+    }
+    const loginCount = () => calls.filter((c) => c.method === 'POST' && c.url.includes('/v4/login')).length;
+    const seriesExt = () => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: { contentRatings: [
+      { name: 'PG', country: 'aus' }, { name: 'TV-14', country: 'usa' }, { name: '12', country: 'deu' },
+    ] } }) });
+
+    // --- A: no key → empty Map, ZERO fetch calls ---
+    settings.updateSettings({ keys: { tvdb_api_key: '' } });
+    delete process.env.TVDB_API_KEY;
+    tvdb.clearToken();
+    installStub(() => Promise.resolve({ ok: true, json: () => Promise.resolve({}) }));
+    let out = await tvdb.mediaCerts(['tt123'], 'series');
+    assert.ok(out instanceof Map && out.size === 0, 'no key → empty Map');
+    assert.strictEqual(calls.length, 0, 'no key → zero fetch calls');
+
+    // --- B: login POST → remoteid GET → series extended GET; Bearer token header; parse ---
+    settings.updateSettings({ keys: { tvdb_api_key: 'test-key' } });
+    tvdb.clearToken();
+    installStub((u) => {
+      if (u.includes('/v4/login')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: { token: 'tok' } }) });
+      if (u.includes('/v4/search/remoteid/ttseries')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: [{ series: { id: 324126 } }] }) });
+      if (u.includes('/v4/series/324126/extended')) return seriesExt();
+      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
+    });
+    out = await tvdb.mediaCerts(['ttseries'], 'series');
+    assert.strictEqual(loginCount(), 1, 'exactly one login');
+    assert.strictEqual(calls[0].method, 'POST');
+    assert.ok(calls[0].url.includes('/v4/login'), 'call 0 is the login POST');
+    assert.deepStrictEqual(JSON.parse(calls[0].body), { apikey: 'test-key' }, 'login body carries the key');
+    assert.strictEqual(calls[1].method, 'GET');
+    assert.ok(calls[1].url.includes('/v4/search/remoteid/ttseries'), 'call 1 is the remoteid GET');
+    assert.strictEqual(calls[1].auth, 'Bearer tok', 'remoteid carries the token (not the key)');
+    assert.strictEqual(calls[2].method, 'GET');
+    assert.ok(calls[2].url.includes('/v4/series/324126/extended'), 'call 2 is the series extended GET');
+    assert.ok(calls[2].url.includes('short=true'), 'series extended carries short=true');
+    assert.strictEqual(calls[2].auth, 'Bearer tok', 'series extended carries the token');
+    assert.deepStrictEqual(out.get('ttseries'), { aus: 'PG', usa: 'TV-14' }, 'parse keeps only the six chain countries (deu dropped)');
+
+    // --- C: a second mediaCerts reuses the token (no second login) ---
+    installStub((u) => {
+      if (u.includes('/v4/search/remoteid/ttseries')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: [{ series: { id: 324126 } }] }) });
+      if (u.includes('/v4/series/324126/extended')) return seriesExt();
+      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
+    });
+    out = await tvdb.mediaCerts(['ttseries'], 'series');
+    assert.strictEqual(loginCount(), 0, 'second mediaCerts reuses the token — no login');
+    assert.deepStrictEqual(out.get('ttseries'), { aus: 'PG', usa: 'TV-14' });
+
+    // --- D: a 401 on a data GET → exactly one re-login, then retry ---
+    tvdb.clearToken();
+    let remoteid401 = 0;
+    installStub((u) => {
+      if (u.includes('/v4/login')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: { token: 'tok' } }) });
+      if (u.includes('/v4/search/remoteid/tt401')) {
+        remoteid401 += 1;
+        if (remoteid401 === 1) return Promise.resolve({ ok: false, status: 401, json: () => Promise.resolve({}) });
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: [{ series: { id: 324126 } }] }) });
+      }
+      if (u.includes('/v4/series/324126/extended')) return seriesExt();
+      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
+    });
+    out = await tvdb.mediaCerts(['tt401'], 'series');
+    assert.strictEqual(loginCount(), 2, 'initial login + exactly one re-login after the 401');
+    assert.strictEqual(remoteid401, 2, 'remoteid retried once after the 401');
+    assert.deepStrictEqual(out.get('tt401'), { aus: 'PG', usa: 'TV-14' });
+
+    // --- E: a movie match uses /movies/{id}/extended ---
+    tvdb.clearToken();
+    installStub((u) => {
+      if (u.includes('/v4/login')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: { token: 'tok' } }) });
+      if (u.includes('/v4/search/remoteid/ttmovie')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: [{ movie: { id: 12345 } }] }) });
+      if (u.includes('/v4/movies/12345/extended')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: { contentRatings: [
+        { name: '12', country: 'esp' }, { name: 'PG-13', country: 'usa' },
+      ] } }) });
+      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
+    });
+    out = await tvdb.mediaCerts(['ttmovie'], 'movie');
+    const movieExt = calls.find((c) => c.url.includes('/v4/movies/12345/extended'));
+    assert.ok(movieExt, 'movie match uses /movies/{id}/extended');
+    assert.ok(movieExt.url.includes('short=true'), 'movie extended carries short=true');
+    assert.deepStrictEqual(out.get('ttmovie'), { usa: 'PG-13' }, 'movie parse keeps only the six chain countries (esp dropped)');
+
+    // --- F: network error on login → empty object for the title, logged, no throw ---
+    settings.updateSettings({ keys: { tvdb_api_key: 'test-key' } });
+    tvdb.clearToken();
+    tvdb.setTvdbFetch(() => Promise.reject(new Error('network down')));
+    const warnings = [];
+    out = await tvdb.mediaCerts(['tt123'], 'series', { warn: (m) => warnings.push(m) });
+    assert.deepStrictEqual(out.get('tt123'), {}, 'login failure → empty object for the title');
+    assert.ok(warnings.some((w) => w.includes('TVDB login failed')), 'login failure logged');
+
+    // Restore: no key, no env, no token, global fetch untouched.
+    settings.updateSettings({ keys: { tvdb_api_key: '' } });
+    delete process.env.TVDB_API_KEY;
+    tvdb.clearToken();
+    tvdb.setTvdbFetch(global.fetch);
+  });
+
+  okAsync('AGE-1 V3: tvdbKey — Server Config first, then process env', async () => {
+    // Server Config key takes precedence.
+    settings.updateSettings({ keys: { tvdb_api_key: 'config-key' } });
+    process.env.TVDB_API_KEY = 'env-key';
+    assert.strictEqual(tvdb.tvdbKey(), 'config-key');
+    // Env fallback when no Server Config key.
+    settings.updateSettings({ keys: { tvdb_api_key: '' } });
+    assert.strictEqual(tvdb.tvdbKey(), 'env-key');
+    // Neither → empty.
+    delete process.env.TVDB_API_KEY;
+    assert.strictEqual(tvdb.tvdbKey(), '');
+  });
+
+  // ---- AGE-1: verdict store + service API + sources ----
+  const ageStore = require('../src/ageVerification/store');
+  const ageVerify = require('../src/ageVerification');
+  const ageSources = require('../src/ageVerification/sources');
+
+  okAsync('AGE-1 S1: verdict store — record/read/TTL/unknown/prune (per tier)', async () => {
+    const now = Date.now();
+    // Record + read roundtrip
+    ageStore.recordVerdict('series', '111', tier.id, 'allow', 'csm', '14', now);
+    let v = ageStore.getVerdict('series', '111', tier.id, now);
+    assert.deepStrictEqual(v, { verdict: 'allow', source: 'csm', rating: '14' });
+    // Overwrite (same PK)
+    ageStore.recordVerdict('series', '111', tier.id, 'block', 'au', 'R18+', now);
+    v = ageStore.getVerdict('series', '111', tier.id, now);
+    assert.deepStrictEqual(v, { verdict: 'block', source: 'au', rating: 'R18+' });
+    // Unknown verdict never stored (A5)
+    assert.strictEqual(ageStore.recordVerdict('series', '222', tier.id, 'unknown', 'llm', null, now), false);
+    assert.strictEqual(ageStore.getVerdict('series', '222', tier.id, now), null);
+    // TTL: source verdict older than 30 days → expired
+    const old30 = now - 31 * 24 * 3600e3;
+    ageStore.recordVerdict('series', '333', tier.id, 'allow', 'csm', '14', old30);
+    assert.strictEqual(ageStore.getVerdict('series', '333', tier.id, now), null); // expired
+    // TTL: LLM verdict older than 90 days → expired
+    const old90 = now - 91 * 24 * 3600e3;
+    ageStore.recordVerdict('series', '444', tier.id, 'allow', 'llm', 'ok', old90);
+    assert.strictEqual(ageStore.getVerdict('series', '444', tier.id, now), null); // expired
+    // TTL: LLM verdict within 90 days → still valid
+    const old89 = now - 89 * 24 * 3600e3;
+    ageStore.recordVerdict('series', '555', tier.id, 'block', 'llm', 'no', old89);
+    v = ageStore.getVerdict('series', '555', tier.id, now);
+    assert.deepStrictEqual(v, { verdict: 'block', source: 'llm', rating: 'no' });
+    // Prune removes expired rows
+    const pruned = ageStore.prune(now);
+    assert.ok(pruned >= 2); // at least the 333 and 444 rows
+    assert.strictEqual(ageStore.getVerdict('series', '333', tier.id, now), null);
+    assert.strictEqual(ageStore.getVerdict('series', '444', tier.id, now), null);
+  });
+
+  okAsync('AGE-1 S2: service API — verify records; passesStored re-checks', async () => {
+    const log = { warn: () => {} };
+    // verify with a simple chain (CSM answers everything)
+    const sources = {
+      tmdbRatings: () => new Map(),
+      csmAges: () => new Map([['tt1', 14], ['tt2', 15]]),
+      tvdbRatings: () => new Map(),
+      simklCerts: () => new Map(),
+      mdblistCerts: () => new Map(),
+      llmGate: () => new Map(),
+    };
+    const titles = [
+      { key: 'series:101', imdb_id: 'tt1', adult: false, title: 'A', year: 2020, genres: [], certification: null },
+      { key: 'series:102', imdb_id: 'tt2', adult: false, title: 'B', year: 2020, genres: [], certification: null },
+    ];
+    const result = await ageVerify.verify(titles, 'series', tier, sources, log);
+    // verify recorded the verdicts
+    assert.deepStrictEqual(result.get('series:101'), { verdict: 'allow', source: 'csm', rating: '14' });
+    assert.deepStrictEqual(result.get('series:102'), { verdict: 'block', source: 'csm', rating: '15' });
+    // passesStored: block → false, allow → true, absent → true
+    assert.strictEqual(ageVerify.passesStored('series', '101', tier.id), true);  // allow
+    assert.strictEqual(ageVerify.passesStored('series', '102', tier.id), false); // block
+    assert.strictEqual(ageVerify.passesStored('series', '999', tier.id), true);  // absent → fail-open
+  });
+
+  okAsync('AGE-1 C4: passesStored — the card matrix over stored verdicts', async () => {
+    const now = Date.now();
+    // csm:15 → block → false
+    ageStore.recordVerdict('movie', 'c4-1', tier.id, 'block', 'csm', '15', now);
+    assert.strictEqual(ageVerify.passesStored('movie', 'c4-1', tier.id, now), false);
+    // csm:14 → allow → true
+    ageStore.recordVerdict('movie', 'c4-2', tier.id, 'allow', 'csm', '14', now);
+    assert.strictEqual(ageVerify.passesStored('movie', 'c4-2', tier.id, now), true);
+    // au:MA15+ → block → false
+    ageStore.recordVerdict('movie', 'c4-3', tier.id, 'block', 'au', 'MA15+', now);
+    assert.strictEqual(ageVerify.passesStored('movie', 'c4-3', tier.id, now), false);
+    // au:M → allow → true
+    ageStore.recordVerdict('movie', 'c4-4', tier.id, 'allow', 'au', 'M', now);
+    assert.strictEqual(ageVerify.passesStored('movie', 'c4-4', tier.id, now), true);
+    // llm:no → block → false
+    ageStore.recordVerdict('movie', 'c4-5', tier.id, 'block', 'llm', 'no', now);
+    assert.strictEqual(ageVerify.passesStored('movie', 'c4-5', tier.id, now), false);
+    // llm:ok → allow → true
+    ageStore.recordVerdict('movie', 'c4-6', tier.id, 'allow', 'llm', 'ok', now);
+    assert.strictEqual(ageVerify.passesStored('movie', 'c4-6', tier.id, now), true);
+    // null (no stored verdict) → true (fail-open)
+    assert.strictEqual(ageVerify.passesStored('movie', 'c4-none', tier.id, now), true);
+    // The card's "garbage" string case cannot occur: the serve-time re-check
+    // reads the verdict store (valid verdicts only), not a raw certification string.
+  });
+
+  // T3 (F3+F4): cache-first verify — a fresh stored verdict is answered from the
+  // store without any source call; only misses go to the chain; an expired
+  // verdict is re-judged; and a verdict under one tier never leaks into another.
+  okAsync('AGE-1 T3: cache-first verify — fresh from cache, expiry, per-tier isolation', async () => {
+    const store = require('../src/ageVerification/store');
+    const DAY = 24 * 3600e3;
+    let sourceCalls = 0;
+    const sources = {
+      tmdbRatings: async () => { sourceCalls++; return new Map(); },
+      csmAges: async (type, ids) => { sourceCalls++; const m = new Map(); for (const id of ids) m.set(id, 14); return m; },
+      tvdbRatings: async () => { sourceCalls++; return new Map(); },
+      simklCerts: async () => { sourceCalls++; return new Map(); },
+      mdblistCerts: async () => { sourceCalls++; return new Map(); },
+      llmGate: async () => { sourceCalls++; return new Map(); },
+    };
+    const titles = [
+      { key: 'series:tmT31', imdb_id: 'ttT31', adult: false, title: 'T3-1', year: 2020, genres: [], certification: null },
+      { key: 'series:tmT32', imdb_id: 'ttT32', adult: false, title: 'T3-2', year: 2020, genres: [], certification: null },
+      { key: 'series:tmT33', imdb_id: 'ttT33', adult: false, title: 'T3-3', year: 2020, genres: [], certification: null },
+    ];
+    // First verify: sources called, verdicts recorded (fresh).
+    sourceCalls = 0;
+    let r1 = await ageVerify.verify(titles, 'series', tier, sources);
+    assert.ok(sourceCalls > 0, 'first verify calls the sources');
+    assert.deepStrictEqual(r1.get('series:tmT31'), { verdict: 'allow', source: 'csm', rating: '14' });
+    // Second verify: zero source calls, same verdicts (from cache).
+    sourceCalls = 0;
+    let r2 = await ageVerify.verify(titles, 'series', tier, sources);
+    assert.strictEqual(sourceCalls, 0, 'second verify makes zero source calls (cache)');
+    assert.deepStrictEqual(r2.get('series:tmT31'), { verdict: 'allow', source: 'csm', rating: '14' });
+    // Plant an expired verdict for one title (31 days ago > 30-day TTL).
+    store.recordVerdict('series', 'tmT31', tier.id, 'allow', 'csm', '14', Date.now() - 31 * DAY);
+    // Third verify: the expired title is re-judged (sources called again); the
+    // fresh titles stay answered from cache.
+    sourceCalls = 0;
+    let r3 = await ageVerify.verify(titles, 'series', tier, sources);
+    assert.ok(sourceCalls > 0, 'third verify re-judges the expired title');
+    assert.deepStrictEqual(r3.get('series:tmT32'), { verdict: 'allow', source: 'csm', rating: '14' });
+    assert.deepStrictEqual(r3.get('series:tmT33'), { verdict: 'allow', source: 'csm', rating: '14' });
+    // Per-tier isolation: a verdict recorded for 'tv14' is not returned for 'age10'.
+    assert.ok(store.getVerdicts('series', 'tv14', ['tmT32']).has('tmT32'), 'tv14 verdict present');
+    assert.ok(!store.getVerdicts('series', 'age10', ['tmT32']).has('tmT32'), 'age10 does not see the tv14 verdict');
+  });
+
+  ok('AGE-1 S3: buildSources returns the six seams', () => {
+    const src = ageSources.buildSources({});
+    assert.strictEqual(typeof src.tmdbRatings, 'function');
+    assert.strictEqual(typeof src.csmAges, 'function');
+    assert.strictEqual(typeof src.tvdbRatings, 'function');
+    assert.strictEqual(typeof src.simklCerts, 'function');
+    assert.strictEqual(typeof src.mdblistCerts, 'function');
+    assert.strictEqual(typeof src.llmGate, 'function');
+  });
+
+  okAsync('AGE-1 S4: llmGate — tier wording + cache key; omitted stays unknown', async () => {
+    // Stub groq.ageGate to record its arguments and write verdicts to the cache.
+    const origAgeGate = groq.ageGate;
+    let captured = {};
+    groq.ageGate = async (type, ageLimit, titles, log, opts) => {
+      captured = { type, ageLimit, titles, opts };
+      // Simulate the cache: one title suitable, one omitted
+      const cache = {};
+      cache[`${type}:${opts.tier.llm.cacheKey}:${titles[0].id}`] = true;
+      // titles[1] omitted (no entry)
+      require('../src/store').saveAgeVerdicts(cache);
+    };
+    try {
+      const sources = ageSources.buildSources({});
+      const titles = [
+        { key: 'series:201', imdb_id: 'tt201', adult: false, title: 'Suitable', year: 2020, genres: [], certification: null },
+        { key: 'series:202', imdb_id: 'tt202', adult: false, title: 'Omitted', year: 2020, genres: [], certification: null },
+      ];
+      const out = await sources.llmGate('series', tier, titles);
+      // Tier wording passed through
+      assert.strictEqual(captured.type, 'series');
+      assert.strictEqual(captured.ageLimit, tier.llm.age);
+      assert.strictEqual(captured.opts.tier, tier);
+      // Suitable → true, omitted → absent
+      assert.strictEqual(out.get('series:201'), true);
+      assert.strictEqual(out.has('series:202'), false);
+    } finally {
+      groq.ageGate = origAgeGate;
+    }
+  });
+
+  // ---- AGE-1 T1: tmdbRatings fetch-level (F1) — the append_to_response query
+  // must survive to the URL, the per-country parse must be correct, and a 404
+  // must yield {} (no answer) without throwing. This is the test that would
+  // have caught F1: the old one-arg get dropped the query, so the URL never
+  // carried append_to_response and TMDB returned no ratings. ----
+  okAsync('AGE-1 T1: tmdbRatings — append_to_response on URL; per-country parse; 404 → {}', async () => {
+    const urls = [];
+    const stub = (url) => {
+      const u = String(url);
+      urls.push(u);
+      const path = new URL(u).pathname;
+      if (path.endsWith('/tv/1908')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          content_ratings: { results: [
+            { iso_3166_1: 'AU', rating: 'R 18+' },
+            { iso_3166_1: 'US', rating: 'TV-14' },
+            { iso_3166_1: 'GB', rating: '15' },
+          ] },
+        }) });
+      }
+      if (path.endsWith('/tv/114922')) {
+        return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) }); // 404 → no answer
+      }
+      if (path.endsWith('/movie/550')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          release_dates: { results: [
+            { iso_3166_1: 'AU', release_dates: [{ certification: 'M' }] },
+            { iso_3166_1: 'US', release_dates: [{ certification: 'TV-14' }] },
+          ] },
+        }) });
+      }
+      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
+    };
+    ageSources.setTmdbFetch(stub);
+    settings.updateSettings({ keys: { tmdb_api_key: 'test-tmdb-key' } });
+    try {
+      // Series → append_to_response=content_ratings; per-country parse.
+      const seriesOut = await ageSources.tmdbRatings({}, 'series', [
+        { key: 'series:1908', imdb_id: 'tt1' },
+        { key: 'series:114922', imdb_id: 'tt2' },
+      ]);
+      assert.ok(urls.some((u) => u.includes('append_to_response=content_ratings')), 'series URL carries append_to_response=content_ratings');
+      assert.deepStrictEqual(seriesOut.get('series:1908'), { AU: 'R 18+', US: 'TV-14', GB: '15' });
+      assert.deepStrictEqual(seriesOut.get('series:114922'), {}); // 404 → no answer, no throw
+      // Movie → append_to_response=release_dates; first non-empty certification per country.
+      const movieOut = await ageSources.tmdbRatings({}, 'movie', [
+        { key: 'movie:550', imdb_id: 'tt3' },
+      ]);
+      assert.ok(urls.some((u) => u.includes('append_to_response=release_dates')), 'movie URL carries append_to_response=release_dates');
+      assert.deepStrictEqual(movieOut.get('movie:550'), { AU: 'M', US: 'TV-14' });
+    } finally {
+      ageSources.setTmdbFetch(global.fetch);
+      settings.updateSettings({ keys: { tmdb_api_key: '' } });
+    }
+  });
+
+  // ---- AGE-1 T4: simklCerts fetch-level (F5) — the /search/id → /tv|/movies
+  // call sequence and paths, the certification parse, the 20-title cap, and the
+  // no-auth → empty Map. Monkey-patches simkl.authedGet (isolated from the
+  // parallel global-fetch stubs of the other AGE-1 async tests). ----
+  okAsync('AGE-1 T4: simklCerts — /search/id → /tv|/movies parse; 20-title cap; no auth → empty', async () => {
+    const simkl = require('../src/services/simkl');
+    const calls = [];
+    const origAuthedGet = simkl.authedGet;
+    simkl.authedGet = async (profile, path, extra = {}) => {
+      calls.push({ path, extra });
+      if (path === '/search/id') {
+        const imdb = extra.imdb;
+        if (imdb === 'tttv') return { tv: [{ ids: { simkl: 324126 }, type: 2 }] };
+        if (imdb === 'ttmovie') return { movies: [{ ids: { simkl: 12345 }, type: 1 }] };
+        return { movies: [], tv: [] }; // no match
+      }
+      if (path === '/tv/324126') return { tv: { certification: 'TV-PG' } };
+      if (path === '/movies/12345') return { movie: { certification: 'R' } };
+      throw new Error(`unexpected path ${path}`);
+    };
+    const profile = { keys: { simkl_client_id: 'cid' }, simkl_auth: { access_token: 'tok' } };
+    try {
+      // Series → /search/id → /tv/{id}?extended=full → media.tv.certification.
+      let out = await ageSources.simklCerts(profile, 'series', ['tttv', 'ttmovie']);
+      assert.deepStrictEqual(calls.map((c) => c.path), ['/search/id', '/tv/324126', '/search/id', '/movies/12345'], 'call sequence + paths');
+      assert.deepStrictEqual(calls[0].extra, { imdb: 'tttv' }, 'search/id carries the imdb param');
+      assert.deepStrictEqual(calls[1].extra, { extended: 'full' }, 'media GET carries extended=full');
+      assert.deepStrictEqual(out.get('tttv'), 'TV-PG', 'series certification parsed');
+      assert.deepStrictEqual(out.get('ttmovie'), 'R', 'movie certification parsed');
+      // No match → null (no answer for that title), no throw.
+      out = await ageSources.simklCerts(profile, 'series', ['ttnone']);
+      assert.deepStrictEqual(out.get('ttnone'), null, 'no match → null');
+      // 20-title cap: only the first 20 titles are queried.
+      calls.length = 0;
+      const many = Array.from({ length: 25 }, (_, i) => `tt${i}`);
+      out = await ageSources.simklCerts(profile, 'series', many);
+      assert.strictEqual(calls.filter((c) => c.path === '/search/id').length, 20, 'only 20 titles queried');
+      // No Simkl connection → empty Map, zero authedGet calls.
+      calls.length = 0;
+      out = await ageSources.simklCerts({}, 'series', ['tttv']);
+      assert.ok(out instanceof Map && out.size === 0, 'no auth → empty Map');
+      assert.strictEqual(calls.length, 0, 'no auth → zero authedGet calls');
+    } finally {
+      simkl.authedGet = origAuthedGet;
+    }
+  });
+}
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');
 const BASE = `http://localhost:${process.env.PORT}`;
 
 async function httpTests() {
+  // Await any async unit tests (AGE-1 decision chain) before the HTTP surface.
+  await Promise.all(asyncPending);
   // The migrateFromProfiles unit test above seeds the GLOBAL settings with
   // JAMES-* lookup keys. Now that the addon reads GLOBAL keys, clear them so the
   // addon-serve tests start from a known "no keys" baseline (tests that need a

@@ -14,7 +14,7 @@ const store = require('./store');
 
 // Secret fields (sealed on disk). Nested under their sections.
 const LLM_SECRET_FIELDS = ['custom_api_key', 'groq_api_key', 'groq_api_key_backup', 'embed_api_key'];
-const KEY_SECRET_FIELDS = ['tmdb_api_key', 'mdblist_api_key', 'rpdb_api_key'];
+const KEY_SECRET_FIELDS = ['tmdb_api_key', 'mdblist_api_key', 'rpdb_api_key', 'tvdb_api_key'];
 
 const DEFAULT_RPDB_KEY = 't0-free-rpdb'; // generic free-tier key, as in v5
 
@@ -37,6 +37,7 @@ function blankSettings() {
       tmdb_api_key: '',
       mdblist_api_key: '',
       rpdb_api_key: DEFAULT_RPDB_KEY,
+      tvdb_api_key: '', // AGE-1: TVDB v4 key for country certifications (sealed at rest)
     },
     // v7 (SC-07): admin-only global engine enablement map { engineId: bool }.
     // Genesis is permanently enabled in code (engines.isEnabled), so its stored
