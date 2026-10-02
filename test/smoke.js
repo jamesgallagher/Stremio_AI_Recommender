@@ -1917,10 +1917,10 @@ ok('marquee envelope: discoverParams (spec §3.1)', () => {
     compile({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 0 }),
     { include_adult: 'false', with_release_type: '4|5|6', 'vote_count.gte': '1000' });
   // AGE-2: kids 10 is now a chain tier → certification_country AU + certification.lte
-  // MA 15+ (the chain path's source ceiling). Step 3 makes it per-tier (M for 10+/12+).
+  // M (the 10+ tier's discover ceiling; TV-14/15+ → MA 15+).
   assert.deepStrictEqual(
     compile({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 10 }),
-    { include_adult: 'false', with_release_type: '4|5|6', 'vote_count.gte': '1000', certification_country: 'AU', 'certification.lte': 'MA 15+' });
+    { include_adult: 'false', with_release_type: '4|5|6', 'vote_count.gte': '1000', certification_country: 'AU', 'certification.lte': 'M' });
   // recency 10 → primary_release_date.gte 2016-01-01
   assert.deepStrictEqual(
     compile({ min_rating: 0, vote_count_floor: 1000, max_age_years: 10, excluded_genres: [], age_limit: 0 }),
@@ -3794,6 +3794,36 @@ ok('calibrated A2: incremental greedy is fast (425 rows, listSize 50)', () => {
         () => ageVerify.verify(titles, 'movie', tier, sources, { warn() {} }),
         /No LLM/,
       );
+    }
+  });
+
+  ok('AGE-2 T7: Marquee Cinema per-tier ceiling + floor', () => {
+    const marqueeFilters = require('../src/engines/marquee/filters');
+    const genreMap = {};
+    const nowYear = 2026;
+    // vote_count high enough to clear the vote floor so the cert check is reached.
+    const vc = 10000;
+    // discover ceiling: M@10+/12+, MA 15+@TV-14/15+
+    for (const [limit, ceiling] of [[10, 'M'], [12, 'M'], [14, 'MA 15+'], [15, 'MA 15+']]) {
+      const env = marqueeFilters.compileEnvelope({ age_limit: limit }, { nowYear, genreMap });
+      const p = env.discoverParams();
+      assert.strictEqual(p.certification_country, 'AU', `discover ceiling country at ${limit}`);
+      assert.strictEqual(p['certification.lte'], ceiling, `discover ceiling at ${limit}`);
+    }
+    // hard filter: AU MA15+ @10+ → reject; @TV-14 → pass
+    const h10 = marqueeFilters.compileEnvelope({ age_limit: 10 }, { nowYear, genreMap }).hardFilter;
+    assert.deepStrictEqual(h10({ imdb_id: 'tt1', certAU: 'MA15+', vote_count: vc }), { ok: false, reason: 'cert_over' }, 'AU MA15+ @10+ rejected');
+    const h14 = marqueeFilters.compileEnvelope({ age_limit: 14 }, { nowYear, genreMap }).hardFilter;
+    assert.deepStrictEqual(h14({ imdb_id: 'tt2', certAU: 'MA15+', vote_count: vc }), { ok: true }, 'AU MA15+ @TV-14 passes');
+    // hard filter: AU R18+ every tier → reject
+    for (const limit of [10, 12, 14, 15]) {
+      const h = marqueeFilters.compileEnvelope({ age_limit: limit }, { nowYear, genreMap }).hardFilter;
+      assert.deepStrictEqual(h({ imdb_id: 'tt3', certAU: 'R18+', vote_count: vc }), { ok: false, reason: 'cert_over' }, `AU R18+ @${limit} rejected`);
+    }
+    // hard filter: unknown cert every tier → pass
+    for (const limit of [10, 12, 14, 15]) {
+      const h = marqueeFilters.compileEnvelope({ age_limit: limit }, { nowYear, genreMap }).hardFilter;
+      assert.deepStrictEqual(h({ imdb_id: 'tt4', vote_count: vc }), { ok: true }, `unknown cert @${limit} passes`);
     }
   });
 

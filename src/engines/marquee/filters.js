@@ -73,17 +73,12 @@ function compileEnvelope(filters, { nowYear, genreMap }) {
       }
       if (ids.length) p.without_genres = ids.join(',');
     }
-    if (kids) {
-      if (chainTier) {
-        p.certification_country = 'AU';
-        p['certification.lte'] = 'MA 15+'; // TV-14: only R 18+ and above are cut at the source
-      } else {
-        const ceiling = auCeilingFor(judgementAge); // legacy tiers: UNCHANGED
-        if (ceiling) {
-          p.certification_country = 'AU';
-          p['certification.lte'] = ceiling;
-        }
-      }
+    // AGE-2: every positive age limit is a chain tier, so the discover ceiling
+    // is the tier's `discoverCeilingAU` (10+/12+ → M; TV-14/15+ → MA 15+).
+    // The legacy auCeilingFor(judgementAge) path is gone (mandate B3).
+    if (kids && chainTier) {
+      p.certification_country = 'AU';
+      p['certification.lte'] = chainTier.discoverCeilingAU;
     }
     return p;
   }
@@ -124,17 +119,13 @@ function compileEnvelope(filters, { nowYear, genreMap }) {
     if ((r.vote_count || 0) < voteFloor) { stats.votes += 1; return { ok: false, reason: 'votes' }; }
     // UNKNOWN passes (fail open, like the serve path).
     if (r.availability === 'NOT_YET') { stats.unavailable += 1; return { ok: false, reason: 'unavailable' }; }
-    if (kids) {
-      if (chainTier) {
-        // TV-14: hard floor only (AU R18+/X18+/RC, US NC-17). Unknown or other
-        // certificates PASS here — ageGatePool's verify() decides after the build.
-        if (ratings.isHardFloor(r.certAU, r.certUS, chainTier)) { stats.cert_over += 1; return { ok: false, reason: 'cert_over' }; }
-      } else {
-        // legacy tiers: UNCHANGED
-        const m = strictestMinAge(r.certAU, r.certUS);
-        if (m === null) { stats.cert_unknown += 1; return { ok: false, reason: 'cert_unknown' }; }
-        if (m > judgementAge) { stats.cert_over += 1; return { ok: false, reason: 'cert_over' }; }
-      }
+    // AGE-2: every positive age limit is a chain tier, so the hard filter is
+    // the tier's hard floor (10+/12+ → MA15+/AV15+/R18+/X18+/RC + NC-17;
+    // TV-14/15+ → R18+/X18+/RC + NC-17). Unknown or other certificates PASS
+    // here — ageGatePool's verify() decides after the build (mandate B3: the
+    // legacy strictestMinAge/judgementAge path is gone).
+    if (kids && chainTier) {
+      if (ratings.isHardFloor(r.certAU, r.certUS, chainTier)) { stats.cert_over += 1; return { ok: false, reason: 'cert_over' }; }
     }
     return { ok: true };
   }
