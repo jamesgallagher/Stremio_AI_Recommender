@@ -3853,37 +3853,37 @@ ok('calibrated A2: incremental greedy is fast (425 rows, listSize 50)', () => {
   const ageVerify = require('../src/ageVerification');
   const ageSources = require('../src/ageVerification/sources');
 
-  okAsync('AGE-1 S1: verdict store — record/read/TTL/unknown/prune', async () => {
+  okAsync('AGE-1 S1: verdict store — record/read/TTL/unknown/prune (per tier)', async () => {
     const now = Date.now();
     // Record + read roundtrip
-    ageStore.recordVerdict('series', '111', 'allow', 'csm', '14', now);
-    let v = ageStore.getVerdict('series', '111', now);
+    ageStore.recordVerdict('series', '111', tier.id, 'allow', 'csm', '14', now);
+    let v = ageStore.getVerdict('series', '111', tier.id, now);
     assert.deepStrictEqual(v, { verdict: 'allow', source: 'csm', rating: '14' });
     // Overwrite (same PK)
-    ageStore.recordVerdict('series', '111', 'block', 'au', 'R18+', now);
-    v = ageStore.getVerdict('series', '111', now);
+    ageStore.recordVerdict('series', '111', tier.id, 'block', 'au', 'R18+', now);
+    v = ageStore.getVerdict('series', '111', tier.id, now);
     assert.deepStrictEqual(v, { verdict: 'block', source: 'au', rating: 'R18+' });
     // Unknown verdict never stored (A5)
-    assert.strictEqual(ageStore.recordVerdict('series', '222', 'unknown', 'llm', null, now), false);
-    assert.strictEqual(ageStore.getVerdict('series', '222', now), null);
+    assert.strictEqual(ageStore.recordVerdict('series', '222', tier.id, 'unknown', 'llm', null, now), false);
+    assert.strictEqual(ageStore.getVerdict('series', '222', tier.id, now), null);
     // TTL: source verdict older than 30 days → expired
     const old30 = now - 31 * 24 * 3600e3;
-    ageStore.recordVerdict('series', '333', 'allow', 'csm', '14', old30);
-    assert.strictEqual(ageStore.getVerdict('series', '333', now), null); // expired
+    ageStore.recordVerdict('series', '333', tier.id, 'allow', 'csm', '14', old30);
+    assert.strictEqual(ageStore.getVerdict('series', '333', tier.id, now), null); // expired
     // TTL: LLM verdict older than 90 days → expired
     const old90 = now - 91 * 24 * 3600e3;
-    ageStore.recordVerdict('series', '444', 'allow', 'llm', 'ok', old90);
-    assert.strictEqual(ageStore.getVerdict('series', '444', now), null); // expired
+    ageStore.recordVerdict('series', '444', tier.id, 'allow', 'llm', 'ok', old90);
+    assert.strictEqual(ageStore.getVerdict('series', '444', tier.id, now), null); // expired
     // TTL: LLM verdict within 90 days → still valid
     const old89 = now - 89 * 24 * 3600e3;
-    ageStore.recordVerdict('series', '555', 'block', 'llm', 'no', old89);
-    v = ageStore.getVerdict('series', '555', now);
+    ageStore.recordVerdict('series', '555', tier.id, 'block', 'llm', 'no', old89);
+    v = ageStore.getVerdict('series', '555', tier.id, now);
     assert.deepStrictEqual(v, { verdict: 'block', source: 'llm', rating: 'no' });
     // Prune removes expired rows
     const pruned = ageStore.prune(now);
     assert.ok(pruned >= 2); // at least the 333 and 444 rows
-    assert.strictEqual(ageStore.getVerdict('series', '333', now), null);
-    assert.strictEqual(ageStore.getVerdict('series', '444', now), null);
+    assert.strictEqual(ageStore.getVerdict('series', '333', tier.id, now), null);
+    assert.strictEqual(ageStore.getVerdict('series', '444', tier.id, now), null);
   });
 
   okAsync('AGE-1 S2: service API — verify records; passesStored re-checks', async () => {
@@ -3906,35 +3906,79 @@ ok('calibrated A2: incremental greedy is fast (425 rows, listSize 50)', () => {
     assert.deepStrictEqual(result.get('series:101'), { verdict: 'allow', source: 'csm', rating: '14' });
     assert.deepStrictEqual(result.get('series:102'), { verdict: 'block', source: 'csm', rating: '15' });
     // passesStored: block → false, allow → true, absent → true
-    assert.strictEqual(ageVerify.passesStored('series', '101'), true);  // allow
-    assert.strictEqual(ageVerify.passesStored('series', '102'), false); // block
-    assert.strictEqual(ageVerify.passesStored('series', '999'), true);  // absent → fail-open
+    assert.strictEqual(ageVerify.passesStored('series', '101', tier.id), true);  // allow
+    assert.strictEqual(ageVerify.passesStored('series', '102', tier.id), false); // block
+    assert.strictEqual(ageVerify.passesStored('series', '999', tier.id), true);  // absent → fail-open
   });
 
   okAsync('AGE-1 C4: passesStored — the card matrix over stored verdicts', async () => {
     const now = Date.now();
     // csm:15 → block → false
-    ageStore.recordVerdict('movie', 'c4-1', 'block', 'csm', '15', now);
-    assert.strictEqual(ageVerify.passesStored('movie', 'c4-1', now), false);
+    ageStore.recordVerdict('movie', 'c4-1', tier.id, 'block', 'csm', '15', now);
+    assert.strictEqual(ageVerify.passesStored('movie', 'c4-1', tier.id, now), false);
     // csm:14 → allow → true
-    ageStore.recordVerdict('movie', 'c4-2', 'allow', 'csm', '14', now);
-    assert.strictEqual(ageVerify.passesStored('movie', 'c4-2', now), true);
+    ageStore.recordVerdict('movie', 'c4-2', tier.id, 'allow', 'csm', '14', now);
+    assert.strictEqual(ageVerify.passesStored('movie', 'c4-2', tier.id, now), true);
     // au:MA15+ → block → false
-    ageStore.recordVerdict('movie', 'c4-3', 'block', 'au', 'MA15+', now);
-    assert.strictEqual(ageVerify.passesStored('movie', 'c4-3', now), false);
+    ageStore.recordVerdict('movie', 'c4-3', tier.id, 'block', 'au', 'MA15+', now);
+    assert.strictEqual(ageVerify.passesStored('movie', 'c4-3', tier.id, now), false);
     // au:M → allow → true
-    ageStore.recordVerdict('movie', 'c4-4', 'allow', 'au', 'M', now);
-    assert.strictEqual(ageVerify.passesStored('movie', 'c4-4', now), true);
+    ageStore.recordVerdict('movie', 'c4-4', tier.id, 'allow', 'au', 'M', now);
+    assert.strictEqual(ageVerify.passesStored('movie', 'c4-4', tier.id, now), true);
     // llm:no → block → false
-    ageStore.recordVerdict('movie', 'c4-5', 'block', 'llm', 'no', now);
-    assert.strictEqual(ageVerify.passesStored('movie', 'c4-5', now), false);
+    ageStore.recordVerdict('movie', 'c4-5', tier.id, 'block', 'llm', 'no', now);
+    assert.strictEqual(ageVerify.passesStored('movie', 'c4-5', tier.id, now), false);
     // llm:ok → allow → true
-    ageStore.recordVerdict('movie', 'c4-6', 'allow', 'llm', 'ok', now);
-    assert.strictEqual(ageVerify.passesStored('movie', 'c4-6', now), true);
+    ageStore.recordVerdict('movie', 'c4-6', tier.id, 'allow', 'llm', 'ok', now);
+    assert.strictEqual(ageVerify.passesStored('movie', 'c4-6', tier.id, now), true);
     // null (no stored verdict) → true (fail-open)
-    assert.strictEqual(ageVerify.passesStored('movie', 'c4-none', now), true);
+    assert.strictEqual(ageVerify.passesStored('movie', 'c4-none', tier.id, now), true);
     // The card's "garbage" string case cannot occur: the serve-time re-check
     // reads the verdict store (valid verdicts only), not a raw certification string.
+  });
+
+  // T3 (F3+F4): cache-first verify — a fresh stored verdict is answered from the
+  // store without any source call; only misses go to the chain; an expired
+  // verdict is re-judged; and a verdict under one tier never leaks into another.
+  okAsync('AGE-1 T3: cache-first verify — fresh from cache, expiry, per-tier isolation', async () => {
+    const store = require('../src/ageVerification/store');
+    const DAY = 24 * 3600e3;
+    let sourceCalls = 0;
+    const sources = {
+      tmdbRatings: async () => { sourceCalls++; return new Map(); },
+      csmAges: async (type, ids) => { sourceCalls++; const m = new Map(); for (const id of ids) m.set(id, 14); return m; },
+      tvdbRatings: async () => { sourceCalls++; return new Map(); },
+      simklCerts: async () => { sourceCalls++; return new Map(); },
+      mdblistCerts: async () => { sourceCalls++; return new Map(); },
+      llmGate: async () => { sourceCalls++; return new Map(); },
+    };
+    const titles = [
+      { key: 'series:tmT31', imdb_id: 'ttT31', adult: false, title: 'T3-1', year: 2020, genres: [], certification: null },
+      { key: 'series:tmT32', imdb_id: 'ttT32', adult: false, title: 'T3-2', year: 2020, genres: [], certification: null },
+      { key: 'series:tmT33', imdb_id: 'ttT33', adult: false, title: 'T3-3', year: 2020, genres: [], certification: null },
+    ];
+    // First verify: sources called, verdicts recorded (fresh).
+    sourceCalls = 0;
+    let r1 = await ageVerify.verify(titles, 'series', tier, sources);
+    assert.ok(sourceCalls > 0, 'first verify calls the sources');
+    assert.deepStrictEqual(r1.get('series:tmT31'), { verdict: 'allow', source: 'csm', rating: '14' });
+    // Second verify: zero source calls, same verdicts (from cache).
+    sourceCalls = 0;
+    let r2 = await ageVerify.verify(titles, 'series', tier, sources);
+    assert.strictEqual(sourceCalls, 0, 'second verify makes zero source calls (cache)');
+    assert.deepStrictEqual(r2.get('series:tmT31'), { verdict: 'allow', source: 'csm', rating: '14' });
+    // Plant an expired verdict for one title (31 days ago > 30-day TTL).
+    store.recordVerdict('series', 'tmT31', tier.id, 'allow', 'csm', '14', Date.now() - 31 * DAY);
+    // Third verify: the expired title is re-judged (sources called again); the
+    // fresh titles stay answered from cache.
+    sourceCalls = 0;
+    let r3 = await ageVerify.verify(titles, 'series', tier, sources);
+    assert.ok(sourceCalls > 0, 'third verify re-judges the expired title');
+    assert.deepStrictEqual(r3.get('series:tmT32'), { verdict: 'allow', source: 'csm', rating: '14' });
+    assert.deepStrictEqual(r3.get('series:tmT33'), { verdict: 'allow', source: 'csm', rating: '14' });
+    // Per-tier isolation: a verdict recorded for 'tv14' is not returned for 'age10'.
+    assert.ok(store.getVerdicts('series', 'tv14', ['tmT32']).has('tmT32'), 'tv14 verdict present');
+    assert.ok(!store.getVerdicts('series', 'age10', ['tmT32']).has('tmT32'), 'age10 does not see the tv14 verdict');
   });
 
   ok('AGE-1 S3: buildSources returns the six seams', () => {

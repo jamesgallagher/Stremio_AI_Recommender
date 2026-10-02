@@ -646,7 +646,7 @@ function passesAgeBand(row, filters = {}) {
   const ageVerify = require('./ageVerification');
   const tier = ageVerify.tierFor({ age_limit: limit });
   if (tier && tier.mode === 'chain' && row.type && row.tmdb_id) {
-    return ageVerify.passesStored(row.type, row.tmdb_id);
+    return ageVerify.passesStored(row.type, row.tmdb_id, tier.id);
   }
   const mal  = certMinAge(row.age_classification);   // existing MAL-band table, unchanged
   const real = certs.anyCertMinAge(row.certification);

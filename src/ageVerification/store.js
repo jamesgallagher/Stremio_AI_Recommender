@@ -13,11 +13,12 @@ function init() {
     CREATE TABLE IF NOT EXISTS age_verdicts (
       type        TEXT NOT NULL,
       tmdb_id     TEXT NOT NULL,
+      tier        TEXT NOT NULL,   -- the tier's id (e.g. 'tv14') — verdicts are per-tier
       verdict     TEXT NOT NULL,   -- 'allow' | 'block'
       source      TEXT NOT NULL,   -- 'csm' | 'au' | 'us' | 'tvdb-au' | ... | 'llm'
       rating      TEXT,            -- the rating that answered (null for llm)
       at          INTEGER NOT NULL,
-      PRIMARY KEY (type, tmdb_id)
+      PRIMARY KEY (type, tmdb_id, tier)
     );
   `);
   ready = true;
@@ -33,34 +34,37 @@ function ttlFor(source) {
 }
 
 // Record a TV-14 verdict. An "unknown" verdict is never stored (A5: the LLM
-// omitted the title — it stays kept and is re-judged next time). Returns true
-// if a row was written.
-function recordVerdict(type, tmdbId, verdict, source, rating, at = Date.now()) {
+// omitted the title — it stays kept and is re-judged next time). `tier` is the
+// tier's id (e.g. 'tv14') — verdicts are stored per tier, so a title's verdict
+// under one age band never leaks into another. Returns true if a row was written.
+function recordVerdict(type, tmdbId, tier, verdict, source, rating, at = Date.now()) {
   init();
   if (verdict !== 'allow' && verdict !== 'block') return false;
   db.get().prepare(`
-    INSERT INTO age_verdicts (type, tmdb_id, verdict, source, rating, at)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(type, tmdb_id) DO UPDATE SET
+    INSERT INTO age_verdicts (type, tmdb_id, tier, verdict, source, rating, at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(type, tmdb_id, tier) DO UPDATE SET
       verdict = excluded.verdict, source = excluded.source, rating = excluded.rating, at = excluded.at
-  `).run(type, String(tmdbId), verdict, source, rating == null ? null : String(rating), at);
+  `).run(type, String(tmdbId), tier, verdict, source, rating == null ? null : String(rating), at);
   return true;
 }
 
-// Read one verdict (null when absent or past its TTL).
-function getVerdict(type, tmdbId, now = Date.now()) {
+// Read one verdict (null when absent or past its TTL). `tier` is the tier's id.
+function getVerdict(type, tmdbId, tier, now = Date.now()) {
   init();
-  const row = db.get().prepare('SELECT verdict, source, rating, at FROM age_verdicts WHERE type = ? AND tmdb_id = ?').get(type, String(tmdbId));
+  const row = db.get().prepare('SELECT verdict, source, rating, at FROM age_verdicts WHERE type = ? AND tmdb_id = ? AND tier = ?').get(type, String(tmdbId), tier);
   if (!row) return null;
   if (now - row.at > ttlFor(row.source)) return null; // expired
   return { verdict: row.verdict, source: row.source, rating: row.rating };
 }
 
-// Batch read (Map<tmdbId, {verdict, source, rating}>), TTL-aware.
-function getVerdicts(type, tmdbIds, now = Date.now()) {
+// Batch read (Map<tmdbId, {verdict, source, rating}>), TTL-aware. `tier` is the
+// tier's id — the query filters by key + tier (not the whole table), so a
+// verdict under one tier never leaks into another.
+function getVerdicts(type, tier, tmdbIds, now = Date.now()) {
   init();
   const out = new Map();
-  const rows = db.get().prepare('SELECT tmdb_id, verdict, source, rating, at FROM age_verdicts WHERE type = ?').all(type);
+  const rows = db.get().prepare('SELECT tmdb_id, verdict, source, rating, at FROM age_verdicts WHERE type = ? AND tier = ?').all(type, tier);
   const want = new Set(tmdbIds.map(String));
   for (const r of rows) {
     if (!want.has(r.tmdb_id)) continue;

@@ -16,21 +16,49 @@ const verdictStore = require('./store');
 // (Map<key, { verdict, source, rating }>). An "unknown" verdict (the LLM
 // omitted the title) is NOT recorded (A5: it stays kept and is re-judged next
 // time).
+//
+// Cache-first (F3): a fresh stored verdict (within its TTL, for THIS tier) is
+// answered from the store without any source call; only the misses go to the
+// chain. The new definitive verdicts are recorded, and the merged Map is
+// returned. A title whose verdict expired (past its TTL) is a miss again.
 async function verify(titles, type, tier, sources, log = console) {
-  const result = await chain.decide(titles, type, tier, sources, log);
-  for (const [key, v] of result) {
-    const tmdbId = key.split(':')[1];
-    verdictStore.recordVerdict(type, tmdbId, v.verdict, v.source, v.rating);
+  const now = Date.now();
+  const tmdbIds = titles.map((t) => t.key.split(':')[1]);
+  // (1) fresh stored verdicts for this tier (TTL-aware; expired = absent).
+  const cached = verdictStore.getVerdicts(type, tier.id, tmdbIds, now);
+  const result = new Map();
+  const misses = [];
+  for (const t of titles) {
+    const v = cached.get(t.key.split(':')[1]);
+    if (v) {
+      // (2) answered from cache (source/rating as stored).
+      result.set(t.key, { verdict: v.verdict, source: v.source, rating: v.rating });
+    } else {
+      misses.push(t);
+    }
   }
+  // (3) only the misses go to the chain.
+  if (misses.length) {
+    const decided = await chain.decide(misses, type, tier, sources, log);
+    for (const [key, v] of decided) {
+      result.set(key, v);
+      // (4) record the new definitive verdicts (unknown is never stored, A5).
+      if (v.verdict === 'allow' || v.verdict === 'block') {
+        verdictStore.recordVerdict(type, key.split(':')[1], tier.id, v.verdict, v.source, v.rating);
+      }
+    }
+  }
+  // (5) the merged Map (cache + newly decided).
   return result;
 }
 
 // Serve-time re-check (TV-14 only): reads the stored verdict without network.
 // A block verdict is rejected; an allow verdict is kept; an unknown/absent
 // verdict is kept (fail-open — the title was never judged, so it stays until a
-// build judges it). Returns true if the title is kept.
-function passesStored(type, tmdbId, now = Date.now()) {
-  const v = verdictStore.getVerdict(type, tmdbId, now);
+// build judges it). `tierId` is the tier's id (e.g. 'tv14') — the verdict is
+// read for that tier only. Returns true if the title is kept.
+function passesStored(type, tmdbId, tierId, now = Date.now()) {
+  const v = verdictStore.getVerdict(type, tmdbId, tierId, now);
   if (!v) return true; // unknown/absent → kept (fail-open)
   return v.verdict === 'allow';
 }

@@ -6042,25 +6042,25 @@ async function main() {
 
     // Seed a verdict for a title
     const now = Date.now();
-    verdictStore.recordVerdict('movie', '100', 'allow', 'csm', '13', now);
+    verdictStore.recordVerdict('movie', '100', tier.id, 'allow', 'csm', '13', now);
     // Read it back
-    const v = verdictStore.getVerdict('movie', '100', now);
+    const v = verdictStore.getVerdict('movie', '100', tier.id, now);
     assert.strictEqual(v.verdict, 'allow');
     assert.strictEqual(v.source, 'csm');
     // Unknown is never stored
-    assert.strictEqual(verdictStore.recordVerdict('movie', '200', 'unknown', 'llm', null, now), false);
-    assert.strictEqual(verdictStore.getVerdict('movie', '200', now), null);
+    assert.strictEqual(verdictStore.recordVerdict('movie', '200', tier.id, 'unknown', 'llm', null, now), false);
+    assert.strictEqual(verdictStore.getVerdict('movie', '200', tier.id, now), null);
     // Expired verdict (30 days ago) is re-decided
     const old = now - 31 * 24 * 3600e3;
-    verdictStore.recordVerdict('movie', '300', 'allow', 'csm', '13', old);
-    assert.strictEqual(verdictStore.getVerdict('movie', '300', now), null, 'expired verdict returns null');
+    verdictStore.recordVerdict('movie', '300', tier.id, 'allow', 'csm', '13', old);
+    assert.strictEqual(verdictStore.getVerdict('movie', '300', tier.id, now), null, 'expired verdict returns null');
     // LLM TTL is 90 days
     const llmOld = now - 91 * 24 * 3600e3;
-    verdictStore.recordVerdict('movie', '400', 'allow', 'llm', 'ok', llmOld);
-    assert.strictEqual(verdictStore.getVerdict('movie', '400', now), null, 'expired LLM verdict returns null');
+    verdictStore.recordVerdict('movie', '400', tier.id, 'allow', 'llm', 'ok', llmOld);
+    assert.strictEqual(verdictStore.getVerdict('movie', '400', tier.id, now), null, 'expired LLM verdict returns null');
     const llmFresh = now - 89 * 24 * 3600e3;
-    verdictStore.recordVerdict('movie', '500', 'allow', 'llm', 'ok', llmFresh);
-    assert.ok(verdictStore.getVerdict('movie', '500', now), 'fresh LLM verdict is readable');
+    verdictStore.recordVerdict('movie', '500', tier.id, 'allow', 'llm', 'ok', llmFresh);
+    assert.ok(verdictStore.getVerdict('movie', '500', tier.id, now), 'fresh LLM verdict is readable');
   });
 
   // ── I4. Catalogs at TV-14: Watch Later → chain; banded → legacy ─────────────
