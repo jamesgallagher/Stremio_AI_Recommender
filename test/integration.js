@@ -3945,6 +3945,72 @@ async function main() {
     }
   });
 
+  await it('marquee m4 T8: bench --marquee-config writes only the snapshot settings (A/B off-switch)', async () => {
+    const fs = require('fs');
+    const path = require('path');
+    const os = require('os');
+    const { spawnSync } = require('child_process');
+    const { DatabaseSync } = require('node:sqlite');
+    const bench = require('../src/bench/engineBench');
+
+    // (a) Section-wise merge: override keys win, existing keys and untouched
+    // sections survive; the merge lands in the settings.json of the dir given.
+    const mergeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'marquee-m4-t8-'));
+    fs.writeFileSync(path.join(mergeDir, 'settings.json'), JSON.stringify({
+      marquee: { agreement: { genre_blend: 0.5, min_genre_size: 5 }, prescore: { genre: 0.3 } },
+      other: 'keep',
+    }));
+    const merged = bench.applyMarqueeConfig(mergeDir, { agreement: { genre_blend: 0 } });
+    assert.deepStrictEqual(merged.agreement, { genre_blend: 0, min_genre_size: 5 }, 'override key wins, existing keys preserved');
+    const reloaded = JSON.parse(fs.readFileSync(path.join(mergeDir, 'settings.json'), 'utf8'));
+    assert.deepStrictEqual(reloaded.marquee.prescore, { genre: 0.3 }, 'untouched sections stay');
+    assert.strictEqual(reloaded.other, 'keep', 'non-marquee settings stay');
+    fs.rmSync(mergeDir, { recursive: true, force: true });
+
+    // (b) Refuses to write anywhere outside the temp snapshot dir — before any write.
+    assert.throws(() => bench.applyMarqueeConfig(__dirname, { agreement: { genre_blend: 0 } }), /outside the temp snapshot dir/);
+
+    // (c) Snapshot + apply never touches the LIVE settings.json.
+    const liveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'marquee-m4-t8-'));
+    fs.writeFileSync(path.join(liveDir, 'settings.json'), JSON.stringify({ marquee: { agreement: { genre_blend: 0.5 } } }, null, 2));
+    const liveDb = new DatabaseSync(path.join(liveDir, 'store.db'));
+    liveDb.close();
+    const liveBefore = fs.readFileSync(path.join(liveDir, 'settings.json'), 'utf8');
+    const { benchDir } = bench.snapshotStore(liveDir);
+    bench.applyMarqueeConfig(benchDir, { agreement: { genre_blend: 0 } });
+    assert.strictEqual(fs.readFileSync(path.join(liveDir, 'settings.json'), 'utf8'), liveBefore, 'live settings content unchanged');
+    fs.rmSync(benchDir, { recursive: true, force: true });
+    fs.rmSync(liveDir, { recursive: true, force: true });
+
+    // (d) Subprocess: valid JSON → the header shows the override, the run exits 2
+    // (no profile in the hermetic live dir), and the live settings are untouched.
+    const liveDir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'marquee-m4-t8-'));
+    fs.writeFileSync(path.join(liveDir2, 'settings.json'), JSON.stringify({ marquee: { agreement: { genre_blend: 0.5 } } }, null, 2));
+    const liveDb2 = new DatabaseSync(path.join(liveDir2, 'store.db'));
+    liveDb2.close();
+    const liveSettingsPath = path.join(liveDir2, 'settings.json');
+    const liveBefore2 = fs.readFileSync(liveSettingsPath, 'utf8');
+    const liveMtimeBefore = fs.statSync(liveSettingsPath).mtimeMs;
+    const ok = spawnSync(process.execPath, [
+      path.join(__dirname, '..', 'scripts', 'bench-engines.js'),
+      'NoProfile', '--marquee-config', '{"agreement":{"genre_blend":0}}',
+    ], { env: { ...process.env, DATA_DIR: liveDir2 }, encoding: 'utf8' });
+    assert.strictEqual(ok.status, 2, 'exits 2 (no profile in the hermetic live dir)');
+    assert.ok(ok.stdout.includes('marquee config override: {"agreement":{"genre_blend":0}}'), 'header shows the override: ' + ok.stdout);
+    assert.ok(ok.stderr.includes('profile not found: NoProfile'), 'the run never reached a real profile');
+    assert.strictEqual(fs.readFileSync(liveSettingsPath, 'utf8'), liveBefore2, 'live settings content unchanged');
+    assert.ok(Math.abs(fs.statSync(liveSettingsPath).mtimeMs - liveMtimeBefore) < 2, 'live settings mtime unchanged');
+
+    // (e) Invalid JSON → exit 2 with a usage error, before any store access.
+    const bad = spawnSync(process.execPath, [
+      path.join(__dirname, '..', 'scripts', 'bench-engines.js'),
+      'NoProfile', '--marquee-config', 'not-json',
+    ], { env: { ...process.env, DATA_DIR: liveDir2 }, encoding: 'utf8' });
+    assert.strictEqual(bad.status, 2, 'invalid JSON exits 2');
+    assert.ok(bad.stderr.includes('must be a JSON object'), 'usage error: ' + bad.stderr);
+    fs.rmSync(liveDir2, { recursive: true, force: true });
+  });
+
   await it('bench m2: reachability + hit@20r + per-target positions and Marquee fate', async () => {
     const bench = require('../src/bench/engineBench');
     const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 10, excluded_genres: [], age_limit: 0 };

@@ -319,6 +319,35 @@ function snapshotStore(liveDir) {
   return { benchDir, readOnlyPath };
 }
 
+// m4 (spec §17): merge a --marquee-config JSON into the SNAPSHOT's
+// settings.json, section-wise: settings.marquee[section] =
+// { ...existing[section], ...override[section] }. Lets the reviewer A/B the
+// genre-fair agreement (β=0 vs β=0.5) on a real profile without touching the
+// live settings. Refuses to write anywhere outside the temp snapshot dir —
+// the live settings file must never be written by the bench.
+function applyMarqueeConfig(benchDir, override) {
+  const fs = require('fs');
+  const path = require('path');
+  const os = require('os');
+  if (!override || typeof override !== 'object' || Array.isArray(override)) {
+    throw new Error('--marquee-config must be a JSON object');
+  }
+  const root = path.resolve(benchDir);
+  if (!root.startsWith(path.resolve(os.tmpdir()))) {
+    throw new Error('refusing to write settings outside the temp snapshot dir: ' + root);
+  }
+  const settingsPath = path.join(root, 'settings.json');
+  const settings = fs.existsSync(settingsPath) ? JSON.parse(fs.readFileSync(settingsPath, 'utf8')) : {};
+  const marquee = settings.marquee && typeof settings.marquee === 'object' ? settings.marquee : {};
+  for (const section of Object.keys(override)) {
+    const base = marquee[section] && typeof marquee[section] === 'object' ? marquee[section] : {};
+    marquee[section] = { ...base, ...override[section] };
+  }
+  settings.marquee = marquee;
+  fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+  return marquee;
+}
+
 // m2: can a held-out film be recommended AT ALL under this profile's filters?
 // Runs Marquee's hard filter (the serve rules + vote floor + home availability
 // + kids cert) on the film's own metadata. Seams: `metaFor(tmdbId)` → the
@@ -503,4 +532,4 @@ function renderTable(results) {
   return lines.join('\n');
 }
 
-module.exports = { pickTargets, metrics, renderTable, runBench, removeHoldout, snapshotStore, parseComps, assessReachability, serveStrategyMetrics, renderServeTable };
+module.exports = { pickTargets, metrics, renderTable, runBench, removeHoldout, snapshotStore, applyMarqueeConfig, parseComps, assessReachability, serveStrategyMetrics, renderServeTable };
