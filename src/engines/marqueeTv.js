@@ -47,10 +47,8 @@ function defaultFetchers(ctx, profile, cfg, nowMs, log) {
   return {
     ladder: (profileId) => seriesEngagement.ladderFor(profileId, { now: nowMs, kind: 'show' }),
     tvMeta: (apiKey, ids) => meta.ensureTvMeta(apiKey, ids, { now: nowMs, log }),
-    simklRecs: async (p, id) => {
-      const m = await simklRecs.ensureShowRecs(p, [id], { cap: cfg.t1_uncached_cap, now: nowMs, log });
-      return m.get(id) || [];
-    },
+    // L2 (TV-3 §5): one batch call per build — the uncached cap is per build.
+    simklRecs: (p, ids) => simklRecs.ensureShowRecs(p, ids, { cap: cfg.t1_uncached_cap, now: nowMs, log }),
     tmdbRecs: (apiKey, tmdbId) => tmdb.getRecommendations(apiKey, 'series', tmdbId),
     discover: (apiKey, params, opts) => tmdb.discoverTv(apiKey, params, opts),
     trending: (lt) => simklTrending.getList(lt),
@@ -70,19 +68,34 @@ function comfortOf(ladderEntries, isAnimeRow, cfg) {
   return totals.length % 2 ? totals[mid] : (totals[mid - 1] + totals[mid]) / 2;
 }
 
-// The candidate's list-payload genre names (tvGenres-split): from its genre
-// names (trending) or genre_ids (TMDB list items) → the split genre names.
+// L1 (TV-3 §5): Simkl trending genre names → TMDB raw TV genre names. The
+// pre-score genre affinity must use raw names because taste.dims.genres is
+// keyed by raw names (Sci-Fi & Fantasy, Action & Adventure, …); the other
+// trending names pass through unchanged. The hard filter and output genres
+// are unchanged (they still use tvGenres).
+const SIMKL_TRENDING_GENRE_MAP = {
+  'Science-Fiction': 'Sci-Fi & Fantasy',
+  'Fantasy': 'Sci-Fi & Fantasy',
+  'Action': 'Action & Adventure',
+  'Adventure': 'Action & Adventure',
+  'War': 'War & Politics',
+  'Politics': 'War & Politics',
+  'Children': 'Kids',
+};
+
+// The candidate's list-payload genre names (raw names): from its genre names
+// (trending) or genre_ids (TMDB list items) → the raw genre names.
 function listGenreNames(c) {
   const names = new Set();
   if (Array.isArray(c.genres) && c.genres.length) {
-    for (const g of c.genres) names.add(g);
+    for (const g of c.genres) names.add(SIMKL_TRENDING_GENRE_MAP[g] || g);
   } else if (Array.isArray(c.genre_ids) && c.genre_ids.length) {
     for (const id of c.genre_ids) {
       const name = GENRE_ID_TO_NAME[id];
       if (name) names.add(name);
     }
   }
-  return filters.tvGenres({ genres: [...names] });
+  return [...names];
 }
 
 // Merge the raw source payloads into a single pool keyed by tmdb_id, keeping
@@ -354,4 +367,6 @@ module.exports = {
   },
   generate,
   ALGORITHM_VERSION: marqueeTvConfig.ALGORITHM_VERSION,
+  // Exported for the L1 test (TV-3 §5).
+  listGenreNames,
 };

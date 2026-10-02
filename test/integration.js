@@ -7197,6 +7197,27 @@ async function main() {
     }
   });
 
+  // ── TV-3 L2: the T1 Simkl uncached cap is per build — 50 uncached seeds →
+  //    exactly 40 /tv/{id} GETs in one build (count the fetcher calls) ──
+  await it('TV-3 L2: ensureShowRecs — 50 uncached seeds, cap 40 → exactly 40 /tv/{id} fetches in one build', async () => {
+    const simklRecs = require('../src/engines/marqueeTv/simklRecs');
+    const p = config.addProfile('INT-TV3-L2');
+    config.updateProfile(p.id, { keys: { simkl_client_id: 'c3' }, simkl_auth: { access_token: 'tok' } });
+    const profile = config.getProfile(p.id);
+    const origAuthedGet = simkl.authedGet;
+    let fetches = 0;
+    try {
+      simkl.authedGet = (prof, path, extra) => { fetches += 1; return Promise.resolve({ users_recommendations: [] }); };
+      const ids = Array.from({ length: 50 }, (_, i) => 9000 + i);
+      const out = await simklRecs.ensureShowRecs(profile, ids, { cap: 40, now: Date.now(), log: quiet });
+      assert.strictEqual(fetches, 40, 'exactly 40 /tv/{id} fetches');
+      assert.strictEqual(out.size, 40, '40 ids served');
+    } finally {
+      simkl.authedGet = origAuthedGet;
+      config.removeProfile(p.id);
+    }
+  });
+
   // ── TV-2 E1: the full orchestrator (hermetic; stubbed network fetchers) ──
   // A temp DB with series_progress rows (a normal seed, an anime row, a Reality
   // show seen only as sampled_left) + Glass meta + stubs for every network
@@ -7238,14 +7259,19 @@ async function main() {
     };
 
     // Simkl recs: the candidates for seed1 (good1, anime2, reality2, horror2).
-    const simklRecs = async (profile, simklId) => {
-      if (simklId !== 100) return [];
-      return [
-        { tmdb_id: 'good1', imdb_id: 'ttgood1', title: 'Good Show', year: 2024 },
-        { tmdb_id: 'anime2', imdb_id: 'ttanime2', title: 'Anime Show 2', year: 2024 },
-        { tmdb_id: 'reality2', imdb_id: 'ttreality2', title: 'Reality Show 2', year: 2024 },
-        { tmdb_id: 'horror2', imdb_id: 'tthorror2', title: 'Horror Show 2', year: 2024 },
-      ];
+    // Batch fetcher (L2, TV-3 §5): (profile, simklIds) → Map<simkl_id, recs[]>.
+    const simklRecs = async (profile, ids) => {
+      const m = new Map();
+      for (const id of ids) {
+        if (id !== 100) continue;
+        m.set(id, [
+          { tmdb_id: 'good1', imdb_id: 'ttgood1', title: 'Good Show', year: 2024 },
+          { tmdb_id: 'anime2', imdb_id: 'ttanime2', title: 'Anime Show 2', year: 2024 },
+          { tmdb_id: 'reality2', imdb_id: 'ttreality2', title: 'Reality Show 2', year: 2024 },
+          { tmdb_id: 'horror2', imdb_id: 'tthorror2', title: 'Horror Show 2', year: 2024 },
+        ]);
+      }
+      return m;
     };
 
     const tmdbRecs = () => [];
@@ -7337,7 +7363,12 @@ async function main() {
       }
       return m;
     };
-    const simklRecs = async () => [{ tmdb_id: 'e2good1', imdb_id: 'tte2good1', title: 'Good Show', year: 2024 }];
+    // Batch fetcher (L2, TV-3 §5): (profile, simklIds) → Map<simkl_id, recs[]>.
+    const simklRecs = async (profile, ids) => {
+      const m = new Map();
+      for (const id of ids) m.set(id, [{ tmdb_id: 'e2good1', imdb_id: 'tte2good1', title: 'Good Show', year: 2024 }]);
+      return m;
+    };
     const tmdbRecs = () => [];
     const discover = () => [];
     const trending = () => [];
