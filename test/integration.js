@@ -7063,6 +7063,95 @@ async function main() {
     config.removeProfile(p.id); watchedStore.deleteForProfile(p.id);
   });
 
+  // ── TV-2 N1: discoverTv + tvDetailsFull (fetch-level) ────────────────────
+  await it('TV-2 N1: discoverTv URL + tvDetailsFull append/parse (extras + certAU/certUS)', async () => {
+    const origFetch = global.fetch;
+    const mkResponse = (payload) => ({ ok: true, status: 200, json: async () => payload });
+    try {
+      // (1) discover/tv: the params + language + page are on the URL; the
+      //     results map to series list items.
+      const tvItem = { id: 42, name: 'T', first_air_date: '2024-01-01', genre_ids: [18], vote_average: 7.5, vote_count: 900, popularity: 3, adult: false, poster_path: '/p.jpg' };
+      global.fetch = async (url) => {
+        const u = new URL(url);
+        assert.ok(u.pathname.includes('discover/tv'), 'discover/tv path');
+        assert.strictEqual(u.searchParams.get('language'), 'en-US');
+        assert.strictEqual(u.searchParams.get('page'), '2');
+        assert.strictEqual(u.searchParams.get('sort_by'), 'vote_count.desc');
+        assert.strictEqual(u.searchParams.get('with_genres'), '18|35');
+        return mkResponse({ results: [tvItem] });
+      };
+      const discovered = await tmdb.discoverTv('key', { sort_by: 'vote_count.desc', with_genres: '18|35' }, { page: 2 });
+      assert.deepStrictEqual(discovered, [{ type: 'series', tmdb_id: '42', title: 'T', year: 2024, genre_ids: [18], vote_average: 7.5, vote_count: 900, popularity: 3, adult: false, poster: '/p.jpg' }]);
+
+      // (2) tv/{id}: the append block is exact; the fixture payload yields a
+      //     deep meta + extras with every §5.1 field, and certAU/certUS come
+      //     from content_ratings.
+      const payload = {
+        id: 1234, name: 'Test Show', type: 'Scripted', status: 'Returning Series',
+        first_air_date: '2020-01-01', last_air_date: '2026-09-01',
+        last_episode_to_air: { air_date: '2026-09-01', runtime: 45 },
+        next_episode_to_air: { air_date: '2026-10-01' },
+        number_of_seasons: 5, number_of_episodes: 50, episode_run_time: [45],
+        origin_country: ['US'], original_language: 'en',
+        genres: [{ id: 18, name: 'Drama' }], poster_path: '/p.jpg',
+        vote_average: 8.5, vote_count: 1000, popularity: 5,
+        external_ids: { imdb_id: 'tt1234' },
+        content_ratings: { results: [{ iso_3166_1: 'AU', rating: 'MA15+' }, { iso_3166_1: 'US', rating: 'TV-14' }] },
+      };
+      global.fetch = async (url) => {
+        const u = new URL(url);
+        assert.ok(u.pathname.includes('tv/1234'), 'tv/1234 path');
+        assert.strictEqual(u.searchParams.get('append_to_response'), 'credits,keywords,external_ids,content_ratings');
+        assert.strictEqual(u.searchParams.get('language'), 'en-US');
+        return mkResponse(payload);
+      };
+      const res = await tmdb.tvDetailsFull('key', 1234);
+      assert.ok(res.deep, 'deep meta present');
+      assert.strictEqual(res.deep.imdb_id, 'tt1234');
+      assert.deepStrictEqual(res.extras, {
+        tvType: 'Scripted', status: 'Returning Series',
+        first_air_date: '2020-01-01', last_air_date: '2026-09-01',
+        last_episode_air_date: '2026-09-01', next_episode_air_date: '2026-10-01',
+        number_of_seasons: 5, number_of_episodes: 50, episode_runtime: 45,
+        origin_country: ['US'], original_language: 'en', raw_genres: ['Drama'],
+        certAU: 'MA15+', certUS: 'TV-14',
+      });
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  // ── TV-2 N2: ensureTvMeta (fetch only missing/expired; writes both stores; TTL) ──
+  await it('TV-2 N2: ensureTvMeta fetches missing, writes Glass metaStore + marquee_tv_meta, TTL 14d', async () => {
+    const meta = require('../src/engines/marqueeTv/meta');
+    const glassMetaStore = require('../src/engines/glass/metaStore');
+    const db = require('../src/db');
+    const fetchCalls = [];
+    const fetcher = (apiKey, id) => {
+      fetchCalls.push(id);
+      return Promise.resolve({
+        deep: { tmdb_id: String(id), imdb_id: 'tt' + id, type: 'series', title: 'Show ' + id, genres: ['Drama'] },
+        extras: { tvType: 'Scripted', status: 'Returning Series', certAU: 'MA15+', certUS: 'TV-14' },
+      });
+    };
+    const now = Date.now();
+    // (1) First call: both ids are missing → both fetched; both stores written.
+    const out1 = await meta.ensureTvMeta('key', ['ntv1', 'ntv2'], { fetcher, now });
+    assert.deepStrictEqual([...fetchCalls].sort(), ['ntv1', 'ntv2'], 'first call fetches both');
+    assert.ok(out1.has('ntv1') && out1.has('ntv2'), 'both in the map');
+    assert.ok(glassMetaStore.get('series', 'ntv1'), 'Glass metaStore series ntv1');
+    assert.ok(glassMetaStore.get('series', 'ntv2'), 'Glass metaStore series ntv2');
+    const row1 = db.get().prepare('SELECT extras FROM marquee_tv_meta WHERE tmdb_id = ?').get('ntv1');
+    assert.ok(row1 && JSON.parse(row1.extras).certAU === 'MA15+', 'marquee_tv_meta ntv1 extras');
+    // (2) Second call within 14 days: zero fetches (served from cache).
+    const out2 = await meta.ensureTvMeta('key', ['ntv1', 'ntv2'], { fetcher, now: now + 1000 });
+    assert.strictEqual(fetchCalls.length, 2, 'second call fetches nothing');
+    assert.ok(out2.has('ntv1') && out2.has('ntv2'), 'both served from cache');
+    // (3) A call after the 14-day TTL refetches.
+    const out3 = await meta.ensureTvMeta('key', ['ntv1'], { fetcher, now: now + 15 * 24 * 3600e3 });
+    assert.strictEqual(fetchCalls.length, 3, 'after TTL the id refetches');
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();
