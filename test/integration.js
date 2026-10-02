@@ -6543,6 +6543,51 @@ async function main() {
     }
   });
 
+  await it('O5. ladderFor — reads series_progress, joins taste_ratings (type=series) by tmdb_id (I5)', async () => {
+    const seriesEngagement = require('../src/seriesEngagement');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const p = config.addProfile('INT-O5');
+    const now = Date.parse('2026-06-01T00:00:00Z');
+    const DAY = 86400e3;
+    try {
+      const rowA = { simkl_id: 100, kind: 'show', imdb_id: 'tt100', tmdb_id: '100', title: 'Show A', year: 2020, status: 'watching', watched_eps: 6, total_eps: 20, not_aired_eps: 0, last_watched_at: now - 10 * DAY, first_watched_at: now - 30 * DAY, first_real_at: now - 30 * DAY, last_real_at: now - 10 * DAY, stamps: 3, real_stamps: 3, eps_per_week: null };
+      const rowB = { simkl_id: 200, kind: 'show', imdb_id: 'tt200', tmdb_id: '200', title: 'Show B', year: 2021, status: 'watching', watched_eps: 24, total_eps: 50, not_aired_eps: 0, last_watched_at: now - 5 * DAY, first_watched_at: now - 40 * DAY, first_real_at: now - 40 * DAY, last_real_at: now - 5 * DAY, stamps: 4, real_stamps: 4, eps_per_week: 5 };
+      const rowC = { simkl_id: 300, kind: 'anime', imdb_id: 'tt300', tmdb_id: null, title: 'Anime C', year: 2022, status: 'watching', watched_eps: 2, total_eps: 12, not_aired_eps: 0, last_watched_at: now - 1 * DAY, first_watched_at: now - 1 * DAY, first_real_at: now - 1 * DAY, last_real_at: now - 1 * DAY, stamps: 1, real_stamps: 1, eps_per_week: null };
+      assert.strictEqual(watchedStore.upsertSeriesProgress(p.id, [rowA, rowB, rowC]), 3);
+      // Show ratings (type='series'), keyed by tmdb_id.
+      tasteFeedback.upsertRating(p.id, { type: 'series', tmdb_id: '100', rating: 10 });
+      tasteFeedback.upsertRating(p.id, { type: 'series', tmdb_id: '200', rating: 4 });
+      tasteFeedback.upsertRating(p.id, { type: 'series', tmdb_id: '999', rating: 9 }); // a show NOT in series_progress
+      const out = seriesEngagement.ladderFor(p.id, { now });
+      assert.strictEqual(out.size, 3, 'three shows');
+      // 100: engaged, rated 10 → weight 3.0 (rating overrides the rung weight).
+      const a = out.get(100);
+      assert.strictEqual(a.row.simkl_id, 100);
+      assert.strictEqual(a.rung, 'engaged');
+      assert.strictEqual(a.weight, 3.0, 'rated 10 overrides the rung weight');
+      assert.strictEqual(a.rated, true);
+      // 200: committed, rated 4 → weight -1.2.
+      const b = out.get(200);
+      assert.strictEqual(b.rung, 'committed');
+      assert.strictEqual(b.weight, -1.2, 'rated 4 overrides the rung weight');
+      assert.strictEqual(b.rated, true);
+      // 300: no tmdb_id → unrated → rung weight (sampling → 0.3).
+      const c = out.get(300);
+      assert.strictEqual(c.rung, 'sampling');
+      assert.strictEqual(c.weight, 0.3, 'unrated → rung weight');
+      assert.strictEqual(c.rated, false);
+      // kind filter.
+      const shows = seriesEngagement.ladderFor(p.id, { now, kind: 'show' });
+      assert.strictEqual(shows.size, 2, 'kind=show → 2 rows');
+      assert.ok(shows.has(100) && shows.has(200));
+      const anime = seriesEngagement.ladderFor(p.id, { now, kind: 'anime' });
+      assert.strictEqual(anime.size, 1, 'kind=anime → 1 row');
+      assert.ok(anime.has(300));
+    } finally {
+      config.removeProfile(p.id); watchedStore.deleteForProfile(p.id); tasteFeedback.deleteForProfile(p.id);
+    }
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();

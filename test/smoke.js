@@ -4561,6 +4561,83 @@ ok('TV-1 P2: parseSeriesProgress — bulk boundary (exactly 300000 ms)', () => {
   assert.strictEqual(r3.real_stamps, 1, 'single stamp → real');
 });
 
+// ---- TV-1: seriesEngagement (pure) ----
+ok('TV-1 P3: rungOf — first-match-wins rung logic', () => {
+  const { rungOf, DEFAULTS } = require('../src/seriesEngagement');
+  const DAY = 86400e3;
+  const base = { status: 'watching', total_eps: 20, not_aired_eps: 0, last_watched_at: Date.now() - 1 * DAY };
+  // finished via status.
+  assert.strictEqual(rungOf({ ...base, status: 'completed', watched_eps: 2 }, DEFAULTS), 'finished');
+  // finished via caught-up (w >= aired).
+  assert.strictEqual(rungOf({ ...base, watched_eps: 20 }, DEFAULTS), 'finished');
+  // committed via 60% of aired (0.6*20 = 12).
+  assert.strictEqual(rungOf({ ...base, watched_eps: 12 }, DEFAULTS), 'committed');
+  // committed via committed_any_eps (24) even when < 60% of aired.
+  assert.strictEqual(rungOf({ ...base, total_eps: 50, watched_eps: 24 }, DEFAULTS), 'committed');
+  // engaged (>= engaged_min_eps, not committed).
+  assert.strictEqual(rungOf({ ...base, watched_eps: 10 }, DEFAULTS), 'engaged');
+  // tried (3..tried_max_eps).
+  assert.strictEqual(rungOf({ ...base, watched_eps: 4 }, DEFAULTS), 'tried');
+  // sampled_left (w <= sampled_max_eps, idle >= idle_days, more aired).
+  assert.strictEqual(rungOf({ ...base, watched_eps: 2, last_watched_at: Date.now() - 90 * DAY }, DEFAULTS), 'sampled_left');
+  // sampling (w <= sampled_max_eps, touched recently).
+  assert.strictEqual(rungOf({ ...base, watched_eps: 2, last_watched_at: Date.now() - 1 * DAY }, DEFAULTS), 'sampling');
+  // total_eps null: committed via committed_any_eps only.
+  assert.strictEqual(rungOf({ status: 'watching', total_eps: null, not_aired_eps: 0, watched_eps: 24, last_watched_at: Date.now() }, DEFAULTS), 'committed');
+});
+
+ok('TV-1 P4: ladder modifiers — recency half-life, activeNow, binge bonus', () => {
+  const { ladder } = require('../src/seriesEngagement');
+  const now = 1_000_000_000_000;
+  const DAY = 86400e3;
+  // (a) Recency half-life (180 days): recency = 0.5^(ageDays / 180).
+  const mkRow = (daysAgo) => ({ watched_eps: 6, total_eps: 20, not_aired_eps: 0, status: 'watching', last_watched_at: now - daysAgo * DAY, real_stamps: 3, eps_per_week: null });
+  assert.ok(Math.abs(ladder(mkRow(180), { now }).recency - 0.5) < 1e-9, '180 days → 0.5');
+  assert.ok(Math.abs(ladder(mkRow(360), { now }).recency - 0.25) < 1e-9, '360 days → 0.25');
+  assert.ok(Math.abs(ladder(mkRow(0), { now }).recency - 1) < 1e-9, '0 days → 1');
+  // (b) activeNow (watched within active_days = 30).
+  assert.strictEqual(ladder(mkRow(10), { now }).activeNow, true, '10 days → activeNow');
+  assert.strictEqual(ladder(mkRow(40), { now }).activeNow, false, '40 days → not activeNow');
+  // (c) Binge bonus (>= binge_eps_per_week AND >= binge_min_real real stamps).
+  const binge = (epw, real) => ({ watched_eps: 6, total_eps: 20, not_aired_eps: 0, status: 'watching', last_watched_at: now - 10 * DAY, real_stamps: real, eps_per_week: epw });
+  assert.strictEqual(ladder(binge(5, 4), { now }).binge, 0.3, '5 epw + 4 real → +0.3');
+  assert.strictEqual(ladder(binge(4.9, 4), { now }).binge, 0, '4.9 epw → no binge');
+  assert.strictEqual(ladder(binge(5, 3), { now }).binge, 0, '3 real → no binge');
+  // value = weight * recency * (activeNow ? active_factor : 1) + binge.
+  const r = ladder(mkRow(10), { now });
+  assert.ok(Math.abs(r.value - (1.0 * r.recency * 1.3)) < 1e-9, 'value = weight*recency*active');
+});
+
+ok('TV-1 P5: rating override — the film rating table (Q9)', () => {
+  const { ratingWeight, ladder, RUNG_WEIGHTS } = require('../src/seriesEngagement');
+  // The film rating table.
+  assert.strictEqual(ratingWeight(10), 3.0);
+  assert.strictEqual(ratingWeight(9), 2.0);
+  assert.strictEqual(ratingWeight(7), 1.2);
+  assert.strictEqual(ratingWeight(8), 1.2);
+  assert.strictEqual(ratingWeight(5), 0.4);
+  assert.strictEqual(ratingWeight(6), 0.4);
+  assert.strictEqual(ratingWeight(1), -1.2);
+  assert.strictEqual(ratingWeight(4), -1.2);
+  assert.strictEqual(ratingWeight(null), null);
+  assert.strictEqual(ratingWeight(0), null);
+  // ladder: a show rating overrides the rung weight (rated per SHOW, never per episode).
+  const now = 1_000_000_000_000;
+  const row = { watched_eps: 6, total_eps: 20, not_aired_eps: 0, status: 'watching', last_watched_at: now - 10 * 86400e3, real_stamps: 3, eps_per_week: null };
+  const unrated = ladder(row, { now, rating: null });
+  assert.strictEqual(unrated.rung, 'engaged');
+  assert.strictEqual(unrated.weight, RUNG_WEIGHTS.engaged, 'unrated → rung weight');
+  assert.strictEqual(unrated.rated, false);
+  const r10 = ladder(row, { now, rating: 10 });
+  assert.strictEqual(r10.weight, 3.0, 'rated 10 → 3.0');
+  assert.strictEqual(r10.rated, true);
+  const r4 = ladder(row, { now, rating: 4 });
+  assert.strictEqual(r4.weight, -1.2, 'rated 4 → -1.2');
+  // value uses the rating weight.
+  const r9 = ladder(row, { now, rating: 9 });
+  assert.ok(Math.abs(r9.value - (2.0 * r9.recency * 1.3)) < 1e-9, 'value uses rating weight');
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');
