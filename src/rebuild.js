@@ -31,7 +31,6 @@ const settings = require('./settings');
 const catalogs = require('./catalogs');
 const simkl = require('./services/simkl');
 const watchedStore = require('./watchedStore');
-const llm = require('./services/groq');
 const tmdb = require('./services/tmdb');
 const mdblist = require('./services/mdblist');
 const animeMap = require('./services/animeMap');
@@ -123,7 +122,6 @@ function cleanMetas(metas) {
 // on a real classification instead of guessing at one.
 async function applyAnimeGate(metas, profile, log = console) {
   if (!metas.length) return metas;
-  const limit = profile.filters?.age_limit || 0;
   await animeMap.ensureLoaded(log);
 
   const malByMeta = new Map();
@@ -137,6 +135,12 @@ async function applyAnimeGate(metas, profile, log = console) {
   const out = [];
   let blocked = 0;
   let aged = 0;
+  // AGE-2: the MAL band is per tier — the tier's `malMaxAge` replaces the
+  // legacy "judged one year above the limit" (judgementAge). 10+/12+ allow
+  // MAL G/PG (block PG-13); TV-14/15+ allow PG-13 (block R); R+ stays blocked
+  // (adultish) at every tier. `limit` is still read for the no-limit case.
+  const ageVerification = require('./ageVerification');
+  const tier = ageVerification.tierFor(profile.filters);
   for (const m of metas) {
     const malId = malByMeta.get(m);
     const v = malId ? verdicts.get(malId) : null;
@@ -145,7 +149,7 @@ async function applyAnimeGate(metas, profile, log = console) {
       blocked++;
       continue;
     }
-    if (mal.blockedForAge(v, limit === 0 ? 0 : judgementAge(profile.filters))) {
+    if (mal.blockedForAge(v, tier ? tier.malMaxAge : 0)) {
       log.log(`[anime] "${m.name}" rated ${v.code} (${v.minAge}+) > limit — dropped`);
       aged++;
       continue;
@@ -240,50 +244,30 @@ async function applyExtraAgeGate(profile, def, metas, log = console) {
   let list = await applyAnimeGate(metas, gateProfile, log);
   if (limit <= 0 || !list.length) return list;
   metas = list;
-  // TV-14: run the multi-source decision chain (mandate A1: only age_limit===14
-  // uses the chain; every other tier runs the LLM path below, byte-identical).
+  // AGE-2: every positive age limit is a chain tier — the multi-source decision
+  // chain is the ONLY age gate (mandate B3: no legacy LLM age path remains).
+  // The chain's LLM step (step 5) is fail-closed: without an LLM it throws, so
+  // the caller keeps the previous list rather than publishing an unvetted one.
   const ageVerify = require('./ageVerification');
   const tier = ageVerify.tierFor({ age_limit: limit });
-  if (tier && tier.mode === 'chain') {
-    const sources = require('./ageVerification/sources').buildSources(profile, log);
-    const titles = metas.map((m) => ({
-      key: `${def.type}:${m._tmdb_id}`,
-      imdb_id: m.id,
-      adult: m._adult || false,
-      title: m.name,
-      year: m.releaseInfo,
-      genres: m._genre_names || [],
-      certification: m._certification || null,
-    }));
-    const result = await ageVerify.verify(titles, def.type, tier, sources, log);
-    const blocked = new Set();
-    for (const [k, v] of result) {
-      if (v.verdict === 'block') blocked.add(k.split(':')[1]);
-    }
-    const out = metas.filter((m) => !blocked.has(m._tmdb_id));
-    if (blocked.size) {
-      log.log(`[extra] ${profile.name}/${def.id}: TV-14 chain removed ${blocked.size} of ${metas.length}`);
-    }
-    return out;
+  const sources = require('./ageVerification/sources').buildSources(profile, log);
+  const titles = metas.map((m) => ({
+    key: `${def.type}:${m._tmdb_id}`,
+    imdb_id: m.id,
+    adult: m._adult || false,
+    title: m.name,
+    year: m.releaseInfo,
+    genres: m._genre_names || [],
+    certification: m._certification || null,
+  }));
+  const result = await ageVerify.verify(titles, def.type, tier, sources, log);
+  const blocked = new Set();
+  for (const [k, v] of result) {
+    if (v.verdict === 'block') blocked.add(k.split(':')[1]);
   }
-  // Other tiers: LLM age gate (unchanged).
-  if (!settings.hasLlm()) {
-    throw new Error(`No LLM configured — required for the age check on "${def.name}" (set a Custom LLM or Groq key in Server Config)`);
-  }
-  const vetoed = await llm.ageGate(
-    def.type, judgementAge(gateProfile.filters),
-    // Genres matter: judging "Berserk" on a truncated overview alone is a
-    // much weaker signal than judging it as Action/Horror/Fantasy. They were
-    // being stripped before the gate saw them (cleanMetas ran too early).
-    metas.map((m) => ({
-      id: m.id, cacheId: m._tmdb_id, title: m.name, year: m.releaseInfo,
-      genres: m._genre_names, certification: m._certification, overview: m.description,
-    })),
-    log,
-  );
-  const out = metas.filter((m) => !vetoed.has(m.id));
-  if (vetoed.size) {
-    log.log(`[extra] ${profile.name}/${def.id}: AI age gate removed ${vetoed.size} of ${metas.length} (band ${limit})`);
+  const out = metas.filter((m) => !blocked.has(m._tmdb_id));
+  if (blocked.size) {
+    log.log(`[extra] ${profile.name}/${def.id}: chain removed ${blocked.size} of ${metas.length} (band ${limit})`);
   }
   return out;
 }

@@ -398,49 +398,35 @@ async function ageGatePool(profile, log = console, onProgress = () => {}) {
   let dropped = 0;
   for (const r of rows) if (!keptKeys.has(key(r.type, r.tmdb_id))) { hardDrop(profile.id, r.type, r.tmdb_id); dropped++; }
 
-  // 2. Age gate — TV-14 uses the decision chain; other tiers use the LLM age gate.
+  // 2. Age gate — every positive age limit is a chain tier (AGE-2): the
+  // multi-source decision chain is the ONLY age gate (mandate B3: no legacy
+  // LLM age path remains). The chain's LLM step (step 5) is fail-closed.
   let vetoed = 0;
   if (limit > 0) {
     const ageVerify = require('./ageVerification');
     const tier = ageVerify.tierFor({ age_limit: limit });
-    if (tier && tier.mode === 'chain') {
-      // TV-14: run the multi-source decision chain (mandate A1: only age_limit===14
-      // uses the chain; every other tier runs the LLM path below, byte-identical).
-      onProgress(50, 'Age-checking with the TV-14 chain…');
-      const sources = require('./ageVerification/sources').buildSources(profile, log);
-      for (const type of ['movie', 'series']) {
-        const survivors = getRecommended(profile.id, { type, limit: 100000 });
-        if (!survivors.length) continue;
-        const titles = survivors.map((r) => ({
-          key: `${type}:${r.tmdb_id}`,
-          imdb_id: r.imdb_id,
-          adult: r.adult || false,
-          title: r.title,
-          year: r.year,
-          genres: r.primary_genre ? [r.primary_genre] : [],
-          certification: r.certification || r.age_classification,
-        }));
-        const result = await ageVerify.verify(titles, type, tier, sources, log);
-        for (const [k, v] of result) {
-          const tmdbId = k.split(':')[1];
-          if (v.verdict === 'block') { hardDrop(profile.id, type, tmdbId); vetoed++; }
-          // A7: store the verdict's source+rating on the pool row's certification column.
-          if (v.verdict === 'allow' || v.verdict === 'block') {
-            setCertification(profile.id, type, tmdbId, `${v.source}:${v.rating || ''}`);
-          }
+    onProgress(50, 'Age-checking with the verification chain…');
+    const sources = require('./ageVerification/sources').buildSources(profile, log);
+    for (const type of ['movie', 'series']) {
+      const survivors = getRecommended(profile.id, { type, limit: 100000 });
+      if (!survivors.length) continue;
+      const titles = survivors.map((r) => ({
+        key: `${type}:${r.tmdb_id}`,
+        imdb_id: r.imdb_id,
+        adult: r.adult || false,
+        title: r.title,
+        year: r.year,
+        genres: r.primary_genre ? [r.primary_genre] : [],
+        certification: r.certification || r.age_classification,
+      }));
+      const result = await ageVerify.verify(titles, type, tier, sources, log);
+      for (const [k, v] of result) {
+        const tmdbId = k.split(':')[1];
+        if (v.verdict === 'block') { hardDrop(profile.id, type, tmdbId); vetoed++; }
+        // A7: store the verdict's source+rating on the pool row's certification column.
+        if (v.verdict === 'allow' || v.verdict === 'block') {
+          setCertification(profile.id, type, tmdbId, `${v.source}:${v.rating || ''}`);
         }
-      }
-    } else {
-      // Other tiers: LLM ACB pass — kids only, remove-only, per type (unchanged).
-      onProgress(50, 'Age-checking with the LLM…');
-      for (const type of ['movie', 'series']) {
-        const survivors = getRecommended(profile.id, { type, limit: 100000 });
-        if (!survivors.length) continue;
-        // SH-01: the real AU/US movie classification (when stored) informs the LLM
-        // judgement; the MAL band (age_classification) remains the fallback.
-        const veto = await groq.ageGate(type, rebuild.judgementAge(profile.filters),
-          survivors.map((r) => ({ id: r.tmdb_id, title: r.title, year: r.year, genres: r.primary_genre ? [r.primary_genre] : [], certification: r.certification || r.age_classification })), log);
-        for (const r of survivors) if (veto.has(r.tmdb_id)) { hardDrop(profile.id, r.type, r.tmdb_id); vetoed++; }
       }
     }
   }
@@ -642,17 +628,14 @@ function certMinAge(cert) {
 function passesAgeBand(row, filters = {}) {
   const limit = filters.age_limit || 0;
   if (limit <= 0) return true;                       // adults: unchanged, always true
-  // TV-14: serve-time re-check reads the stored verdict without network (A7).
+  // AGE-2: every positive age limit is a chain tier — the serve-time re-check
+  // reads the stored verdict without network (A7). No legacy cert/MAL path
+  // remains (mandate B3). An unrated/unknown row (no type or tmdb_id) stays
+  // kept (fail-open), exactly as before.
   const ageVerify = require('./ageVerification');
   const tier = ageVerify.tierFor({ age_limit: limit });
-  if (tier && tier.mode === 'chain' && row.type && row.tmdb_id) {
-    return ageVerify.passesStored(row.type, row.tmdb_id, tier.id);
-  }
-  const mal  = certMinAge(row.age_classification);   // existing MAL-band table, unchanged
-  const real = certs.anyCertMinAge(row.certification);
-  const known = [mal, real].filter((m) => m !== null);
-  if (!known.length) return true;                    // unknown stays KEPT at serve (unchanged rule)
-  return Math.max(...known) <= limit + 1;            // SH-01: stricter-only — the stricter source wins
+  if (!row.type || !row.tmdb_id) return true;        // unrated/unknown stays kept (fail-open)
+  return ageVerify.passesStored(row.type, row.tmdb_id, tier.id);
 }
 
 // Round-robin across primary_genre buckets: take the strongest remaining title
