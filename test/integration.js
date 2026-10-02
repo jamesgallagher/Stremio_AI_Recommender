@@ -6917,6 +6917,152 @@ async function main() {
     }
   });
 
+  // ── TV-2 C1: ageGatePool logs ONE per-source line per profile (AGE-2 §2.9) ──
+  // A fixture with mixed sources (a cache hit + freshly-decided titles) must
+  // produce the exact per-source line; only sources with n > 0 are listed.
+  await it('TV-2 C1: ageGatePool logs a per-source line (mixed sources incl. a cache hit)', async () => {
+    const ageVerify = require('../src/ageVerification');
+    const sources = require('../src/ageVerification/sources');
+    const verdictStore = require('../src/ageVerification/store');
+    const db = require('../src/db');
+    offlineAnimeMap();
+    const p = config.addProfile('INT-TV2-C1');
+    config.updateProfile(p.id, { filters: { age_limit: 14 } });
+    const profile = config.getProfile(p.id);
+    const tier = ageVerify.tierFor({ age_limit: 14 });
+    // Seed the pool: six movie rows.
+    rs.upsertCandidates(p.id, ['c100', 'c101', 'c102', 'c103', 'c104', 'c105'].map((id) => ({
+      type: 'movie', tmdb_id: id, imdb_id: 'tt' + id, title: 'Show ' + id, year: 2020,
+      primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, affinity: 10, rec_count: 1, popularity: 0,
+    })));
+    // Cache hits (stored source is what the line counts): c100 csm allow,
+    // c101 au block, c105 tvdb-au allow.
+    verdictStore.recordVerdict('movie', 'c100', tier.id, 'allow', 'csm', '13', Date.now());
+    verdictStore.recordVerdict('movie', 'c101', tier.id, 'block', 'au', 'MA 15+', Date.now());
+    verdictStore.recordVerdict('movie', 'c105', tier.id, 'allow', 'tvdb-au', 'PG', Date.now());
+    // Stub the sources so the three non-cached titles decide as:
+    // c102 → us allow (US PG), c103 → hard-floor block (AU R 18+), c104 → llm allow.
+    const origBuildSources = sources.buildSources;
+    sources.buildSources = () => ({
+      tmdbRatings: async (_type, titles) => {
+        const out = new Map();
+        const ratings = { c102: { US: 'PG' }, c103: { AU: 'R 18+' }, c104: {} };
+        for (const t of titles) out.set(t.key, ratings[t.key.split(':')[1]] || {});
+        return out;
+      },
+      csmAges: async () => new Map(),
+      tvdbRatings: async () => new Map(),
+      simklCerts: async () => new Map(),
+      mdblistCerts: async () => new Map(),
+      llmGate: async (_type, _tier, titles) => {
+        const out = new Map();
+        for (const t of titles) if (t.key === 'movie:c104') out.set(t.key, true);
+        return out;
+      },
+    });
+    const lines = [];
+    const log = { log: (s) => lines.push(s), warn: () => {}, error: () => {} };
+    try {
+      await rs.ageGatePool(profile, log);
+      const line = lines.find((l) => l.includes('age gate'));
+      assert.ok(line, 'age gate line logged');
+      assert.ok(line.includes('age gate (TV-14 (14+, AU M))'), 'tier label present: ' + line);
+      assert.ok(line.includes('decided: csm 1, au 1, us 1, tvdb-au 1, hard-floor 1, llm 1'), 'per-source decided counts: ' + line);
+      assert.ok(line.includes('blocked 2 (au 1, hard-floor 1)'), 'per-source blocked counts: ' + line);
+      assert.ok(line.includes('· 4 remain'), '4 remain: ' + line);
+      // The two blocked titles are dropped from the pool.
+      assert.strictEqual(rs.getRecommended(p.id, { type: 'movie', limit: 100 }).length, 4, 'two blocked titles dropped');
+    } finally {
+      sources.buildSources = origBuildSources;
+      db.get().prepare("DELETE FROM age_verdicts WHERE type = 'movie' AND tier = 'tv14' AND tmdb_id IN ('c100','c101','c105')").run();
+      config.removeProfile(p.id); rs.deleteForProfile(p.id);
+    }
+  });
+
+  // ── TV-2 C2: syncFromSimkl logs the series backfill inside the backfill block ──
+  // A backfill run logs the line once (even when the activities gate then
+  // returns early); a non-backfill run does not.
+  await it('TV-2 C2: syncFromSimkl logs the series backfill once on backfill, not on steady-state', async () => {
+    const simklSvc = require('../src/services/simkl');
+    const p = config.addProfile('INT-TV2-C2');
+    config.updateProfile(p.id, { keys: { simkl_client_id: 'c2' }, simkl_auth: { access_token: 'tok' } });
+    const profile = config.getProfile(p.id);
+    const origGetAllItems = simklSvc.getAllItems;
+    const origGetActivities = simklSvc.getActivities;
+    const lines = [];
+    const log = { log: (s) => lines.push(s), warn: () => {}, error: () => {} };
+    // A show (kind 'show') and an anime (kind 'anime'), so the backfill counts both.
+    // Shape mirrors Simkl's all-items entry: item.show / item.anime carries ids
+    // (simkl required), seasons[].episodes[].watched_at drives the stamps.
+    const showItem = {
+      show: { ids: { simkl: 11, imdb: 'ttc2s', tmdb: 'c2s' }, title: 'Show C2', year: 2020 },
+      seasons: [{ episodes: [{ watched_at: '2026-06-01' }] }],
+      last_watched_at: '2026-06-01', status: 'completed', watched_episodes_count: 1, total_episodes_count: 1,
+    };
+    const animeItem = {
+      anime: { ids: { simkl: 12, imdb: 'ttc2a', tmdb: 'c2a' }, title: 'Anime C2', year: 2020 },
+      seasons: [{ episodes: [{ watched_at: '2026-06-01' }] }],
+      last_watched_at: '2026-06-01', status: 'completed', watched_episodes_count: 1, total_episodes_count: 1,
+    };
+    simklSvc.getAllItems = (prof, section, opts) => Promise.resolve(
+      section === 'shows' ? [showItem] : section === 'anime' ? [animeItem] : []);
+    simklSvc.getActivities = () => Promise.resolve({ all: 'c2-timestamp' });
+    try {
+      // (1) Backfill run: no series_progress_sync marker → the backfill block runs.
+      await watchedStore.syncFromSimkl(profile, log);
+      const backfillLines = lines.filter((l) => l.includes('series progress backfilled'));
+      assert.strictEqual(backfillLines.length, 1, 'backfill logged once: ' + JSON.stringify(lines));
+      assert.ok(backfillLines[0].includes('series progress backfilled — 1 show(s), 1 anime'), 'backfill counts show + anime: ' + backfillLines[0]);
+      lines.length = 0;
+      // (2) Steady-state run: marker now set → the backfill block is skipped, so
+      //    no backfill line (even though the activities gate would return early).
+      await watchedStore.syncFromSimkl(profile, log);
+      assert.strictEqual(lines.filter((l) => l.includes('series progress backfilled')).length, 0, 'no backfill line on steady-state: ' + JSON.stringify(lines));
+    } finally {
+      simklSvc.getAllItems = origGetAllItems;
+      simklSvc.getActivities = origGetActivities;
+      config.removeProfile(p.id); watchedStore.deleteForProfile(p.id);
+    }
+  });
+
+  // ── TV-2 C3: the series bench report is named bench-<profile>-series-<ts>.json ──
+  await it('TV-2 C3: reportFileName — series carries -series, movie keeps the plain name', async () => {
+    const bench = require('../src/bench/engineBench');
+    const ts = '2026-10-02T00-00-00-000Z';
+    assert.strictEqual(bench.reportFileName('James', 'series', ts), 'bench-James-series-2026-10-02T00-00-00-000Z.json', 'series report name');
+    assert.strictEqual(bench.reportFileName('James', 'movie', ts), 'bench-James-2026-10-02T00-00-00-000Z.json', 'movie report name (unchanged)');
+  });
+
+  // ── TV-2 C5: removeSeriesHoldout also removes pending_watched rows by IMDb id ──
+  // A pending row that carries ONLY an IMDb id (no tmdb_id) must be removed via
+  // the target's series_progress imdb lookup (before the series_progress row is deleted).
+  await it('TV-2 C5: removeSeriesHoldout removes a pending_watched row keyed only by IMDb id', async () => {
+    const db = require('../src/db');
+    const bench = require('../src/bench/engineBench');
+    const p = config.addProfile('INT-TV2-C5');
+    // A series_progress row for the target (tmdb s51, imdb tts51).
+    watchedStore.upsertSeriesProgress(p.id, [{
+      simkl_id: 51, kind: 'show', imdb_id: 'tts51', tmdb_id: 's51', title: 'Show 51', year: 2020,
+      status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0,
+      last_watched_at: Date.now(), first_watched_at: Date.now(),
+      first_real_at: Date.now(), last_real_at: Date.now(), stamps: 10, real_stamps: 10, eps_per_week: null,
+    }]);
+    // A pending_watched row keyed ONLY by IMDb id (no tmdb_id).
+    watchedStore.addPendingWatched(p.id, { type: 'series', imdbId: 'tts51' });
+    // Sanity: the pending row exists and has no tmdb_id.
+    const conn = db.get();
+    let row = conn.prepare('SELECT id, imdb_id, tmdb_id FROM pending_watched WHERE profile_id = ? AND imdb_id = ?').get(p.id, 'tts51');
+    assert.ok(row, 'pending row present before removal');
+    assert.strictEqual(row.tmdb_id, null, 'pending row has no tmdb_id');
+    // removeSeriesHoldout must remove it (via the series_progress imdb lookup).
+    bench.removeSeriesHoldout(p.id, ['s51'], { db });
+    row = conn.prepare('SELECT id FROM pending_watched WHERE profile_id = ? AND imdb_id = ?').get(p.id, 'tts51');
+    assert.strictEqual(row, undefined, 'pending row removed by IMDb id');
+    // The series_progress row is also gone.
+    assert.strictEqual(conn.prepare('SELECT tmdb_id FROM series_progress WHERE profile_id = ? AND tmdb_id = ?').get(p.id, 's51'), undefined, 'series_progress row removed');
+    config.removeProfile(p.id); watchedStore.deleteForProfile(p.id);
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();

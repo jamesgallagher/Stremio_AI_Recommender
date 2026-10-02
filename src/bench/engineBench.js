@@ -315,8 +315,18 @@ function removeHoldout(profileId, targetIds, { db, noCache = false }) {
 function removeSeriesHoldout(profileId, targetIds, { db, noCache = false }) {
   const conn = db.get();
   const inList = targetIds.map(() => '?').join(',');
+  // TV-2 C5: a pending_watched row may carry ONLY an IMDb id (its dedupe key
+  // `id` is imdb-preferred), so the tmdb-keyed delete below misses it. Look up
+  // the targets' imdb ids from their series_progress rows BEFORE those rows are
+  // deleted, then remove the imdb-keyed pending rows too.
+  const progressImdb = conn.prepare('SELECT imdb_id FROM series_progress WHERE profile_id = ? AND tmdb_id IN (' + inList + ')').all(profileId, ...targetIds);
+  const imdbIds = progressImdb.map((r) => r.imdb_id).filter((id) => id != null && id !== '');
   conn.prepare('DELETE FROM watched WHERE profile_id = ? AND type = ? AND tmdb_id IN (' + inList + ')').run(profileId, 'series', ...targetIds);
   conn.prepare('DELETE FROM pending_watched WHERE profile_id = ? AND tmdb_id IN (' + inList + ')').run(profileId, ...targetIds);
+  if (imdbIds.length) {
+    const imdbInList = imdbIds.map(() => '?').join(',');
+    conn.prepare('DELETE FROM pending_watched WHERE profile_id = ? AND imdb_id IN (' + imdbInList + ')').run(profileId, ...imdbIds);
+  }
   conn.prepare('DELETE FROM dont_recommend WHERE profile_id = ? AND tmdb_id IN (' + inList + ')').run(profileId, ...targetIds);
   conn.prepare('DELETE FROM series_progress WHERE profile_id = ? AND tmdb_id IN (' + inList + ')').run(profileId, ...targetIds);
   conn.prepare('DELETE FROM recommended WHERE profile_id = ? AND type = ?').run(profileId, 'series');
@@ -622,4 +632,12 @@ function renderTable(results) {
   return lines.join('\n');
 }
 
-module.exports = { pickTargets, pickSeriesTargets, metrics, renderTable, runBench, removeHoldout, removeSeriesHoldout, snapshotStore, applyMarqueeConfig, parseComps, assessReachability, serveStrategyMetrics, renderServeTable };
+// TV-2 C3: the bench report file name. Series reports carry a -series infix
+// (bench-<profile>-series-<timestamp>.json); movie reports keep the existing
+// bench-<profile>-<timestamp>.json name. Pure so the suite can assert both.
+function reportFileName(profileName, type, ts) {
+  const typeSuffix = type === 'series' ? '-series' : '';
+  return `bench-${profileName}${typeSuffix}-${ts}.json`;
+}
+
+module.exports = { pickTargets, pickSeriesTargets, metrics, renderTable, runBench, removeHoldout, removeSeriesHoldout, snapshotStore, applyMarqueeConfig, parseComps, assessReachability, serveStrategyMetrics, renderServeTable, reportFileName };

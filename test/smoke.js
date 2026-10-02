@@ -4677,6 +4677,11 @@ ok('TV-1 P6: cfg overrides — weights and rating_weights (V3)', () => {
   assert.strictEqual(ladder(engaged, { now, rating: 9, cfg: { rating_weights: { r10: 4 } } }).weight, 2.0, 'other rating bands untouched');
 });
 
+ok('TV-2 C4: Dockerfile ships scripts/ (bench tool) in the image', () => {
+  const dockerfile = fs.readFileSync(path.join(__dirname, '..', 'Dockerfile'), 'utf8');
+  assert.ok(dockerfile.includes('COPY scripts ./scripts'), 'Dockerfile ships scripts/ (COPY scripts ./scripts)');
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');
