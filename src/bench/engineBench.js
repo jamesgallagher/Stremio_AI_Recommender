@@ -110,6 +110,16 @@ const metrics = (rows, targets, filters, { selectServe, stored, buildSeconds, re
   };
 };
 
+// Convert a snake_case serve config (config.js DEFAULTS.serve or a bench
+// --serve-opts JSON) to the camelCase opts calibratedOrder expects — the same
+// conversion selectServeFor applies to the stored serve config.
+const camelServeOpts = (o) => {
+  if (!o || typeof o !== 'object') return {};
+  const out = {};
+  for (const [k, v] of Object.entries(o)) out[k.replace(/_([a-z])/g, (_, c) => c.toUpperCase())] = v;
+  return out;
+};
+
 // §6: serve-strategy comparison for Marquee (round-robin vs calibrated vs pure
 // score), on the SAME stored rows + SAME stored target. Pure / seam-injected so
 // the integration suite can drive it hermetically. Each strategy serves 20; the
@@ -117,9 +127,15 @@ const metrics = (rows, targets, filters, { selectServe, stored, buildSeconds, re
 // specifics — KL of the served mix vs the stored target (exclusions applied),
 // top20Share (how many served films sit in the top-20 scores), rank stats, and
 // the wildcard title (the discovery slot, when one is on).
+//
+// `serveOptsOverride` (bench --serve-opts) adds a 4th row, `calibrated*`: the
+// same calibrated order but with the override merged over the stored serve
+// config — so a window_factor change can be compared without editing settings.
+// Bench-only: the live serve path never sees it.
 function serveStrategyMetrics(rows, profile, filters, {
   selectServe, selectServeFor, filterServable, serveCalibration,
   targets, reachable = null, serveOptions = null, nowYear = new Date().getFullYear(),
+  serveOptsOverride = null, listSizeFor = null,
 }) {
   const rankOf = new Map(rows.map((r, i) => [r.tmdb_id, i + 1]));
   const top20Pool = new Set(rows.slice(0, 20).map((r) => r.tmdb_id));
@@ -176,6 +192,18 @@ function serveStrategyMetrics(rows, profile, filters, {
       return String(a.tmdb_id) < String(b.tmdb_id) ? -1 : 1;
     });
   add('pure_score', passed.slice(0, 20));
+
+  // calibrated*: the same calibrated order with the --serve-opts override
+  // merged over the stored serve config (camel-cased like selectServeFor).
+  // Needs a stored target (p); bench-only — the live serve path ignores it.
+  if (serveOptsOverride && p) {
+    const n = listSizeFor ? listSizeFor(profile) : (() => {
+      const m = parseInt(profile?.filters?.list_size, 10);
+      return Number.isFinite(m) ? Math.min(50, Math.max(5, m)) : 20;
+    })();
+    const merged = { ...(serveOptions ? camelServeOpts(serveOptions) : {}), ...camelServeOpts(serveOptsOverride) };
+    add('calibrated*', serveCalibration.calibratedOrder(passed, p, { listSize: n, ...merged }).slice(0, 20));
+  }
 
   // wildcard: the film placed at the wildcard position (index 5) of the
   // calibrated list, when a discovery slot is on (wildcard_slots >= 1).
@@ -323,10 +351,10 @@ async function assessReachability(targetIds, filters, { metaFor, imdbRatingFor =
 // measures RANKING quality, not age safety), time the build, and compute the
 // exact metrics against the holdout. Returns the structured result object that
 // renderTable / the --json writer consume.
-async function runBench({ profile, engineIds, holdout, deps }) {
+async function runBench({ profile, engineIds, holdout, serveOptsOverride = null, deps }) {
   const {
     engines, pipeline, rs, watchedStore, db, settings, selectServe,
-    selectServeFor, filterServable, serveCalibration,
+    selectServeFor, filterServable, serveCalibration, listSizeFor = null,
     log = console, now = Date.now, noCache = false, ctxExtras = {}, reachability = null,
   } = deps;
 
@@ -418,7 +446,9 @@ async function runBench({ profile, engineIds, holdout, deps }) {
     results.engines.marquee.serveStrategies = serveStrategyMetrics(marqueeRows, profile, profile.filters || {}, {
       selectServe, selectServeFor, filterServable, serveCalibration,
       targets: targetIds, reachable: reachableSet, serveOptions,
+      serveOptsOverride, listSizeFor,
     });
+    if (serveOptsOverride) results.engines.marquee.serveOptsOverride = serveOptsOverride;
   }
   return results;
 }

@@ -444,6 +444,9 @@ async function markUnwatched(profile, ref, deps = {}) {
   D.tasteFeedback.deleteRating(profile.id, type, row.tmdb_id);
   D.tasteFeedback.setIgnored(profile.id, { type, tmdb_id: row.tmdb_id }, false, now);
   D.watchedStore.addUnwatchedBlock(profile.id, type, { imdbId: row.imdb_id, tmdbId: row.tmdb_id }, now);
+  // The movie ledger entry goes with the film — a later rewatch must be
+  // pushed to Simkl again.
+  if (row.imdb_id) D.watchedStore.clearPushedMovie(profile.id, row.imdb_id);
   D.tasteFeedback.recordChange(profile.id, now);
   item.status = 'unwatched';
   item.rating = null;

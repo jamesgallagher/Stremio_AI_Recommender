@@ -105,6 +105,19 @@ function init() {
       attempts   INTEGER NOT NULL,
       PRIMARY KEY (profile_id, imdb_id)
     );
+
+    -- Scrobble movie ledger: the movies this app has already pushed to the
+    -- profile's Simkl history (Simkl accepted them). Movies de-duped against the
+    -- watched store only catch films whose Simkl id matches the provider's; a
+    -- film whose Simkl id differs (e.g. Pokémon 4Ever: Nuvio tt0287635 vs
+    -- Simkl's tt0313487, same TMDB 12600) would otherwise be re-sent every
+    -- hour. A full re-push ignores the ledger; markUnwatched clears the entry.
+    CREATE TABLE IF NOT EXISTS scrobble_pushed_movies (
+      profile_id TEXT NOT NULL,
+      imdb_id    TEXT NOT NULL,
+      pushed_at  INTEGER NOT NULL,
+      PRIMARY KEY (profile_id, imdb_id)
+    );
   `);
   ready = true;
 }
@@ -316,6 +329,47 @@ function recordPushedEpisodes(profileId, body, at = Date.now()) {
   return n;
 }
 
+// Scrobble movie ledger: Set<imdb_id> of movies this app has already pushed to
+// the profile's Simkl history (Simkl accepted them). A normal scrobble skips
+// them; a full re-push ignores the ledger.
+function pushedMovieIds(profileId) {
+  init();
+  const out = new Set();
+  for (const r of db.get().prepare('SELECT imdb_id FROM scrobble_pushed_movies WHERE profile_id = ?').all(profileId)) {
+    out.add(r.imdb_id);
+  }
+  return out;
+}
+
+// Record the movies Simkl just accepted (upsert on (profile_id, imdb_id)). One
+// synchronous transaction (no await inside). Returns the number recorded.
+function recordPushedMovies(profileId, imdbIds, at = Date.now()) {
+  init();
+  const ids = (imdbIds || []).filter((id) => id != null && id !== '').map(String);
+  if (!ids.length) return 0;
+  const conn = db.get();
+  const ins = conn.prepare(`
+    INSERT INTO scrobble_pushed_movies (profile_id, imdb_id, pushed_at) VALUES (?, ?, ?)
+    ON CONFLICT(profile_id, imdb_id) DO UPDATE SET pushed_at = excluded.pushed_at
+  `);
+  conn.exec('BEGIN');
+  try {
+    for (const id of ids) ins.run(profileId, id, at);
+    conn.exec('COMMIT');
+  } catch (err) {
+    conn.exec('ROLLBACK');
+    throw err;
+  }
+  return ids.length;
+}
+
+// Drop one movie's ledger entry (the user marked it unwatched — a later
+// rewatch must be pushed to Simkl again).
+function clearPushedMovie(profileId, imdbId) {
+  init();
+  db.get().prepare('DELETE FROM scrobble_pushed_movies WHERE profile_id = ? AND imdb_id = ?').run(profileId, imdbId);
+}
+
 // Scrobble Part A: record a film Simkl could not match (its imdb id came back
 // in not_found). Upsert on (profile_id, imdb_id): on insert first_seen =
 // last_tried = at and attempts = 1; on conflict last_tried = at, attempts + 1,
@@ -379,6 +433,7 @@ function listUnmatched(profileId) {
 function deleteForProfile(profileId) {
   init();
   db.get().prepare('DELETE FROM scrobble_pushed_episodes WHERE profile_id = ?').run(profileId);
+  db.get().prepare('DELETE FROM scrobble_pushed_movies WHERE profile_id = ?').run(profileId);
   db.get().prepare('DELETE FROM watched WHERE profile_id = ?').run(profileId);
   db.get().prepare('DELETE FROM sync_state WHERE profile_id = ?').run(profileId);
   db.get().prepare('DELETE FROM pending_watched WHERE profile_id = ?').run(profileId);
@@ -515,6 +570,9 @@ module.exports = {
   clearUnwatchedBlock,
   pushedEpisodeKeys,
   recordPushedEpisodes,
+  pushedMovieIds,
+  recordPushedMovies,
+  clearPushedMovie,
   recordUnmatched,
   unmatchedBackoff,
   clearUnmatched,

@@ -101,6 +101,38 @@ function klDivergence(p, q, alpha = 0.01) {
   return s;
 }
 
+// A row's fractional genre vector: Map<genre, 1/k>, k = the row's genre count.
+// Empty Map when the row has no genres. Precomputed once per window row so the
+// greedy can add it to the running genre totals without re-scanning the row.
+function genreVec(row) {
+  const gs = rowGenres(row);
+  const out = new Map();
+  if (gs.length) for (const g of gs) out.set(g, 1 / gs.length);
+  return out;
+}
+
+// KL(target ‖ mix(S∪{r})) from the running genre totals `tot` (which equal
+// genreMix's `counts` for the selected set S, built in the same selection
+// order) plus the candidate's fractional vector `vecR`. Bit-identical to
+// klDivergence(target, genreMix([...S, r]), alpha): the mix value for each
+// genre is (tot[g] + vecR[g]) / total, where `total` is summed over the union
+// of genres in the same insertion order genreMix([...S, r]) uses, and the KL
+// sums the target's genres in the same order klDivergence uses.
+function klForCandidate(vecR, tot, target, alpha) {
+  let total = 0;
+  for (const g of tot.keys()) total += tot.get(g) + (vecR.get(g) || 0);
+  for (const g of vecR.keys()) if (!tot.has(g)) total += vecR.get(g);
+  let s = 0;
+  for (const [g, pv] of Object.entries(target || {})) {
+    if (!(pv > 0)) continue;
+    const cp = (tot.get(g) || 0) + (vecR.get(g) || 0);
+    const qv = total > 0 ? cp / total : 0;
+    const qtilde = (1 - alpha) * qv + alpha * pv;
+    s += pv * Math.log(pv / qtilde);
+  }
+  return s;
+}
+
 // §3.3 — the calibrated full ordering.
 //
 // `rows` are the filter-passing pool rows, already sorted by score descending.
@@ -137,18 +169,25 @@ function calibratedOrder(rows, target, opts = {}) {
   const span = (maxW - minW) || 1;
   const normByRow = new Map(window.map((r, i) => [r, (raw[i] - minW) / span]));
 
+  // Precompute each window row's fractional genre vector once.
+  const vecByRow = new Map(window.map((r) => [r, genreVec(r)]));
+
   // Greedy set-selection over the whole window: at each step pick the remaining
   // row maximising U(S∪{r}) = (1−λ)·Σ normScore − λ·KL(target, mix(S∪{r})).
-  // Ties break by higher score, then tmdb_id string order (C9).
+  // Ties break by higher score, then tmdb_id string order (C9). The genre mix is
+  // kept incrementally (running genre totals `tot`), so each candidate's KL is
+  // O(|target|) instead of rebuilding genreMix([...S, r]) — identical output.
   const S = [];
-  let pool = window.slice();
+  const picked = new Set();
+  const tot = new Map();
   let sumNorm = 0;
-  while (pool.length) {
+  for (let step = 0; step < window.length; step++) {
     let best = null;
     let bestU = -Infinity;
-    for (const r of pool) {
+    for (const r of window) {
+      if (picked.has(r)) continue;
       const U = (1 - lambda) * (sumNorm + normByRow.get(r))
-        - lambda * klDivergence(target, genreMix([...S, r]), klAlpha);
+        - lambda * klForCandidate(vecByRow.get(r), tot, target, klAlpha);
       if (U > bestU) { bestU = U; best = r; continue; }
       if (U === bestU && best !== null) {
         const sa = r.affinity || 0;
@@ -157,8 +196,10 @@ function calibratedOrder(rows, target, opts = {}) {
       }
     }
     S.push(best);
+    picked.add(best);
     sumNorm += normByRow.get(best);
-    pool = pool.filter((r) => r !== best);
+    const vb = vecByRow.get(best);
+    for (const [g, v] of vb) tot.set(g, (tot.get(g) || 0) + v);
   }
 
   let order = [...S, ...rest];

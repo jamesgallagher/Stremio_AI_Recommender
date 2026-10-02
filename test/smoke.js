@@ -3319,6 +3319,146 @@ ok('calibrated K9: wildcard slot', () => {
   assert.notStrictEqual(orderNoQual[5].tmdb_id, 'd0');
 });
 
+// ---- Part A: incremental greedy equivalence + speed (A1–A3) ----
+// A frozen copy of the ORIGINAL calibratedOrder (the per-candidate
+// genreMix([...S, r]) greedy). It reuses the module's unchanged pure helpers
+// (rowGenres / genreMix / klDivergence), so only the greedy loop differs from
+// the new incremental implementation. A1 asserts the two produce identical
+// orderings.
+function referenceOrder(rows, target, opts = {}) {
+  const lambda = opts.lambda ?? 0.5;
+  const windowFactor = opts.windowFactor ?? 3;
+  const klAlpha = opts.klAlpha ?? 0.01;
+  const wildcardSlots = opts.wildcardSlots ?? 0;
+  const wildcardMaxShare = opts.wildcardMaxShare ?? 0.05;
+  const wildcardPosition = opts.wildcardPosition ?? 6;
+  const listSize = opts.listSize ?? 20;
+  const all = rows || [];
+  const W = Math.min(all.length, windowFactor * listSize);
+  const window = all.slice(0, W);
+  const rest = all.slice(W);
+  const raw = window.map((r) => r.affinity || 0);
+  const minW = raw.length ? Math.min(...raw) : 0;
+  const maxW = raw.length ? Math.max(...raw) : 0;
+  const span = (maxW - minW) || 1;
+  const normByRow = new Map(window.map((r, i) => [r, (raw[i] - minW) / span]));
+  const S = [];
+  let pool = window.slice();
+  let sumNorm = 0;
+  while (pool.length) {
+    let best = null;
+    let bestU = -Infinity;
+    for (const r of pool) {
+      const U = (1 - lambda) * (sumNorm + normByRow.get(r))
+        - lambda * serveCalibration.klDivergence(target, serveCalibration.genreMix([...S, r]), klAlpha);
+      if (U > bestU) { bestU = U; best = r; continue; }
+      if (U === bestU && best !== null) {
+        const sa = r.affinity || 0;
+        const sb = best.affinity || 0;
+        if (sa > sb || (sa === sb && String(r.tmdb_id) < String(best.tmdb_id))) best = r;
+      }
+    }
+    S.push(best);
+    sumNorm += normByRow.get(best);
+    pool = pool.filter((r) => r !== best);
+  }
+  let order = [...S, ...rest];
+  if (wildcardSlots > 0 && listSize > wildcardPosition) {
+    const top2W = all.slice(0, 2 * W);
+    const targetMap = target instanceof Map ? target : new Map(Object.entries(target || {}));
+    for (let slot = 0; slot < wildcardSlots; slot++) {
+      const firstSet = new Set(order.slice(0, listSize));
+      let pick = null;
+      for (const r of top2W) {
+        if (firstSet.has(r)) continue;
+        const gs = serveCalibration.rowGenres(r);
+        if (!gs.length) continue;
+        if (!gs.every((g) => (targetMap.get(g) || 0) < wildcardMaxShare)) continue;
+        if (pick === null || (r.affinity || 0) > (pick.affinity || 0)
+          || ((r.affinity || 0) === (pick.affinity || 0) && String(r.tmdb_id) < String(pick.tmdb_id))) pick = r;
+      }
+      if (!pick) break;
+      order.splice(order.indexOf(pick), 1);
+      order.splice(wildcardPosition - 1 + 7 * slot, 0, pick);
+    }
+  }
+  return order;
+}
+
+// Deterministic PRNG (mulberry32) so the fixtures are reproducible.
+function mulberry32(seed) {
+  return function () {
+    seed |= 0;
+    seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const A_GENRES = ['Action', 'Comedy', 'Drama', 'SciFi', 'Horror', 'Romance', 'Crime', 'Fantasy', 'Thriller', 'Documentary', 'Animation', 'History'];
+
+ok('calibrated A1: incremental greedy is identical to the original (200 seeded fixtures)', () => {
+  const rnd = mulberry32(20261002);
+  for (let t = 0; t < 200; t++) {
+    const nRows = 20 + Math.floor(rnd() * 181); // 20–200
+    const rows = [];
+    for (let i = 0; i < nRows; i++) {
+      const gCount = Math.floor(rnd() * 4); // 0–3 genres (0 = no genre signal)
+      const gs = [];
+      for (let g = 0; g < gCount; g++) {
+        const gname = A_GENRES[Math.floor(rnd() * 12)];
+        if (!gs.includes(gname)) gs.push(gname);
+      }
+      const affinity = rnd() < 0.3 ? Math.floor(rnd() * 50) : Math.floor(rnd() * 10000) / 100; // ties common
+      rows.push({ tmdb_id: 'r' + t + '_' + i, genres: gs.join(','), affinity });
+    }
+    const sorted = rows.slice().sort((a, b) => b.affinity - a.affinity);
+    const nTg = 1 + Math.floor(rnd() * 4); // 1–4 target genres
+    const tgs = [];
+    for (let g = 0; g < nTg; g++) {
+      const gname = A_GENRES[Math.floor(rnd() * 12)];
+      if (!tgs.includes(gname)) tgs.push(gname);
+    }
+    const target = {};
+    let tw = 0;
+    for (const g of tgs) { const w = 1 + Math.floor(rnd() * 10); target[g] = w; tw += w; }
+    for (const g of tgs) target[g] /= tw;
+    const listSize = [5, 20, 50][Math.floor(rnd() * 3)];
+    const wildcardSlots = rnd() < 0.5 ? 0 : 1;
+    const opts = { listSize, wildcardSlots };
+    const o1 = serveCalibration.calibratedOrder(sorted.slice(), target, opts);
+    const o2 = referenceOrder(sorted.slice(), target, opts);
+    assert.deepStrictEqual(o1.map((r) => r.tmdb_id), o2.map((r) => r.tmdb_id), 'fixture ' + t);
+  }
+});
+
+ok('calibrated A2: incremental greedy is fast (425 rows, listSize 50)', () => {
+  const rnd = mulberry32(999);
+  const rows = [];
+  for (let i = 0; i < 425; i++) {
+    const gCount = 1 + Math.floor(rnd() * 3); // 1–3 genres
+    const gs = [];
+    for (let g = 0; g < gCount; g++) {
+      const gname = A_GENRES[Math.floor(rnd() * 12)];
+      if (!gs.includes(gname)) gs.push(gname);
+    }
+    rows.push({ tmdb_id: 's' + i, genres: gs.join(','), affinity: Math.floor(rnd() * 10000) / 100 });
+  }
+  const sorted = rows.slice().sort((a, b) => b.affinity - a.affinity);
+  const target = { Action: 0.3, Comedy: 0.3, Drama: 0.2, SciFi: 0.2 };
+  const times = [];
+  for (let run = 0; run < 5; run++) {
+    const t0 = process.hrtime.bigint();
+    serveCalibration.calibratedOrder(sorted, target, { listSize: 50 });
+    const t1 = process.hrtime.bigint();
+    times.push(Number(t1 - t0) / 1e6); // ms
+  }
+  const avg = times.reduce((a, b) => a + b, 0) / times.length;
+  console.log('  A2 measured: ' + times.map((x) => x.toFixed(1)).join(', ') + ' ms; avg ' + avg.toFixed(2) + ' ms');
+  assert.ok(avg < 40, 'avg ' + avg.toFixed(2) + ' ms must be < 40 ms');
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');

@@ -37,10 +37,12 @@ const REPO_ROOT = path.join(__dirname, '..');
 const USAGE =
   'Usage: node --experimental-sqlite scripts/bench-engines.js <profileName>\n'
   + '  [--holdout 10] [--engines genesis,glass,marquee] [--no-cache] [--json] [--keep]\n'
-  + 'Expect several minutes per profile on a cold cache (Marquee\'s LLM fit dominates).';
+  + "  [--serve-opts '<json>']\n"
+  + 'Expect several minutes per profile on a cold cache (Marquee\'s LLM fit dominates).\n'
+  + "  --serve-opts: a JSON object of serve-config overrides (snake_case, e.g. '{\"window_factor\":4}')";
 
 function parseArgs(argv) {
-  const a = { profile: null, holdout: 10, engines: ['genesis', 'glass', 'marquee'], noCache: false, json: false, keep: false, help: false };
+  const a = { profile: null, holdout: 10, engines: ['genesis', 'glass', 'marquee'], noCache: false, json: false, keep: false, serveOpts: null, help: false };
   for (let i = 0; i < argv.length; i++) {
     const x = argv[i];
     if (x === '--holdout') a.holdout = Number(argv[++i]);
@@ -48,6 +50,17 @@ function parseArgs(argv) {
     else if (x === '--no-cache') a.noCache = true;
     else if (x === '--json') a.json = true;
     else if (x === '--keep') a.keep = true;
+    else if (x === '--serve-opts') {
+      const raw = argv[++i];
+      let parsed;
+      try { parsed = JSON.parse(raw); } catch { parsed = null; }
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        console.error("--serve-opts must be a JSON object (e.g. '{\"window_factor\":4}')");
+        console.error(USAGE);
+        process.exit(2);
+      }
+      a.serveOpts = parsed;
+    }
     else if (x === '--help' || x === '-h') a.help = true;
     else if (x.startsWith('--')) { console.error('unknown flag: ' + x); console.error(USAGE); process.exit(2); }
     else if (a.profile === null) a.profile = x;
@@ -89,10 +102,11 @@ async function main() {
   let results;
   try {
     results = await bench.runBench({
-      profile, engineIds: a.engines, holdout: a.holdout,
+      profile, engineIds: a.engines, holdout: a.holdout, serveOptsOverride: a.serveOpts,
       deps: {
         engines, pipeline, rs, watchedStore, db, settings,
         selectServe: rs.selectServe, selectServeFor: rs.selectServeFor, filterServable: rs.filterServable,
+        listSizeFor: rs.listSizeFor,
         serveCalibration: require('../src/serveCalibration'),
         log: quiet, noCache: a.noCache,
         // m2: could each held-out film be served at all under this profile's
@@ -149,7 +163,9 @@ async function main() {
       targets: results.targets,
       engines: Object.fromEntries(Object.entries(results.engines).map(([id, e]) => [id, {
         metrics: e.metrics, hitTargets: e.hitTargets, positions: e.positions,
-        ...(e.serveStrategies ? { serveStrategies: e.serveStrategies } : {}),
+        ...(e.serveStrategies
+          ? { serveStrategies: e.serveStrategies, ...(e.serveOptsOverride ? { serveOptsOverride: e.serveOptsOverride } : {}) }
+          : {}),
       }])),
     };
     fs.writeFileSync(outFile, JSON.stringify(payload, null, 2));

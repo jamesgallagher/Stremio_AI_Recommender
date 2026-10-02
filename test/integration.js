@@ -4039,6 +4039,85 @@ async function main() {
     }
   });
 
+  // ── Part B: warn once per (profile, type, reason) ──
+  await it('B1: fallback warns once per (profile, type, reason); cleared on a successful calibrated serve', async () => {
+    const p = config.addProfile('INT-MQB1');
+    try {
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      settings.updateSettings({ engines: { marquee: true } });
+      const affByGenre = {
+        'Action': [100, 96, 92, 88, 84, 80, 76, 72, 68, 64],
+        'Drama': [99, 95, 91, 87, 83, 79, 75, 71, 67, 63],
+        'Comedy': [98, 94, 90, 86, 82, 78, 74, 70, 66, 62],
+      };
+      const rows = [];
+      for (const g of Object.keys(affByGenre)) affByGenre[g].forEach((aff, i) => rows.push(mkPoolRow(g + '-' + i, g, aff)));
+      rs.upsertCandidates(p.id, rows);
+      const stored = rs.getRecommended(p.id, { type: 'movie', limit: 100000 });
+      const profile = config.getProfile(p.id);
+      const target = { Action: 0.4, Drama: 0.3, Comedy: 0.3 };
+      rs._resetServeWarnings();
+      const origWarn = console.warn;
+      const warns = [];
+      console.warn = (msg) => { warns.push(msg); };
+      try {
+        // 5 serves with no target → exactly 1 warning (reason no-target).
+        for (let i = 0; i < 5; i++) rs.selectServeFor(profile, 'movie', stored, { limit: 20 });
+        assert.strictEqual(warns.length, 1, '5 no-target serves → exactly 1 warning');
+        assert.ok(warns[0].includes('no-target'), 'warning carries the reason');
+        // Store a target → a serve calibrates (no new warning).
+        serveCalibration.setTarget(p.id, 'movie', 'marquee', target, 30, Date.now());
+        const before = warns.length;
+        rs.selectServeFor(profile, 'movie', stored, { limit: 20 });
+        assert.strictEqual(warns.length, before, 'calibrated serve does not warn');
+        // Delete the target → the next serve warns again (1 more).
+        serveCalibration.deleteForProfile(p.id);
+        rs.selectServeFor(profile, 'movie', stored, { limit: 20 });
+        assert.strictEqual(warns.length, before + 1, 'after target deleted, the next serve warns again');
+      } finally {
+        console.warn = origWarn;
+      }
+    } finally {
+      settings.updateSettings({ engines: { marquee: false }, marquee: {} });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); serveCalibration.deleteForProfile(p.id);
+    }
+  });
+
+  await it('B2: strategy round_robin never warns (unchanged behaviour)', async () => {
+    const p = config.addProfile('INT-MQB2');
+    try {
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      settings.updateSettings({ engines: { marquee: true } });
+      const affByGenre = {
+        'Action': [100, 96, 92, 88, 84, 80],
+        'Drama': [99, 95, 91, 87, 83, 79],
+        'Comedy': [98, 94, 90, 86, 82, 78],
+      };
+      const rows = [];
+      for (const g of Object.keys(affByGenre)) affByGenre[g].forEach((aff, i) => rows.push(mkPoolRow(g + '-' + i, g, aff)));
+      rs.upsertCandidates(p.id, rows);
+      const stored = rs.getRecommended(p.id, { type: 'movie', limit: 100000 });
+      const profile = config.getProfile(p.id);
+      const target = { Action: 0.4, Drama: 0.3, Comedy: 0.3 };
+      serveCalibration.setTarget(p.id, 'movie', 'marquee', target, 18, Date.now());
+      settings.updateSettings({ marquee: { serve: { strategy: 'round_robin' } } });
+      rs._resetServeWarnings();
+      const origWarn = console.warn;
+      const warns = [];
+      console.warn = (msg) => { warns.push(msg); };
+      try {
+        // 5 serves with strategy round_robin → no warnings (deliberate round_robin).
+        for (let i = 0; i < 5; i++) rs.selectServeFor(profile, 'movie', stored, { limit: 20 });
+        assert.strictEqual(warns.length, 0, 'strategy round_robin never warns');
+      } finally {
+        console.warn = origWarn;
+      }
+    } finally {
+      settings.updateSettings({ engines: { marquee: false }, marquee: {} });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); serveCalibration.deleteForProfile(p.id);
+    }
+  });
+
   await it('K17: selectServe (old) output is unchanged — filter + balanceByGenre (regression guard)', async () => {
     const nowYear = new Date().getFullYear();
     // A fixture exercising the rating floor, excluded genres, movies-only recency,
@@ -4110,6 +4189,61 @@ async function main() {
       }
       // pure_score serves the top 20 by score → all 20 are in the top-20 scores.
       assert.strictEqual(strategies.pure_score.top20Share, 20, 'pure_score top20Share = 20');
+    } finally {
+      settings.updateSettings({ engines: { marquee: false }, marquee: {} });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); serveCalibration.deleteForProfile(p.id);
+    }
+  });
+
+  await it('C1: bench --serve-opts override adds a calibrated* row that reaches past the default window', async () => {
+    const bench = require('../src/bench/engineBench');
+    const mqCfg = require('../src/engines/marquee/config');
+    const p = config.addProfile('INT-MQC1');
+    try {
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      settings.updateSettings({ engines: { marquee: true } });
+      // 80 pool rows: the top 60 are Action (affinity 100..41), rows 61–80 are
+      // Drama (affinity 40..21). The target wants Drama. With the default
+      // window_factor 3 the calibrated window (top 60) never sees the Drama
+      // rows; window_factor 4 (window 80) does, and the greedy picks one.
+      const rows = [];
+      for (let i = 0; i < 60; i++) rows.push(mkPoolRow('A' + i, 'Action', 100 - i));
+      for (let i = 0; i < 20; i++) rows.push(mkPoolRow('D' + i, 'Drama', 40 - i));
+      rs.upsertCandidates(p.id, rows);
+      serveCalibration.setTarget(p.id, 'movie', 'marquee', { Drama: 0.9, Action: 0.1 }, 80, Date.now());
+      const profile = config.getProfile(p.id);
+      const stored = rs.getRecommended(p.id, { type: 'movie', limit: 100000 });
+
+      const strategies = bench.serveStrategyMetrics(stored, profile, profile.filters, {
+        selectServe: rs.selectServe,
+        selectServeFor: rs.selectServeFor,
+        filterServable: rs.filterServable,
+        serveCalibration,
+        targets: [stored[0].tmdb_id],
+        reachable: null,
+        serveOptions: mqCfg.resolveConfig(settings.getSettings()).serve,
+        serveOptsOverride: { window_factor: 4 },
+        listSizeFor: rs.listSizeFor,
+      });
+
+      // Four strategies, in order (the override adds the 4th).
+      assert.deepStrictEqual(Object.keys(strategies), ['round_robin', 'calibrated', 'pure_score', 'calibrated*']);
+      // The default window (3 × list_size 20 = 60) never reaches the Drama rows;
+      // the wider window (4 × 20 = 80) does.
+      assert.ok(strategies.calibrated.worstRank <= 3 * 20, 'calibrated worstRank within the default window');
+      assert.ok(strategies['calibrated*'].worstRank > 3 * 20, 'calibrated* reaches past the default window');
+      // No override → no calibrated* row (K18's three rows unchanged).
+      const plain = bench.serveStrategyMetrics(stored, profile, profile.filters, {
+        selectServe: rs.selectServe,
+        selectServeFor: rs.selectServeFor,
+        filterServable: rs.filterServable,
+        serveCalibration,
+        targets: [stored[0].tmdb_id],
+        reachable: null,
+        serveOptions: mqCfg.resolveConfig(settings.getSettings()).serve,
+        listSizeFor: rs.listSizeFor,
+      });
+      assert.deepStrictEqual(Object.keys(plain), ['round_robin', 'calibrated', 'pure_score']);
     } finally {
       settings.updateSettings({ engines: { marquee: false }, marquee: {} });
       config.removeProfile(p.id); rs.deleteForProfile(p.id); serveCalibration.deleteForProfile(p.id);
@@ -5369,6 +5503,171 @@ async function main() {
       server.close();
       if (p) { config.removeProfile(p.id); watchedStore.deleteForProfile(p.id); }
       db.get().exec('DELETE FROM glass_metadata');
+    }
+  });
+
+  await it('Scrobble D1: not-found movie matched on retry → ledgered; the next run re-sends nothing (skip log)', async () => {
+    const scrobble = require('../src/services/scrobble');
+    const nuvio = require('../src/services/nuvio');
+    const crypto = require('../src/services/crypto');
+    const profile = { id: 'p-d1', name: 'T', keys: { simkl_client_id: 'c', tmdb_api_key: 'k' }, simkl_auth: { access_token: 't' }, scrobble: { enabled: true, provider: 'nuvio', email: 'a@b.c', password_enc: crypto.encrypt('pw') } };
+    const origPull = nuvio.pullWatched; const origAdd = simkl.addToHistory; const origFind = tmdb.findByImdbId;
+    const calls = [];
+    const logLines = [];
+    const log = { log: (m) => logLines.push(m), warn() {}, error() {} };
+    simkl.addToHistory = async (_p, body) => {
+      calls.push(body);
+      return calls.length === 1 ? { not_found: { movies: [{ ids: { imdb: 'ttA' } }] } } : {};
+    };
+    tmdb.findByImdbId = async (_key, _type, imdb) => (imdb === 'ttA' ? 12600 : null);
+    try {
+      nuvio.pullWatched = async () => [{ type: 'movie', imdbId: 'ttA', watchedAtMs: 1000 }];
+      // Run 1: not found → retry with the TMDB id → matched (the Conor case).
+      const res = await scrobble.syncProfile(profile, log);
+      assert.strictEqual(calls.length, 2, 'two POSTs (main + retry)');
+      assert.strictEqual(res.matchedOnRetry, 1, 'matched on retry');
+      assert.ok(watchedStore.pushedMovieIds(profile.id).has('ttA'), 'the movie is ledgered');
+      // Run 2: the ledger skips it — no POSTs, and the skip log appears.
+      await scrobble.syncProfile(profile, log);
+      assert.strictEqual(calls.length, 2, 'no re-send on the next run');
+      assert.ok(logLines.some((l) => l.includes('1 movie(s) skipped (already sent to Simkl)')), 'the skip log appears');
+    } finally {
+      nuvio.pullWatched = origPull; simkl.addToHistory = origAdd; tmdb.findByImdbId = origFind;
+      watchedStore.deleteForProfile(profile.id);
+    }
+  });
+
+  await it('Scrobble D2: accepted on the first POST → ledgered; the next run skips; full re-sends', async () => {
+    const scrobble = require('../src/services/scrobble');
+    const nuvio = require('../src/services/nuvio');
+    const crypto = require('../src/services/crypto');
+    const profile = { id: 'p-d2', name: 'T', keys: { simkl_client_id: 'c', tmdb_api_key: 'k' }, simkl_auth: { access_token: 't' }, scrobble: { enabled: true, provider: 'nuvio', email: 'a@b.c', password_enc: crypto.encrypt('pw') } };
+    const origPull = nuvio.pullWatched; const origAdd = simkl.addToHistory; const origFind = tmdb.findByImdbId;
+    const calls = [];
+    const logLines = [];
+    const log = { log: (m) => logLines.push(m), warn() {}, error() {} };
+    simkl.addToHistory = async (_p, body) => { calls.push(body); return {}; };
+    tmdb.findByImdbId = async () => null;
+    try {
+      nuvio.pullWatched = async () => [{ type: 'movie', imdbId: 'ttB', watchedAtMs: 1000 }];
+      await scrobble.syncProfile(profile, log);
+      assert.strictEqual(calls.length, 1, 'one POST');
+      assert.ok(watchedStore.pushedMovieIds(profile.id).has('ttB'), 'ledgered');
+      await scrobble.syncProfile(profile, log);
+      assert.strictEqual(calls.length, 1, 'no re-send on the next run');
+      assert.ok(logLines.some((l) => l.includes('1 movie(s) skipped (already sent to Simkl)')), 'the skip log appears');
+      // full: re-sends despite the ledger.
+      await scrobble.syncProfile(profile, log, { full: true });
+      assert.strictEqual(calls.length, 2, 'full re-sends');
+      assert.deepStrictEqual(calls[1].movies.map((m) => m.ids.imdb), ['ttB']);
+    } finally {
+      nuvio.pullWatched = origPull; simkl.addToHistory = origAdd; tmdb.findByImdbId = origFind;
+      watchedStore.deleteForProfile(profile.id);
+    }
+  });
+
+  await it('Scrobble D3: a thrown first POST → nothing ledgered; the next run re-sends', async () => {
+    const scrobble = require('../src/services/scrobble');
+    const nuvio = require('../src/services/nuvio');
+    const crypto = require('../src/services/crypto');
+    const profile = { id: 'p-d3', name: 'T', keys: { simkl_client_id: 'c', tmdb_api_key: 'k' }, simkl_auth: { access_token: 't' }, scrobble: { enabled: true, provider: 'nuvio', email: 'a@b.c', password_enc: crypto.encrypt('pw') } };
+    const origPull = nuvio.pullWatched; const origAdd = simkl.addToHistory; const origFind = tmdb.findByImdbId;
+    const calls = [];
+    const log = { log() {}, warn() {}, error() {} };
+    simkl.addToHistory = async (_p, body) => {
+      calls.push(body);
+      if (calls.length === 1) throw new Error('Simkl down');
+      return {};
+    };
+    tmdb.findByImdbId = async () => null;
+    try {
+      nuvio.pullWatched = async () => [{ type: 'movie', imdbId: 'ttC', watchedAtMs: 1000 }];
+      await assert.rejects(() => scrobble.syncProfile(profile, log), /Simkl down/);
+      assert.strictEqual(watchedStore.pushedMovieIds(profile.id).size, 0, 'nothing ledgered');
+      // Next run: re-sends (the film was never accepted).
+      await scrobble.syncProfile(profile, log);
+      assert.strictEqual(calls.length, 2, 're-sent on the next run');
+      assert.ok(watchedStore.pushedMovieIds(profile.id).has('ttC'), 'ledgered after the successful run');
+    } finally {
+      nuvio.pullWatched = origPull; simkl.addToHistory = origAdd; tmdb.findByImdbId = origFind;
+      watchedStore.deleteForProfile(profile.id);
+    }
+  });
+
+  await it('Scrobble D4: still not found after the retry → NOT ledgered; in the scrobble_unmatched backoff', async () => {
+    const scrobble = require('../src/services/scrobble');
+    const nuvio = require('../src/services/nuvio');
+    const crypto = require('../src/services/crypto');
+    const profile = { id: 'p-d4', name: 'T', keys: { simkl_client_id: 'c', tmdb_api_key: 'k' }, simkl_auth: { access_token: 't' }, scrobble: { enabled: true, provider: 'nuvio', email: 'a@b.c', password_enc: crypto.encrypt('pw') } };
+    const origPull = nuvio.pullWatched; const origAdd = simkl.addToHistory; const origFind = tmdb.findByImdbId;
+    const calls = [];
+    const log = { log() {}, warn() {}, error() {} };
+    simkl.addToHistory = async (_p, body) => { calls.push(body); return { not_found: { movies: [{ ids: { imdb: 'ttD' } }] } }; };
+    tmdb.findByImdbId = async (_key, _type, imdb) => (imdb === 'ttD' ? 12600 : null);
+    try {
+      nuvio.pullWatched = async () => [{ type: 'movie', imdbId: 'ttD', watchedAtMs: 1000 }];
+      const res = await scrobble.syncProfile(profile, log);
+      assert.strictEqual(calls.length, 2, 'main + retry POSTs');
+      assert.strictEqual(res.unmatched, 1, 'still not found');
+      assert.strictEqual(res.matchedOnRetry, 0);
+      assert.strictEqual(watchedStore.pushedMovieIds(profile.id).size, 0, 'not ledgered');
+      const rows = watchedStore.listUnmatched(profile.id);
+      assert.strictEqual(rows.length, 1);
+      assert.strictEqual(rows[0].imdb_id, 'ttD');
+      assert.strictEqual(rows[0].tmdb_id, '12600');
+      // Next run: in backoff — no re-send.
+      await scrobble.syncProfile(profile, log);
+      assert.strictEqual(calls.length, 2, 'in backoff — no re-send');
+    } finally {
+      nuvio.pullWatched = origPull; simkl.addToHistory = origAdd; tmdb.findByImdbId = origFind;
+      watchedStore.deleteForProfile(profile.id);
+    }
+  });
+
+  await it('Scrobble D5: unwatch clears the ledger entry + sets the block; an older provider watch is skipped, a newer one is pushed and re-ledgered', async () => {
+    const scrobble = require('../src/services/scrobble');
+    const nuvio = require('../src/services/nuvio');
+    const crypto = require('../src/services/crypto');
+    const trainer = require('../src/trainer');
+    const profile = { id: 'p-d5', name: 'T', keys: { simkl_client_id: 'c', tmdb_api_key: 'k' }, simkl_auth: { access_token: 't' }, scrobble: { enabled: true, provider: 'nuvio', email: 'a@b.c', password_enc: crypto.encrypt('pw') } };
+    const origPull = nuvio.pullWatched; const origAdd = simkl.addToHistory; const origFind = tmdb.findByImdbId; const origRemove = simkl.removeFromHistory;
+    const calls = [];
+    const logLines = [];
+    const log = { log: (m) => logLines.push(m), warn() {}, error() {} };
+    simkl.addToHistory = async (_p, body) => { calls.push(body); return {}; };
+    tmdb.findByImdbId = async () => null;
+    try {
+      nuvio.pullWatched = async () => [{ type: 'movie', imdbId: 'ttE', watchedAtMs: 1000 }];
+      // (a) The movie is ledgered, then watched in the local store.
+      await scrobble.syncProfile(profile, log);
+      assert.ok(watchedStore.pushedMovieIds(profile.id).has('ttE'), 'ledgered');
+      watchedStore.upsertMany(profile.id, [{ simkl_id: 1, type: 'movie', imdb_id: 'ttE', tmdb_id: '12600', title: 'E', year: 2017, watched_at: '2026-01-01T00:00:00Z' }]);
+      // (b) markUnwatched: the ledger entry is cleared and the block is set.
+      const deps = {
+        simkl: { removeFromHistory: async () => {}, removeRatings: async () => {} },
+        now: () => 5000,
+        log: quiet,
+      };
+      const res = await trainer.markUnwatched(profile, { type: 'movie', tmdb_id: '12600' }, deps);
+      assert.strictEqual(res.ok, true);
+      assert.strictEqual(watchedStore.pushedMovieIds(profile.id).size, 0, 'ledger entry cleared');
+      assert.ok(watchedStore.unwatchedBlocks(profile.id, 'movie').has('ttE'), 'block set');
+      // (c) An older provider watch (≤ the block time) is skipped by the block.
+      logLines.length = 0;
+      const before = calls.length;
+      await scrobble.syncProfile(profile, log);
+      assert.strictEqual(calls.length, before, 'no POST — skipped by the block');
+      assert.ok(logLines.some((l) => l.includes('1 movie(s) skipped (unwatched by the user)')), 'the block skip log');
+      // (d) A newer provider watch (a genuine rewatch) is pushed and re-ledgered.
+      nuvio.pullWatched = async () => [{ type: 'movie', imdbId: 'ttE', watchedAtMs: 9000 }];
+      await scrobble.syncProfile(profile, log);
+      assert.strictEqual(calls.length, before + 1, 'the rewatch is pushed');
+      assert.deepStrictEqual(calls[calls.length - 1].movies.map((m) => m.ids.imdb), ['ttE']);
+      assert.ok(watchedStore.pushedMovieIds(profile.id).has('ttE'), 're-ledgered');
+      assert.ok(!watchedStore.unwatchedBlocks(profile.id, 'movie').has('ttE'), 'block cleared by the rewatch');
+    } finally {
+      nuvio.pullWatched = origPull; simkl.addToHistory = origAdd; tmdb.findByImdbId = origFind; simkl.removeFromHistory = origRemove;
+      watchedStore.deleteForProfile(profile.id);
     }
   });
 
