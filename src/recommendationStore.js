@@ -983,6 +983,38 @@ async function ensureBuilt(profile, log = console) {
   return jobs.enqueue(profile.id, 'recs', (progress) => buildPool(profile, log, progress));
 }
 
+// ENG-1: a settings/engine change must ALWAYS take effect, even while a build
+// for this profile is running. Unlike ensureBuilt (which joins the in-flight
+// build), this queues a NEW build with afterActive — it runs AFTER the running
+// one and reads the profile FRESH when it starts, so the change is never lost.
+// The running build holds the profile object captured when it started (still
+// the old engine), so joining it would silently drop the change until the next
+// scheduled rebuild.
+function rebuildAfterChange(profileId, log = console) {
+  const jobs = require('./jobs');
+  return jobs.enqueue(profileId, 'recs', (progress) => {
+    const fresh = require('./config').getProfile(profileId);
+    if (!fresh) return { skipped: true, reason: 'profile removed' };
+    return buildPool(fresh, log, progress);
+  }, { afterActive: true });
+}
+
+// ENG-1 (E2): after a successful build of a type, the type's slice must hold
+// ONLY the rows produced by that build's engine. Rows of that type with another
+// engine_id (including NULL, i.e. legacy rows) are deleted. Only when the build
+// stored at least one row — an empty or failed build never prunes. A row the new
+// engine re-produced keeps its row and takes the new engine_id via upsert's
+// conflict clause, so only true leftovers are removed.
+function pruneOtherEngines(profileId, type, engineId) {
+  init();
+  if (!engineId) return 0;
+  const r = db.get().prepare(`
+    DELETE FROM recommended
+    WHERE profile_id = ? AND type = ? AND (engine_id IS NULL OR engine_id != ?)
+  `).run(profileId, String(type), String(engineId));
+  return Number(r.changes || 0);
+}
+
 module.exports = {
   init,
   // Re-exported from the Genesis Engine (their new home) so existing imports and
@@ -993,6 +1025,8 @@ module.exports = {
   ageGatePool,
   buildPool,
   ensureBuilt,
+  rebuildAfterChange,
+  pruneOtherEngines,
   needsBuild,
   resetRecommendations,
   clearType,
