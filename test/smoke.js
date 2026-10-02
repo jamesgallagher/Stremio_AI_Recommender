@@ -4782,6 +4782,42 @@ ok('TV-2 F4: formatHistory — families at rung tried or better; cold start → 
   assert.deepStrictEqual([...formatHistory([], new Map())], ['scripted'], 'no history → scripted');
 });
 
+ok('TV-2 F5: commitmentFit — comfort 20 (spec §4.6)', () => {
+  const { commitmentFit } = require('../src/engines/marqueeTv/scoring');
+  assert.strictEqual(commitmentFit(30, 20), 1, '30 → 1');
+  assert.ok(Math.abs(commitmentFit(80, 20) - 0.6667) < 1e-4, '80 → 0.6667');
+  assert.ok(Math.abs(commitmentFit(160, 20) - 0.3333) < 1e-4, '160 → 0.3333');
+  assert.strictEqual(commitmentFit(320, 20), 0, '320 → 0');
+  assert.strictEqual(commitmentFit(null, 20), 0.5, 'null → 0.5');
+});
+
+ok('TV-2 F6: airing — near now → 1, Returning → 0.5, Ended → 0 (spec §4.7)', () => {
+  const { airing } = require('../src/engines/marqueeTv/scoring');
+  const nowMs = Date.parse('2026-09-01T00:00:00Z');
+  // last episode 10 days ago → 1.
+  assert.strictEqual(airing({ last_episode_air_date: '2026-08-22T00:00:00Z', status: 'Returning Series' }, nowMs, 60), 1, 'last episode 10 days ago → 1');
+  // next episode in 20 days → 1.
+  assert.strictEqual(airing({ next_episode_air_date: '2026-09-21T00:00:00Z', status: 'Returning Series' }, nowMs, 60), 1, 'next episode 20 days away → 1');
+  // Returning but nothing near → 0.5.
+  assert.strictEqual(airing({ status: 'Returning Series' }, nowMs, 60), 0.5, 'Returning, nothing near → 0.5');
+  // Ended → 0.
+  assert.strictEqual(airing({ status: 'Ended' }, nowMs, 60), 0, 'Ended → 0');
+});
+
+ok('TV-2 F7: collabRaw + normalization + because (spec §4.6)', () => {
+  const { collabRaw, normalizeCollab, becauseSeed } = require('../src/engines/marqueeTv/sources');
+  const sw = { simkl: 1.0, tmdb: 0.6 };
+  const seedValue = new Map([['A', 2], ['B', 1]]);
+  const cand = { seedHits: new Map([['A', new Set(['simkl', 'tmdb'])], ['B', new Set(['tmdb'])]]) };
+  // 2·1.0 + 2·0.6 + 1·0.6 = 3.8
+  assert.ok(Math.abs(collabRaw(cand, seedValue, sw) - 3.8) < 1e-9, 'collabRaw = 3.8');
+  // normalization: one candidate → max = 3.8 → normalized = 1.0.
+  const raws = new Map([['c1', 3.8]]);
+  assert.ok(Math.abs(normalizeCollab(raws).get('c1') - 1.0) < 1e-9, 'normalized = 1.0');
+  // because = A (the highest contributor).
+  assert.strictEqual(becauseSeed(cand, seedValue, sw), 'A', 'because = A');
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');

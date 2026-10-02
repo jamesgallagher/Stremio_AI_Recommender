@@ -20,4 +20,31 @@ function formatHistory(ladderEntries, metaById) {
   return fams;
 }
 
-module.exports = { formatHistory };
+// §4.5 Taste events: one event per non-anime show with ladder value > 0 (the
+// ladder value already includes recency, so ts = now — the Glass blend then
+// multiplies by ~1). Plus the profile's series dont_recommend rows as
+// negatives (Glass's own weights/timestamps).
+function tasteEvents(ladderEntries, dontRows, nowMs, isAnimeRow) {
+  const ev = [];
+  for (const e of ladderEntries) {
+    if (e.value <= 0 || !e.row.tmdb_id || isAnimeRow(e.row)) continue;
+    ev.push({ type: 'series', tmdb_id: String(e.row.tmdb_id), weight: e.value, ts: nowMs, kind: 'watched', fallback_genre: null });
+  }
+  for (const r of dontRows) {
+    const isUser = r.reason === 'user';
+    ev.push({ type: 'series', tmdb_id: String(r.tmdb_id), weight: isUser ? -1.5 : -0.5, ts: r.at || nowMs, kind: isUser ? 'rejected_user' : 'rejected_decayed', fallback_genre: null });
+  }
+  return ev;
+}
+
+// §4.5 Seeds: the seed-eligible ladder entries (the ladder's own `seedEligible`
+// flag — engaged-or-better by rung, then the rating override), non-anime,
+// tmdb_id present, sorted by value DESC, first cfg.seed_cap.
+function seeds(ladderEntries, cfg, isAnimeRow) {
+  const eligible = ladderEntries
+    .filter((e) => e.seedEligible && e.row.tmdb_id && !isAnimeRow(e.row))
+    .sort((a, b) => b.value - a.value);
+  return eligible.slice(0, cfg.seed_cap);
+}
+
+module.exports = { formatHistory, tasteEvents, seeds };
