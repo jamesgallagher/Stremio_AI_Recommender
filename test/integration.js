@@ -6248,6 +6248,96 @@ async function main() {
     config.removeProfile(p.id);
   });
 
+  // ── T5. End-to-end safety: the REAL buildSources against a stubbed global.fetch ─
+  // This is the test that would have caught F1 (the TMDB append_to_response drop).
+  // All four real source adapters (TMDB, MDBList/CSM, TVDB, Simkl) are exercised
+  // through the real buildSources(profile) with ONLY global.fetch stubbed — the
+  // source fetch seams (setTmdbFetch/setTvdbFetch) stay at their global.fetch
+  // default, so the real URL/query construction is what is under test.
+  await it('T5. end-to-end safety: real buildSources + stubbed global.fetch (TMDB/CSM/TVDB/Simkl)', async () => {
+    const chain = require('../src/ageVerification/chain');
+    const ageSources = require('../src/ageVerification/sources');
+    const tier = require('../src/ageVerification/tiers').TIERS[14];
+    const tvdb = require('../src/services/tvdb');
+
+    // TV-14 profile: three keys set, NO Simkl connection (simklCerts → empty, no fetch).
+    const profile = {
+      id: 'INT-T5', name: 'INT-T5',
+      keys: { tmdb_api_key: 'itest-tmdb', mdblist_api_key: 'itest-mdb', tvdb_api_key: 'itest-tvdb' },
+      simkl_auth: null,
+      filters: { age_limit: 14 },
+    };
+    const prevKeys = Object.assign({}, settings.getSettings().keys);
+    const prevCsm = store.loadCsmCache();
+    store.saveCsmCache({}); // clear the CSM disk cache so the batch fetch is exercised
+    settings.updateSettings({ keys: { tmdb_api_key: 'itest-tmdb', mdblist_api_key: 'itest-mdb', tvdb_api_key: 'itest-tvdb' } });
+    tvdb.clearToken(); // force a fresh login in the TVDB flow
+
+    const fetchLog = [];
+    const origFetch = global.fetch;
+    // The TMDB and TVDB adapters read their fetch from a module seam that captured
+    // the original global.fetch at module load; point both seams (and global.fetch)
+    // at the same stub so all four real adapters answer from fixtures.
+    const fetchStub = (url, opts) => {
+      const u = String(url);
+      fetchLog.push({ url: u, method: (opts && opts.method) || 'GET' });
+      // TMDB content_ratings (series) — the append_to_response query must survive (F1).
+      if (u.includes('api.themoviedb.org/3/tv/')) {
+        const id = u.split('/tv/')[1].split('?')[0];
+        let results = [];
+        if (id === '1908') results = [{ iso_3166_1: 'AU', rating: 'R 18+' }, { iso_3166_1: 'US', rating: 'TV-14' }];
+        else if (id === '114922') results = [{ iso_3166_1: 'AU', rating: 'MA 15+' }, { iso_3166_1: 'US', rating: 'TV-14' }];
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ content_ratings: { results } }) });
+      }
+      // MDBList batch (POST /imdb/show) — Common Sense age.
+      if (u.includes('api.mdblist.com/imdb/show')) {
+        const ids = JSON.parse(opts.body).ids;
+        const arr = ids.map((id) => (id === 'tt9794044' ? { ids: { imdb: id }, age_rating: 14 } : { ids: { imdb: id } }));
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(arr) });
+      }
+      // TVDB v4: login → search/remoteid → series extended.
+      if (u.includes('api4.thetvdb.com/v4/login')) {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: { token: 'tok' } }) });
+      }
+      if (u.includes('api4.thetvdb.com/v4/search/remoteid/')) {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: [{ series: { id: 324126 } }] }) });
+      }
+      if (u.includes('api4.thetvdb.com/v4/series/324126/extended')) {
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: { contentRatings: [{ name: 'PG', country: 'aus' }] } }) });
+      }
+      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
+    };
+    global.fetch = fetchStub;
+    ageSources.setTmdbFetch(fetchStub);
+    tvdb.setTvdbFetch(fetchStub);
+
+    const titles = [
+      { key: 'series:1908', imdb_id: 'tt0086759', adult: false, title: 'Miami Vice', year: 1984, genres: [], certification: null },
+      { key: 'series:114922', imdb_id: 'tt9794044', adult: false, title: 'Citadel', year: 2023, genres: [], certification: null },
+      { key: 'series:99999', imdb_id: 'tt9999999', adult: false, title: 'TVDB-only', year: 2024, genres: [], certification: null },
+    ];
+    try {
+      const sources = ageSources.buildSources(profile, quiet);
+      const r = await chain.decide(titles, 'series', tier, sources, quiet);
+      // Miami Vice: TMDB AU R 18+ → hard-floor block (step 0).
+      assert.deepStrictEqual(r.get('series:1908'), { verdict: 'block', source: 'hard-floor', rating: 'R18+' });
+      // Citadel: TMDB AU MA 15+ (not a hard floor), Common Sense 14 → allow/csm (step 1).
+      assert.deepStrictEqual(r.get('series:114922'), { verdict: 'allow', source: 'csm', rating: '14' });
+      // TVDB-only: no Common Sense, no TMDB rating, TVDB aus: PG → allow/tvdb-au (step 2).
+      assert.deepStrictEqual(r.get('series:99999'), { verdict: 'allow', source: 'tvdb-au', rating: 'PG' });
+      // The TMDB fetch carried append_to_response (the F1 regression — this would
+      // have caught it: without the query TMDB returns no per-country ratings).
+      assert.ok(fetchLog.some((c) => c.url.includes('append_to_response=content_ratings')), 'TMDB URL carries append_to_response');
+    } finally {
+      global.fetch = origFetch;
+      ageSources.setTmdbFetch(origFetch);
+      tvdb.setTvdbFetch(origFetch);
+      settings.updateSettings({ keys: prevKeys });
+      store.saveCsmCache(prevCsm);
+      tvdb.clearToken();
+    }
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();
