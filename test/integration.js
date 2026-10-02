@@ -4194,6 +4194,61 @@ async function main() {
     }
   });
 
+  await it('C1: bench --serve-opts override adds a calibrated* row that reaches past the default window', async () => {
+    const bench = require('../src/bench/engineBench');
+    const mqCfg = require('../src/engines/marquee/config');
+    const p = config.addProfile('INT-MQC1');
+    try {
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      settings.updateSettings({ engines: { marquee: true } });
+      // 80 pool rows: the top 60 are Action (affinity 100..41), rows 61–80 are
+      // Drama (affinity 40..21). The target wants Drama. With the default
+      // window_factor 3 the calibrated window (top 60) never sees the Drama
+      // rows; window_factor 4 (window 80) does, and the greedy picks one.
+      const rows = [];
+      for (let i = 0; i < 60; i++) rows.push(mkPoolRow('A' + i, 'Action', 100 - i));
+      for (let i = 0; i < 20; i++) rows.push(mkPoolRow('D' + i, 'Drama', 40 - i));
+      rs.upsertCandidates(p.id, rows);
+      serveCalibration.setTarget(p.id, 'movie', 'marquee', { Drama: 0.9, Action: 0.1 }, 80, Date.now());
+      const profile = config.getProfile(p.id);
+      const stored = rs.getRecommended(p.id, { type: 'movie', limit: 100000 });
+
+      const strategies = bench.serveStrategyMetrics(stored, profile, profile.filters, {
+        selectServe: rs.selectServe,
+        selectServeFor: rs.selectServeFor,
+        filterServable: rs.filterServable,
+        serveCalibration,
+        targets: [stored[0].tmdb_id],
+        reachable: null,
+        serveOptions: mqCfg.resolveConfig(settings.getSettings()).serve,
+        serveOptsOverride: { window_factor: 4 },
+        listSizeFor: rs.listSizeFor,
+      });
+
+      // Four strategies, in order (the override adds the 4th).
+      assert.deepStrictEqual(Object.keys(strategies), ['round_robin', 'calibrated', 'pure_score', 'calibrated*']);
+      // The default window (3 × list_size 20 = 60) never reaches the Drama rows;
+      // the wider window (4 × 20 = 80) does.
+      assert.ok(strategies.calibrated.worstRank <= 3 * 20, 'calibrated worstRank within the default window');
+      assert.ok(strategies['calibrated*'].worstRank > 3 * 20, 'calibrated* reaches past the default window');
+      // No override → no calibrated* row (K18's three rows unchanged).
+      const plain = bench.serveStrategyMetrics(stored, profile, profile.filters, {
+        selectServe: rs.selectServe,
+        selectServeFor: rs.selectServeFor,
+        filterServable: rs.filterServable,
+        serveCalibration,
+        targets: [stored[0].tmdb_id],
+        reachable: null,
+        serveOptions: mqCfg.resolveConfig(settings.getSettings()).serve,
+        listSizeFor: rs.listSizeFor,
+      });
+      assert.deepStrictEqual(Object.keys(plain), ['round_robin', 'calibrated', 'pure_score']);
+    } finally {
+      settings.updateSettings({ engines: { marquee: false }, marquee: {} });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); serveCalibration.deleteForProfile(p.id);
+    }
+  });
+
   // ── Marquee m2 engagement: finished = liked, abandoned before halfway = not ──
   const mqEngagement = require('../src/engines/marquee/engagement');
   const DAYMS = 24 * 3600e3;
