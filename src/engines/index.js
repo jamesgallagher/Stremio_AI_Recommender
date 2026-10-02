@@ -15,8 +15,13 @@ const glass = require('./glass');
 // defaults OFF) until an admin enables it in Server Config (SC-07) — a
 // user-visible no-op until then.
 const marquee = require('./marquee');
+// Marquee TV (TV-2) — series-only. Registered here so it appears in the series
+// dropdown, but it ships GLOBALLY DISABLED (isEnabled below: non-Genesis
+// defaults OFF) until an admin enables it in Server Config (SC-07) — a
+// user-visible no-op until then (M1).
+const marqueeTv = require('./marqueeTv');
 
-const REGISTRY = new Map([[genesis.id, genesis], [glass.id, glass], [marquee.id, marquee]]);
+const REGISTRY = new Map([[genesis.id, genesis], [glass.id, glass], [marquee.id, marquee], [marqueeTv.id, marqueeTv]]);
 const DEFAULT_ID = 'genesis';
 
 function get(id) { return REGISTRY.get(id) || null; }

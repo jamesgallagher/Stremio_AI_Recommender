@@ -816,11 +816,12 @@ ok('recommendationStore: T12 passesAgeBand fallback — no stored verdict, judge
 ok('engines: registry lists Genesis, resolveFor/availableFor honour age gating (I7) + global enablement (SC-07)', () => {
   const engines = require('../src/engines');
   const settings = require('../src/settings');
-  // The registry lists Genesis + Glass for both types, and Marquee (movie-only)
-  // for movie. All ship globally DISABLED, so each is in listForType yet absent
-  // from availableFor until an admin enables it (SC-07).
+  // The registry lists Genesis + Glass for both types, Marquee (movie-only) for
+  // movie, and Marquee TV (series-only) for series. All ship globally DISABLED,
+  // so each is in listForType yet absent from availableFor until an admin enables
+  // it (SC-07).
   assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['genesis', 'glass', 'marquee']);
-  assert.deepStrictEqual(engines.listForType('series').map((e) => e.id), ['genesis', 'glass']);
+  assert.deepStrictEqual(engines.listForType('series').map((e) => e.id), ['genesis', 'glass', 'marquee-tv']);
   // Genesis is the permanent default + safe floor — always enabled (SC-07).
   assert.strictEqual(engines.isEnabled('genesis'), true);
   // resolveFor falls back to Genesis for any profile, incl. a vestigial old id.
@@ -4818,6 +4819,47 @@ ok('TV-2 F7: collabRaw + normalization + because (spec §4.6)', () => {
   assert.strictEqual(becauseSeed(cand, seedValue, sw), 'A', 'because = A');
 });
 
+ok('TV-2 F8: tasteEvents — one event per non-anime value>0 show + dont negatives (spec §4.5)', () => {
+  const { tasteEvents } = require('../src/engines/marqueeTv/taste');
+  const nowMs = 1_000_000;
+  const isAnimeRow = (row) => row.simklType === 'anime';
+  const ladderEntries = [
+    { value: 1.5, row: { tmdb_id: 'a' } },           // value 1.5 → event weight 1.5, ts = now
+    { value: 0, row: { tmdb_id: 'b' } },             // value 0 → skipped
+    { value: 1.0, row: { tmdb_id: 'c', simklType: 'anime' } }, // anime row → skipped
+  ];
+  const dontRows = [
+    { tmdb_id: 'd', reason: 'user', at: nowMs - 1000 },   // user dont → −1.5
+    { tmdb_id: 'e', reason: 'decay', at: nowMs - 2000 },  // decayed dont → −0.5
+  ];
+  const ev = tasteEvents(ladderEntries, dontRows, nowMs, isAnimeRow);
+  assert.strictEqual(ev.length, 3, '3 events (a, d, e)');
+  assert.deepStrictEqual(ev[0], { type: 'series', tmdb_id: 'a', weight: 1.5, ts: nowMs, kind: 'watched', fallback_genre: null }, 'value 1.5 → weight 1.5, ts = now');
+  assert.deepStrictEqual(ev[1], { type: 'series', tmdb_id: 'd', weight: -1.5, ts: nowMs - 1000, kind: 'rejected_user', fallback_genre: null }, 'user dont → −1.5');
+  assert.deepStrictEqual(ev[2], { type: 'series', tmdb_id: 'e', weight: -0.5, ts: nowMs - 2000, kind: 'rejected_decayed', fallback_genre: null }, 'decayed dont → −0.5');
+});
+
+ok('TV-2 F9: scoreTv — features × weights sum + Canceled+1-season penalty (spec §4.7)', () => {
+  const { scoreTv } = require('../src/engines/marqueeTv/scoring');
+  const cfg = require('../src/engines/marqueeTv/config').DEFAULTS;
+  const glassCfg = require('../src/engines/glass/config').resolveConfig({});
+  const nowMs = Date.parse('2026-10-02T00:00:00Z');
+  const c = { imdb_rating: 8, vote_average: 8, vote_count: 1000, number_of_episodes: 20, status: 'Returning Series', last_episode_air_date: '2026-09-22T00:00:00Z' };
+  const meta = { genres: ['Drama'], keywords: [] };
+  const taste = { dims: { genres: { Drama: 1 } } };
+  const { features, penalty, score } = scoreTv(c, meta, taste, glassCfg, { collabNorm: 1.0, trendingRaw: 0.5, comfort: 20, nowMs, cfg });
+  // the features × weights sum (minus the penalty).
+  let expected = 0;
+  for (const [k, w] of Object.entries(cfg.weights)) expected += (features[k] || 0) * w;
+  assert.ok(Math.abs(score - (expected - penalty)) < 1e-9, 'score = Σ features·weights − penalty');
+  // the penalty applies only to Canceled + 1 season.
+  assert.strictEqual(penalty, 0, 'Returning Series → no penalty');
+  const p1 = scoreTv({ ...c, status: 'Canceled', number_of_seasons: 1 }, meta, taste, glassCfg, { collabNorm: 1.0, trendingRaw: 0.5, comfort: 20, nowMs, cfg }).penalty;
+  assert.strictEqual(p1, cfg.cancelled_one_season_penalty, 'Canceled + 1 season → penalty');
+  const p2 = scoreTv({ ...c, status: 'Canceled', number_of_seasons: 2 }, meta, taste, glassCfg, { collabNorm: 1.0, trendingRaw: 0.5, comfort: 20, nowMs, cfg }).penalty;
+  assert.strictEqual(p2, 0, 'Canceled + 2 seasons → no penalty');
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');
@@ -5378,11 +5420,11 @@ async function httpTests() {
   console.log('  ✓ /api/genres');
 
   // /api/engines — the static registry for the portal's per-type dropdowns (SC-02).
-  // It advertises Genesis + Glass (both types) + Marquee (movie-only), Glass and
-  // Marquee registered but globally disabled.
+  // It advertises Genesis + Glass (both types) + Marquee (movie-only) + Marquee TV
+  // (series-only); Glass, Marquee and Marquee TV registered but globally disabled.
   const eng = await (await fetch(`${BASE}/api/engines`)).json();
   assert.strictEqual(eng.default, 'genesis');
-  assert.deepStrictEqual(eng.engines.map((e) => e.id), ['genesis', 'glass', 'marquee']);
+  assert.deepStrictEqual(eng.engines.map((e) => e.id), ['genesis', 'glass', 'marquee', 'marquee-tv']);
   assert.deepStrictEqual(eng.engines[0].supported_types, ['movie', 'series']);
   assert.ok(eng.engines[0].description && eng.engines[0].capabilities.unrestricted === false);
   const glassAd = eng.engines.find((e) => e.id === 'glass');
