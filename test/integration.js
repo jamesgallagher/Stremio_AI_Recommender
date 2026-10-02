@@ -4038,6 +4038,85 @@ async function main() {
     }
   });
 
+  // ── Part B: warn once per (profile, type, reason) ──
+  await it('B1: fallback warns once per (profile, type, reason); cleared on a successful calibrated serve', async () => {
+    const p = config.addProfile('INT-MQB1');
+    try {
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      settings.updateSettings({ engines: { marquee: true } });
+      const affByGenre = {
+        'Action': [100, 96, 92, 88, 84, 80, 76, 72, 68, 64],
+        'Drama': [99, 95, 91, 87, 83, 79, 75, 71, 67, 63],
+        'Comedy': [98, 94, 90, 86, 82, 78, 74, 70, 66, 62],
+      };
+      const rows = [];
+      for (const g of Object.keys(affByGenre)) affByGenre[g].forEach((aff, i) => rows.push(mkPoolRow(g + '-' + i, g, aff)));
+      rs.upsertCandidates(p.id, rows);
+      const stored = rs.getRecommended(p.id, { type: 'movie', limit: 100000 });
+      const profile = config.getProfile(p.id);
+      const target = { Action: 0.4, Drama: 0.3, Comedy: 0.3 };
+      rs._resetServeWarnings();
+      const origWarn = console.warn;
+      const warns = [];
+      console.warn = (msg) => { warns.push(msg); };
+      try {
+        // 5 serves with no target → exactly 1 warning (reason no-target).
+        for (let i = 0; i < 5; i++) rs.selectServeFor(profile, 'movie', stored, { limit: 20 });
+        assert.strictEqual(warns.length, 1, '5 no-target serves → exactly 1 warning');
+        assert.ok(warns[0].includes('no-target'), 'warning carries the reason');
+        // Store a target → a serve calibrates (no new warning).
+        serveCalibration.setTarget(p.id, 'movie', 'marquee', target, 30, Date.now());
+        const before = warns.length;
+        rs.selectServeFor(profile, 'movie', stored, { limit: 20 });
+        assert.strictEqual(warns.length, before, 'calibrated serve does not warn');
+        // Delete the target → the next serve warns again (1 more).
+        serveCalibration.deleteForProfile(p.id);
+        rs.selectServeFor(profile, 'movie', stored, { limit: 20 });
+        assert.strictEqual(warns.length, before + 1, 'after target deleted, the next serve warns again');
+      } finally {
+        console.warn = origWarn;
+      }
+    } finally {
+      settings.updateSettings({ engines: { marquee: false }, marquee: {} });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); serveCalibration.deleteForProfile(p.id);
+    }
+  });
+
+  await it('B2: strategy round_robin never warns (unchanged behaviour)', async () => {
+    const p = config.addProfile('INT-MQB2');
+    try {
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      settings.updateSettings({ engines: { marquee: true } });
+      const affByGenre = {
+        'Action': [100, 96, 92, 88, 84, 80],
+        'Drama': [99, 95, 91, 87, 83, 79],
+        'Comedy': [98, 94, 90, 86, 82, 78],
+      };
+      const rows = [];
+      for (const g of Object.keys(affByGenre)) affByGenre[g].forEach((aff, i) => rows.push(mkPoolRow(g + '-' + i, g, aff)));
+      rs.upsertCandidates(p.id, rows);
+      const stored = rs.getRecommended(p.id, { type: 'movie', limit: 100000 });
+      const profile = config.getProfile(p.id);
+      const target = { Action: 0.4, Drama: 0.3, Comedy: 0.3 };
+      serveCalibration.setTarget(p.id, 'movie', 'marquee', target, 18, Date.now());
+      settings.updateSettings({ marquee: { serve: { strategy: 'round_robin' } } });
+      rs._resetServeWarnings();
+      const origWarn = console.warn;
+      const warns = [];
+      console.warn = (msg) => { warns.push(msg); };
+      try {
+        // 5 serves with strategy round_robin → no warnings (deliberate round_robin).
+        for (let i = 0; i < 5; i++) rs.selectServeFor(profile, 'movie', stored, { limit: 20 });
+        assert.strictEqual(warns.length, 0, 'strategy round_robin never warns');
+      } finally {
+        console.warn = origWarn;
+      }
+    } finally {
+      settings.updateSettings({ engines: { marquee: false }, marquee: {} });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); serveCalibration.deleteForProfile(p.id);
+    }
+  });
+
   await it('K17: selectServe (old) output is unchanged — filter + balanceByGenre (regression guard)', async () => {
     const nowYear = new Date().getFullYear();
     // A fixture exercising the rating floor, excluded genres, movies-only recency,

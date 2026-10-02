@@ -688,6 +688,12 @@ const camelServeOpts = (o) => {
 // One serve entry point (spec §16, C7): every serve surface (Stremio catalogs,
 // the portal View, the companion) takes a prefix of the SAME calibrated full
 // ordering, so the served list for any limit is `order.slice(0, limit)` (C3).
+// Part B: the fallback warning is emitted at most once per (profileId, type,
+// reason) per process. The keys are cleared on a successful calibrated serve so
+// a later regression (e.g. the target is deleted) warns again.
+const warnedServe = new Set();
+function _resetServeWarnings() { warnedServe.clear(); }
+
 // For a Marquee profile with a stored taste target, the served genre mix is
 // calibrated to that taste (Steck, RecSys 2018); otherwise — Genesis, Glass, no
 // target, engine id mismatch, strategy 'round_robin', or any calibration
@@ -715,17 +721,33 @@ function selectServeFor(profile, type, rows, { limit = SERVE_LIMIT } = {}) {
     p && Object.keys(p).length > 0;
   if (!calibrated) {
     // A calibrated engine that can't serve calibrated (no target / mismatched /
-    // empty) is logged once per serve (C6, ids only); a non-calibrated engine
-    // (Genesis/Glass) or a deliberate 'round_robin' strategy is not.
+    // empty) warns once per (profileId, type, reason) per process (C6, ids only);
+    // a non-calibrated engine (Genesis/Glass) or a deliberate 'round_robin'
+    // strategy is not.
     if (engine.capabilities.serveOrder === 'calibrated' && !(opts && opts.strategy === 'round_robin')) {
-      console.warn(`[serve] ${profile.id}/${type}: no usable calibrated target — serving genre-balanced`);
+      const reason = !t ? 'no-target' : (t.engine_id !== engine.id ? 'engine-mismatch' : 'empty-after-exclusions');
+      const key = `${profile.id}|${type}|${reason}`;
+      if (!warnedServe.has(key)) {
+        warnedServe.add(key);
+        console.warn(`[serve] ${profile.id}/${type}: no usable calibrated target (${reason}) — serving genre-balanced`);
+      }
     }
     return balanceByGenre(passed, limit);
   }
   try {
-    return serveCalibration.calibratedOrder(passed, p, { listSize: listSizeFor(profile), ...camelServeOpts(opts) }).slice(0, limit);
+    const picked = serveCalibration.calibratedOrder(passed, p, { listSize: listSizeFor(profile), ...camelServeOpts(opts) }).slice(0, limit);
+    // A successful calibrated serve clears this profile/type's warning keys so a
+    // later regression (e.g. the target is deleted) warns again.
+    for (const key of [...warnedServe]) {
+      if (key.startsWith(`${profile.id}|${type}|`)) warnedServe.delete(key);
+    }
+    return picked;
   } catch (err) {
-    console.warn(`[serve] ${profile.id}/${type}: calibrated serving failed (${err.message}) — serving genre-balanced`);
+    const key = `${profile.id}|${type}|calibration-error`;
+    if (!warnedServe.has(key)) {
+      warnedServe.add(key);
+      console.warn(`[serve] ${profile.id}/${type}: calibrated serving failed (${err.message}) — serving genre-balanced`);
+    }
     return balanceByGenre(passed, limit);
   }
 }
@@ -935,6 +957,7 @@ module.exports = {
   selectServe,
   filterServable,
   selectServeFor,
+  _resetServeWarnings,
   balanceByGenre,
   certMinAge,
   passesAgeBand,
