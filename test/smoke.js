@@ -1836,19 +1836,22 @@ ok('marquee envelope: kids cert filtering (MD-3)', () => {
   assert.strictEqual(kids.kids, true);
   assert.strictEqual(kids.judgementAge, 11); // age_limit + 1
   const run = (certAU, certUS) => kids.hardFilter({ ...base, certAU, certUS });
-  // unknown cert → cert_unknown
-  assert.deepStrictEqual(run(null, null), { ok: false, reason: 'cert_unknown' });
-  // PG (8 <= 11) → kept
+  // AGE-2: age_limit 10 is now a chain tier — the hard filter applies the 10+
+  // hard floor only (AU MA15+/AV15+/R18+/X18+/RC, US TV-MA/R/NC-17); unknown or
+  // other certificates pass (ageGatePool's verify() decides after the build).
+  // unknown cert → passes
+  assert.deepStrictEqual(run(null, null), { ok: true });
+  // PG (below the floor) → passes
   assert.deepStrictEqual(run('PG', 'PG'), { ok: true });
-  // M (15 > 11) → cert_over
-  assert.deepStrictEqual(run('M', null), { ok: false, reason: 'cert_over' });
-  // PG-13 (13 > 11) → cert_over
-  assert.deepStrictEqual(run(null, 'PG-13'), { ok: false, reason: 'cert_over' });
-  // PG + R (strictest 17 > 11) → cert_over
+  // M (not on the 10+ hard floor) → passes
+  assert.deepStrictEqual(run('M', null), { ok: true });
+  // PG-13 (not on the 10+ hard floor) → passes
+  assert.deepStrictEqual(run(null, 'PG-13'), { ok: true });
+  // R (on the 10+ US hard floor) → cert_over
   assert.deepStrictEqual(run('PG', 'R'), { ok: false, reason: 'cert_over' });
-  // US-only G (0 <= 11) → kept
+  // G → passes
   assert.deepStrictEqual(run(null, 'G'), { ok: true });
-  // R 18+ (Infinity) → cert_over
+  // R 18+ (AU hard floor) → cert_over
   assert.deepStrictEqual(run('R 18+', null), { ok: false, reason: 'cert_over' });
   // age_limit 14 (TV-14 chain tier): hard floor only — AU R18+/X18+/RC, US NC-17.
   // M and MA 15+ pass; R passes (not hard floor); R 18+ is blocked.
@@ -1913,10 +1916,11 @@ ok('marquee envelope: discoverParams (spec §3.1)', () => {
   assert.deepStrictEqual(
     compile({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 0 }),
     { include_adult: 'false', with_release_type: '4|5|6', 'vote_count.gte': '1000' });
-  // kids 10 → certification_country AU + certification.lte PG (judgementAge 11 → ceiling PG)
+  // AGE-2: kids 10 is now a chain tier → certification_country AU + certification.lte
+  // MA 15+ (the chain path's source ceiling). Step 3 makes it per-tier (M for 10+/12+).
   assert.deepStrictEqual(
     compile({ min_rating: 0, vote_count_floor: 1000, max_age_years: 0, excluded_genres: [], age_limit: 10 }),
-    { include_adult: 'false', with_release_type: '4|5|6', 'vote_count.gte': '1000', certification_country: 'AU', 'certification.lte': 'PG' });
+    { include_adult: 'false', with_release_type: '4|5|6', 'vote_count.gte': '1000', certification_country: 'AU', 'certification.lte': 'MA 15+' });
   // recency 10 → primary_release_date.gte 2016-01-01
   assert.deepStrictEqual(
     compile({ min_rating: 0, vote_count_floor: 1000, max_age_years: 10, excluded_genres: [], age_limit: 0 }),
@@ -1971,12 +1975,14 @@ ok('marquee envelope: stats counters (both stages + copy semantics)', () => {
   env.hardFilter(H({ genres: ['Horror'] }));                         // genre
   env.hardFilter(H({ vote_count: 999 }));                            // votes
   env.hardFilter(H({ availability: 'NOT_YET' }));                    // unavailable
-  env.hardFilter(H({ certAU: null, certUS: null }));                 // cert_unknown
-  env.hardFilter(H({ certAU: 'M', certUS: null }));                  // cert_over
+  // AGE-2: age_limit 10 is a chain tier — unknown cert passes (verify() decides
+  // later), and only the 10+ hard floor increments cert_over.
+  env.hardFilter(H({ certAU: null, certUS: null }));                 // passes (no cert counter)
+  env.hardFilter(H({ certAU: 'R 18+', certUS: null }));             // cert_over (AU hard floor)
   const s = env.stats();
   assert.deepStrictEqual(s, {
     adult: 1, votes: 2, recency: 2, genre: 2, rating: 2,
-    no_imdb: 1, unavailable: 1, cert_unknown: 1, cert_over: 1,
+    no_imdb: 1, unavailable: 1, cert_unknown: 0, cert_over: 1,
   });
   // copy semantics: mutating the returned object doesn't affect the envelope
   s.adult = 999;
@@ -3578,6 +3584,115 @@ ok('calibrated A2: incremental greedy is fast (425 rows, listSize 50)', () => {
     assert.strictEqual(ratings.classifyLoose('XYZ', tier), null);
   });
 
+  // ---- AGE-2: tier table + age-based foreign table (pure) ----
+  ok('AGE-2 T1: tier table — allow/block per tier; hard floor; tierFor rounding', () => {
+    const T = tiers.TIERS;
+    for (const n of [10, 12, 14, 15]) {
+      const t = T[n];
+      assert.strictEqual(t.mode, 'chain');
+      for (const type of ['series', 'movie']) {
+        for (const r of t.lists[type].allow) {
+          assert.strictEqual(ratings.classify(r, type, t), 'allow', `tier ${n} ${type} allow ${r}`);
+        }
+        for (const r of t.lists[type].block) {
+          assert.strictEqual(ratings.classify(r, type, t), 'block', `tier ${n} ${type} block ${r}`);
+        }
+      }
+      for (const r of t.hardFloor.AU) {
+        assert.ok(ratings.isHardFloor(r, null, t), `tier ${n} AU hard floor ${r}`);
+      }
+      for (const r of t.hardFloor.US) {
+        assert.ok(ratings.isHardFloor(null, r, t), `tier ${n} US hard floor ${r}`);
+      }
+    }
+    // tierFor rounding: 1-11 → 10, 12-13 → 12, 14 → 14, 15+ → 15
+    const expect = { 1: 'age10', 5: 'age10', 9: 'age10', 10: 'age10', 11: 'age10', 12: 'age12', 13: 'age12', 14: 'tv14', 15: 'age15', 16: 'age15', 18: 'age15' };
+    for (const [n, id] of Object.entries(expect)) {
+      assert.strictEqual(tiers.tierFor({ age_limit: n }).id, id, `tierFor(${n})`);
+    }
+    assert.strictEqual(tiers.tierFor({ age_limit: 0 }), null);
+    assert.strictEqual(tiers.tierFor({}), null);
+    assert.strictEqual(tiers.tierFor(null), null);
+  });
+
+  ok('AGE-2 T2: foreign identity — AGE-1 TV-14 table reproduced; 10+/15+ shift', () => {
+    // AGE-1's fixed TV-14 foreign table — the reference the age-based table must
+    // reproduce exactly at TV-14.
+    const AGE1 = {
+      GB: { allow: ['U', 'PG', '12', '12A'], block: ['15', '18', 'R18'] },
+      IE: { allow: ['G', 'PG', '12', '12A', '12PG'], block: ['15A', '15', '16', '18'] },
+      NZ: { allow: ['G', 'PG', 'R13', 'RP13'], block: ['M', 'R15', 'R16', 'RP16', 'R18', 'R'] },
+      CA: { allow: ['G', 'PG', '14A', 'C', 'C8', '14+'], block: ['18A', 'R', 'A', '18+'] },
+    };
+    const tv14 = tiers.TIERS[14];
+    for (const cc of ['GB', 'IE', 'NZ', 'CA']) {
+      for (const r of AGE1[cc].allow) {
+        assert.strictEqual(ratings.classifyForeign(cc, r, tv14), 'allow', `TV-14 ${cc} ${r}`);
+      }
+      for (const r of AGE1[cc].block) {
+        assert.strictEqual(ratings.classifyForeign(cc, r, tv14), 'block', `TV-14 ${cc} ${r}`);
+      }
+    }
+    // 3-letter TVDB codes
+    assert.strictEqual(ratings.classifyForeign('GBR', '12A', tv14), 'allow');
+    assert.strictEqual(ratings.classifyForeign('IRL', '12PG', tv14), 'allow');
+    assert.strictEqual(ratings.classifyForeign('NZL', 'R13', tv14), 'allow');
+    assert.strictEqual(ratings.classifyForeign('CAN', '14A', tv14), 'allow');
+    assert.strictEqual(ratings.classifyForeign('GBR', '15', tv14), 'block');
+    assert.strictEqual(ratings.classifyForeign('CAN', '18A', tv14), 'block');
+    // 10+: GB 12 → block (min 12 > 10); GB PG → allow (min 8 ≤ 10)
+    const t10 = tiers.TIERS[10];
+    assert.strictEqual(ratings.classifyForeign('GB', '12', t10), 'block');
+    assert.strictEqual(ratings.classifyForeign('GB', 'PG', t10), 'allow');
+    // 15+: GB 15 → allow (min 15 ≤ 15); NZ M (16) → block (min 16 > 15)
+    const t15 = tiers.TIERS[15];
+    assert.strictEqual(ratings.classifyForeign('GB', '15', t15), 'allow');
+    assert.strictEqual(ratings.classifyForeign('NZ', 'M', t15), 'block');
+  });
+
+  okAsync('AGE-2 T3: chain at each tier — CSM strict, E3 hard floor, US/AU per tier', async () => {
+    const log = { warn: () => {} };
+    const empty = () => new Map();
+    function run(tier, title, stubs) {
+      const sources = {
+        tmdbRatings: stubs.tmdbRatings || empty,
+        csmAges: stubs.csmAges || empty,
+        tvdbRatings: stubs.tvdbRatings || empty,
+        simklCerts: stubs.simklCerts || empty,
+        mdblistCerts: stubs.mdblistCerts || empty,
+        llmGate: stubs.llmGate || empty,
+      };
+      return chain.decide([title], 'series', tier, sources, log);
+    }
+    const t10 = tiers.TIERS[10], t12 = tiers.TIERS[12], t15 = tiers.TIERS[15];
+    // CSM 11 at 10+ → block; CSM 10 → allow
+    let r = await run(t10, { key: 'k1', imdb_id: 'tt1' }, { csmAges: () => new Map([['tt1', 11]]) });
+    assert.deepStrictEqual(r.get('k1'), { verdict: 'block', source: 'csm', rating: '11' });
+    r = await run(t10, { key: 'k2', imdb_id: 'tt2' }, { csmAges: () => new Map([['tt2', 10]]) });
+    assert.deepStrictEqual(r.get('k2'), { verdict: 'allow', source: 'csm', rating: '10' });
+    // AU MA 15+ with CSM 9 at 10+ → block / hard-floor (E3)
+    r = await run(t10, { key: 'k3', imdb_id: 'tt3' }, {
+      tmdbRatings: () => new Map([['k3', { AU: 'MA15+' }]]),
+      csmAges: () => new Map([['tt3', 9]]),
+    });
+    assert.deepStrictEqual(r.get('k3'), { verdict: 'block', source: 'hard-floor', rating: 'MA15+' });
+    // US TV-MA with CSM 8 at 12+ → block / hard-floor
+    r = await run(t12, { key: 'k4', imdb_id: 'tt4' }, {
+      tmdbRatings: () => new Map([['k4', { US: 'TV-MA' }]]),
+      csmAges: () => new Map([['tt4', 8]]),
+    });
+    assert.deepStrictEqual(r.get('k4'), { verdict: 'block', source: 'hard-floor', rating: 'TV-MA' });
+    // US TV-14 at 12+ (no CSM, no AU) → block / us
+    r = await run(t12, { key: 'k5', imdb_id: 'tt5' }, { tmdbRatings: () => new Map([['k5', { US: 'TV-14' }]]) });
+    assert.deepStrictEqual(r.get('k5'), { verdict: 'block', source: 'us', rating: 'TV-14' });
+    // AU MA 15+ at 15+ (no CSM) → allow / au
+    r = await run(t15, { key: 'k6', imdb_id: 'tt6' }, { tmdbRatings: () => new Map([['k6', { AU: 'MA15+' }]]) });
+    assert.deepStrictEqual(r.get('k6'), { verdict: 'allow', source: 'au', rating: 'MA15+' });
+    // TV-MA at 15+ (no CSM/AU) → block / us
+    r = await run(t15, { key: 'k7', imdb_id: 'tt7' }, { tmdbRatings: () => new Map([['k7', { US: 'TV-MA' }]]) });
+    assert.deepStrictEqual(r.get('k7'), { verdict: 'block', source: 'us', rating: 'TV-MA' });
+  });
+
   // ---- AGE-1: decision chain (pure, seams) ----
   okAsync('AGE-1 C1: chain order — first step that answers wins', async () => {
     const log = { warn: () => {} };
@@ -4386,13 +4501,14 @@ async function httpTests() {
     // every fake title as non-anime (they pass step 1 untouched).
     animeMap._setIndex({ at: Date.now(), etag: 'sc06', byImdb: {}, byTmdb: {} });
     const prof = config.addProfile('SC06-AGE');
-    config.updateProfile(prof.id, { filters: { age_limit: 8 } }); // kids profile → judged at 9
+    config.updateProfile(prof.id, { filters: { age_limit: 10 } }); // kids profile → age10 chain tier
     const ctx = { tmdbKey: 'unused', mdblistKey: '', settings: settings.getSettings(), filters: config.getProfile(prof.id).filters, log: q };
     await pipeline.runEngineBuild(config.getProfile(prof.id), 'movie', fake, ctx, () => {});
     assert.strictEqual(rs.getRecommended(prof.id, { type: 'movie', limit: 100 }).length, 3);
     const prevVerdicts = store.loadAgeVerdicts();
-    // fake-movie-1 is judged UNSUITABLE at the judgement age (9); the others pass.
-    store.saveAgeVerdicts({ 'movie:9:fake-movie-1': false, 'movie:9:fake-movie-2': true, 'movie:9:fake-movie-3': true });
+    // fake-movie-1 is judged UNSUITABLE at the age10 tier; the others pass.
+    // AGE-2: the LLM gate is the chain's step 5, keyed `${type}:${tier.llm.cacheKey}:${id}`.
+    store.saveAgeVerdicts({ 'movie:age10:fake-movie-1': false, 'movie:age10:fake-movie-2': true, 'movie:age10:fake-movie-3': true });
     try {
       const r = await rs.ageGatePool(config.getProfile(prof.id), q);
       assert.strictEqual(r.vetoed, 1);   // the shared age gate removed the over-band title
@@ -4628,14 +4744,17 @@ async function httpTests() {
   assert.deepStrictEqual(
     await rebuildMod.applyExtraAgeGate({ name: 'Adult', filters: { age_limit: 0 }, keys: {} }, action, metas, quiet),
     metas);
-  // A BANDED kids catalog gates even an adult profile -> needs the LLM -> fail-closed
+  // A BANDED kids catalog gates even an adult profile -> needs the LLM -> fail-closed.
+  // AGE-2: every positive age limit is a chain tier, so the gate runs the
+  // multi-source chain; its LLM step (step 5) fails closed with the LLM provider
+  // error when no LLM is configured (the legacy `No LLM configured` throw is gone).
   await assert.rejects(
     () => rebuildMod.applyExtraAgeGate({ name: 'Adult', filters: { age_limit: 0 }, keys: {} }, kids, metas, quiet),
-    /No LLM configured/);
+    /No LLM/);
   // A plain catalog on a kid profile also gates -> fail-closed
   await assert.rejects(
     () => rebuildMod.applyExtraAgeGate({ name: 'Kid', filters: { age_limit: 8 }, keys: {} }, action, metas, quiet),
-    /No LLM configured/);
+    /No LLM/);
   console.log('  ✓ extra-catalog age gate: band applied always, plain gated only for kids, fail-closed');
 
   await new Promise(r => setTimeout(r, 400)); // let server bind

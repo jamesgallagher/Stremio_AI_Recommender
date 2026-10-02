@@ -37,11 +37,16 @@ function classify(rating, type, tier) {
 
 // Foreign (country) classification. Countries are 2-letter (TMDB) or 3-letter
 // (TVDB): GB/GBR, IE/IRL, NZ/NZL, CA/CAN. Anything else → null.
+//
+// AGE-2: each foreign rating maps to a minimum age. A rating is `allow` if its
+// minimum age is at or under the tier's `foreignMaxAge`, else `block`. Unknown
+// ratings → null (the next step decides). At TV-14 (foreignMaxAge 14) this
+// reproduces AGE-1's fixed allow/block lists exactly (test T2).
 const FOREIGN = {
-  GB: { allow: ['U', 'PG', '12', '12A'], block: ['15', '18', 'R18'] },
-  IE: { allow: ['G', 'PG', '12', '12A', '12PG'], block: ['15A', '15', '16', '18'] },
-  NZ: { allow: ['G', 'PG', 'R13', 'RP13'], block: ['M', 'R15', 'R16', 'RP16', 'R18', 'R'] },
-  CA: { allow: ['G', 'PG', '14A', 'C', 'C8', '14+'], block: ['18A', 'R', 'A', '18+'] },
+  GB: { U: 0, PG: 8, '12': 12, '12A': 12, '15': 15, '18': 18, R18: 18 },
+  IE: { G: 0, PG: 8, '12': 12, '12A': 12, '12PG': 12, '15A': 15, '15': 15, '16': 16, '18': 18 },
+  NZ: { G: 0, PG: 8, R13: 13, RP13: 13, M: 16, R15: 15, R16: 16, RP16: 16, R18: 18, R: 18 },
+  CA: { G: 0, C: 0, C8: 8, PG: 8, '14A': 14, '14+': 14, '18A': 18, '18+': 18, R: 18, A: 18 },
 };
 const COUNTRY_MAP = { GB: 'GB', GBR: 'GB', IE: 'IE', IRL: 'IE', NZ: 'NZ', NZL: 'NZ', CA: 'CA', CAN: 'CA' };
 
@@ -50,10 +55,9 @@ function classifyForeign(country, rating, tier) {
   if (!cc || !FOREIGN[cc]) return null;
   const n = normalizeRating(rating);
   if (!n) return null;
-  const l = FOREIGN[cc];
-  if (l.allow.includes(n)) return 'allow';
-  if (l.block.includes(n)) return 'block';
-  return null;
+  const minAge = FOREIGN[cc][n];
+  if (minAge == null) return null;
+  return minAge <= tier.foreignMaxAge ? 'allow' : 'block';
 }
 
 // Loose classification for MDBList's country-less `certification`. First try the
