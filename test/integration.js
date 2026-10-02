@@ -4063,6 +4063,58 @@ async function main() {
     assert.ok(ids.includes('6'), 'F kept');
   });
 
+  await it('K18: bench serveStrategies — three strategies, fields present, pure_score top20Share = 20', async () => {
+    const bench = require('../src/bench/engineBench');
+    const mqCfg = require('../src/engines/marquee/config');
+    const p = config.addProfile('INT-MQK18');
+    try {
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      settings.updateSettings({ engines: { marquee: true } });
+      // 40 pool rows: 10 per genre (all filter-passing), affinities interleaved.
+      const affByGenre = {
+        'Action': [100, 96, 92, 88, 84, 80, 76, 72, 68, 64],
+        'Drama': [99, 95, 91, 87, 83, 79, 75, 71, 67, 63],
+        'Comedy': [98, 94, 90, 86, 82, 78, 74, 70, 66, 62],
+        'Science Fiction': [97, 93, 89, 85, 81, 77, 73, 69, 65, 61],
+      };
+      const rows = [];
+      for (const g of Object.keys(affByGenre)) affByGenre[g].forEach((aff, i) => rows.push(mkPoolRow(g + '-' + i, g, aff)));
+      rs.upsertCandidates(p.id, rows);
+      serveCalibration.setTarget(p.id, 'movie', 'marquee', { Action: 0.4, Drama: 0.3, Comedy: 0.2, 'Science Fiction': 0.1 }, 40, Date.now());
+      const profile = config.getProfile(p.id);
+      const stored = rs.getRecommended(p.id, { type: 'movie', limit: 100000 });
+
+      const strategies = bench.serveStrategyMetrics(stored, profile, profile.filters, {
+        selectServe: rs.selectServe,
+        selectServeFor: rs.selectServeFor,
+        filterServable: rs.filterServable,
+        serveCalibration,
+        // a few holdout targets (the bench drives this against the real holdout).
+        targets: [stored[0].tmdb_id, stored[1].tmdb_id, stored[2].tmdb_id],
+        reachable: null,
+        serveOptions: mqCfg.resolveConfig(settings.getSettings()).serve,
+      });
+
+      // Three strategies, in order.
+      assert.deepStrictEqual(Object.keys(strategies), ['round_robin', 'calibrated', 'pure_score']);
+      // Each strategy carries the §6 fields.
+      for (const s of Object.values(strategies)) {
+        assert.ok(typeof s.hitAt20 === 'number', 'hitAt20 present');
+        assert.ok(s.hitAt20Reachable === null || typeof s.hitAt20Reachable === 'number', 'hitAt20Reachable present');
+        assert.ok(s.kl === null || typeof s.kl === 'number', 'kl present');
+        assert.ok(typeof s.top20Share === 'number', 'top20Share present');
+        assert.ok(s.meanRank === null || typeof s.meanRank === 'number', 'meanRank present');
+        assert.ok('worstRank' in s, 'worstRank present');
+        assert.ok('wildcard' in s, 'wildcard present');
+      }
+      // pure_score serves the top 20 by score → all 20 are in the top-20 scores.
+      assert.strictEqual(strategies.pure_score.top20Share, 20, 'pure_score top20Share = 20');
+    } finally {
+      settings.updateSettings({ engines: { marquee: false }, marquee: {} });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); serveCalibration.deleteForProfile(p.id);
+    }
+  });
+
   // ── Marquee m2 engagement: finished = liked, abandoned before halfway = not ──
   const mqEngagement = require('../src/engines/marquee/engagement');
   const DAYMS = 24 * 3600e3;

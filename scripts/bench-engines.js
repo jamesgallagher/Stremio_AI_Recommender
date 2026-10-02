@@ -92,7 +92,9 @@ async function main() {
       profile, engineIds: a.engines, holdout: a.holdout,
       deps: {
         engines, pipeline, rs, watchedStore, db, settings,
-        selectServe: rs.selectServe, log: quiet, noCache: a.noCache,
+        selectServe: rs.selectServe, selectServeFor: rs.selectServeFor, filterServable: rs.filterServable,
+        serveCalibration: require('../src/serveCalibration'),
+        log: quiet, noCache: a.noCache,
         // m2: could each held-out film be served at all under this profile's
         // filters? Cached deep meta first; a read-only TMDB fetch (≤ holdout
         // calls) only when the cache lacks it or predates availability data.
@@ -127,6 +129,11 @@ async function main() {
   }
 
   console.log(bench.renderTable(results));
+  // §6: Marquee serve-strategy comparison (round-robin vs calibrated vs pure
+  // score) on the same pool — printed as a second table under the main one.
+  if (results.engines.marquee && results.engines.marquee.serveStrategies) {
+    console.log('\n' + bench.renderServeTable(results.engines.marquee.serveStrategies));
+  }
   console.log('\nNote: the age gate is NOT run in the bench — it measures ranking quality, not age safety.');
   console.log('Snapshot: live store.db read via node:sqlite ' + readOnlyPath + ' open + VACUUM INTO. Live store.db was never written.');
 
@@ -140,7 +147,10 @@ async function main() {
       at: new Date().toISOString(),
       holdout: results.holdout,
       targets: results.targets,
-      engines: Object.fromEntries(Object.entries(results.engines).map(([id, e]) => [id, { metrics: e.metrics, hitTargets: e.hitTargets, positions: e.positions }])),
+      engines: Object.fromEntries(Object.entries(results.engines).map(([id, e]) => [id, {
+        metrics: e.metrics, hitTargets: e.hitTargets, positions: e.positions,
+        ...(e.serveStrategies ? { serveStrategies: e.serveStrategies } : {}),
+      }])),
     };
     fs.writeFileSync(outFile, JSON.stringify(payload, null, 2));
     console.log('JSON report written to: ' + outFile);

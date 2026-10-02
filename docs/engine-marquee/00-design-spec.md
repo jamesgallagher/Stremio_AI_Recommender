@@ -392,3 +392,14 @@ real signal is completion:
 - To confirm retention live: `test/verify-marquee-live.js` check **V7** prints movie progress rows
   by bucket and age (counts only).
 - Next: re-run the bench (ideally `--holdout 30` and every profile) and record run 2 here.
+
+## 16. Calibrated serving
+
+**Problem.** The serve path balances the served list by strict round-robin across primary genres, so the served genre mix ignores the person's actual taste mix — a genre they barely watch is still force-filled to one slot per round.
+**Method (Steck, RecSys 2018).** The served genre mix is calibrated to the person's own taste: a greedy set-selection over the best-scored films, each step picking the remaining row that maximises `U = (1−λ)·Σ normScore − λ·KL(p ‖ q̃)`, `q̃ = (1−α)·q + α·p`, `q` the fractional genre mix of the set (a k-genre film counts 1/k to each genre).
+**Quality window.** Only the top `window_factor × list_size` filter-passing rows (by score) are candidates; rows outside the window are appended after the calibrated part in score order, so a liked genre with no strong candidate is under-filled — never a weak filler.
+**Taste target.** Computed at Marquee build time from the watched films (same signals as the taste model: recency blend, rating weight excluding negative 1–4, Loved(10) decay floor, ignored excluded; genres from deep meta else `primary_genre`) and stored per profile/type. Excluded genres are removed at serve time and the rest renormalised; serving stays instant, local and network-free.
+**Wildcard (discovery) slot.** Off by default (`wildcard_slots: 0`). When ≥1, the highest-scored filter-passing row among the top `2W` whose genres all have target share < `wildcard_max_share` and is not already in the first `list_size` positions is placed at `wildcard_position` (6th).
+**Safe fallback.** No stored target, engine-id mismatch, empty target, `strategy:'round_robin'`, or any calibration exception → the existing `balanceByGenre` (logged once per serve, ids only); serving must never fail because of calibration. Genesis and Glass keep round-robin.
+**Defaults** (`DEFAULTS.serve`, Tier-2 overridable via `settings.marquee.serve`): `strategy:'calibrated'`, `lambda:0.5`, `window_factor:3`, `kl_alpha:0.01`, `wildcard_slots:0`, `wildcard_max_share:0.05`, `wildcard_position:6`.
+**Bench.** `scripts/bench-engines.js` reports a second table comparing `round_robin`, `calibrated` and `pure_score` on the same stored rows + target (hit@20, hit@20r, KL, top20, meanRank, worstRank, wildcard); also under `engines.marquee.serveStrategies` in `--json`.

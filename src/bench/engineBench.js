@@ -110,6 +110,108 @@ const metrics = (rows, targets, filters, { selectServe, stored, buildSeconds, re
   };
 };
 
+// §6: serve-strategy comparison for Marquee (round-robin vs calibrated vs pure
+// score), on the SAME stored rows + SAME stored target. Pure / seam-injected so
+// the integration suite can drive it hermetically. Each strategy serves 20; the
+// metrics are the main table's hit@20 / hit@20r plus the calibrated-serving
+// specifics — KL of the served mix vs the stored target (exclusions applied),
+// top20Share (how many served films sit in the top-20 scores), rank stats, and
+// the wildcard title (the discovery slot, when one is on).
+function serveStrategyMetrics(rows, profile, filters, {
+  selectServe, selectServeFor, filterServable, serveCalibration,
+  targets, reachable = null, serveOptions = null, nowYear = new Date().getFullYear(),
+}) {
+  const rankOf = new Map(rows.map((r, i) => [r.tmdb_id, i + 1]));
+  const top20Pool = new Set(rows.slice(0, 20).map((r) => r.tmdb_id));
+
+  // The stored target (with the profile's excluded genres removed) — the
+  // reference mix the calibrated strategy is measured against.
+  const stored = serveCalibration.getTarget(profile.id, 'movie');
+  const p = stored ? serveCalibration.applyExclusions(stored.target, (filters || {}).excluded_genres || []) : null;
+
+  const strategies = {};
+  const add = (name, served) => {
+    const ids = served.map((r) => r.tmdb_id);
+    const idSet = new Set(ids);
+    let hit20 = 0;
+    for (const t of targets) if (idSet.has(t)) hit20 += 1;
+    let hitReach = null; let reachN = null;
+    if (reachable) {
+      reachN = targets.filter((t) => reachable.has(t)).length;
+      hitReach = targets.filter((t) => reachable.has(t) && idSet.has(t)).length;
+    }
+    const kl = p ? serveCalibration.klDivergence(p, serveCalibration.genreMix(served), 0.01) : null;
+    let top20Share = 0;
+    for (const id of ids) if (top20Pool.has(id)) top20Share += 1;
+    let rankSum = 0; let rankN = 0; let worst = null;
+    for (const id of ids) {
+      const pos = rankOf.get(id);
+      if (pos) { rankSum += pos; rankN += 1; if (worst == null || pos > worst) worst = pos; }
+    }
+    strategies[name] = {
+      hitAt20: hit20,
+      hitAt20Reachable: hitReach,
+      reachableTargets: reachN,
+      kl,
+      top20Share,
+      meanRank: rankN ? rankSum / rankN : null,
+      worstRank: worst,
+      wildcard: null,
+    };
+  };
+
+  // round-robin: the existing strict genre rotation.
+  add('round_robin', selectServe(rows, filters, { limit: 20 }));
+
+  // calibrated: the one serve entry point (uses the stored target).
+  const cal = selectServeFor(profile, 'movie', rows, { limit: 20 });
+  add('calibrated', cal);
+
+  // pure score: the top 20 of the filter-passing pool by score (ties by tmdb_id).
+  const passed = filterServable(rows, filters || {}, { nowYear })
+    .slice()
+    .sort((a, b) => {
+      const sa = a.affinity || 0, sb = b.affinity || 0;
+      if (sb !== sa) return sb - sa;
+      return String(a.tmdb_id) < String(b.tmdb_id) ? -1 : 1;
+    });
+  add('pure_score', passed.slice(0, 20));
+
+  // wildcard: the film placed at the wildcard position (index 5) of the
+  // calibrated list, when a discovery slot is on (wildcard_slots >= 1).
+  if (serveOptions && (serveOptions.wildcard_slots || 0) >= 1) {
+    const pos = (serveOptions.wildcard_position || 6) - 1;
+    const w = cal[pos];
+    if (w) strategies.calibrated.wildcard = w.title;
+  }
+
+  return strategies;
+}
+
+// §6: the second table under the main one — Marquee's serve strategies on the
+// same pool. Pure string over the structured result.
+function renderServeTable(results) {
+  const pad = (s, n) => String(s).padEnd(n);
+  const head = [
+    pad('strategy', 12), pad('hit@20', 8), pad('hit@20r', 9), pad('KL', 8),
+    pad('top20', 8), pad('meanRank', 10), pad('worstRank', 10), 'wildcard',
+  ].join(' ');
+  const lines = ['Marquee serve strategies (same pool):', head, '─'.repeat(head.length)];
+  for (const [name, s] of Object.entries(results)) {
+    lines.push([
+      pad(name, 12),
+      pad(String(s.hitAt20), 8),
+      pad(s.hitAt20Reachable == null ? 'n/a' : `${s.hitAt20Reachable}/${s.reachableTargets}`, 9),
+      pad(s.kl == null ? 'n/a' : s.kl.toFixed(3), 8),
+      pad(String(s.top20Share), 8),
+      pad(s.meanRank == null ? '—' : s.meanRank.toFixed(1), 10),
+      pad(s.worstRank == null ? '—' : '#' + s.worstRank, 10),
+      s.wildcard || '-',
+    ].join(' '));
+  }
+  return lines.join('\n');
+}
+
 // Delete the holdout titles from the BENCH copy of the store so they cannot leak
 // into the build (spec §5.3): watched, pending_watched, dont_recommend, the
 // profile's whole recommended pool, and (if present) marquee_ratings — a held-out
@@ -224,6 +326,7 @@ async function assessReachability(targetIds, filters, { metaFor, imdbRatingFor =
 async function runBench({ profile, engineIds, holdout, deps }) {
   const {
     engines, pipeline, rs, watchedStore, db, settings, selectServe,
+    selectServeFor, filterServable, serveCalibration,
     log = console, now = Date.now, noCache = false, ctxExtras = {}, reachability = null,
   } = deps;
 
@@ -252,6 +355,8 @@ async function runBench({ profile, engineIds, holdout, deps }) {
   const reachableSet = reach ? new Set([...reach].filter(([, r]) => r.reachable).map(([id]) => id)) : null;
 
   const results = { profile: profile.name, holdout, targets, engines: {} };
+  let marqueeRows = null;   // §6: the Marquee stored rows for the serve-strategy comparison
+  let marqueeEngine = null;
   for (const id of engineIds) {
     const engine = engines.get(id);
     if (!engine) {
@@ -281,6 +386,7 @@ async function runBench({ profile, engineIds, holdout, deps }) {
     const buildSeconds = (now() - t0) / 1000;
 
     const rows = rs.getRecommended(profile.id, { type: 'movie', limit: 100000 });
+    if (id === 'marquee') { marqueeRows = rows; marqueeEngine = engine; }
     const m = metrics(rows, targetIds, profile.filters || {}, { selectServe, stored: rows.length, buildSeconds, reachable: reachableSet });
     // Which targets did this engine actually hit in the top-20 served?
     const served20 = selectServe(rows, profile.filters || {}, { limit: 20 });
@@ -301,6 +407,18 @@ async function runBench({ profile, engineIds, holdout, deps }) {
       positions[t] = { rank, served: served20Ids.has(t), fate, sources: ctx.marqueeTrace?.generated.get(t) || null };
     }
     results.engines[id] = { metrics: m, hitTargets, positions };
+  }
+
+  // §6: Marquee serve-strategy comparison (round-robin vs calibrated vs pure
+  // score) on the SAME stored rows + SAME stored target. Marquee only, and only
+  // when the serve-strategy deps are injected (the bench script provides them;
+  // hermetic callers that don't need the comparison pass only `selectServe`).
+  if (marqueeRows && marqueeEngine && serveCalibration && selectServeFor && filterServable) {
+    const serveOptions = marqueeEngine.serveOptions ? marqueeEngine.serveOptions(settings.getSettings()) : null;
+    results.engines.marquee.serveStrategies = serveStrategyMetrics(marqueeRows, profile, profile.filters || {}, {
+      selectServe, selectServeFor, filterServable, serveCalibration,
+      targets: targetIds, reachable: reachableSet, serveOptions,
+    });
   }
   return results;
 }
@@ -355,4 +473,4 @@ function renderTable(results) {
   return lines.join('\n');
 }
 
-module.exports = { pickTargets, metrics, renderTable, runBench, removeHoldout, snapshotStore, parseComps, assessReachability };
+module.exports = { pickTargets, metrics, renderTable, runBench, removeHoldout, snapshotStore, parseComps, assessReachability, serveStrategyMetrics, renderServeTable };
