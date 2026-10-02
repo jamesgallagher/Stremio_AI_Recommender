@@ -91,6 +91,7 @@ async function main() {
     watched_eps: e.row.watched_eps,
     total_eps: e.row.total_eps,
     not_aired_eps: e.row.not_aired_eps,
+    stamps: e.row.stamps,
     real_stamps: e.row.real_stamps,
     eps_per_week: e.row.eps_per_week != null ? Number(e.row.eps_per_week.toFixed(2)) : null,
   })).sort((x, y) => (y.value - x.value) || String(x.title).localeCompare(String(y.title)));
@@ -102,10 +103,12 @@ async function main() {
     const head = [
       pad('title', 28), pad('kind', 6), pad('rung', 13), pad('weight', 8),
       pad('recency', 9), pad('active', 8), pad('binge', 7), pad('seed', 6),
-      pad('rated', 7), pad('value', 9), 'eps',
+      pad('rated', 7), pad('value', 9), pad('real%', 7), 'eps',
     ].join(' ');
     const lines = [`Profile: ${a.profile}   kind: ${a.kind}   shows: ${list.length}`, head, '─'.repeat(head.length)];
     for (const r of list) {
+      const realPct = r.stamps > 0 ? Math.round((r.real_stamps / r.stamps) * 100) : null;
+      const aired = r.total_eps != null ? r.total_eps - (r.not_aired_eps || 0) : null;
       lines.push([
         pad(r.title, 28),
         pad(r.kind, 6),
@@ -117,11 +120,15 @@ async function main() {
         pad(r.seedEligible ? 'yes' : 'no', 6),
         pad(r.rated ? 'yes' : 'no', 7),
         pad(String(r.value), 9),
-        `${r.watched_eps}/${r.total_eps}`,
+        pad(realPct != null ? realPct + '%' : '—', 7),
+        `${r.watched_eps}/${aired != null ? aired : '?'}`,
       ].join(' '));
     }
     lines.push('');
-    lines.push('value = weight × recency × (active?1.3:1) + binge; a rated show\'s weight is the film rating table (Q9).');
+    const rungCounts = {};
+    for (const r of list) rungCounts[r.rung] = (rungCounts[r.rung] || 0) + 1;
+    lines.push('Rung counts: ' + Object.keys(rungCounts).sort().map((k) => k + ' ' + rungCounts[k]).join(', '));
+    lines.push('value = (weight + binge) × recency × active; a rated show\'s weight is the film rating table (Q9).');
     console.log(lines.join('\n'));
   }
 

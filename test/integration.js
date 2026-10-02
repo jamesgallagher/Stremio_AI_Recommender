@@ -6884,6 +6884,39 @@ async function main() {
     }
   });
 
+  await it('TV-1 S4: series-ladder.js footer (weight+binge)×recency×active, rung counts, real% column, watched/aired', async () => {
+    const { execFileSync } = require('child_process');
+    const path = require('path');
+    const p = config.addProfile('INT-TV1-S4');
+    const DAY = 86400e3;
+    const base = Date.parse('2026-06-01T00:00:00Z');
+    try {
+      watchedStore.upsertSeriesProgress(p.id, [
+        { simkl_id: 1, kind: 'show', imdb_id: 'tt1', tmdb_id: 's41', title: 'Show A', year: 2020,
+          status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 5,
+          last_watched_at: base + 10 * DAY, first_watched_at: base + 1 * DAY,
+          first_real_at: base + 1 * DAY, last_real_at: base + 10 * DAY,
+          stamps: 10, real_stamps: 4, eps_per_week: null },
+        { simkl_id: 2, kind: 'show', imdb_id: 'tt2', tmdb_id: 's42', title: 'Show B', year: 2020,
+          status: 'ended', watched_eps: 5, total_eps: 10, not_aired_eps: 0,
+          last_watched_at: base + 5 * DAY, first_watched_at: base + 2 * DAY,
+          first_real_at: base + 2 * DAY, last_real_at: base + 5 * DAY,
+          stamps: 5, real_stamps: 5, eps_per_week: null },
+      ]);
+      const out = execFileSync(process.execPath, ['--experimental-sqlite', 'scripts/series-ladder.js', 'INT-TV1-S4'], {
+        encoding: 'utf8',
+        env: { ...process.env, DATA_DIR: process.env.DATA_DIR },
+        cwd: path.join(__dirname, '..'),
+      });
+      assert.ok(out.includes('(weight + binge) × recency × active'), 'footer shows (weight + binge) × recency × active');
+      assert.ok(out.includes('Rung counts:'), 'rung-count summary present');
+      assert.ok(out.includes('real%'), 'real-stamp % column present');
+      assert.ok(out.includes('10/15'), 'eps column shows watched/aired (10 watched / 15 aired)');
+    } finally {
+      config.removeProfile(p.id); watchedStore.deleteForProfile(p.id);
+    }
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();
