@@ -2155,7 +2155,7 @@ ok('marquee ME-04: config copies Glass values independently + resolveConfig deep
   assert.deepStrictEqual(marqueeCfg.DEFAULTS.brief, { input_cap: 60 });
   // collab_reserve added in review round 1 (F1): the S2 collaborative reserve.
   assert.deepStrictEqual(marqueeCfg.DEFAULTS.simkl, { recs_max_uncached: 40, recs_ttl_days: 30, ratings_resolve_cap: 50, collab_reserve: 40 });
-  assert.strictEqual(marqueeCfg.ALGORITHM_VERSION, 'marquee-m3');
+  assert.strictEqual(marqueeCfg.ALGORITHM_VERSION, 'marquee-m4');
   // resolveConfig: deep clone — mutating the result must not touch DEFAULTS
   const resolved = marqueeCfg.resolveConfig({});
   resolved.half_life_days.movie.recent = 999;
@@ -2365,6 +2365,58 @@ ok('marquee m2: preScore — seed agreement leads; trending counts only in propo
   const base = { genres: ['Horror'], sources: new Set(['trending']), trending: {}, vote_average: 7 };
   assert.strictEqual(f.preScore(offTaste, taste, { weekN: 100 }), f.preScore(base, taste, { weekN: 100 }), 'off-taste trending adds nothing');
   assert.ok(f.preScore(onTaste, taste, { weekN: 100 }) > f.preScore({ ...onTaste, trending: {} }, taste, { weekN: 100 }), 'on-taste trending adds');
+});
+
+ok('marquee m4 T1: genreRelativeNormalizer — blend of global + within-genre (spec §17)', () => {
+  const f = require('../src/engines/marquee/features');
+  // Group A: 6 candidates, values 10, 8, 7, 6, 5, 4 (the hub group).
+  // Group B: 5 candidates, values 4, 3, 2, 1, 0.5 (the small genre).
+  const cands = [...[10, 8, 7, 6, 5, 4].map((v) => ({ g: 'A', v })), ...[4, 3, 2, 1, 0.5].map((v) => ({ g: 'B', v }))];
+  const valueOf = (c) => c.v;
+  const groupOf = (c) => c.g;
+  const bestB = { g: 'B', v: 4 };
+  const normHalf = f.genreRelativeNormalizer(cands, valueOf, groupOf, { blend: 0.5, minGroupSize: 5 });
+  assert.ok(Math.abs(normHalf(bestB) - (0.5 * (4 / 10) + 0.5 * 1)) < 1e-9, 'β=0.5 → 0.5·global + 0.5·genre = 0.7');
+  const normZero = f.genreRelativeNormalizer(cands, valueOf, groupOf, { blend: 0, minGroupSize: 5 });
+  assert.ok(Math.abs(normZero(bestB) - 0.4) < 1e-9, 'β=0 → pure global');
+  const normOne = f.genreRelativeNormalizer(cands, valueOf, groupOf, { blend: 1, minGroupSize: 5 });
+  assert.ok(Math.abs(normOne(bestB) - 1) < 1e-9, 'β=1 → pure within-genre');
+  // The hub's best stays 1 under any blend.
+  assert.ok(Math.abs(normHalf({ g: 'A', v: 10 }) - 1) < 1e-9, 'hub best stays 1');
+  // A candidate not in cands is computed as if it were (group stats reused).
+  assert.ok(Math.abs(normHalf({ g: 'B', v: 2 }) - (0.5 * 0.2 + 0.5 * 0.5)) < 1e-9, 'outside candidate uses group stats');
+  // An unknown group falls back to the global normalisation.
+  assert.ok(Math.abs(normHalf({ g: 'X', v: 4 }) - 0.4) < 1e-9, 'unknown group → global');
+  // Blend is clamped to [0, 1].
+  const normClamped = f.genreRelativeNormalizer(cands, valueOf, groupOf, { blend: 7, minGroupSize: 5 });
+  assert.ok(Math.abs(normClamped(bestB) - 1) < 1e-9, 'blend > 1 clamps to 1');
+});
+
+ok('marquee m4 T2: genreRelativeNormalizer — small-group guard (minGroupSize)', () => {
+  const f = require('../src/engines/marquee/features');
+  // Group C has only 3 candidates → below minGroupSize 5 → global only.
+  const cands = [...[10, 8, 7, 6, 5, 4].map((v) => ({ g: 'A', v })), ...[2, 1, 0.5].map((v) => ({ g: 'C', v }))];
+  const bestC = { g: 'C', v: 2 };
+  const normHalf = f.genreRelativeNormalizer(cands, (c) => c.v, (c) => c.g, { blend: 0.5, minGroupSize: 5 });
+  const normZero = f.genreRelativeNormalizer(cands, (c) => c.v, (c) => c.g, { blend: 0, minGroupSize: 5 });
+  assert.ok(Math.abs(normHalf(bestC) - normZero(bestC)) < 1e-9, 'small group → genreNorm = globalNorm (β=0 value)');
+  assert.ok(Math.abs(normHalf(bestC) - 0.2) < 1e-9, 'value is the global-normalised 2/10');
+  // A group of exactly minGroupSize keeps the within-genre normalisation.
+  const cands5 = [...[10, 8, 7, 6, 5, 4].map((v) => ({ g: 'A', v })), ...[2, 1, 0.5, 0.4, 0.3].map((v) => ({ g: 'C', v }))];
+  const normHalf5 = f.genreRelativeNormalizer(cands5, (c) => c.v, (c) => c.g, { blend: 0.5, minGroupSize: 5 });
+  assert.ok(Math.abs(normHalf5(bestC) - (0.5 * 0.2 + 0.5 * 1)) < 1e-9, 'group of exactly 5 → within-genre applies');
+});
+
+ok('marquee m4 T3: primaryGenreOf — first genre of an array or comma string, else Other', () => {
+  const f = require('../src/engines/marquee/features');
+  assert.strictEqual(f.primaryGenreOf({ genres: ['Comedy', 'Drama'] }), 'Comedy', 'array → first');
+  assert.strictEqual(f.primaryGenreOf({ genres: 'Comedy, Drama' }), 'Comedy', 'comma string → first trimmed');
+  assert.strictEqual(f.primaryGenreOf({ genres: ' , Drama' }), 'Drama', 'skips empty entries');
+  assert.strictEqual(f.primaryGenreOf({ genres: [] }), 'Other', 'empty array → Other');
+  assert.strictEqual(f.primaryGenreOf({ genres: '' }), 'Other', 'empty string → Other');
+  assert.strictEqual(f.primaryGenreOf({ genres: ',,' }), 'Other', 'only empty entries → Other');
+  assert.strictEqual(f.primaryGenreOf({}), 'Other', 'no genres → Other');
+  assert.strictEqual(f.primaryGenreOf(null), 'Other', 'null candidate → Other');
 });
 
 ok('marquee ME-05: parseSuggestions — fenced JSON, invalid year/title dropped, dedupe, all-invalid throws', () => {

@@ -113,6 +113,67 @@ function seedAffinityRaw(cand) {
   return sum;
 }
 
+// m4 (spec §17): the candidate's PRIMARY genre — the first non-empty entry of
+// c.genres (an array of names, or a comma-separated string), else 'Other'. The
+// genre group for within-genre normalisation.
+function primaryGenreOf(c) {
+  const g = c?.genres;
+  if (Array.isArray(g)) {
+    for (const name of g) {
+      const s = String(name || '').trim();
+      if (s) return s;
+    }
+    return 'Other';
+  }
+  if (typeof g === 'string') {
+    for (const name of g.split(',')) {
+      const s = name.trim();
+      if (s) return s;
+    }
+    return 'Other';
+  }
+  return 'Other';
+}
+
+// m4 (spec §17): a PURE genre-relative normalizer. Blends the global
+// normalisation (value ÷ the build's max) with a within-genre normalisation
+// (value ÷ the max within the candidate's genre group), so a strong film in a
+// small genre can compete with a hub film in a big one:
+//
+//   value = (1 − blend) · globalNorm + blend · genreNorm
+//
+// `cands` are the candidates the normalisation is measured over; `valueOf(c)`
+// is the raw quantity (e.g. seed affinity); `groupOf(c)` is the genre group
+// (null/unknown → global normalisation only). A group with fewer than
+// `minGroupSize` candidates uses the global normalisation only, so one weak
+// film in a tiny genre cannot become "best in genre = 1.0". Returns
+// norm(c) → [0, 1]; a candidate not in `cands` is computed as if it were
+// (the group stats are reused; an unknown group falls back to global).
+function genreRelativeNormalizer(cands, valueOf, groupOf, { blend = 0, minGroupSize = 5 } = {}) {
+  const b = clamp01(Number(blend) || 0);
+  let globalMax = 0;
+  const groupMax = {};
+  const groupSize = {};
+  for (const c of cands || []) {
+    const v = valueOf(c);
+    if (v > globalMax) globalMax = v;
+    const g = groupOf ? groupOf(c) : null;
+    if (g != null && g !== '') {
+      if (v > (groupMax[g] || 0)) groupMax[g] = v;
+      groupSize[g] = (groupSize[g] || 0) + 1;
+    }
+  }
+  return (c) => {
+    const v = valueOf(c);
+    const globalNorm = globalMax > 0 ? clamp01(v / globalMax) : 0;
+    const g = groupOf ? groupOf(c) : null;
+    const genreNorm = (g != null && g !== '' && (groupSize[g] || 0) >= minGroupSize && (groupMax[g] || 0) > 0)
+      ? clamp01(v / groupMax[g])
+      : globalNorm;
+    return (1 - b) * globalNorm + b * genreNorm;
+  };
+}
+
 // The m2 pre-score defaults (mirrors config DEFAULTS.prescore; used when a
 // caller passes no weights).
 const PRESCORE_DEFAULTS = { seed_affinity: 0.35, genre: 0.30, trending: 0.15, quality: 0.10, sources: 0.10, trending_genre_gate: 0.5 };
@@ -125,10 +186,13 @@ const PRESCORE_DEFAULTS = { seed_affinity: 0.35, genre: 0.30, trending: 0.15, qu
 // + quality · vote_average/10
 // + sources · min(1, countedSources/3)                 — same groups as consensus
 // `maxSeedAff` is the build's max seedAffinityRaw (0 → the term is 0).
-function preScore(cand, taste, { weekN, dayN, maxSeedAff = 0, weights = PRESCORE_DEFAULTS } = {}) {
+// m4: `seedAffinityNorm` is the genre-relative normalised seed affinity from
+// genreRelativeNormalizer — when provided it REPLACES the maxSeedAff path
+// (back-compatible: without it the m3 behaviour stands).
+function preScore(cand, taste, { weekN, dayN, maxSeedAff = 0, seedAffinityNorm = null, weights = PRESCORE_DEFAULTS } = {}) {
   const w = { ...PRESCORE_DEFAULTS, ...(weights || {}) };
   const ga = Math.max(0, glassCandidates.genreAffinity(cand, taste));
-  const sa = maxSeedAff > 0 ? clamp01(seedAffinityRaw(cand) / maxSeedAff) : 0;
+  const sa = seedAffinityNorm != null ? seedAffinityNorm : (maxSeedAff > 0 ? clamp01(seedAffinityRaw(cand) / maxSeedAff) : 0);
   const tr = trendingRaw(cand.trending, { weekN, dayN }) * clamp01(ga / (w.trending_genre_gate || 1));
   const q = (cand.vote_average || 0) / 10;
   const cs = countedGroups(cand.sources);
@@ -147,5 +211,7 @@ module.exports = {
   weightedSum,
   preScore,
   seedAffinityRaw,
+  primaryGenreOf,
+  genreRelativeNormalizer,
   PRESCORE_DEFAULTS,
 };

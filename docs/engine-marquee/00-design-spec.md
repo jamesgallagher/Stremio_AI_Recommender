@@ -403,3 +403,13 @@ real signal is completion:
 **Safe fallback.** No stored target, engine-id mismatch, empty target, `strategy:'round_robin'`, or any calibration exception → the existing `balanceByGenre` (logged once per serve, ids only); serving must never fail because of calibration. Genesis and Glass keep round-robin.
 **Defaults** (`DEFAULTS.serve`, Tier-2 overridable via `settings.marquee.serve`): `strategy:'calibrated'`, `lambda:0.5`, `window_factor:3`, `kl_alpha:0.01`, `wildcard_slots:0`, `wildcard_max_share:0.05`, `wildcard_position:6`.
 **Bench.** `scripts/bench-engines.js` reports a second table comparing `round_robin`, `calibrated` and `pure_score` on the same stored rows + target (hit@20, hit@20r, KL, top20, meanRank, worstRank, wildcard); also under `engines.marquee.serveStrategies` in `--json`.
+
+## 17. m4 — genre-fair agreement
+
+**Problem.** `seed_affinity` and `consensus` are normalised by ONE global maximum, which is always a big franchise "hub" film; genres the person loves less cap out far below it (Comedy is 21% of the taste mix but was served at ≤9%).
+**Fix.** Blend the global normalisation with a within-genre one: `value = (1−β)·globalNorm + β·genreNorm`, β = `agreement.genre_blend` (default 0.5). `genreNorm` is the same quantity normalised by the maximum within the candidate's genre group.
+**Genre group.** The candidate's PRIMARY genre (first genre name, `'Other'` if none). Pre-score stage: from the list-payload genres; final-score stage: from deep meta. Small-group guard: a group with fewer than `agreement.min_genre_size` (5) candidates uses global normalisation only.
+**Consensus form.** `consensus = (1−β)·raw + β·genreNorm(raw)`, `genreNorm = min(1, raw/groupMax)` when the group is large enough, else `raw` — so β=0 reproduces m3 exactly (m3 never normalised consensus).
+**Scope.** Only `seed_affinity` and `consensus` change, in BOTH the pre-score and the final score; all other features, weights, filters, serving and calibration are unchanged. `genre_blend: 0` reproduces m3 exactly — every pre-score, feature, final score, ranking and stored row (tested against a frozen fixture).
+**Version.** `ALGORITHM_VERSION = marquee-m4`; `pruneSupersededVersions` cleans the old m3 rows on the next build.
+**Bench A/B.** `scripts/bench-engines.js --marquee-config '<json>'` merges JSON sections into the SNAPSHOT's `settings.json` (`settings.marquee[section] = { ...existing, ...override }`); the live settings file is never written (the merge refuses any path outside the temp snapshot dir). The header prints the override; `--json` records `marqueeConfigOverride`.

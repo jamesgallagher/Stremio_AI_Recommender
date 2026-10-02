@@ -8,6 +8,7 @@
 // Usage:
 //   node --experimental-sqlite scripts/bench-engines.js <profileName>
 //     [--holdout 10] [--engines genesis,glass,marquee] [--no-cache] [--json] [--keep]
+//     [--marquee-config '<json>']
 //
 // What it READS: the live store (profiles.json, settings.json, store.db) —
 // snapshotted into a temp dir. It NEVER writes the live store.db (the snapshot
@@ -38,11 +39,14 @@ const USAGE =
   'Usage: node --experimental-sqlite scripts/bench-engines.js <profileName>\n'
   + '  [--holdout 10] [--engines genesis,glass,marquee] [--no-cache] [--json] [--keep]\n'
   + "  [--serve-opts '<json>']\n"
+  + "  [--marquee-config '<json>']\n"
   + 'Expect several minutes per profile on a cold cache (Marquee\'s LLM fit dominates).\n'
-  + "  --serve-opts: a JSON object of serve-config overrides (snake_case, e.g. '{\"window_factor\":4}')";
+  + "  --serve-opts: a JSON object of serve-config overrides (snake_case, e.g. '{\"window_factor\":4}')\n"
+  + "  --marquee-config: a JSON object of Marquee config sections (e.g. '{\"agreement\":{\"genre_blend\":0}}'),\n"
+  + '  merged section-wise into the SNAPSHOT\'s settings.json only — the live settings are never written.';
 
 function parseArgs(argv) {
-  const a = { profile: null, holdout: 10, engines: ['genesis', 'glass', 'marquee'], noCache: false, json: false, keep: false, serveOpts: null, help: false };
+  const a = { profile: null, holdout: 10, engines: ['genesis', 'glass', 'marquee'], noCache: false, json: false, keep: false, serveOpts: null, marqueeConfig: null, help: false };
   for (let i = 0; i < argv.length; i++) {
     const x = argv[i];
     if (x === '--holdout') a.holdout = Number(argv[++i]);
@@ -61,6 +65,17 @@ function parseArgs(argv) {
       }
       a.serveOpts = parsed;
     }
+    else if (x === '--marquee-config') {
+      const raw = argv[++i];
+      let parsed;
+      try { parsed = JSON.parse(raw); } catch { parsed = null; }
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        console.error("--marquee-config must be a JSON object (e.g. '{\"agreement\":{\"genre_blend\":0}}')");
+        console.error(USAGE);
+        process.exit(2);
+      }
+      a.marqueeConfig = parsed;
+    }
     else if (x === '--help' || x === '-h') a.help = true;
     else if (x.startsWith('--')) { console.error('unknown flag: ' + x); console.error(USAGE); process.exit(2); }
     else if (a.profile === null) a.profile = x;
@@ -78,6 +93,14 @@ async function main() {
   const liveDir = process.env.DATA_DIR || path.join(REPO_ROOT, 'data');
   const bench = require('../src/bench/engineBench');
   const { benchDir, readOnlyPath } = bench.snapshotStore(liveDir);
+
+  // m4 (spec §17): merge --marquee-config into the SNAPSHOT's settings.json,
+  // section-wise — BEFORE the app modules are required (settings.json is read
+  // at require time). The live settings.json is never written.
+  if (a.marqueeConfig) {
+    bench.applyMarqueeConfig(benchDir, a.marqueeConfig);
+    console.log('marquee config override: ' + JSON.stringify(a.marqueeConfig));
+  }
 
   // Point DATA_DIR at the throwaway copy ONLY NOW, then require the app modules
   // (they read DATA_DIR at require time). The live store.db is never opened for
@@ -161,6 +184,7 @@ async function main() {
       at: new Date().toISOString(),
       holdout: results.holdout,
       targets: results.targets,
+      marqueeConfigOverride: a.marqueeConfig,
       engines: Object.fromEntries(Object.entries(results.engines).map(([id, e]) => [id, {
         metrics: e.metrics, hitTargets: e.hitTargets, positions: e.positions,
         ...(e.serveStrategies

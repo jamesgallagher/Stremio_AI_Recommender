@@ -3009,7 +3009,7 @@ async function main() {
     const stored = rs.getRecommended('p-mq19', { type: 'movie', limit: 10 })[0];
     assert.strictEqual(stored.affinity, row.rankScore, 'affinity = rankScore');
     assert.strictEqual(stored.rec_count, row.recCount, 'rec_count = recCount');
-    assert.strictEqual(stored.algorithm_version, 'marquee-m3', 'algorithm_version = marquee-m3');
+    assert.strictEqual(stored.algorithm_version, 'marquee-m4', 'algorithm_version = marquee-m4');
     const comps = JSON.parse(stored.score_components);
     assert.ok(comps.features && comps.weights, 'score_components JSON parses');
     rs.deleteForProfile('p-mq19');
@@ -3674,7 +3674,11 @@ async function main() {
     glassMeta._clear();
     const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
     const env = mqEnvelope(filters);
-    const cfg = { ...mqCfgResolved, lookup_cap: 30, exploration_pct: 0 };
+    // m4 (spec §17): the m4 default (genre_blend 0.5) lifts the within-genre
+    // term, so the on-genre singletons now pre-score above the off-genre
+    // 10-seed title. This test documents the m2/m3 GLOBAL-normalisation
+    // behaviour, so it pins the Tier-2 off-switch (genre_blend 0).
+    const cfg = { ...mqCfgResolved, lookup_cap: 30, exploration_pct: 0, agreement: { ...mqCfgResolved.agreement, genre_blend: 0 } };
     const seeds = Array.from({ length: 40 }, (_, i) => mqSeed('g' + i));
     // Every seed recommends its own on-genre (Action) title; seeds g0–g9 also
     // all recommend one off-genre title ('agreed', genre id 99 = unknown here).
@@ -3752,7 +3756,259 @@ async function main() {
     assert.strictEqual(by.get('sa3').scoreComponents.features.seed_affinity, 0);
     assert.ok('seed_affinity' in by.get('sa1').scoreComponents.weights, 'seed_affinity is a weighted feature');
     assert.ok(by.get('sa1').rankScore > by.get('sa2').rankScore && by.get('sa2').rankScore > by.get('sa3').rankScore, 'more agreement ranks higher, all else equal');
-    assert.strictEqual(by.get('sa1').algorithmVersion, 'marquee-m3');
+    assert.strictEqual(by.get('sa1').algorithmVersion, 'marquee-m4');
+  });
+
+  // ── Marquee m4 (spec §17): genre-fair agreement ──
+  await it('marquee m4 T4 (G4): genre_blend 0 reproduces the frozen m3 snapshot exactly', async () => {
+    glassMeta._clear();
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const mqShape = require('../src/engines/marquee/shape');
+      const fx = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'marquee-m4-identity.json'), 'utf8'));
+      const { genreMap, taste, filters, seeds, items, recs, similar, simklRecs, discover, trendingWeek, trendingDay, simklTrending } = fx.input;
+      // Rebuild the stub fetchers from the fixture input (single source of truth).
+      const item = (id) => ({ type: 'movie', tmdb_id: id, title: 'T' + id, ...items[id] });
+      const fullMeta = (id) => ({
+        tmdb_id: String(id), imdb_id: 'tt' + id, type: 'movie', title: 'M' + id,
+        overview: 'ov ' + id, year: items[id].year, decade: items[id].year - (items[id].year % 10),
+        poster: 'https://image.tmdb.org/t/p/w500/p' + id + '.jpg',
+        genres: items[id].genre_ids.map((g) => genreMap[g]),
+        primary_genre: items[id].genre_ids.map((g) => genreMap[g])[0],
+        vote_average: items[id].vote_average, vote_count: items[id].vote_count, popularity: items[id].popularity,
+        original_language: 'en', runtime: 120,
+        director: ['D1'], cast: ['C1'], keywords: ['k1'],
+        collection: null, networks: [],
+        certAU: 'M', certUS: 'R', availability: 'AVAILABLE',
+      });
+      const f = {
+        recs: async (id) => (recs[id] || []).map(item),
+        similar: async (id) => (similar[id] || []).map(item),
+        discover: async () => discover.map(item),
+        collection: async () => [],
+        trendingWeek: async () => trendingWeek.map(([id, rank]) => ({ ...item(id), rank })),
+        trendingDay: async () => trendingDay.map(([id, rank]) => ({ ...item(id), rank })),
+        simklTrending: async () => simklTrending.map(([id, watched, drop_rate]) => ({
+          tmdb_id: id, title: 'T' + id, year: items[id].year,
+          genres: items[id].genre_ids.map((g) => genreMap[g]),
+          watched, drop_rate,
+          ratings: { imdb: { rating: items[id].vote_average, votes: items[id].vote_count } },
+        })),
+        simklRecs: async (ids) => new Map(ids.map((sid) => [sid, (simklRecs[sid] || []).map(item)])),
+        chat: async () => '[]',
+        resolve: async () => null,
+        deepMeta: async (_k, _t, id) => fullMeta(id),
+        imdbRatings: async () => new Map(),
+      };
+      const profile = { id: 'p-m4t4', name: 'M4T4', filters };
+      const ctx = {
+        tmdbKey: 'k', mdblistKey: '',
+        settings: { marquee: { agreement: { genre_blend: 0 } } }, // Tier-2 off-switch (G4)
+        filters, log: quiet,
+        watchedIds: { tmdb: new Set(), imdb: new Set() }, dont: new Set(), stats: {},
+      };
+      const cfg = mqCfg.resolveConfig(ctx.settings);
+      assert.strictEqual(cfg.agreement.genre_blend, 0, 'Tier-2 genre_blend 0 applies');
+      const envelope = mqFilters.compileEnvelope(filters, { nowYear: fx.nowYear, genreMap });
+      const { candidates, meta } = await mqSources.gatherCandidates(profile, ctx, {
+        taste, brief: null, briefHash: 'h', seeds, envelope, cfg, genreMap, fetchers: f, chain: [], log: quiet,
+      });
+      const { scored, envelopeStats } = await mqScoring.scoreCandidates(profile, ctx, candidates, {
+        taste, envelope, cfg, gatherMeta: meta, fetchers: f, nowYear: fx.nowYear, nowMs: fx.nowMs, log: quiet,
+      });
+      const fitScored = await mqLlmFit.applyLlmFit(profile.id, scored, {
+        brief: null, briefHash: 'h', cfg, chain: [], chat: async () => '[]', log: quiet, now: fx.nowMs,
+      });
+      const final = mqShape.shapeOutput(fitScored, { cfg, listSize: fx.listSize, envelopeStats, log: quiet, profileName: profile.name, trace: null });
+      assert.deepStrictEqual(
+        candidates.map((c) => ({ id: c.tmdb_id, pre: c._preScore, sources: [...c.sources].sort(), seeds: [...c.seeds].sort(), seedWeights: [...c._seedWeights.entries()] })),
+        fx.expected.prescore,
+        'pre-scores identical to the frozen m3 snapshot',
+      );
+      assert.deepStrictEqual(
+        final.map((r) => ({ id: r.tmdb_id, rankScore: r.rankScore, features: r.scoreComponents.features, weights: r.scoreComponents.weights, penalty: r.scoreComponents.penalty })),
+        fx.expected.stored,
+        'stored rows identical to the frozen m3 snapshot',
+      );
+    } finally {
+      glassMeta._clear();
+    }
+  });
+
+  await it('marquee m4 T5: the hub effect — a strong comedy competes with a big-franchise hub (β=0.5 vs 0)', async () => {
+    glassMeta._clear();
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const taste = {
+      type: 'movie',
+      dims: { genres: { Adventure: 0.5, Comedy: 0.5 }, franchises: {}, keywords: {}, directors: {}, cast: {}, decades: {}, languages: {}, runtimeBands: {} },
+      genreMass: {},
+    };
+    const genreOf = (id) => (id === 'hub' || id.startsWith('a') ? 'Adventure' : 'Comedy');
+    const cand = (id, raw) => mqCand(id, { genres: [genreOf(id)], seeds: new Set(['x']), _seedWeights: new Map([['x', raw]]) });
+    // 6 Adventure (one hub, raw 10; others 2–4) + 6 Comedy (raw 2–4, best 4).
+    const cands = [
+      cand('hub', 10), cand('a2', 4), cand('a3', 3), cand('a4', 2), cand('a5', 2), cand('a6', 2),
+      cand('c1', 4), cand('c2', 3), cand('c3', 3), cand('c4', 2), cand('c5', 2), cand('c6', 2),
+    ];
+    const run = async (blend) => {
+      glassMeta._clear();
+      const env = mqEnvelope(filters);
+      const ctx = mqCtx(filters);
+      const { f } = mqScoreFetchers({ deepMeta: (id) => mqFullMeta(id, { genres: [genreOf(id)], primary_genre: genreOf(id) }) });
+      const { scored } = await mqScoring.scoreCandidates({ id: 'p-m4t5', name: 'M4T5', filters }, ctx, cands, {
+        taste, envelope: env, cfg: mqCfg.resolveConfig({ marquee: { agreement: { genre_blend: blend } } }),
+        gatherMeta: { weekN: 0, dayN: 0, hadTrending: false }, fetchers: f,
+        nowYear: 2026, nowMs: Date.parse('2026-06-01T00:00:00Z'), log: quiet,
+      });
+      return scored;
+    };
+    const s0 = await run(0);
+    const s05 = await run(0.5);
+    const by = (scored, id) => scored.find((r) => r.tmdb_id === id);
+    // β=0: the best comedy is capped by the GLOBAL (Adventure) max — 4/10 = 0.4.
+    assert.strictEqual(by(s0, 'c1').scoreComponents.features.seed_affinity, 0.4, 'β=0: best comedy capped by the global max');
+    // β=0.5: the within-genre term lifts it to 0.5·(4/10) + 0.5·(4/4) = 0.7.
+    assert.ok(by(s05, 'c1').scoreComponents.features.seed_affinity >= 0.69, 'β=0.5: best comedy ≥ 0.69');
+    assert.strictEqual(by(s05, 'c1').scoreComponents.features.seed_affinity, (1 - 0.5) * (4 / 10) + 0.5 * (4 / 4), 'β=0.5: the exact blend');
+    // The hub stays #1 in both runs; the best comedy moves UP against the β=0 run.
+    assert.strictEqual(s0[0].tmdb_id, 'hub', 'β=0: the hub stays #1');
+    assert.strictEqual(s05[0].tmdb_id, 'hub', 'β=0.5: the hub stays #1');
+    assert.ok(s05.findIndex((r) => r.tmdb_id === 'c1') < s0.findIndex((r) => r.tmdb_id === 'c1'), 'the best comedy moves up');
+  });
+
+  await it('marquee m4 T6: pre-score cut — β=0.5 keeps the best comedy inside the lookup set where β=0 drops it', async () => {
+    glassMeta._clear();
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const genreMap = { 12: 'Adventure', 35: 'Comedy' };
+    const taste = {
+      type: 'movie',
+      dims: { genres: { Adventure: 0.5, Comedy: 0.5 }, franchises: {}, keywords: {}, directors: {}, cast: {}, decades: {}, languages: {}, runtimeBands: {} },
+      genreMass: {},
+    };
+    // Seed weights sum to each candidate's raw seed affinity: the Adventure
+    // group maxes at 0.9 (a1/a6), the Comedy group at 0.65 (c1).
+    const seeds = [
+      mqSeed('s1', { weight: 0.5 }), mqSeed('s2', { weight: 0.4 }), mqSeed('s3', { weight: 0.3 }),
+      mqSeed('s4', { weight: 0.2 }), mqSeed('s5', { weight: 0.15 }), mqSeed('s6', { weight: 0.1 }), mqSeed('s7', { weight: 0.05 }),
+    ];
+    const recsBy = {
+      s1: ['a1', 'a2', 'a4', 'a6'], s2: ['a1', 'a3', 'a5'], s3: ['a2', 'a3', 'a6', 'c1'],
+      s4: ['a4', 'a5', 'c1', 'c4'], s5: ['c1', 'c2', 'c5'], s6: ['c2', 'c3'], s7: ['c3', 'c6'],
+    };
+    const mkItem = (id) => mqItem(id, { genre_ids: [id.startsWith('a') ? 12 : 35] });
+    const run = async (blend) => {
+      glassMeta._clear();
+      const env = mqEnvelope(filters);
+      const { f } = mqFetchers({ recs: (id) => (recsBy[id] || []).map(mkItem) });
+      const trace = { generated: new Map(), dropped: new Map() };
+      const ctx = mqCtx(filters, { marqueeTrace: trace });
+      const cfg = mqCfg.resolveConfig({ marquee: { agreement: { genre_blend: blend }, lookup_cap: 5 } });
+      const { candidates } = await mqSources.gatherCandidates({ id: 'p-m4t6', name: 'M4T6', filters }, ctx, {
+        taste, brief: null, briefHash: 'h', seeds, envelope: env, cfg, genreMap, fetchers: f, chain: [], log: quiet,
+      });
+      return { candidates, trace };
+    };
+    const { candidates: c0, trace: t0 } = await run(0);
+    assert.ok(!c0.some((c) => c.tmdb_id === 'c1'), 'β=0: the best comedy is truncated out of the lookup set');
+    assert.ok(String(t0.dropped.get('c1') || '').startsWith('truncated'), 'β=0: recorded as truncated');
+    const { candidates: c05 } = await run(0.5);
+    assert.ok(c05.some((c) => c.tmdb_id === 'c1'), 'β=0.5: the best comedy is kept inside the lookup set');
+  });
+
+  await it('marquee m4 T7: stored rows carry marquee-m4 + the agreement trace; Tier-2 off-switch → blend 0', async () => {
+    glassMeta._clear();
+    const filters = { min_rating: 0, vote_count_floor: 100, max_age_years: 0, excluded_genres: [], age_limit: 0 };
+    const cands = [mqCand('t7a'), mqCand('t7b'), mqCand('t7c')];
+    const run = async (cfg) => {
+      glassMeta._clear();
+      const env = mqEnvelope(filters);
+      const ctx = mqCtx(filters);
+      const { f } = mqScoreFetchers({ deepMeta: (id) => mqFullMeta(id) });
+      const { scored } = await mqScoring.scoreCandidates({ id: 'p-m4t7', name: 'M4T7', filters }, ctx, cands, {
+        taste: mqTaste, envelope: env, cfg, gatherMeta: { weekN: 0, dayN: 0, hadTrending: false },
+        fetchers: f, nowYear: 2026, nowMs: Date.parse('2026-06-01T00:00:00Z'), log: quiet,
+      });
+      return scored;
+    };
+    // Default config: β = 0.5.
+    const s05 = await run(mqCfgResolved);
+    for (const r of s05) {
+      assert.strictEqual(r.algorithmVersion, 'marquee-m4', 'algorithm_version = marquee-m4');
+      assert.strictEqual(r.scoreComponents.agreement.blend, 0.5, 'the default blend is recorded');
+      assert.strictEqual(r.scoreComponents.agreement.group, 'Action', 'the genre group from deep meta');
+    }
+    // Tier-2 off-switch: settings.marquee.agreement.genre_blend = 0.
+    const s0 = await run(mqCfg.resolveConfig({ marquee: { agreement: { genre_blend: 0 } } }));
+    for (const r of s0) {
+      assert.strictEqual(r.scoreComponents.agreement.blend, 0, 'Tier-2 genre_blend 0 is recorded');
+    }
+  });
+
+  await it('marquee m4 T8: bench --marquee-config writes only the snapshot settings (A/B off-switch)', async () => {
+    const fs = require('fs');
+    const path = require('path');
+    const os = require('os');
+    const { spawnSync } = require('child_process');
+    const { DatabaseSync } = require('node:sqlite');
+    const bench = require('../src/bench/engineBench');
+
+    // (a) Section-wise merge: override keys win, existing keys and untouched
+    // sections survive; the merge lands in the settings.json of the dir given.
+    const mergeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'marquee-m4-t8-'));
+    fs.writeFileSync(path.join(mergeDir, 'settings.json'), JSON.stringify({
+      marquee: { agreement: { genre_blend: 0.5, min_genre_size: 5 }, prescore: { genre: 0.3 } },
+      other: 'keep',
+    }));
+    const merged = bench.applyMarqueeConfig(mergeDir, { agreement: { genre_blend: 0 } });
+    assert.deepStrictEqual(merged.agreement, { genre_blend: 0, min_genre_size: 5 }, 'override key wins, existing keys preserved');
+    const reloaded = JSON.parse(fs.readFileSync(path.join(mergeDir, 'settings.json'), 'utf8'));
+    assert.deepStrictEqual(reloaded.marquee.prescore, { genre: 0.3 }, 'untouched sections stay');
+    assert.strictEqual(reloaded.other, 'keep', 'non-marquee settings stay');
+    fs.rmSync(mergeDir, { recursive: true, force: true });
+
+    // (b) Refuses to write anywhere outside the temp snapshot dir — before any write.
+    assert.throws(() => bench.applyMarqueeConfig(__dirname, { agreement: { genre_blend: 0 } }), /outside the temp snapshot dir/);
+
+    // (c) Snapshot + apply never touches the LIVE settings.json.
+    const liveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'marquee-m4-t8-'));
+    fs.writeFileSync(path.join(liveDir, 'settings.json'), JSON.stringify({ marquee: { agreement: { genre_blend: 0.5 } } }, null, 2));
+    const liveDb = new DatabaseSync(path.join(liveDir, 'store.db'));
+    liveDb.close();
+    const liveBefore = fs.readFileSync(path.join(liveDir, 'settings.json'), 'utf8');
+    const { benchDir } = bench.snapshotStore(liveDir);
+    bench.applyMarqueeConfig(benchDir, { agreement: { genre_blend: 0 } });
+    assert.strictEqual(fs.readFileSync(path.join(liveDir, 'settings.json'), 'utf8'), liveBefore, 'live settings content unchanged');
+    fs.rmSync(benchDir, { recursive: true, force: true });
+    fs.rmSync(liveDir, { recursive: true, force: true });
+
+    // (d) Subprocess: valid JSON → the header shows the override, the run exits 2
+    // (no profile in the hermetic live dir), and the live settings are untouched.
+    const liveDir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'marquee-m4-t8-'));
+    fs.writeFileSync(path.join(liveDir2, 'settings.json'), JSON.stringify({ marquee: { agreement: { genre_blend: 0.5 } } }, null, 2));
+    const liveDb2 = new DatabaseSync(path.join(liveDir2, 'store.db'));
+    liveDb2.close();
+    const liveSettingsPath = path.join(liveDir2, 'settings.json');
+    const liveBefore2 = fs.readFileSync(liveSettingsPath, 'utf8');
+    const liveMtimeBefore = fs.statSync(liveSettingsPath).mtimeMs;
+    const ok = spawnSync(process.execPath, [
+      path.join(__dirname, '..', 'scripts', 'bench-engines.js'),
+      'NoProfile', '--marquee-config', '{"agreement":{"genre_blend":0}}',
+    ], { env: { ...process.env, DATA_DIR: liveDir2 }, encoding: 'utf8' });
+    assert.strictEqual(ok.status, 2, 'exits 2 (no profile in the hermetic live dir)');
+    assert.ok(ok.stdout.includes('marquee config override: {"agreement":{"genre_blend":0}}'), 'header shows the override: ' + ok.stdout);
+    assert.ok(ok.stderr.includes('profile not found: NoProfile'), 'the run never reached a real profile');
+    assert.strictEqual(fs.readFileSync(liveSettingsPath, 'utf8'), liveBefore2, 'live settings content unchanged');
+    assert.ok(Math.abs(fs.statSync(liveSettingsPath).mtimeMs - liveMtimeBefore) < 2, 'live settings mtime unchanged');
+
+    // (e) Invalid JSON → exit 2 with a usage error, before any store access.
+    const bad = spawnSync(process.execPath, [
+      path.join(__dirname, '..', 'scripts', 'bench-engines.js'),
+      'NoProfile', '--marquee-config', 'not-json',
+    ], { env: { ...process.env, DATA_DIR: liveDir2 }, encoding: 'utf8' });
+    assert.strictEqual(bad.status, 2, 'invalid JSON exits 2');
+    assert.ok(bad.stderr.includes('must be a JSON object'), 'usage error: ' + bad.stderr);
+    fs.rmSync(liveDir2, { recursive: true, force: true });
   });
 
   await it('bench m2: reachability + hit@20r + per-target positions and Marquee fate', async () => {

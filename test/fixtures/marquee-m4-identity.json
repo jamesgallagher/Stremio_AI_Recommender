@@ -1,0 +1,1190 @@
+{
+  "note": "Marquee m4 T4 (G4) frozen snapshot. Captured from the m3 code (v7, 7.25.0-beta) on 2026-10-02: gather → score → shape with the embedded stub fixture. The m4 test re-runs the same fixture with settings.marquee.agreement.genre_blend = 0 and expects identical _preScores, features, scores and stored order.",
+  "nowYear": 2026,
+  "nowMs": 1780272000000,
+  "listSize": 20,
+  "input": {
+    "genreMap": {
+      "12": "Adventure",
+      "18": "Drama",
+      "28": "Action",
+      "35": "Comedy",
+      "878": "Science Fiction"
+    },
+    "taste": {
+      "type": "movie",
+      "dims": {
+        "genres": {
+          "Action": 0.9,
+          "Drama": 0.5,
+          "Comedy": 0.4,
+          "Adventure": 0.3
+        },
+        "franchises": {},
+        "keywords": {},
+        "directors": {},
+        "cast": {},
+        "decades": {},
+        "languages": {},
+        "runtimeBands": {}
+      },
+      "genreMass": {}
+    },
+    "filters": {
+      "min_rating": 0,
+      "vote_count_floor": 100,
+      "max_age_years": 0,
+      "excluded_genres": [],
+      "age_limit": 0
+    },
+    "seeds": [
+      {
+        "tmdb_id": "s1",
+        "simkl_id": null,
+        "imdb_id": "tt91",
+        "title": "Seed1",
+        "year": 2020,
+        "rating": 8,
+        "weight": 1,
+        "watched_at": "2026-05-01T00:00:00Z"
+      },
+      {
+        "tmdb_id": "s2",
+        "simkl_id": "sk2",
+        "imdb_id": "tt92",
+        "title": "Seed2",
+        "year": 2020,
+        "rating": 8,
+        "weight": 0.8,
+        "watched_at": "2026-05-02T00:00:00Z"
+      },
+      {
+        "tmdb_id": "s3",
+        "simkl_id": null,
+        "imdb_id": "tt93",
+        "title": "Seed3",
+        "year": 2020,
+        "rating": 8,
+        "weight": 0.6,
+        "watched_at": "2026-05-03T00:00:00Z"
+      },
+      {
+        "tmdb_id": "s4",
+        "simkl_id": "sk4",
+        "imdb_id": "tt94",
+        "title": "Seed4",
+        "year": 2020,
+        "rating": 8,
+        "weight": 0.4,
+        "watched_at": "2026-05-04T00:00:00Z"
+      }
+    ],
+    "items": {
+      "a1": {
+        "genre_ids": [
+          28
+        ],
+        "vote_average": 7.5,
+        "vote_count": 1200,
+        "year": 2020,
+        "popularity": 6
+      },
+      "a2": {
+        "genre_ids": [
+          28
+        ],
+        "vote_average": 6.8,
+        "vote_count": 900,
+        "year": 2019,
+        "popularity": 5
+      },
+      "a3": {
+        "genre_ids": [
+          28
+        ],
+        "vote_average": 7.1,
+        "vote_count": 800,
+        "year": 2021,
+        "popularity": 4
+      },
+      "a4": {
+        "genre_ids": [
+          28,
+          18
+        ],
+        "vote_average": 7.9,
+        "vote_count": 1500,
+        "year": 2018,
+        "popularity": 8
+      },
+      "a5": {
+        "genre_ids": [
+          28
+        ],
+        "vote_average": 6.5,
+        "vote_count": 700,
+        "year": 2022,
+        "popularity": 3
+      },
+      "a6": {
+        "genre_ids": [
+          28
+        ],
+        "vote_average": 6.1,
+        "vote_count": 350,
+        "year": 2015,
+        "popularity": 1
+      },
+      "c1": {
+        "genre_ids": [
+          35
+        ],
+        "vote_average": 7.2,
+        "vote_count": 1000,
+        "year": 2020,
+        "popularity": 5
+      },
+      "c2": {
+        "genre_ids": [
+          35
+        ],
+        "vote_average": 6.9,
+        "vote_count": 850,
+        "year": 2019,
+        "popularity": 4
+      },
+      "c3": {
+        "genre_ids": [
+          35,
+          18
+        ],
+        "vote_average": 7.4,
+        "vote_count": 1100,
+        "year": 2021,
+        "popularity": 6
+      },
+      "c4": {
+        "genre_ids": [
+          35
+        ],
+        "vote_average": 6.6,
+        "vote_count": 600,
+        "year": 2018,
+        "popularity": 3
+      },
+      "c5": {
+        "genre_ids": [
+          35
+        ],
+        "vote_average": 7,
+        "vote_count": 950,
+        "year": 2022,
+        "popularity": 4
+      },
+      "c6": {
+        "genre_ids": [
+          35
+        ],
+        "vote_average": 6.2,
+        "vote_count": 400,
+        "year": 2016,
+        "popularity": 2
+      },
+      "d1": {
+        "genre_ids": [
+          12
+        ],
+        "vote_average": 7.3,
+        "vote_count": 900,
+        "year": 2020,
+        "popularity": 5
+      },
+      "d2": {
+        "genre_ids": [
+          12
+        ],
+        "vote_average": 6.7,
+        "vote_count": 700,
+        "year": 2019,
+        "popularity": 4
+      },
+      "d3": {
+        "genre_ids": [
+          12,
+          28
+        ],
+        "vote_average": 7.6,
+        "vote_count": 1300,
+        "year": 2021,
+        "popularity": 7
+      },
+      "d4": {
+        "genre_ids": [
+          12
+        ],
+        "vote_average": 6.4,
+        "vote_count": 500,
+        "year": 2017,
+        "popularity": 2
+      },
+      "w1": {
+        "genre_ids": [
+          28
+        ],
+        "vote_average": 8,
+        "vote_count": 2000,
+        "year": 2023,
+        "popularity": 9
+      },
+      "w2": {
+        "genre_ids": [
+          35
+        ],
+        "vote_average": 7.8,
+        "vote_count": 1800,
+        "year": 2023,
+        "popularity": 8
+      },
+      "w3": {
+        "genre_ids": [
+          12
+        ],
+        "vote_average": 7.5,
+        "vote_count": 1600,
+        "year": 2023,
+        "popularity": 7
+      },
+      "w4": {
+        "genre_ids": [
+          35
+        ],
+        "vote_average": 7.1,
+        "vote_count": 1200,
+        "year": 2023,
+        "popularity": 6
+      },
+      "w5": {
+        "genre_ids": [
+          35
+        ],
+        "vote_average": 7,
+        "vote_count": 1000,
+        "year": 2022,
+        "popularity": 5
+      },
+      "w6": {
+        "genre_ids": [
+          28
+        ],
+        "vote_average": 6.9,
+        "vote_count": 900,
+        "year": 2022,
+        "popularity": 4
+      },
+      "w7": {
+        "genre_ids": [
+          878
+        ],
+        "vote_average": 7.2,
+        "vote_count": 1400,
+        "year": 2023,
+        "popularity": 5
+      }
+    },
+    "recs": {
+      "s1": [
+        "a1",
+        "a2"
+      ],
+      "s2": [
+        "c1",
+        "c2"
+      ],
+      "s3": [
+        "a3",
+        "c3"
+      ],
+      "s4": [
+        "d1"
+      ]
+    },
+    "similar": {
+      "s1": [
+        "a4"
+      ],
+      "s2": [
+        "c4"
+      ],
+      "s3": [
+        "a5"
+      ],
+      "s4": [
+        "d2"
+      ]
+    },
+    "simklRecs": {
+      "sk2": [
+        "c5"
+      ],
+      "sk4": [
+        "d3"
+      ]
+    },
+    "discover": [
+      "d4",
+      "c6",
+      "a6"
+    ],
+    "trendingWeek": [
+      [
+        "w1",
+        1
+      ],
+      [
+        "w2",
+        2
+      ],
+      [
+        "w3",
+        3
+      ],
+      [
+        "w7",
+        4
+      ]
+    ],
+    "trendingDay": [
+      [
+        "w1",
+        1
+      ],
+      [
+        "w4",
+        2
+      ]
+    ],
+    "simklTrending": [
+      [
+        "w5",
+        500,
+        0.1
+      ],
+      [
+        "w6",
+        300,
+        null
+      ]
+    ]
+  },
+  "expected": {
+    "prescore": [
+      {
+        "id": "a4",
+        "pre": 0.7323333333333334,
+        "sources": [
+          "tmdb_similar"
+        ],
+        "seeds": [
+          "s1"
+        ],
+        "seedWeights": [
+          [
+            "s1",
+            1
+          ]
+        ]
+      },
+      {
+        "id": "a1",
+        "pre": 0.7283333333333334,
+        "sources": [
+          "tmdb_recs"
+        ],
+        "seeds": [
+          "s1"
+        ],
+        "seedWeights": [
+          [
+            "s1",
+            1
+          ]
+        ]
+      },
+      {
+        "id": "a2",
+        "pre": 0.7213333333333333,
+        "sources": [
+          "tmdb_recs"
+        ],
+        "seeds": [
+          "s1"
+        ],
+        "seedWeights": [
+          [
+            "s1",
+            1
+          ]
+        ]
+      },
+      {
+        "id": "a3",
+        "pre": 0.5843333333333333,
+        "sources": [
+          "tmdb_recs"
+        ],
+        "seeds": [
+          "s3"
+        ],
+        "seedWeights": [
+          [
+            "s3",
+            0.6
+          ]
+        ]
+      },
+      {
+        "id": "a5",
+        "pre": 0.5783333333333333,
+        "sources": [
+          "tmdb_similar"
+        ],
+        "seeds": [
+          "s3"
+        ],
+        "seedWeights": [
+          [
+            "s3",
+            0.6
+          ]
+        ]
+      },
+      {
+        "id": "c1",
+        "pre": 0.5053333333333333,
+        "sources": [
+          "tmdb_recs"
+        ],
+        "seeds": [
+          "s2"
+        ],
+        "seedWeights": [
+          [
+            "s2",
+            0.8
+          ]
+        ]
+      },
+      {
+        "id": "c2",
+        "pre": 0.5023333333333333,
+        "sources": [
+          "tmdb_recs"
+        ],
+        "seeds": [
+          "s2"
+        ],
+        "seedWeights": [
+          [
+            "s2",
+            0.8
+          ]
+        ]
+      },
+      {
+        "id": "w1",
+        "pre": 0.5,
+        "sources": [
+          "trending"
+        ],
+        "seeds": [],
+        "seedWeights": []
+      },
+      {
+        "id": "c4",
+        "pre": 0.4993333333333333,
+        "sources": [
+          "tmdb_similar"
+        ],
+        "seeds": [
+          "s2"
+        ],
+        "seedWeights": [
+          [
+            "s2",
+            0.8
+          ]
+        ]
+      },
+      {
+        "id": "c3",
+        "pre": 0.4673333333333333,
+        "sources": [
+          "tmdb_recs"
+        ],
+        "seeds": [
+          "s3"
+        ],
+        "seedWeights": [
+          [
+            "s3",
+            0.6
+          ]
+        ]
+      },
+      {
+        "id": "w6",
+        "pre": 0.44596466540300667,
+        "sources": [
+          "trending"
+        ],
+        "seeds": [],
+        "seedWeights": []
+      },
+      {
+        "id": "a6",
+        "pre": 0.36433333333333334,
+        "sources": [
+          "discover"
+        ],
+        "seeds": [],
+        "seedWeights": []
+      },
+      {
+        "id": "d1",
+        "pre": 0.3363333333333333,
+        "sources": [
+          "tmdb_recs"
+        ],
+        "seeds": [
+          "s4"
+        ],
+        "seedWeights": [
+          [
+            "s4",
+            0.4
+          ]
+        ]
+      },
+      {
+        "id": "d2",
+        "pre": 0.3303333333333333,
+        "sources": [
+          "tmdb_similar"
+        ],
+        "seeds": [
+          "s4"
+        ],
+        "seedWeights": [
+          [
+            "s4",
+            0.4
+          ]
+        ]
+      },
+      {
+        "id": "c5",
+        "pre": 0.3133333333333333,
+        "sources": [
+          "simkl_recs"
+        ],
+        "seeds": [
+          "s2"
+        ],
+        "seedWeights": [
+          [
+            "s2",
+            0.8
+          ]
+        ]
+      },
+      {
+        "id": "w5",
+        "pre": 0.2933041225646132,
+        "sources": [
+          "trending"
+        ],
+        "seeds": [],
+        "seedWeights": []
+      },
+      {
+        "id": "w2",
+        "pre": 0.2663188130311928,
+        "sources": [
+          "trending"
+        ],
+        "seeds": [],
+        "seedWeights": []
+      },
+      {
+        "id": "w4",
+        "pre": 0.2472884295714251,
+        "sources": [
+          "trending"
+        ],
+        "seeds": [],
+        "seedWeights": []
+      },
+      {
+        "id": "c6",
+        "pre": 0.21533333333333332,
+        "sources": [
+          "discover"
+        ],
+        "seeds": [],
+        "seedWeights": []
+      },
+      {
+        "id": "w3",
+        "pre": 0.19356544249626134,
+        "sources": [
+          "trending"
+        ],
+        "seeds": [],
+        "seedWeights": []
+      },
+      {
+        "id": "d4",
+        "pre": 0.18733333333333332,
+        "sources": [
+          "discover"
+        ],
+        "seeds": [],
+        "seedWeights": []
+      },
+      {
+        "id": "d3",
+        "pre": 0.1733333333333333,
+        "sources": [
+          "simkl_recs"
+        ],
+        "seeds": [
+          "s4"
+        ],
+        "seedWeights": [
+          [
+            "s4",
+            0.4
+          ]
+        ]
+      },
+      {
+        "id": "w7",
+        "pre": 0.072,
+        "sources": [
+          "exploration",
+          "trending"
+        ],
+        "seeds": [],
+        "seedWeights": []
+      }
+    ],
+    "stored": [
+      {
+        "id": "a1",
+        "rankScore": 0.5002317073170732,
+        "features": {
+          "taste_match": 0.30600000000000005,
+          "trending_raw": 0,
+          "trending_eff": 0,
+          "quality": 0.6875,
+          "consensus": 0.33333333333333337,
+          "seed_affinity": 1,
+          "freshness": 0.8
+        },
+        "weights": {
+          "taste_match": 0.2926829268292683,
+          "seed_affinity": 0.24390243902439024,
+          "trending_eff": 0.19512195121951217,
+          "quality": 0.12195121951219512,
+          "consensus": 0.07317073170731707,
+          "freshness": 0.07317073170731707
+        },
+        "penalty": 0
+      },
+      {
+        "id": "a4",
+        "rankScore": 0.4980975609756098,
+        "features": {
+          "taste_match": 0.30600000000000005,
+          "trending_raw": 0,
+          "trending_eff": 0,
+          "quality": 0.71,
+          "consensus": 0.33333333333333337,
+          "seed_affinity": 1,
+          "freshness": 0.7333333333333333
+        },
+        "weights": {
+          "taste_match": 0.2926829268292683,
+          "seed_affinity": 0.24390243902439024,
+          "trending_eff": 0.19512195121951217,
+          "quality": 0.12195121951219512,
+          "consensus": 0.07317073170731707,
+          "freshness": 0.07317073170731707
+        },
+        "penalty": 0
+      },
+      {
+        "id": "a2",
+        "rankScore": 0.4943549201009252,
+        "features": {
+          "taste_match": 0.30600000000000005,
+          "trending_raw": 0,
+          "trending_eff": 0,
+          "quality": 0.6593103448275862,
+          "consensus": 0.33333333333333337,
+          "seed_affinity": 1,
+          "freshness": 0.7666666666666667
+        },
+        "weights": {
+          "taste_match": 0.2926829268292683,
+          "seed_affinity": 0.24390243902439024,
+          "trending_eff": 0.19512195121951217,
+          "quality": 0.12195121951219512,
+          "consensus": 0.07317073170731707,
+          "freshness": 0.07317073170731707
+        },
+        "penalty": 0
+      },
+      {
+        "id": "w1",
+        "rankScore": 0.4144216027874565,
+        "features": {
+          "taste_match": 0.30600000000000005,
+          "trending_raw": 1,
+          "trending_eff": 0.8742857142857144,
+          "quality": 0.725,
+          "consensus": 0,
+          "seed_affinity": 0,
+          "freshness": 0.9
+        },
+        "weights": {
+          "taste_match": 0.2926829268292683,
+          "seed_affinity": 0.24390243902439024,
+          "trending_eff": 0.19512195121951217,
+          "quality": 0.12195121951219512,
+          "consensus": 0.07317073170731707,
+          "freshness": 0.07317073170731707
+        },
+        "penalty": 0
+      },
+      {
+        "id": "c5",
+        "rankScore": 0.4039636213311286,
+        "features": {
+          "taste_match": 0.136,
+          "trending_raw": 0,
+          "trending_eff": 0,
+          "quality": 0.6661016949152543,
+          "consensus": 0.33333333333333337,
+          "seed_affinity": 0.8,
+          "freshness": 0.8666666666666667
+        },
+        "weights": {
+          "taste_match": 0.2926829268292683,
+          "seed_affinity": 0.24390243902439024,
+          "trending_eff": 0.19512195121951217,
+          "quality": 0.12195121951219512,
+          "consensus": 0.07317073170731707,
+          "freshness": 0.07317073170731707
+        },
+        "penalty": 0
+      },
+      {
+        "id": "a5",
+        "rankScore": 0.4029756097560976,
+        "features": {
+          "taste_match": 0.30600000000000005,
+          "trending_raw": 0,
+          "trending_eff": 0,
+          "quality": 0.65,
+          "consensus": 0.33333333333333337,
+          "seed_affinity": 0.6,
+          "freshness": 0.8666666666666667
+        },
+        "weights": {
+          "taste_match": 0.2926829268292683,
+          "seed_affinity": 0.24390243902439024,
+          "trending_eff": 0.19512195121951217,
+          "quality": 0.12195121951219512,
+          "consensus": 0.07317073170731707,
+          "freshness": 0.07317073170731707
+        },
+        "penalty": 0
+      },
+      {
+        "id": "a3",
+        "rankScore": 0.40262717770034845,
+        "features": {
+          "taste_match": 0.30600000000000005,
+          "trending_raw": 0,
+          "trending_eff": 0,
+          "quality": 0.6671428571428571,
+          "consensus": 0.33333333333333337,
+          "seed_affinity": 0.6,
+          "freshness": 0.8333333333333334
+        },
+        "weights": {
+          "taste_match": 0.2926829268292683,
+          "seed_affinity": 0.24390243902439024,
+          "trending_eff": 0.19512195121951217,
+          "quality": 0.12195121951219512,
+          "consensus": 0.07317073170731707,
+          "freshness": 0.07317073170731707
+        },
+        "penalty": 0
+      },
+      {
+        "id": "c1",
+        "rankScore": 0.3999674796747968,
+        "features": {
+          "taste_match": 0.136,
+          "trending_raw": 0,
+          "trending_eff": 0,
+          "quality": 0.6733333333333333,
+          "consensus": 0.33333333333333337,
+          "seed_affinity": 0.8,
+          "freshness": 0.8
+        },
+        "weights": {
+          "taste_match": 0.2926829268292683,
+          "seed_affinity": 0.24390243902439024,
+          "trending_eff": 0.19512195121951217,
+          "quality": 0.12195121951219512,
+          "consensus": 0.07317073170731707,
+          "freshness": 0.07317073170731707
+        },
+        "penalty": 0
+      },
+      {
+        "id": "c2",
+        "rankScore": 0.396137783483098,
+        "features": {
+          "taste_match": 0.136,
+          "trending_raw": 0,
+          "trending_eff": 0,
+          "quality": 0.6619298245614036,
+          "consensus": 0.33333333333333337,
+          "seed_affinity": 0.8,
+          "freshness": 0.7666666666666667
+        },
+        "weights": {
+          "taste_match": 0.2926829268292683,
+          "seed_affinity": 0.24390243902439024,
+          "trending_eff": 0.19512195121951217,
+          "quality": 0.12195121951219512,
+          "consensus": 0.07317073170731707,
+          "freshness": 0.07317073170731707
+        },
+        "penalty": 0
+      },
+      {
+        "id": "c4",
+        "rankScore": 0.3925253283302064,
+        "features": {
+          "taste_match": 0.136,
+          "trending_raw": 0,
+          "trending_eff": 0,
+          "quality": 0.6523076923076923,
+          "consensus": 0.33333333333333337,
+          "seed_affinity": 0.8,
+          "freshness": 0.7333333333333333
+        },
+        "weights": {
+          "taste_match": 0.2926829268292683,
+          "seed_affinity": 0.24390243902439024,
+          "trending_eff": 0.19512195121951217,
+          "quality": 0.12195121951219512,
+          "consensus": 0.07317073170731707,
+          "freshness": 0.07317073170731707
+        },
+        "penalty": 0
+      },
+      {
+        "id": "c3",
+        "rankScore": 0.3646262785208498,
+        "features": {
+          "taste_match": 0.17,
+          "trending_raw": 0,
+          "trending_eff": 0,
+          "quality": 0.6819354838709677,
+          "consensus": 0.33333333333333337,
+          "seed_affinity": 0.6,
+          "freshness": 0.8333333333333334
+        },
+        "weights": {
+          "taste_match": 0.2926829268292683,
+          "seed_affinity": 0.24390243902439024,
+          "trending_eff": 0.19512195121951217,
+          "quality": 0.12195121951219512,
+          "consensus": 0.07317073170731707,
+          "freshness": 0.07317073170731707
+        },
+        "penalty": 0
+      },
+      {
+        "id": "d3",
+        "rankScore": 0.35704065040650407,
+        "features": {
+          "taste_match": 0.30600000000000005,
+          "trending_raw": 0,
+          "trending_eff": 0,
+          "quality": 0.6933333333333334,
+          "consensus": 0.33333333333333337,
+          "seed_affinity": 0.4,
+          "freshness": 0.8333333333333334
+        },
+        "weights": {
+          "taste_match": 0.2926829268292683,
+          "seed_affinity": 0.24390243902439024,
+          "trending_eff": 0.19512195121951217,
+          "quality": 0.12195121951219512,
+          "consensus": 0.07317073170731707,
+          "freshness": 0.07317073170731707
+        },
+        "penalty": 0
+      },
+      {
+        "id": "w6",
+        "rankScore": 0.35540679284377025,
+        "features": {
+          "taste_match": 0.30600000000000005,
+          "trending_raw": 0.7130977693533775,
+          "trending_eff": 0.6234511926346673,
+          "quality": 0.6624137931034483,
+          "consensus": 0,
+          "seed_affinity": 0,
+          "freshness": 0.8666666666666667
+        },
+        "weights": {
+          "taste_match": 0.2926829268292683,
+          "seed_affinity": 0.24390243902439024,
+          "trending_eff": 0.19512195121951217,
+          "quality": 0.12195121951219512,
+          "consensus": 0.07317073170731707,
+          "freshness": 0.07317073170731707
+        },
+        "penalty": 0
+      },
+      {
+        "id": "d1",
+        "rankScore": 0.29263751051303616,
+        "features": {
+          "taste_match": 0.10200000000000001,
+          "trending_raw": 0,
+          "trending_eff": 0,
+          "quality": 0.6748275862068965,
+          "consensus": 0.33333333333333337,
+          "seed_affinity": 0.4,
+          "freshness": 0.8
+        },
+        "weights": {
+          "taste_match": 0.2926829268292683,
+          "seed_affinity": 0.24390243902439024,
+          "trending_eff": 0.19512195121951217,
+          "quality": 0.12195121951219512,
+          "consensus": 0.07317073170731707,
+          "freshness": 0.07317073170731707
+        },
+        "penalty": 0
+      },
+      {
+        "id": "d2",
+        "rankScore": 0.287803071364047,
+        "features": {
+          "taste_match": 0.10200000000000001,
+          "trending_raw": 0,
+          "trending_eff": 0,
+          "quality": 0.6551851851851852,
+          "consensus": 0.33333333333333337,
+          "seed_affinity": 0.4,
+          "freshness": 0.7666666666666667
+        },
+        "weights": {
+          "taste_match": 0.2926829268292683,
+          "seed_affinity": 0.24390243902439024,
+          "trending_eff": 0.19512195121951217,
+          "quality": 0.12195121951219512,
+          "consensus": 0.07317073170731707,
+          "freshness": 0.07317073170731707
+        },
+        "penalty": 0
+      },
+      {
+        "id": "w5",
+        "rankScore": 0.2497902934670727,
+        "features": {
+          "taste_match": 0.136,
+          "trending_raw": 0.8608676880384432,
+          "trending_eff": 0.33450858735208083,
+          "quality": 0.6666666666666667,
+          "consensus": 0,
+          "seed_affinity": 0,
+          "freshness": 0.8666666666666667
+        },
+        "weights": {
+          "taste_match": 0.2926829268292683,
+          "seed_affinity": 0.24390243902439024,
+          "trending_eff": 0.19512195121951217,
+          "quality": 0.12195121951219512,
+          "consensus": 0.07317073170731707,
+          "freshness": 0.07317073170731707
+        },
+        "penalty": 0
+      },
+      {
+        "id": "a6",
+        "rankScore": 0.23883445770627917,
+        "features": {
+          "taste_match": 0.30600000000000005,
+          "trending_raw": 0,
+          "trending_eff": 0,
+          "quality": 0.6440425531914894,
+          "consensus": 0.33333333333333337,
+          "seed_affinity": 0,
+          "freshness": 0.6333333333333333
+        },
+        "weights": {
+          "taste_match": 0.2926829268292683,
+          "seed_affinity": 0.24390243902439024,
+          "trending_eff": 0.19512195121951217,
+          "quality": 0.12195121951219512,
+          "consensus": 0.07317073170731707,
+          "freshness": 0.07317073170731707
+        },
+        "penalty": 0
+      },
+      {
+        "id": "w2",
+        "rankScore": 0.23560188590319758,
+        "features": {
+          "taste_match": 0.136,
+          "trending_raw": 0.5693234419266069,
+          "trending_eff": 0.22122282314862443,
+          "quality": 0.7115789473684211,
+          "consensus": 0,
+          "seed_affinity": 0,
+          "freshness": 0.9
+        },
+        "weights": {
+          "taste_match": 0.2926829268292683,
+          "seed_affinity": 0.24390243902439024,
+          "trending_eff": 0.19512195121951217,
+          "quality": 0.12195121951219512,
+          "consensus": 0.07317073170731707,
+          "freshness": 0.07317073170731707
+        },
+        "penalty": 0
+      },
+      {
+        "id": "w4",
+        "rankScore": 0.2232350820985543,
+        "features": {
+          "taste_match": 0.136,
+          "trending_raw": 0.46907024642854245,
+          "trending_eff": 0.1822672957550908,
+          "quality": 0.6725,
+          "consensus": 0,
+          "seed_affinity": 0,
+          "freshness": 0.9
+        },
+        "weights": {
+          "taste_match": 0.2926829268292683,
+          "seed_affinity": 0.24390243902439024,
+          "trending_eff": 0.19512195121951217,
+          "quality": 0.12195121951219512,
+          "consensus": 0.07317073170731707,
+          "freshness": 0.07317073170731707
+        },
+        "penalty": 0
+      },
+      {
+        "id": "w3",
+        "rankScore": 0.19844398070224484,
+        "features": {
+          "taste_match": 0.10200000000000001,
+          "trending_raw": 0.31739380551401475,
+          "trending_eff": 0.09249762332122717,
+          "quality": 0.6944444444444444,
+          "consensus": 0,
+          "seed_affinity": 0,
+          "freshness": 0.9
+        },
+        "weights": {
+          "taste_match": 0.2926829268292683,
+          "seed_affinity": 0.24390243902439024,
+          "trending_eff": 0.19512195121951217,
+          "quality": 0.12195121951219512,
+          "consensus": 0.07317073170731707,
+          "freshness": 0.07317073170731707
+        },
+        "penalty": 0
+      },
+      {
+        "id": "c6",
+        "rankScore": 0.1916341463414634,
+        "features": {
+          "taste_match": 0.136,
+          "trending_raw": 0,
+          "trending_eff": 0,
+          "quality": 0.645,
+          "consensus": 0.33333333333333337,
+          "seed_affinity": 0,
+          "freshness": 0.6666666666666666
+        },
+        "weights": {
+          "taste_match": 0.2926829268292683,
+          "seed_affinity": 0.24390243902439024,
+          "trending_eff": 0.19512195121951217,
+          "quality": 0.12195121951219512,
+          "consensus": 0.07317073170731707,
+          "freshness": 0.07317073170731707
+        },
+        "penalty": 0
+      },
+      {
+        "id": "d4",
+        "rankScore": 0.18448780487804878,
+        "features": {
+          "taste_match": 0.10200000000000001,
+          "trending_raw": 0,
+          "trending_eff": 0,
+          "quality": 0.648,
+          "consensus": 0.33333333333333337,
+          "seed_affinity": 0,
+          "freshness": 0.7
+        },
+        "weights": {
+          "taste_match": 0.2926829268292683,
+          "seed_affinity": 0.24390243902439024,
+          "trending_eff": 0.19512195121951217,
+          "quality": 0.12195121951219512,
+          "consensus": 0.07317073170731707,
+          "freshness": 0.07317073170731707
+        },
+        "penalty": 0
+      },
+      {
+        "id": "w7",
+        "rankScore": 0.1486370157819225,
+        "features": {
+          "taste_match": 0,
+          "trending_raw": 0.1386468838532139,
+          "trending_eff": 0,
+          "quality": 0.6788235294117647,
+          "consensus": 0,
+          "seed_affinity": 0,
+          "freshness": 0.9
+        },
+        "weights": {
+          "taste_match": 0.2926829268292683,
+          "seed_affinity": 0.24390243902439024,
+          "trending_eff": 0.19512195121951217,
+          "quality": 0.12195121951219512,
+          "consensus": 0.07317073170731707,
+          "freshness": 0.07317073170731707
+        },
+        "penalty": 0
+      }
+    ]
+  }
+}
