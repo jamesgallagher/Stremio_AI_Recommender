@@ -125,26 +125,26 @@ ok('catalogs: registry, defaults, and per-source requirements', () => {
   assert.strictEqual(anime.type, 'series');
   assert.strictEqual(anime.target, 50);
   assert.strictEqual(anime.min_imdb, 6);   // list's imdb_ratings=6-10
-  assert.strictEqual(anime.min_profile_age, 13); // TV-14 band
+  assert.strictEqual(anime.min_profile_age, 14); // TV-14 band (AGE-2: the real TV-14 tier)
   assert.ok(!anime.default_on);
   assert.strictEqual(catalogs.requirementMet({ keys: { mdblist_api_key: 'k' } }, anime), true);
   assert.strictEqual(catalogs.requirementMet({ keys: {} }, anime), false);
 
-  // Catalog-level age band (TV-14 -> 13+). A profile limited below the band
+  // Catalog-level age band (TV-14 -> 14+). A profile limited below the band
   // never sees it; adults (no limit) always do. This is a catalog floor, NOT a
   // per-title certification lookup — it can't drop titles for being unrated.
-  assert.strictEqual(anime.min_profile_age, 13);
-  assert.strictEqual(catalogs.ageAppropriate({ filters: { age_limit: 13 } }, anime), true);
+  assert.strictEqual(anime.min_profile_age, 14);
+  assert.strictEqual(catalogs.ageAppropriate({ filters: { age_limit: 14 } }, anime), true);
   assert.strictEqual(catalogs.ageAppropriate({ filters: { age_limit: 15 } }, anime), true);
-  assert.strictEqual(catalogs.ageAppropriate({ filters: { age_limit: 8 } }, anime), false);
+  assert.strictEqual(catalogs.ageAppropriate({ filters: { age_limit: 12 } }, anime), false); // 12+ is below the band
   assert.strictEqual(catalogs.ageAppropriate({ filters: { age_limit: 0 } }, anime), true); // adult
   assert.strictEqual(catalogs.ageAppropriate({}, anime), true);
-  assert.strictEqual(catalogs.ageAppropriate({ filters: { age_limit: 8 } }, wl), true); // no band
+  assert.strictEqual(catalogs.ageAppropriate({ filters: { age_limit: 10 } }, wl), true); // no band
   // ...and enabling it on an under-age profile must not surface it anyway
-  const under = { filters: { age_limit: 8 }, catalogs: { 'trakt-anime-teen-series': true } };
+  const under = { filters: { age_limit: 12 }, catalogs: { 'trakt-anime-teen-series': true } };
   assert.ok(!catalogs.enabledExtras(under).some(d => d.id === 'trakt-anime-teen-series'));
-  const ok13 = { filters: { age_limit: 13 }, catalogs: { 'trakt-anime-teen-series': true } };
-  assert.ok(catalogs.enabledExtras(ok13).some(d => d.id === 'trakt-anime-teen-series'));
+  const ok14 = { filters: { age_limit: 14 }, catalogs: { 'trakt-anime-teen-series': true } };
+  assert.ok(catalogs.enabledExtras(ok14).some(d => d.id === 'trakt-anime-teen-series'));
 });
 
 ok('store: swapExtra keeps AI catalogs untouched', () => {
@@ -3827,6 +3827,62 @@ ok('calibrated A2: incremental greedy is fast (425 rows, listSize 50)', () => {
     }
   });
 
+  ok('AGE-2 T8: age_limit migration — stored + incoming round to a tier, never loosen', () => {
+    const config = require('../src/config');
+    // applyMigrations: stored non-tier values round to their tier (spec §2.5).
+    for (const [input, expected] of [[5, 10], [8, 10], [11, 10], [13, 12], [16, 15], [17, 15], [18, 15]]) {
+      const p = { name: 'T8', keys: {}, filters: { age_limit: input } };
+      config.applyMigrations(p);
+      assert.strictEqual(p.filters.age_limit, expected, `stored ${input} → ${expected}`);
+    }
+    // tier values + 0 pass through untouched.
+    for (const v of [0, 10, 12, 14, 15]) {
+      const p = { name: 'T8', keys: {}, filters: { age_limit: v } };
+      config.applyMigrations(p);
+      assert.strictEqual(p.filters.age_limit, v, `${v} untouched`);
+    }
+    // Idempotent: a second pass changes nothing.
+    const p2 = { name: 'T8', keys: {}, filters: { age_limit: 13 } };
+    config.applyMigrations(p2);
+    const once = p2.filters.age_limit;
+    config.applyMigrations(p2);
+    assert.strictEqual(p2.filters.age_limit, once, 'idempotent');
+    // updateProfile: an incoming non-tier age_limit is rounded on write.
+    const p = config.addProfile('T8');
+    config.updateProfile(p.id, { filters: { age_limit: 13 } });
+    assert.strictEqual(config.getProfile(p.id).filters.age_limit, 12, 'updateProfile 13 → 12');
+    config.updateProfile(p.id, { filters: { age_limit: 16 } });
+    assert.strictEqual(config.getProfile(p.id).filters.age_limit, 15, 'updateProfile 16 → 15');
+    config.updateProfile(p.id, { filters: { age_limit: 8 } });
+    assert.strictEqual(config.getProfile(p.id).filters.age_limit, 10, 'updateProfile 8 → 10');
+    config.updateProfile(p.id, { filters: { age_limit: 0 } });
+    assert.strictEqual(config.getProfile(p.id).filters.age_limit, 0, 'updateProfile 0 → 0');
+    config.removeProfile(p.id);
+  });
+
+  ok('AGE-2 T9: catalog bands — Anime TV-14 hidden below 14; effective limit is a tier', () => {
+    const catalogs = require('../src/catalogs');
+    const rebuildMod = require('../src/rebuild');
+    const anime = catalogs.getExtra('trakt-anime-teen-series');
+    const kids = catalogs.getExtra('mdb-kids-movies');
+    // Anime TV-14 band is the real TV-14 tier (14).
+    assert.strictEqual(anime.min_profile_age, 14);
+    assert.strictEqual(anime.age_band, 14);
+    // Hidden for 12+, visible at 14+ and above; adult always visible.
+    assert.strictEqual(catalogs.ageAppropriate({ filters: { age_limit: 12 } }, anime), false);
+    assert.strictEqual(catalogs.ageAppropriate({ filters: { age_limit: 14 } }, anime), true);
+    assert.strictEqual(catalogs.ageAppropriate({ filters: { age_limit: 15 } }, anime), true);
+    assert.strictEqual(catalogs.ageAppropriate({ filters: { age_limit: 0 } }, anime), true);
+    // effectiveAgeLimit = min(band, profile limit); every result is a tier value.
+    assert.strictEqual(rebuildMod.effectiveAgeLimit({ filters: { age_limit: 15 } }, anime), 14); // min(14,15)
+    assert.strictEqual(rebuildMod.effectiveAgeLimit({ filters: { age_limit: 14 } }, anime), 14);
+    assert.strictEqual(rebuildMod.effectiveAgeLimit({ filters: { age_limit: 12 } }, anime), 12); // min(14,12)
+    assert.strictEqual(rebuildMod.effectiveAgeLimit({ filters: { age_limit: 0 } }, anime), 14); // band on adult
+    // Trending Kids keeps its 12 band; @15+ → 12.
+    assert.strictEqual(kids.age_band, 12);
+    assert.strictEqual(rebuildMod.effectiveAgeLimit({ filters: { age_limit: 15 } }, kids), 12); // min(12,15)
+  });
+
   // ---- AGE-1: decision chain (pure, seams) ----
   okAsync('AGE-1 C1: chain order — first step that answers wins', async () => {
     const log = { warn: () => {} };
@@ -5198,7 +5254,7 @@ async function httpTests() {
     body: JSON.stringify({ filters: { age_limit: 8, list_size: 999 } }),
   });
   const f = (await res.json()).profile.filters;
-  assert.strictEqual(f.age_limit, 8);
+  assert.strictEqual(f.age_limit, 10); // AGE-2: 8 rounds to the 10+ tier on write (spec §2.5)
   assert.strictEqual(f.list_size, 50); // clamped to max
   console.log('  ✓ age limit + list size persisted (clamped)');
 
@@ -5281,10 +5337,10 @@ async function httpTests() {
   assert.ok(!man3.catalogs.some(c => c.id === 'trakt-anime-teen-series'));
   res = await fetch(`${BASE}/addon/${p2.token}/catalog/series/trakt-anime-teen-series.json`);
   assert.strictEqual(res.status, 404);
-  // Raise the limit to 13+ and it becomes available
+  // Raise the limit to the TV-14 tier (14+) and it becomes available
   await fetch(`${BASE}/api/profiles/${p2.id}`, {
     method: 'PUT', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ filters: { age_limit: 13 }, catalogs: { 'trakt-anime-teen-series': true } }),
+    body: JSON.stringify({ filters: { age_limit: 14 }, catalogs: { 'trakt-anime-teen-series': true } }),
   });
   man3 = await (await fetch(`${BASE}/addon/${p2.token}/manifest.json`)).json();
   assert.ok(man3.catalogs.some(c => c.id === 'trakt-anime-teen-series'));

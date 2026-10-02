@@ -113,6 +113,18 @@ function applyMigrations(p) {
   if (p.keys.groq_api_key === undefined) p.keys.groq_api_key = '';
   if (p.keys.gemini_api_key !== undefined) delete p.keys.gemini_api_key;
   if (p.filters.age_limit === undefined) p.filters.age_limit = 0;
+  // AGE-2 (spec §2.5): the age tiers are exactly 10/12/14/15. Any other
+  // positive age_limit migrates to its tier (1–9→10, 11→10, 13→12, 16+→15).
+  // Never loosens: the tier's bar is at or above the stored limit's effective
+  // bar. Idempotent — a tier value (10/12/14/15) passes through untouched.
+  if (p.filters.age_limit > 0) {
+    const ageVerification = require('./ageVerification');
+    const tier = ageVerification.tierFor({ age_limit: p.filters.age_limit });
+    if (p.filters.age_limit !== tier.csmMaxAge) {
+      console.log(`[config] ${p.name}: age_limit ${p.filters.age_limit} → ${tier.csmMaxAge} (AGE-2 tiers)`);
+      p.filters.age_limit = tier.csmMaxAge;
+    }
+  }
   if (p.filters.list_size === undefined) p.filters.list_size = 20;
   if (p.filters.vote_count_floor === undefined) p.filters.vote_count_floor = 1000;
   // v6.37: title decay became opt-in + configurable. Older profiles ran the
@@ -282,7 +294,15 @@ function updateProfile(id, patch) {
         profile.filters.max_age_years = 0;
       }
       if (Array.isArray(f.excluded_genres)) profile.filters.excluded_genres = f.excluded_genres.map(String);
-      if (f.age_limit !== undefined) profile.filters.age_limit = Math.max(0, parseInt(f.age_limit, 10) || 0);
+      if (f.age_limit !== undefined) {
+        const raw = Math.max(0, parseInt(f.age_limit, 10) || 0);
+        // AGE-2 (spec §2.5): the incoming age_limit is rounded to its tier —
+        // the same rounding applyMigrations applies to stored values
+        // (1–9→10, 11→10, 13→12, 16+→15). A 0 stays 0 (adult, no gate).
+        const ageVerification = require('./ageVerification');
+        const tier = ageVerification.tierFor({ age_limit: raw });
+        profile.filters.age_limit = tier ? tier.csmMaxAge : 0;
+      }
       if (f.list_size !== undefined) profile.filters.list_size = Math.min(50, Math.max(5, parseInt(f.list_size, 10) || 20));
       if (f.vote_count_floor !== undefined) profile.filters.vote_count_floor = Math.max(0, parseInt(f.vote_count_floor, 10) || 0);
       // v7: per-type engine choice, validated against the registry AND the
@@ -415,4 +435,5 @@ module.exports = {
   removeProfile,
   secretsLocked,
   migrateSecrets,
+  applyMigrations, // test seam: the field-level migrations (incl. the AGE-2 age_limit rounding)
 };
