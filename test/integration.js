@@ -6717,6 +6717,98 @@ async function main() {
     assert.ok(out1.includes('Show Two'), 'second target title');
   });
 
+  // ── TV-1 review round 2 (S1): the series holdout must leave `watched`,
+  //    `pending_watched` and `dont_recommend` too — otherwise the pipeline
+  //    excludes every held-out target as "already watched" (the real-data bug:
+  //    hit@20 0/10). The leakage check must also cover the watched id sets. ──
+  await it('TV-1 S1: removeSeriesHoldout clears watched/pending_watched/dont_recommend; runBench hits all 10; leakage check covers watched sets', async () => {
+    const p = config.addProfile('INT-TV1-S1');
+    const DAY = 86400e3;
+    const base = Date.parse('2026-06-01T00:00:00Z');
+    const mk = (i) => ({
+      simkl_id: i, kind: 'show', imdb_id: 'tt' + i, tmdb_id: 's1' + i, title: 'Show ' + i, year: 2020,
+      status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0,
+      last_watched_at: base + i * DAY, first_watched_at: base + i * DAY,
+      first_real_at: base + i * DAY, last_real_at: base + i * DAY,
+      stamps: 10, real_stamps: 10, eps_per_week: null,
+    });
+    // The 10 most recently started (s120..s111) are the holdout.
+    const targetIds = Array.from({ length: 10 }, (_, i) => 's1' + (20 - i));
+    // Seed the full fixture: 20 qualifying series_progress rows + the 10 targets
+    // in watched (type series), pending_watched and dont_recommend — what real
+    // data has for a show you started. upsertMany runs once (so its
+    // clearSupersededPending fires before the pending rows are added), then the
+    // pending_watched rows are added and survive.
+    const seedFixture = () => {
+      watchedStore.upsertSeriesProgress(p.id, Array.from({ length: 20 }, (_, i) => mk(i + 1)));
+      watchedStore.upsertMany(p.id, targetIds.map((t) => {
+        const n = Number(t.slice(2));
+        return { simkl_id: 1000 + n, type: 'series', imdb_id: 'tts' + n, tmdb_id: t, title: 'Show ' + n, year: 2020, watched_at: base + n * DAY };
+      }));
+      for (const t of targetIds) watchedStore.addPendingWatched(p.id, { type: 'series', tmdbId: t });
+      for (const t of targetIds) rs.addDontRecommend(p.id, 'series', t, 'user');
+    };
+    const pipeline = require('../src/engines/pipeline');
+    let stubTargets = targetIds.slice();
+    const dispose = engines._register({
+      id: 'bench-stub-s1', name: 'Bench stub S1', supportedTypes: ['series'],
+      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+      requirements: () => ({ ok: true, missing: [] }),
+      generate: async () => stubTargets.map((t) => ({
+        type: 'series', tmdb_id: t, imdb_id: 'tts' + t.slice(2), title: 'Show ' + t.slice(2), year: 2020,
+        genres: 'Action', primary_genre: 'Action', vote_average: 8, vote_count: 5000,
+        affinity: 10, rankScore: 10, popularity: 5, poster: null,
+      })),
+    });
+    try {
+      // 1. removeSeriesHoldout must clear every table + the watched id sets.
+      seedFixture();
+      bench.removeSeriesHoldout(p.id, targetIds, { db });
+      const conn = db.get();
+      for (const t of targetIds) {
+        assert.ok(!conn.prepare('SELECT tmdb_id FROM watched WHERE profile_id = ? AND type = ? AND tmdb_id = ?').get(p.id, 'series', t), 'watched row removed: ' + t);
+        assert.ok(!conn.prepare('SELECT tmdb_id FROM series_progress WHERE profile_id = ? AND tmdb_id = ?').get(p.id, t), 'series_progress row removed: ' + t);
+        assert.ok(!conn.prepare('SELECT tmdb_id FROM pending_watched WHERE profile_id = ? AND tmdb_id = ?').get(p.id, t), 'pending_watched row removed: ' + t);
+        assert.ok(!conn.prepare('SELECT tmdb_id FROM dont_recommend WHERE profile_id = ? AND tmdb_id = ?').get(p.id, t), 'dont_recommend row removed: ' + t);
+      }
+      const sets = watchedStore.watchedIdSets(p.id);
+      for (const t of targetIds) assert.ok(!sets.tmdb.has(t), 'no target in watched id sets: ' + t);
+
+      // 2. runBench --type series with a stub engine recommending exactly the 10
+      //    targets → hitAt20 === 10 (the targets are no longer "already watched").
+      seedFixture();
+      config.updateProfile(p.id, { filters: {} });
+      const results = await bench.runBench({
+        profile: config.getProfile(p.id), engineIds: ['bench-stub-s1'], holdout: 10, type: 'series',
+        deps: { engines, pipeline, rs, watchedStore, db, settings, selectServe: rs.selectServe, log: quiet },
+      });
+      assert.strictEqual(results.engines['bench-stub-s1'].metrics.hitAt20, 10, 'the stub returns every held-out target → all hit');
+
+      // 3. the leakage check throws if a target survives in the watched id sets —
+      //    replicate the OLD (buggy) removeSeriesHoldout that only cleared
+      //    series_progress, so the watched rows survive.
+      seedFixture();
+      const oldRemoveSeriesHoldout = (pid, ids, opts) => {
+        const c = opts.db.get();
+        const inList = ids.map(() => '?').join(',');
+        c.prepare('DELETE FROM series_progress WHERE profile_id = ? AND tmdb_id IN (' + inList + ')').run(pid, ...ids);
+      };
+      let threw = false;
+      try {
+        await bench.runBench({
+          profile: config.getProfile(p.id), engineIds: ['bench-stub-s1'], holdout: 10, type: 'series',
+          deps: { engines, pipeline, rs, watchedStore, db, settings, selectServe: rs.selectServe, log: quiet, removeSeriesHoldout: oldRemoveSeriesHoldout },
+        });
+      } catch (err) {
+        threw = /leakage: target still in watched set/.test(err.message);
+      }
+      assert.ok(threw, 'leakage check throws when a target survives in the watched id sets');
+    } finally {
+      dispose();
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id);
+    }
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();

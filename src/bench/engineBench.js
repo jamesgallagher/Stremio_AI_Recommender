@@ -305,10 +305,19 @@ function removeHoldout(profileId, targetIds, { db, noCache = false }) {
 // its episodes. Alongside: the profile's whole series recommended pool, and
 // the series taste ratings + ignores (a held-out show rating would otherwise
 // steer Marquee TV's taste). `noCache` also clears the Marquee LLM cache.
+//
+// Card §2.4: the held-out shows must ALSO leave `watched` (type series),
+// `pending_watched` and `dont_recommend` — the pipeline subtracts
+// watchedIdSets (watched + pending_watched) and dont_recommend, so a
+// surviving watched row would exclude every held-out target as "already
+// watched" (the real-data bug: hit@20 0/10).
 // Pure SQL on the injected db handle.
 function removeSeriesHoldout(profileId, targetIds, { db, noCache = false }) {
   const conn = db.get();
   const inList = targetIds.map(() => '?').join(',');
+  conn.prepare('DELETE FROM watched WHERE profile_id = ? AND type = ? AND tmdb_id IN (' + inList + ')').run(profileId, 'series', ...targetIds);
+  conn.prepare('DELETE FROM pending_watched WHERE profile_id = ? AND tmdb_id IN (' + inList + ')').run(profileId, ...targetIds);
+  conn.prepare('DELETE FROM dont_recommend WHERE profile_id = ? AND tmdb_id IN (' + inList + ')').run(profileId, ...targetIds);
   conn.prepare('DELETE FROM series_progress WHERE profile_id = ? AND tmdb_id IN (' + inList + ')').run(profileId, ...targetIds);
   conn.prepare('DELETE FROM recommended WHERE profile_id = ? AND type = ?').run(profileId, 'series');
   if (tableExists(conn, 'taste_ratings')) {
@@ -435,6 +444,10 @@ async function runBench({ profile, engineIds, holdout, type = 'movie', serveOpts
     selectServeFor, filterServable, serveCalibration, listSizeFor = null,
     log = console, now = Date.now, noCache = false, ctxExtras = {}, reachability = null,
   } = deps;
+  // The holdout deletors are injectable so the suite can spy on them (e.g. to
+  // prove the leakage check throws when a delete is skipped).
+  const removeSeriesHoldoutFn = deps.removeSeriesHoldout || removeSeriesHoldout;
+  const removeHoldoutFn = deps.removeHoldout || removeHoldout;
 
   let targetIds, targets;
   if (type === 'series') {
@@ -447,11 +460,17 @@ async function runBench({ profile, engineIds, holdout, type = 'movie', serveOpts
       const row = seriesRows.find((r) => r.tmdb_id === id);
       return { tmdb_id: id, title: row ? row.title : id };
     });
-    removeSeriesHoldout(profile.id, targetIds, { db, noCache });
-    // Leakage check: no target may survive in the series progress rows.
+    removeSeriesHoldoutFn(profile.id, targetIds, { db, noCache });
+    // Leakage check (card §2.4): no target may survive in the series progress
+    // rows OR in the watched id sets (watched + pending_watched) — the pipeline
+    // subtracts watchedIdSets, so a surviving watched row would exclude the target.
     const remainingIds = new Set(watchedStore.getSeriesProgress(profile.id, { kind: 'show' }).map((r) => r.tmdb_id));
     for (const t of targetIds) {
       if (remainingIds.has(t)) throw new Error('leakage: target still in series_progress: ' + t);
+    }
+    const sets = watchedStore.watchedIdSets(profile.id);
+    for (const t of targetIds) {
+      if (sets.tmdb.has(t)) throw new Error('leakage: target still in watched set: ' + t);
     }
   } else {
     const watched = watchedStore.getWatched(profile.id, { type: 'movie' });
@@ -461,7 +480,7 @@ async function runBench({ profile, engineIds, holdout, type = 'movie', serveOpts
       return { tmdb_id: id, title: row ? row.title : id };
     });
     // Delete the holdout from the bench copy so it cannot leak into the build.
-    removeHoldout(profile.id, targetIds, { db, noCache });
+    removeHoldoutFn(profile.id, targetIds, { db, noCache });
     // Leakage check (spec §5.3): no target may survive in the watched id sets.
     const sets = watchedStore.watchedIdSets(profile.id);
     for (const t of targetIds) {
