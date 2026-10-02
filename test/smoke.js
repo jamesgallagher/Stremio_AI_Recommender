@@ -3916,6 +3916,62 @@ ok('calibrated A2: incremental greedy is fast (425 rows, listSize 50)', () => {
       groq.ageGate = origAgeGate;
     }
   });
+
+  // ---- AGE-1 T1: tmdbRatings fetch-level (F1) — the append_to_response query
+  // must survive to the URL, the per-country parse must be correct, and a 404
+  // must yield {} (no answer) without throwing. This is the test that would
+  // have caught F1: the old one-arg get dropped the query, so the URL never
+  // carried append_to_response and TMDB returned no ratings. ----
+  okAsync('AGE-1 T1: tmdbRatings — append_to_response on URL; per-country parse; 404 → {}', async () => {
+    const urls = [];
+    const stub = (url) => {
+      const u = String(url);
+      urls.push(u);
+      const path = new URL(u).pathname;
+      if (path.endsWith('/tv/1908')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          content_ratings: { results: [
+            { iso_3166_1: 'AU', rating: 'R 18+' },
+            { iso_3166_1: 'US', rating: 'TV-14' },
+            { iso_3166_1: 'GB', rating: '15' },
+          ] },
+        }) });
+      }
+      if (path.endsWith('/tv/114922')) {
+        return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) }); // 404 → no answer
+      }
+      if (path.endsWith('/movie/550')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          release_dates: { results: [
+            { iso_3166_1: 'AU', release_dates: [{ certification: 'M' }] },
+            { iso_3166_1: 'US', release_dates: [{ certification: 'TV-14' }] },
+          ] },
+        }) });
+      }
+      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
+    };
+    ageSources.setTmdbFetch(stub);
+    settings.updateSettings({ keys: { tmdb_api_key: 'test-tmdb-key' } });
+    try {
+      // Series → append_to_response=content_ratings; per-country parse.
+      const seriesOut = await ageSources.tmdbRatings({}, 'series', [
+        { key: 'series:1908', imdb_id: 'tt1' },
+        { key: 'series:114922', imdb_id: 'tt2' },
+      ]);
+      assert.ok(urls.some((u) => u.includes('append_to_response=content_ratings')), 'series URL carries append_to_response=content_ratings');
+      assert.deepStrictEqual(seriesOut.get('series:1908'), { AU: 'R 18+', US: 'TV-14', GB: '15' });
+      assert.deepStrictEqual(seriesOut.get('series:114922'), {}); // 404 → no answer, no throw
+      // Movie → append_to_response=release_dates; first non-empty certification per country.
+      const movieOut = await ageSources.tmdbRatings({}, 'movie', [
+        { key: 'movie:550', imdb_id: 'tt3' },
+      ]);
+      assert.ok(urls.some((u) => u.includes('append_to_response=release_dates')), 'movie URL carries append_to_response=release_dates');
+      assert.deepStrictEqual(movieOut.get('movie:550'), { AU: 'M', US: 'TV-14' });
+    } finally {
+      ageSources.setTmdbFetch(global.fetch);
+      settings.updateSettings({ keys: { tmdb_api_key: '' } });
+    }
+  });
 }
 
 // ---- HTTP surface ----

@@ -13,20 +13,33 @@ const store = require('../store');
 const TMDB_API = 'https://api.themoviedb.org/3';
 const COUNTRIES = ['AU', 'US', 'GB', 'IE', 'NZ', 'CA'];
 
+// The TMDB fetch seam. Defaults to the global fetch; a test can replace it via
+// `setTmdbFetch` so a fetch-level test (T1) is isolated from the other AGE-1
+// async tests (which run in parallel and stub the global fetch for TVDB).
+let tmdbFetch = global.fetch;
+function setTmdbFetch(fn) { tmdbFetch = fn; }
+
 // Per-country TMDB ratings (AU/US/GB/IE/NZ/CA) for a batch of titles. `titles`
 // are the chain's shape ({ key: `${type}:${tmdbId}`, ... }); the tmdb id is read
 // off the key. A per-title failure yields an empty object (no answer from this
 // step — the chain continues), never a throw.
-async function tmdbRatings(type, titles, log = console) {
+//
+// The key is read via keyFor(profile, 'tmdb_api_key') (Server Config first, the
+// per-profile value as a legacy fallback) — the same resolution the rest of the
+// app uses, so a per-profile key still works on older profiles.
+async function tmdbRatings(profile, type, titles, log = console) {
   const out = new Map();
-  const apiKey = (settings.getSettings()?.keys?.tmdb_api_key || '').trim();
+  const apiKey = (settings.keyFor(profile, 'tmdb_api_key') || '').trim();
   if (!apiKey) return out; // no key → no answer from this step
   const headers = apiKey.length > 50 ? { Authorization: `Bearer ${apiKey}` } : {};
-  const params = apiKey.length > 50 ? {} : { api_key: apiKey };
-  const get = async (endpoint) => {
+  const authParams = apiKey.length > 50 ? {} : { api_key: apiKey };
+  // `get` takes a params argument so the append_to_response query survives (F1:
+  // the old one-arg get silently dropped {append_to_response:…}, so TMDB never
+  // returned per-country ratings and the hard floor never fired).
+  const get = async (endpoint, params = {}) => {
     const url = new URL(`${TMDB_API}/${endpoint}`);
-    for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
-    const res = await governor.schedule('tmdb', () => fetch(url, { headers }));
+    for (const [k, v] of Object.entries({ ...authParams, ...params })) url.searchParams.set(k, v);
+    const res = await governor.schedule('tmdb', () => tmdbFetch(url, { headers }));
     if (!res.ok) throw new Error(`TMDB ${endpoint} failed (${res.status})`);
     return res.json();
   };
@@ -97,7 +110,7 @@ async function llmGate(type, tier, titles, log = console) {
 function buildSources(profile, log = console) {
   const mdbKey = () => (settings.getSettings()?.keys?.mdblist_api_key || '').trim();
   return {
-    tmdbRatings: (type, titles) => tmdbRatings(type, titles, log),
+    tmdbRatings: (type, titles) => tmdbRatings(profile, type, titles, log),
     csmAges: (type, imdbIds) => {
       const key = mdbKey();
       return key ? mdblist.commonSenseAges(key, type, imdbIds, log) : Promise.resolve(new Map());
@@ -112,4 +125,4 @@ function buildSources(profile, log = console) {
   };
 }
 
-module.exports = { buildSources, tmdbRatings, llmGate };
+module.exports = { buildSources, tmdbRatings, llmGate, setTmdbFetch };
