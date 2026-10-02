@@ -327,11 +327,13 @@ function parseSeriesProgress(item, section) {
   const firstRealAt = realStamps.length ? realStamps[0] : null;
   const lastRealAt = realStamps.length ? realStamps[realStamps.length - 1] : null;
 
-  // Speed: real stamps only, ≥ 4 required.
+  // Speed: real stamps only, ≥ 4 required. eps_per_week = real_stamps / max(1,
+  // span in weeks) — the span is measured in 7-day units (7 * 86400e3 ms), so a
+  // show watched over 2 weeks at 4 real eps is 2 eps/week.
   let epsPerWeek = null;
   if (realStamps.length >= 4) {
-    const spanDays = (lastRealAt - firstRealAt) / (7 * 3600e3);
-    epsPerWeek = realStamps.length / Math.max(1, spanDays);
+    const spanWeeks = (lastRealAt - firstRealAt) / (7 * 86400e3);
+    epsPerWeek = realStamps.length / Math.max(1, spanWeeks);
   }
 
   return {
@@ -353,6 +355,14 @@ function parseSeriesProgress(item, section) {
     real_stamps: realStamps.length,
     eps_per_week: epsPerWeek,
   };
+}
+
+// Map an all-items section (shows | anime) into progress rows, dropping entries
+// parseSeriesProgress can't use (no ids / no simkl id). Pure.
+function parseSeriesProgressItems(items, section) {
+  return (Array.isArray(items) ? items : [])
+    .map((it) => parseSeriesProgress(it, section))
+    .filter(Boolean);
 }
 
 // ---- recent watched history (debug view) ----
@@ -530,6 +540,7 @@ module.exports = {
   parseWatchedItem,
   parseWatchedItems,
   parseSeriesProgress,
+  parseSeriesProgressItems,
   BULK_GAP_MS,
   withParams,
   USER_AGENT,

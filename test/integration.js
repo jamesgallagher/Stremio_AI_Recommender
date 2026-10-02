@@ -6364,6 +6364,185 @@ async function main() {
     }
   });
 
+  // ── O. Marquee TV TV-1: series progress store + one-time backfill ──────────
+  // The per-show progress store (series_progress) and the sync wiring: a one-time
+  // backfill fills it from a full shows+anime pull, steady-state syncs delta-pull
+  // with episodes, and deleteForProfile clears both new tables. Simkl is stubbed
+  // (no network); the pure parseSeriesProgress is exercised through the real
+  // sync path.
+  const simklStub = (fixtures) => {
+    const calls = [];
+    const origAll = simkl.getAllItems;
+    const origAct = simkl.getActivities;
+    simkl.getAllItems = async (_profile, type, opts = {}) => {
+      calls.push({ type, status: opts.status, dateFrom: opts.dateFrom, episodes: !!opts.episodes });
+      return fixtures[`${type}:${opts.status}`] || [];
+    };
+    simkl.getActivities = async () => fixtures.__activities;
+    return {
+      calls,
+      restore() { simkl.getAllItems = origAll; simkl.getActivities = origAct; },
+    };
+  };
+  // A Simkl all-items show/anime entry with per-episode stamps.
+  const seriesItem = (simklId, section, { title, year, status, watched, total, notAired, lastWatchedAt, stamps }) => {
+    const media = { ids: { simkl: simklId, imdb: `tt${simklId}`, tmdb: String(simklId) }, title, year };
+    return {
+      [section]: media,
+      status,
+      watched_episodes_count: watched,
+      total_episodes_count: total,
+      not_aired_episodes_count: notAired,
+      last_watched_at: lastWatchedAt,
+      seasons: [{ episodes: stamps.map((t) => ({ watched_at: t })) }],
+    };
+  };
+  const showA = seriesItem(100, 'show', { title: 'Show A', year: 2020, status: 'completed', watched: 4, total: 10, notAired: 0, lastWatchedAt: '2026-01-15T00:00:00Z', stamps: ['2026-01-01T00:00:00Z', '2026-01-05T00:00:00Z', '2026-01-10T00:00:00Z', '2026-01-15T00:00:00Z'] });
+  const showB = seriesItem(200, 'show', { title: 'Show B', year: 2021, status: 'watching', watched: 2, total: 20, notAired: 5, lastWatchedAt: '2026-02-01T00:00:00Z', stamps: ['2026-02-01T00:00:00Z', '2026-02-01T00:00:00Z'] });
+  const animeC = seriesItem(300, 'anime', { title: 'Anime C', year: 2022, status: 'completed', watched: 1, total: 12, notAired: 0, lastWatchedAt: '2026-03-01T00:00:00Z', stamps: ['2026-03-01T00:00:00Z'] });
+  const movieX = { movie: { ids: { simkl: 500, imdb: 'tt500', tmdb: '500' }, title: 'Movie X', year: 2020 }, last_watched_at: '2026-01-01T00:00:00Z' };
+
+  await it('O1. upsertSeriesProgress + getSeriesProgress round-trip, kind filter, refresh (I1)', async () => {
+    const p = config.addProfile('INT-O1');
+    try {
+      const rowA = { simkl_id: 100, kind: 'show', imdb_id: 'tt100', tmdb_id: '100', title: 'Show A', year: 2020, status: 'completed', watched_eps: 4, total_eps: 10, not_aired_eps: 0, last_watched_at: Date.parse('2026-01-15T00:00:00Z'), first_watched_at: Date.parse('2026-01-01T00:00:00Z'), first_real_at: Date.parse('2026-01-01T00:00:00Z'), last_real_at: Date.parse('2026-01-15T00:00:00Z'), stamps: 4, real_stamps: 4, eps_per_week: 2 };
+      const rowC = { simkl_id: 300, kind: 'anime', imdb_id: 'tt300', tmdb_id: '300', title: 'Anime C', year: 2022, status: 'completed', watched_eps: 1, total_eps: 12, not_aired_eps: 0, last_watched_at: Date.parse('2026-03-01T00:00:00Z'), first_watched_at: Date.parse('2026-03-01T00:00:00Z'), first_real_at: Date.parse('2026-03-01T00:00:00Z'), last_real_at: Date.parse('2026-03-01T00:00:00Z'), stamps: 1, real_stamps: 1, eps_per_week: null };
+      assert.strictEqual(watchedStore.upsertSeriesProgress(p.id, [rowA, rowC]), 2);
+      let rows = watchedStore.getSeriesProgress(p.id);
+      assert.strictEqual(rows.length, 2);
+      // kind filter
+      const shows = watchedStore.getSeriesProgress(p.id, { kind: 'show' });
+      assert.strictEqual(shows.length, 1);
+      assert.strictEqual(shows[0].simkl_id, 100);
+      const anime = watchedStore.getSeriesProgress(p.id, { kind: 'anime' });
+      assert.strictEqual(anime.length, 1);
+      assert.strictEqual(anime[0].simkl_id, 300);
+      // refresh: re-upsert show A with more watched eps — same row, not a duplicate
+      const rowA2 = { ...rowA, watched_eps: 8, eps_per_week: 3 };
+      assert.strictEqual(watchedStore.upsertSeriesProgress(p.id, [rowA2]), 1);
+      rows = watchedStore.getSeriesProgress(p.id);
+      assert.strictEqual(rows.length, 2); // still 2 (upsert, not insert)
+      const a = rows.find((r) => r.simkl_id === 100);
+      assert.strictEqual(a.watched_eps, 8);
+      assert.strictEqual(a.eps_per_week, 3);
+    } finally {
+      config.removeProfile(p.id); watchedStore.deleteForProfile(p.id);
+    }
+  });
+
+  await it('O2. one-time backfill fills series_progress + sets marker, skips shows/anime delta (I2)', async () => {
+    const p = config.addProfile('INT-O2');
+    config.updateProfile(p.id, { keys: { simkl_client_id: 'cid' }, simkl_auth: { access_token: 'tok' } });
+    const profile = config.getProfile(p.id);
+    const fixtures = {
+      __activities: { all: '2026-01-01T00:00:00Z' },
+      'shows:completed': [showA],
+      'shows:watching': [showB],
+      'anime:completed': [animeC],
+      'anime:watching': [],
+      'movies:completed': [movieX],
+    };
+    const stub = simklStub(fixtures);
+    try {
+      const r = await watchedStore.syncFromSimkl(profile, quiet);
+      assert.strictEqual(r.skipped, false);
+      // Backfill made 4 shows/anime GETs (no dateFrom, episodes true).
+      const backfillCalls = stub.calls.filter((c) => (c.type === 'shows' || c.type === 'anime') && !c.dateFrom);
+      assert.strictEqual(backfillCalls.length, 4);
+      assert.ok(backfillCalls.every((c) => c.episodes), 'backfill pulls carry episodes');
+      // The main loop skipped shows/anime (already backfilled) — only movies pulled.
+      const mainShowsAnime = stub.calls.filter((c) => (c.type === 'shows' || c.type === 'anime') && c.dateFrom);
+      assert.strictEqual(mainShowsAnime.length, 0, 'shows/anime delta skipped in the backfill run');
+      const movieCall = stub.calls.find((c) => c.type === 'movies');
+      assert.ok(movieCall, 'movies pulled');
+      assert.strictEqual(movieCall.episodes, false, 'movies pull has no episodes');
+      // series_progress filled from the backfill (3 rows).
+      const rows = watchedStore.getSeriesProgress(p.id);
+      assert.strictEqual(rows.length, 3);
+      const a = rows.find((r) => r.simkl_id === 100);
+      assert.strictEqual(a.kind, 'show');
+      assert.strictEqual(a.watched_eps, 4);
+      assert.strictEqual(a.real_stamps, 4);
+      assert.strictEqual(a.eps_per_week, 2);
+      const b = rows.find((r) => r.simkl_id === 200);
+      assert.strictEqual(b.real_stamps, 0, 'identical stamps are bulk');
+      assert.strictEqual(b.eps_per_week, null);
+      const c = rows.find((r) => r.simkl_id === 300);
+      assert.strictEqual(c.kind, 'anime');
+      // Marker set.
+      assert.ok(watchedStore.getSeriesProgressSync(p.id), 'backfill marker set');
+      // The watched table also got the shows/anime rows from the backfill.
+      const watched = watchedStore.getWatched(p.id, { type: 'series' });
+      assert.strictEqual(watched.length, 3);
+    } finally {
+      stub.restore();
+      config.removeProfile(p.id); watchedStore.deleteForProfile(p.id);
+    }
+  });
+
+  await it('O3. steady-state sync: marker present → no backfill, shows/anime delta with episodes (I3)', async () => {
+    const p = config.addProfile('INT-O3');
+    config.updateProfile(p.id, { keys: { simkl_client_id: 'cid' }, simkl_auth: { access_token: 'tok' } });
+    const profile = config.getProfile(p.id);
+    // Pre-set the backfill marker + a sync cursor (a prior backfill already ran).
+    watchedStore.setSeriesProgressSync(p.id);
+    watchedStore.setSyncState(p.id, '2026-01-01T00:00:00Z');
+    const fixtures = {
+      __activities: { all: '2026-01-02T00:00:00Z' }, // changed → no early return
+      'shows:completed': [showA],
+      'shows:watching': [showB],
+      'anime:completed': [animeC],
+      'anime:watching': [],
+      'movies:completed': [movieX],
+    };
+    const stub = simklStub(fixtures);
+    try {
+      await watchedStore.syncFromSimkl(profile, quiet);
+      // No backfill: no shows/anime pull WITHOUT dateFrom.
+      const backfillCalls = stub.calls.filter((c) => (c.type === 'shows' || c.type === 'anime') && !c.dateFrom);
+      assert.strictEqual(backfillCalls.length, 0, 'no backfill when the marker is present');
+      // Shows/anime delta pulls happened WITH dateFrom + episodes.
+      const deltaShowsAnime = stub.calls.filter((c) => (c.type === 'shows' || c.type === 'anime'));
+      assert.strictEqual(deltaShowsAnime.length, 4);
+      assert.ok(deltaShowsAnime.every((c) => c.dateFrom === '2026-01-01T00:00:00Z' && c.episodes), 'delta pulls carry dateFrom + episodes');
+      // series_progress rows upserted from the delta pulls.
+      const rows = watchedStore.getSeriesProgress(p.id);
+      assert.strictEqual(rows.length, 3);
+      // Marker NOT re-set: backfilled_at unchanged (still the pre-set value).
+      const sync = watchedStore.getSeriesProgressSync(p.id);
+      assert.ok(sync, 'marker still present');
+    } finally {
+      stub.restore();
+      config.removeProfile(p.id); watchedStore.deleteForProfile(p.id);
+    }
+  });
+
+  await it('O4. deleteForProfile clears series_progress + series_progress_sync (I4)', async () => {
+    const p = config.addProfile('INT-O4');
+    config.updateProfile(p.id, { keys: { simkl_client_id: 'cid' }, simkl_auth: { access_token: 'tok' } });
+    const profile = config.getProfile(p.id);
+    const fixtures = {
+      __activities: { all: '2026-01-01T00:00:00Z' },
+      'shows:completed': [showA],
+      'shows:watching': [showB],
+      'anime:completed': [animeC],
+      'anime:watching': [],
+      'movies:completed': [movieX],
+    };
+    const stub = simklStub(fixtures);
+    try {
+      await watchedStore.syncFromSimkl(profile, quiet); // backfill runs
+      assert.strictEqual(watchedStore.getSeriesProgress(p.id).length, 3);
+      assert.ok(watchedStore.getSeriesProgressSync(p.id));
+      watchedStore.deleteForProfile(p.id);
+      assert.strictEqual(watchedStore.getSeriesProgress(p.id).length, 0, 'series_progress cleared');
+      assert.strictEqual(watchedStore.getSeriesProgressSync(p.id), null, 'series_progress_sync cleared');
+    } finally {
+      stub.restore();
+      config.removeProfile(p.id); watchedStore.deleteForProfile(p.id);
+    }
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();
