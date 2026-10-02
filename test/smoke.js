@@ -3511,6 +3511,57 @@ ok('calibrated A2: incremental greedy is fast (425 rows, listSize 50)', () => {
   assert.ok(avg < 40, 'avg ' + avg.toFixed(2) + ' ms must be < 40 ms');
 });
 
+// ---- AGE-1: rating tables (pure) ----
+{
+  const ratings = require('../src/ageVerification/ratings');
+  const tiers = require('../src/ageVerification/tiers');
+  const tier = tiers.TIERS[14];
+
+  ok('AGE-1 R1: normalizeRating / classify', () => {
+    // 'MA 15+' normalises to 'MA15+' → block (series and film)
+    assert.strictEqual(ratings.normalizeRating('MA 15+'), 'MA15+');
+    assert.strictEqual(ratings.classify('MA 15+', 'series', tier), 'block');
+    assert.strictEqual(ratings.classify('MA 15+', 'movie', tier), 'block');
+    // TV-Y7-FV → allow (series)
+    assert.strictEqual(ratings.classify('TV-Y7-FV', 'series', tier), 'allow');
+    // M → allow for both
+    assert.strictEqual(ratings.classify('M', 'series', tier), 'allow');
+    assert.strictEqual(ratings.classify('M', 'movie', tier), 'allow');
+    // a PG-13 show → allow (cross-type: PG-13 is a film rating)
+    assert.strictEqual(ratings.classify('PG-13', 'series', tier), 'allow');
+    // a TV-MA film → block (cross-type: TV-MA is a show rating)
+    assert.strictEqual(ratings.classify('TV-MA', 'movie', tier), 'block');
+    // E, NR, Not Rated, '' → null (no rating)
+    assert.strictEqual(ratings.classify('E', 'series', tier), null);
+    assert.strictEqual(ratings.classify('NR', 'movie', tier), null);
+    assert.strictEqual(ratings.classify('Not Rated', 'series', tier), null);
+    assert.strictEqual(ratings.classify('', 'movie', tier), null);
+  });
+
+  ok('AGE-1 R2: classifyForeign', () => {
+    assert.strictEqual(ratings.classifyForeign('GB', '12A', tier), 'allow');
+    assert.strictEqual(ratings.classifyForeign('GB', '15', tier), 'block');
+    assert.strictEqual(ratings.classifyForeign('IE', '15A', tier), 'block');
+    assert.strictEqual(ratings.classifyForeign('NZ', 'M', tier), 'block');
+    assert.strictEqual(ratings.classifyForeign('NZ', 'R13', tier), 'allow');
+    assert.strictEqual(ratings.classifyForeign('CA', '14A', tier), 'allow');
+    assert.strictEqual(ratings.classifyForeign('CA', '18A', tier), 'block');
+    // 3-letter TVDB codes work
+    assert.strictEqual(ratings.classifyForeign('GBR', '12A', tier), 'allow');
+    // DE 12 → null (not a listed country)
+    assert.strictEqual(ratings.classifyForeign('DE', '12', tier), null);
+  });
+
+  ok('AGE-1 R3: classifyLoose', () => {
+    assert.strictEqual(ratings.classifyLoose('15', tier), 'block');
+    assert.strictEqual(ratings.classifyLoose('12', tier), 'allow');
+    assert.strictEqual(ratings.classifyLoose('M18', tier), 'block');
+    assert.strictEqual(ratings.classifyLoose('NC16', tier), 'block');
+    assert.strictEqual(ratings.classifyLoose('TV-14', tier), 'allow');
+    assert.strictEqual(ratings.classifyLoose('XYZ', tier), null);
+  });
+}
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');
