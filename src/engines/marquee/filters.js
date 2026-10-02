@@ -13,6 +13,7 @@
 const tmdb = require('../../services/tmdb');
 const certs = require('../../certs');
 const recency = require('../../recency');
+const ratings = require('../../ageVerification/ratings');
 
 // Re-export the shared cert table for convenience (ME-01).
 const {
@@ -41,6 +42,8 @@ function compileEnvelope(filters, { nowYear, genreMap }) {
   const maxAge = recency.maxAgeOf(f, nowYear); // decade floor → equivalent window (src/recency.js)
   const excluded = new Set(f.excluded_genres || []);
   const kids = (f.age_limit || 0) > 0;
+  const ageVerification = require('../../ageVerification');
+  const chainTier = ageVerification.usesChain(f) ? ageVerification.tierFor(f) : null;
   const judgementAge = judgementAgeOf(f);
   // Reject counters, incremented by BOTH prefilter and hardFilter on each
   // rejection (P4 uses them to explain a shortfall, spec §8.3).
@@ -71,10 +74,15 @@ function compileEnvelope(filters, { nowYear, genreMap }) {
       if (ids.length) p.without_genres = ids.join(',');
     }
     if (kids) {
-      const ceiling = auCeilingFor(judgementAge);
-      if (ceiling) {
+      if (chainTier) {
         p.certification_country = 'AU';
-        p['certification.lte'] = ceiling; // TMDB's spelling (space in 'MA 15+')
+        p['certification.lte'] = 'MA 15+'; // TV-14: only R 18+ and above are cut at the source
+      } else {
+        const ceiling = auCeilingFor(judgementAge); // legacy tiers: UNCHANGED
+        if (ceiling) {
+          p.certification_country = 'AU';
+          p['certification.lte'] = ceiling;
+        }
       }
     }
     return p;
@@ -117,10 +125,16 @@ function compileEnvelope(filters, { nowYear, genreMap }) {
     // UNKNOWN passes (fail open, like the serve path).
     if (r.availability === 'NOT_YET') { stats.unavailable += 1; return { ok: false, reason: 'unavailable' }; }
     if (kids) {
-      // MD-3: a kids profile drops a title with no known AU/US classification.
-      const m = strictestMinAge(r.certAU, r.certUS);
-      if (m === null) { stats.cert_unknown += 1; return { ok: false, reason: 'cert_unknown' }; }
-      if (m > judgementAge) { stats.cert_over += 1; return { ok: false, reason: 'cert_over' }; }
+      if (chainTier) {
+        // TV-14: hard floor only (AU R18+/X18+/RC, US NC-17). Unknown or other
+        // certificates PASS here — ageGatePool's verify() decides after the build.
+        if (ratings.isHardFloor(r.certAU, r.certUS, chainTier)) { stats.cert_over += 1; return { ok: false, reason: 'cert_over' }; }
+      } else {
+        // legacy tiers: UNCHANGED
+        const m = strictestMinAge(r.certAU, r.certUS);
+        if (m === null) { stats.cert_unknown += 1; return { ok: false, reason: 'cert_unknown' }; }
+        if (m > judgementAge) { stats.cert_over += 1; return { ok: false, reason: 'cert_over' }; }
+      }
     }
     return { ok: true };
   }

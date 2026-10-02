@@ -192,15 +192,38 @@ async function handleSearch(profile, type, extraStr, res) {
     // blacklist is not tied to an age limit.
     metas = await rebuild.applyAnimeGate(metas, profile, console);
     if (kids) {
-      const vetoed = await llm.ageGate(
-        type, rebuild.judgementAge(profile.filters),
-        metas.map((m) => ({
-          id: m.id, cacheId: m._tmdb_id, title: m.name, year: m.releaseInfo,
-          genres: m._genre_names, certification: m._certification, overview: m.description,
-        })),
-        console,
-      );
-      metas = metas.filter((m) => !vetoed.has(m.id));
+      const ageVerify = require('./ageVerification');
+      const tier = ageVerify.tierFor({ age_limit: profile.filters.age_limit || 0 });
+      if (tier && tier.mode === 'chain') {
+        // TV-14: run the multi-source decision chain (mandate A1).
+        const sources = require('./ageVerification/sources').buildSources(profile, console);
+        const titles = metas.map((m) => ({
+          key: `${type}:${m._tmdb_id}`,
+          imdb_id: m.id,
+          adult: m._adult || false,
+          title: m.name,
+          year: m.releaseInfo,
+          genres: m._genre_names || [],
+          certification: m._certification || null,
+        }));
+        const result = await ageVerify.verify(titles, type, tier, sources, console);
+        const blocked = new Set();
+        for (const [k, v] of result) {
+          if (v.verdict === 'block') blocked.add(k.split(':')[1]);
+        }
+        metas = metas.filter((m) => !blocked.has(m._tmdb_id));
+      } else {
+        // Other tiers: LLM age gate (unchanged).
+        const vetoed = await llm.ageGate(
+          type, rebuild.judgementAge(profile.filters),
+          metas.map((m) => ({
+            id: m.id, cacheId: m._tmdb_id, title: m.name, year: m.releaseInfo,
+            genres: m._genre_names, certification: m._certification, overview: m.description,
+          })),
+          console,
+        );
+        metas = metas.filter((m) => !vetoed.has(m.id));
+      }
     }
     console.log(`[search] ${profile.name}/${type} "${query}": ${metas.length} result(s)${kids ? ' (age-gated)' : ''}`);
     return res.json({ metas: applyRpdb(rebuild.cleanMetas(metas), settings.keyFor(profile, 'rpdb_api_key')), cacheMaxAge: 3600 });

@@ -240,6 +240,33 @@ async function applyExtraAgeGate(profile, def, metas, log = console) {
   let list = await applyAnimeGate(metas, gateProfile, log);
   if (limit <= 0 || !list.length) return list;
   metas = list;
+  // TV-14: run the multi-source decision chain (mandate A1: only age_limit===14
+  // uses the chain; every other tier runs the LLM path below, byte-identical).
+  const ageVerify = require('./ageVerification');
+  const tier = ageVerify.tierFor({ age_limit: limit });
+  if (tier && tier.mode === 'chain') {
+    const sources = require('./ageVerification/sources').buildSources(profile, log);
+    const titles = metas.map((m) => ({
+      key: `${def.type}:${m._tmdb_id}`,
+      imdb_id: m.id,
+      adult: m._adult || false,
+      title: m.name,
+      year: m.releaseInfo,
+      genres: m._genre_names || [],
+      certification: m._certification || null,
+    }));
+    const result = await ageVerify.verify(titles, def.type, tier, sources, log);
+    const blocked = new Set();
+    for (const [k, v] of result) {
+      if (v.verdict === 'block') blocked.add(k.split(':')[1]);
+    }
+    const out = metas.filter((m) => !blocked.has(m._tmdb_id));
+    if (blocked.size) {
+      log.log(`[extra] ${profile.name}/${def.id}: TV-14 chain removed ${blocked.size} of ${metas.length}`);
+    }
+    return out;
+  }
+  // Other tiers: LLM age gate (unchanged).
   if (!settings.hasLlm()) {
     throw new Error(`No LLM configured — required for the age check on "${def.name}" (set a Custom LLM or Groq key in Server Config)`);
   }
