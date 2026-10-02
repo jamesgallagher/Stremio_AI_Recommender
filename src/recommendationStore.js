@@ -374,6 +374,11 @@ async function refreshStaleRatings(profileId, mdblistKey, log = console, { now =
   return { checked: due.length, updated };
 }
 
+// TV-2 C1: the canonical order of the age chain's source labels for the
+// per-source log line (deterministic sources first, then the hard floor, then
+// the LLM). Only sources with a non-zero count are listed.
+const AGE_SOURCE_ORDER = ['csm', 'au', 'us', 'tvdb-au', 'tvdb-us', 'simkl', 'mdblist', 'tmdb-gb', 'tmdb-ie', 'tmdb-nz', 'tmdb-ca', 'tvdb-gbr', 'tvdb-irl', 'tvdb-nzl', 'tvdb-can', 'hard-floor', 'llm'];
+
 // Age-gate the pool (docs/v6-features F5). Reuses the shipped v5.2 stack:
 //   1. NSFW blacklist + anime age band (ALL profiles) via rebuild.applyAnimeGate
 //      — porn is dropped for everyone; anime over the band for age-limited ones.
@@ -402,6 +407,8 @@ async function ageGatePool(profile, log = console, onProgress = () => {}) {
   // multi-source decision chain is the ONLY age gate (mandate B3: no legacy
   // LLM age path remains). The chain's LLM step (step 5) is fail-closed.
   let vetoed = 0;
+  const decidedBySource = new Map();
+  const blockedBySource = new Map();
   if (limit > 0) {
     const ageVerify = require('./ageVerification');
     const tier = ageVerify.tierFor({ age_limit: limit });
@@ -426,11 +433,20 @@ async function ageGatePool(profile, log = console, onProgress = () => {}) {
         // A7: store the verdict's source+rating on the pool row's certification column.
         if (v.verdict === 'allow' || v.verdict === 'block') {
           setCertification(profile.id, type, tmdbId, `${v.source}:${v.rating || ''}`);
+          // TV-2 C1: accumulate per-source counts. A cached verdict returns its
+          // stored source from verify(), so cache hits count by their stored source.
+          decidedBySource.set(v.source, (decidedBySource.get(v.source) || 0) + 1);
+          if (v.verdict === 'block') blockedBySource.set(v.source, (blockedBySource.get(v.source) || 0) + 1);
         }
       }
     }
+    // TV-2 C1: one per-source line (AGE-2 card §2.9). Only sources with n > 0
+    // are listed; the tier label names the chain tier.
+    const listBySource = (m) => AGE_SOURCE_ORDER.filter((s) => (m.get(s) || 0) > 0).map((s) => `${s} ${m.get(s)}`);
+    log.log(`[rec] ${profile.name}: age gate (${tier.label}) — ${dropped} NSFW/band dropped · decided: ${listBySource(decidedBySource).join(', ')} · blocked ${vetoed} (${listBySource(blockedBySource).join(', ')}) · ${countRecommended(profile.id)} remain`);
+  } else {
+    log.log(`[rec] ${profile.name}: age gate — ${dropped} NSFW/band dropped, ${vetoed} LLM-vetoed, ${countRecommended(profile.id)} remain`);
   }
-  log.log(`[rec] ${profile.name}: age gate — ${dropped} NSFW/band dropped, ${vetoed} LLM-vetoed, ${countRecommended(profile.id)} remain`);
   return { dropped, vetoed, remain: countRecommended(profile.id) };
 }
 

@@ -186,7 +186,9 @@ async function main() {
     const benchOutDir = path.join(liveDir, 'bench');
     fs.mkdirSync(benchOutDir, { recursive: true });
     const ts = new Date().toISOString().replace(/[:.]/g, '-');
-    const outFile = path.join(benchOutDir, `bench-${a.profile}-${ts}.json`);
+    // TV-2 C3: series reports are named bench-<profile>-series-<timestamp>.json
+    // (movie reports keep the existing bench-<profile>-<timestamp>.json name).
+    const outFile = path.join(benchOutDir, bench.reportFileName(a.profile, a.type, ts));
     const payload = {
       profile: results.profile,
       at: new Date().toISOString(),

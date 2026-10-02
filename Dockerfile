@@ -3,6 +3,9 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --omit=dev || npm install --omit=dev
 COPY src ./src
+# TV-2 C4: ship scripts/ (bench-engines.js and the series-ladder tool) in the
+# image so the reviewer can run the backtest on the staged server.
+COPY scripts ./scripts
 COPY public ./public
 # Mobile Companion app (mounted at /mobile by src/server.js). Runtime code +
 # static SPA; docs/ and test/ are excluded via .dockerignore.

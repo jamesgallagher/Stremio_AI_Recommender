@@ -353,6 +353,14 @@ async function discoverMovies(apiKey, params, { page = 1 } = {}) {
   return (data.results || []).map((r) => mapListItem(r, 'movie'));
 }
 
+// discover/tv with the caller's params (T3 taste-driven discovery + T6
+// airing-now) passed through untouched; the same list-item shape as
+// getRecommendations, typed series.
+async function discoverTv(apiKey, params, { page = 1 } = {}) {
+  const data = await get(apiKey, 'discover/tv', { language: 'en-US', ...params, page });
+  return (data.results || []).map((r) => mapListItem(r, 'series'));
+}
+
 // trending/movie/{day|week}, pages 1..pages fetched SEQUENTIALLY. rank is
 // 1-based and continuous across pages (page 2's first item is
 // rank = page1.length + 1) — P3's 1 − ln(rank)/ln(N+1) assumes it. A failed
@@ -467,6 +475,38 @@ async function deepMeta(apiKey, type, tmdbId, log = console) {
   }
 }
 
+// TV details in ONE append call (TV-2 §5.1): the deep meta (Glass taste
+// dimensions) plus the TV-specific `extras` the engine filters and scores on
+// (format, status, air dates, episode counts, AU/US content ratings). A
+// failure returns null (the caller logs and treats it as "enrich later").
+async function tvDetailsFull(apiKey, tmdbId) {
+  try {
+    const data = await get(apiKey, `tv/${tmdbId}`, {
+      language: 'en-US',
+      append_to_response: 'credits,keywords,external_ids,content_ratings',
+    });
+    const extras = {
+      tvType: data.type || null,
+      status: data.status || null,
+      first_air_date: data.first_air_date || null,
+      last_air_date: data.last_air_date || null,
+      last_episode_air_date: data.last_episode_to_air?.air_date || null,
+      next_episode_air_date: data.next_episode_to_air?.air_date || null,
+      number_of_seasons: data.number_of_seasons ?? null,
+      number_of_episodes: data.number_of_episodes ?? null,
+      episode_runtime: data.episode_run_time?.[0] || data.last_episode_to_air?.runtime || null,
+      origin_country: data.origin_country || [],
+      original_language: data.original_language || null,
+      raw_genres: (data.genres || []).map((g) => g.name),
+      certAU: certForCountryTv(data.content_ratings?.results, 'AU'),
+      certUS: certForCountryTv(data.content_ratings?.results, 'US'),
+    };
+    return { deep: normalizeDeepMeta(data, 'series', tmdbId), extras };
+  } catch (err) {
+    return null;
+  }
+}
+
 // tmdb id -> imdb tt id, via the LIGHTEST possible call (external_ids only, no
 // images/credits). Used to make stored recommendation-pool candidates servable
 // to Stremio, which needs tt ids. Returns null when TMDB has no imdb id (those
@@ -538,6 +578,14 @@ function certForCountry(results, cc) {
   return cert || null;
 }
 
+// TV content_ratings entry is { iso_3166_1, rating } (not the movie
+// release_dates shape), so the cert is the entry's rating directly.
+function certForCountryTv(results, cc) {
+  if (!Array.isArray(results)) return null;
+  const entry = results.find((r) => r.iso_3166_1 === cc);
+  return entry?.rating || null;
+}
+
 // Pick a certification for the watched-store age column. Australia first (our
 // standard), then US, then any non-empty value.
 function pickCertification(results, kind) {
@@ -579,6 +627,8 @@ module.exports = {
   getRecommendations,
   getSimilar,
   discoverMovies,
+  discoverTv,
+  tvDetailsFull,
   trendingMovies,
   collectionParts,
   deepMeta,

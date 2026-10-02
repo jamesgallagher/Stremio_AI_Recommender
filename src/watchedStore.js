@@ -660,6 +660,11 @@ async function syncFromSimkl(profile, log = console, { force = false } = {}) {
     }
     setSeriesProgressSync(profile.id);
     backfilled = true;
+    // TV-2 C2: log inside the backfill block so it appears even when the
+    // activities gate below returns early (the gate is checked after this block).
+    const showN = getSeriesProgress(profile.id, { kind: 'show' }).length;
+    const animeN = getSeriesProgress(profile.id, { kind: 'anime' }).length;
+    log.log(`[simkl] ${profile.name}: series progress backfilled — ${showN} show(s), ${animeN} anime`);
   }
 
   const activities = await simkl.getActivities(profile);

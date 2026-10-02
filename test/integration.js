@@ -6917,6 +6917,467 @@ async function main() {
     }
   });
 
+  // ── TV-2 C1: ageGatePool logs ONE per-source line per profile (AGE-2 §2.9) ──
+  // A fixture with mixed sources (a cache hit + freshly-decided titles) must
+  // produce the exact per-source line; only sources with n > 0 are listed.
+  await it('TV-2 C1: ageGatePool logs a per-source line (mixed sources incl. a cache hit)', async () => {
+    const ageVerify = require('../src/ageVerification');
+    const sources = require('../src/ageVerification/sources');
+    const verdictStore = require('../src/ageVerification/store');
+    const db = require('../src/db');
+    offlineAnimeMap();
+    const p = config.addProfile('INT-TV2-C1');
+    config.updateProfile(p.id, { filters: { age_limit: 14 } });
+    const profile = config.getProfile(p.id);
+    const tier = ageVerify.tierFor({ age_limit: 14 });
+    // Seed the pool: six movie rows.
+    rs.upsertCandidates(p.id, ['c100', 'c101', 'c102', 'c103', 'c104', 'c105'].map((id) => ({
+      type: 'movie', tmdb_id: id, imdb_id: 'tt' + id, title: 'Show ' + id, year: 2020,
+      primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, affinity: 10, rec_count: 1, popularity: 0,
+    })));
+    // Cache hits (stored source is what the line counts): c100 csm allow,
+    // c101 au block, c105 tvdb-au allow.
+    verdictStore.recordVerdict('movie', 'c100', tier.id, 'allow', 'csm', '13', Date.now());
+    verdictStore.recordVerdict('movie', 'c101', tier.id, 'block', 'au', 'MA 15+', Date.now());
+    verdictStore.recordVerdict('movie', 'c105', tier.id, 'allow', 'tvdb-au', 'PG', Date.now());
+    // Stub the sources so the three non-cached titles decide as:
+    // c102 → us allow (US PG), c103 → hard-floor block (AU R 18+), c104 → llm allow.
+    const origBuildSources = sources.buildSources;
+    sources.buildSources = () => ({
+      tmdbRatings: async (_type, titles) => {
+        const out = new Map();
+        const ratings = { c102: { US: 'PG' }, c103: { AU: 'R 18+' }, c104: {} };
+        for (const t of titles) out.set(t.key, ratings[t.key.split(':')[1]] || {});
+        return out;
+      },
+      csmAges: async () => new Map(),
+      tvdbRatings: async () => new Map(),
+      simklCerts: async () => new Map(),
+      mdblistCerts: async () => new Map(),
+      llmGate: async (_type, _tier, titles) => {
+        const out = new Map();
+        for (const t of titles) if (t.key === 'movie:c104') out.set(t.key, true);
+        return out;
+      },
+    });
+    const lines = [];
+    const log = { log: (s) => lines.push(s), warn: () => {}, error: () => {} };
+    try {
+      await rs.ageGatePool(profile, log);
+      const line = lines.find((l) => l.includes('age gate'));
+      assert.ok(line, 'age gate line logged');
+      assert.ok(line.includes('age gate (TV-14 (14+, AU M))'), 'tier label present: ' + line);
+      assert.ok(line.includes('decided: csm 1, au 1, us 1, tvdb-au 1, hard-floor 1, llm 1'), 'per-source decided counts: ' + line);
+      assert.ok(line.includes('blocked 2 (au 1, hard-floor 1)'), 'per-source blocked counts: ' + line);
+      assert.ok(line.includes('· 4 remain'), '4 remain: ' + line);
+      // The two blocked titles are dropped from the pool.
+      assert.strictEqual(rs.getRecommended(p.id, { type: 'movie', limit: 100 }).length, 4, 'two blocked titles dropped');
+    } finally {
+      sources.buildSources = origBuildSources;
+      db.get().prepare("DELETE FROM age_verdicts WHERE type = 'movie' AND tier = 'tv14' AND tmdb_id IN ('c100','c101','c105')").run();
+      config.removeProfile(p.id); rs.deleteForProfile(p.id);
+    }
+  });
+
+  // ── TV-2 C2: syncFromSimkl logs the series backfill inside the backfill block ──
+  // A backfill run logs the line once (even when the activities gate then
+  // returns early); a non-backfill run does not.
+  await it('TV-2 C2: syncFromSimkl logs the series backfill once on backfill, not on steady-state', async () => {
+    const simklSvc = require('../src/services/simkl');
+    const p = config.addProfile('INT-TV2-C2');
+    config.updateProfile(p.id, { keys: { simkl_client_id: 'c2' }, simkl_auth: { access_token: 'tok' } });
+    const profile = config.getProfile(p.id);
+    const origGetAllItems = simklSvc.getAllItems;
+    const origGetActivities = simklSvc.getActivities;
+    const lines = [];
+    const log = { log: (s) => lines.push(s), warn: () => {}, error: () => {} };
+    // A show (kind 'show') and an anime (kind 'anime'), so the backfill counts both.
+    // Shape mirrors Simkl's all-items entry: item.show / item.anime carries ids
+    // (simkl required), seasons[].episodes[].watched_at drives the stamps.
+    const showItem = {
+      show: { ids: { simkl: 11, imdb: 'ttc2s', tmdb: 'c2s' }, title: 'Show C2', year: 2020 },
+      seasons: [{ episodes: [{ watched_at: '2026-06-01' }] }],
+      last_watched_at: '2026-06-01', status: 'completed', watched_episodes_count: 1, total_episodes_count: 1,
+    };
+    const animeItem = {
+      anime: { ids: { simkl: 12, imdb: 'ttc2a', tmdb: 'c2a' }, title: 'Anime C2', year: 2020 },
+      seasons: [{ episodes: [{ watched_at: '2026-06-01' }] }],
+      last_watched_at: '2026-06-01', status: 'completed', watched_episodes_count: 1, total_episodes_count: 1,
+    };
+    simklSvc.getAllItems = (prof, section, opts) => Promise.resolve(
+      section === 'shows' ? [showItem] : section === 'anime' ? [animeItem] : []);
+    simklSvc.getActivities = () => Promise.resolve({ all: 'c2-timestamp' });
+    try {
+      // (1) Backfill run: no series_progress_sync marker → the backfill block runs.
+      await watchedStore.syncFromSimkl(profile, log);
+      const backfillLines = lines.filter((l) => l.includes('series progress backfilled'));
+      assert.strictEqual(backfillLines.length, 1, 'backfill logged once: ' + JSON.stringify(lines));
+      assert.ok(backfillLines[0].includes('series progress backfilled — 1 show(s), 1 anime'), 'backfill counts show + anime: ' + backfillLines[0]);
+      lines.length = 0;
+      // (2) Steady-state run: marker now set → the backfill block is skipped, so
+      //    no backfill line (even though the activities gate would return early).
+      await watchedStore.syncFromSimkl(profile, log);
+      assert.strictEqual(lines.filter((l) => l.includes('series progress backfilled')).length, 0, 'no backfill line on steady-state: ' + JSON.stringify(lines));
+    } finally {
+      simklSvc.getAllItems = origGetAllItems;
+      simklSvc.getActivities = origGetActivities;
+      config.removeProfile(p.id); watchedStore.deleteForProfile(p.id);
+    }
+  });
+
+  // ── TV-2 C3: the series bench report is named bench-<profile>-series-<ts>.json ──
+  await it('TV-2 C3: reportFileName — series carries -series, movie keeps the plain name', async () => {
+    const bench = require('../src/bench/engineBench');
+    const ts = '2026-10-02T00-00-00-000Z';
+    assert.strictEqual(bench.reportFileName('James', 'series', ts), 'bench-James-series-2026-10-02T00-00-00-000Z.json', 'series report name');
+    assert.strictEqual(bench.reportFileName('James', 'movie', ts), 'bench-James-2026-10-02T00-00-00-000Z.json', 'movie report name (unchanged)');
+  });
+
+  // ── TV-2 C5: removeSeriesHoldout also removes pending_watched rows by IMDb id ──
+  // A pending row that carries ONLY an IMDb id (no tmdb_id) must be removed via
+  // the target's series_progress imdb lookup (before the series_progress row is deleted).
+  await it('TV-2 C5: removeSeriesHoldout removes a pending_watched row keyed only by IMDb id', async () => {
+    const db = require('../src/db');
+    const bench = require('../src/bench/engineBench');
+    const p = config.addProfile('INT-TV2-C5');
+    // A series_progress row for the target (tmdb s51, imdb tts51).
+    watchedStore.upsertSeriesProgress(p.id, [{
+      simkl_id: 51, kind: 'show', imdb_id: 'tts51', tmdb_id: 's51', title: 'Show 51', year: 2020,
+      status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0,
+      last_watched_at: Date.now(), first_watched_at: Date.now(),
+      first_real_at: Date.now(), last_real_at: Date.now(), stamps: 10, real_stamps: 10, eps_per_week: null,
+    }]);
+    // A pending_watched row keyed ONLY by IMDb id (no tmdb_id).
+    watchedStore.addPendingWatched(p.id, { type: 'series', imdbId: 'tts51' });
+    // Sanity: the pending row exists and has no tmdb_id.
+    const conn = db.get();
+    let row = conn.prepare('SELECT id, imdb_id, tmdb_id FROM pending_watched WHERE profile_id = ? AND imdb_id = ?').get(p.id, 'tts51');
+    assert.ok(row, 'pending row present before removal');
+    assert.strictEqual(row.tmdb_id, null, 'pending row has no tmdb_id');
+    // removeSeriesHoldout must remove it (via the series_progress imdb lookup).
+    bench.removeSeriesHoldout(p.id, ['s51'], { db });
+    row = conn.prepare('SELECT id FROM pending_watched WHERE profile_id = ? AND imdb_id = ?').get(p.id, 'tts51');
+    assert.strictEqual(row, undefined, 'pending row removed by IMDb id');
+    // The series_progress row is also gone.
+    assert.strictEqual(conn.prepare('SELECT tmdb_id FROM series_progress WHERE profile_id = ? AND tmdb_id = ?').get(p.id, 's51'), undefined, 'series_progress row removed');
+    config.removeProfile(p.id); watchedStore.deleteForProfile(p.id);
+  });
+
+  // ── TV-2 N1: discoverTv + tvDetailsFull (fetch-level) ────────────────────
+  await it('TV-2 N1: discoverTv URL + tvDetailsFull append/parse (extras + certAU/certUS)', async () => {
+    const origFetch = global.fetch;
+    const mkResponse = (payload) => ({ ok: true, status: 200, json: async () => payload });
+    try {
+      // (1) discover/tv: the params + language + page are on the URL; the
+      //     results map to series list items.
+      const tvItem = { id: 42, name: 'T', first_air_date: '2024-01-01', genre_ids: [18], vote_average: 7.5, vote_count: 900, popularity: 3, adult: false, poster_path: '/p.jpg' };
+      global.fetch = async (url) => {
+        const u = new URL(url);
+        assert.ok(u.pathname.includes('discover/tv'), 'discover/tv path');
+        assert.strictEqual(u.searchParams.get('language'), 'en-US');
+        assert.strictEqual(u.searchParams.get('page'), '2');
+        assert.strictEqual(u.searchParams.get('sort_by'), 'vote_count.desc');
+        assert.strictEqual(u.searchParams.get('with_genres'), '18|35');
+        return mkResponse({ results: [tvItem] });
+      };
+      const discovered = await tmdb.discoverTv('key', { sort_by: 'vote_count.desc', with_genres: '18|35' }, { page: 2 });
+      assert.deepStrictEqual(discovered, [{ type: 'series', tmdb_id: '42', title: 'T', year: 2024, genre_ids: [18], vote_average: 7.5, vote_count: 900, popularity: 3, adult: false, poster: '/p.jpg' }]);
+
+      // (2) tv/{id}: the append block is exact; the fixture payload yields a
+      //     deep meta + extras with every §5.1 field, and certAU/certUS come
+      //     from content_ratings.
+      const payload = {
+        id: 1234, name: 'Test Show', type: 'Scripted', status: 'Returning Series',
+        first_air_date: '2020-01-01', last_air_date: '2026-09-01',
+        last_episode_to_air: { air_date: '2026-09-01', runtime: 45 },
+        next_episode_to_air: { air_date: '2026-10-01' },
+        number_of_seasons: 5, number_of_episodes: 50, episode_run_time: [45],
+        origin_country: ['US'], original_language: 'en',
+        genres: [{ id: 18, name: 'Drama' }], poster_path: '/p.jpg',
+        vote_average: 8.5, vote_count: 1000, popularity: 5,
+        external_ids: { imdb_id: 'tt1234' },
+        content_ratings: { results: [{ iso_3166_1: 'AU', rating: 'MA15+' }, { iso_3166_1: 'US', rating: 'TV-14' }] },
+      };
+      global.fetch = async (url) => {
+        const u = new URL(url);
+        assert.ok(u.pathname.includes('tv/1234'), 'tv/1234 path');
+        assert.strictEqual(u.searchParams.get('append_to_response'), 'credits,keywords,external_ids,content_ratings');
+        assert.strictEqual(u.searchParams.get('language'), 'en-US');
+        return mkResponse(payload);
+      };
+      const res = await tmdb.tvDetailsFull('key', 1234);
+      assert.ok(res.deep, 'deep meta present');
+      assert.strictEqual(res.deep.imdb_id, 'tt1234');
+      assert.deepStrictEqual(res.extras, {
+        tvType: 'Scripted', status: 'Returning Series',
+        first_air_date: '2020-01-01', last_air_date: '2026-09-01',
+        last_episode_air_date: '2026-09-01', next_episode_air_date: '2026-10-01',
+        number_of_seasons: 5, number_of_episodes: 50, episode_runtime: 45,
+        origin_country: ['US'], original_language: 'en', raw_genres: ['Drama'],
+        certAU: 'MA15+', certUS: 'TV-14',
+      });
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  // ── TV-2 N2: ensureTvMeta (fetch only missing/expired; writes both stores; TTL) ──
+  await it('TV-2 N2: ensureTvMeta fetches missing, writes Glass metaStore + marquee_tv_meta, TTL 14d', async () => {
+    const meta = require('../src/engines/marqueeTv/meta');
+    const glassMetaStore = require('../src/engines/glass/metaStore');
+    const db = require('../src/db');
+    const fetchCalls = [];
+    const fetcher = (apiKey, id) => {
+      fetchCalls.push(id);
+      return Promise.resolve({
+        deep: { tmdb_id: String(id), imdb_id: 'tt' + id, type: 'series', title: 'Show ' + id, genres: ['Drama'] },
+        extras: { tvType: 'Scripted', status: 'Returning Series', certAU: 'MA15+', certUS: 'TV-14' },
+      });
+    };
+    const now = Date.now();
+    // (1) First call: both ids are missing → both fetched; both stores written.
+    const out1 = await meta.ensureTvMeta('key', ['ntv1', 'ntv2'], { fetcher, now });
+    assert.deepStrictEqual([...fetchCalls].sort(), ['ntv1', 'ntv2'], 'first call fetches both');
+    assert.ok(out1.has('ntv1') && out1.has('ntv2'), 'both in the map');
+    assert.ok(glassMetaStore.get('series', 'ntv1'), 'Glass metaStore series ntv1');
+    assert.ok(glassMetaStore.get('series', 'ntv2'), 'Glass metaStore series ntv2');
+    const row1 = db.get().prepare('SELECT extras FROM marquee_tv_meta WHERE tmdb_id = ?').get('ntv1');
+    assert.ok(row1 && JSON.parse(row1.extras).certAU === 'MA15+', 'marquee_tv_meta ntv1 extras');
+    // (2) Second call within 14 days: zero fetches (served from cache).
+    const out2 = await meta.ensureTvMeta('key', ['ntv1', 'ntv2'], { fetcher, now: now + 1000 });
+    assert.strictEqual(fetchCalls.length, 2, 'second call fetches nothing');
+    assert.ok(out2.has('ntv1') && out2.has('ntv2'), 'both served from cache');
+    // (3) A call after the 14-day TTL refetches.
+    const out3 = await meta.ensureTvMeta('key', ['ntv1'], { fetcher, now: now + 15 * 24 * 3600e3 });
+    assert.strictEqual(fetchCalls.length, 3, 'after TTL the id refetches');
+  });
+
+  // ── TV-2 N3: ensureShowRecs (fetch /tv/{id}?extended=full, parse, TTL 30d, cap, failure) ──
+  await it('TV-2 N3: ensureShowRecs — /tv/{id}?extended=full, parse (drop anime/TMDB-less), TTL 30d, cap, failure', async () => {
+    const simklRecs = require('../src/engines/marqueeTv/simklRecs');
+    const p = config.addProfile('INT-TV2-N3');
+    config.updateProfile(p.id, { keys: { simkl_client_id: 'c3' }, simkl_auth: { access_token: 'tok' } });
+    const profile = config.getProfile(p.id);
+    const origAuthedGet = simkl.authedGet;
+    const calls = [];
+    const body = {
+      users_recommendations: [
+        { title: 'Webster', year: 1983, type: 'tv', ids: { simkl: 7492, imdb: 'tt0085109', tmdb: '3804' } },
+        { title: 'Anime Rec', year: 2010, type: 'anime', ids: { simkl: 1, imdb: 'ttanime', tmdb: '1' } },
+        { title: 'No TMDB', year: 2000, type: 'tv', ids: { simkl: 2, imdb: 'ttnotmdb' } },
+      ],
+    };
+    try {
+      simkl.authedGet = (prof, path, extra) => {
+        calls.push({ path, extra });
+        return Promise.resolve(body);
+      };
+      // (1) Fetch + parse: /tv/100?extended=full; drops anime + TMDB-less.
+      const out = await simklRecs.ensureShowRecs(profile, [100], { now: Date.now(), log: quiet });
+      assert.ok(calls.some((c) => c.path === '/tv/100' && c.extra && c.extra.extended === 'full'), 'calls /tv/100?extended=full');
+      assert.deepStrictEqual(out.get(100), [{ tmdb_id: '3804', imdb_id: 'tt0085109', title: 'Webster', year: 1983 }]);
+      const n1 = calls.length;
+      // (2) Caching: a second call within 30 days makes zero fetches.
+      const out2 = await simklRecs.ensureShowRecs(profile, [100], { now: Date.now() + 1000, log: quiet });
+      assert.strictEqual(calls.length, n1, 'second call within 30d fetches nothing');
+      assert.deepStrictEqual(out2.get(100), [{ tmdb_id: '3804', imdb_id: 'tt0085109', title: 'Webster', year: 1983 }]);
+      // (3) Cap: 6 uncached ids, cap 2 → only 2 fetched.
+      const n2 = calls.length;
+      await simklRecs.ensureShowRecs(profile, [200, 201, 202, 203, 204, 205], { cap: 2, now: Date.now(), log: quiet });
+      assert.strictEqual(calls.length - n2, 2, 'cap: only 2 fetched');
+      // (4) Failure: a throwing fetcher gives no recs for that id without throwing.
+      simkl.authedGet = () => { throw new Error('simkl down'); };
+      const out4 = await simklRecs.ensureShowRecs(profile, [300], { now: Date.now(), log: quiet });
+      assert.strictEqual(out4.get(300), undefined, 'failure: no recs for the id');
+    } finally {
+      simkl.authedGet = origAuthedGet;
+      config.removeProfile(p.id);
+    }
+  });
+
+  // ── TV-2 E1: the full orchestrator (hermetic; stubbed network fetchers) ──
+  // A temp DB with series_progress rows (a normal seed, an anime row, a Reality
+  // show seen only as sampled_left) + Glass meta + stubs for every network
+  // fetcher. generate(series) → no anime/Reality/excluded genre, every row
+  // pre-resolved, stats filled, summary line logged; generate(movie) → [].
+  // Plus the registry: get exists, isEnabled false by default, resolveFor →
+  // Genesis while disabled, marquee-tv once enabled.
+  await it('TV-2 E1: generate(series) end-to-end — no anime/Reality/excluded genre, pre-resolved, stats + summary; movie → []; registry dark', async () => {
+    const marqueeTv = require('../src/engines/marqueeTv');
+    const glassMetaStore = require('../src/engines/glass/metaStore');
+    const nowMs = Date.parse('2026-10-02T00:00:00Z');
+    const p = config.addProfile('INT-TV2-E1');
+    config.updateProfile(p.id, {
+      filters: { engine_series: 'marquee-tv', excluded_genres: ['Horror'], min_year: 2010, min_rating: 7, vote_count_floor: 50, age_limit: 0 },
+      keys: { tmdb_api_key: 'itest-tmdb' },
+      simkl_auth: { access_token: 'tok' },
+    });
+    const profile = config.getProfile(p.id);
+
+    // A temp DB with series_progress rows (a normal seed, an anime row, a
+    // Reality show seen only as sampled_left).
+    watchedStore.upsertSeriesProgress(p.id, [
+      { simkl_id: 100, kind: 'show', imdb_id: 'ttseed1', tmdb_id: 'seed1', title: 'Seed Show', year: 2020, status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0, last_watched_at: nowMs, first_watched_at: nowMs, first_real_at: nowMs, last_real_at: nowMs, stamps: 10, real_stamps: 10, eps_per_week: null },
+      { simkl_id: 200, kind: 'anime', imdb_id: 'ttanime', tmdb_id: 'anime1', title: 'Anime Show', year: 2020, status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0, last_watched_at: nowMs, first_watched_at: nowMs, first_real_at: nowMs, last_real_at: nowMs, stamps: 10, real_stamps: 10, eps_per_week: null },
+      { simkl_id: 300, kind: 'show', imdb_id: 'ttreality', tmdb_id: 'reality1', title: 'Reality Show', year: 2020, status: 'watching', watched_eps: 1, total_eps: 10, not_aired_eps: 0, last_watched_at: nowMs - 90 * 86400e3, first_watched_at: nowMs - 90 * 86400e3, first_real_at: nowMs - 90 * 86400e3, last_real_at: nowMs - 90 * 86400e3, stamps: 1, real_stamps: 1, eps_per_week: null },
+    ]);
+
+    // TV meta: the full merged meta for every candidate (deep + extras).
+    const tvMeta = (apiKey, ids) => {
+      const m = new Map();
+      for (const id of ids) {
+        const base = { tmdb_id: id, imdb_id: 'tt' + id, type: 'series', title: 'Show ' + id, year: 2024, genres: ['Drama'], keywords: [], tvType: 'Scripted', status: 'Returning Series', vote_average: 8, vote_count: 1000, popularity: 5, certAU: null, certUS: null, first_air_date: '2024-01-01', last_air_date: '2026-01-01', number_of_episodes: 20, number_of_seasons: 1 };
+        if (id === 'anime2') { base.simklType = 'anime'; base.genres = ['Animation']; }
+        if (id === 'reality2') { base.tvType = 'Reality'; base.genres = ['Reality']; }
+        if (id === 'horror2') { base.genres = ['Horror']; }
+        m.set(id, base);
+      }
+      return m;
+    };
+
+    // Simkl recs: the candidates for seed1 (good1, anime2, reality2, horror2).
+    const simklRecs = async (profile, simklId) => {
+      if (simklId !== 100) return [];
+      return [
+        { tmdb_id: 'good1', imdb_id: 'ttgood1', title: 'Good Show', year: 2024 },
+        { tmdb_id: 'anime2', imdb_id: 'ttanime2', title: 'Anime Show 2', year: 2024 },
+        { tmdb_id: 'reality2', imdb_id: 'ttreality2', title: 'Reality Show 2', year: 2024 },
+        { tmdb_id: 'horror2', imdb_id: 'tthorror2', title: 'Horror Show 2', year: 2024 },
+      ];
+    };
+
+    const tmdbRecs = () => [];
+    const discover = () => [];
+    const trending = () => [];
+    const imdbRatings = () => new Map();
+
+    // Glass meta for the taste event (seed1) so the taste model is non-empty.
+    glassMetaStore.put('series', 'seed1', { tmdb_id: 'seed1', genres: ['Drama'] });
+
+    const logs = [];
+    const ctx = {
+      settings: {},
+      nowMs,
+      filters: { excluded_genres: ['Horror'], min_year: 2010, min_rating: 7, vote_count_floor: 50, age_limit: 0 },
+      tmdbKey: 'itest-tmdb',
+      mdblistKey: '',
+      log: { log: (msg) => logs.push(msg), warn: () => {}, error: () => {} },
+      stats: {},
+      watchedIds: { imdb: new Set(), tmdb: new Set() },
+      dont: new Set(),
+      marqueeTvFetchers: { tvMeta, simklRecs, tmdbRecs, discover, trending, imdbRatings },
+    };
+
+    try {
+      // (1) generate(series) → one candidate (good1), no anime/Reality/excluded genre.
+      const out = await marqueeTv.generate(profile, 'series', ctx);
+      assert.strictEqual(out.length, 1, 'one candidate (good1)');
+      assert.strictEqual(out[0].tmdb_id, 'good1');
+      assert.ok(!out.some((c) => c.tmdb_id === 'anime2'), 'no anime');
+      assert.ok(!out.some((c) => c.tmdb_id === 'reality2'), 'no Reality');
+      assert.ok(!out.some((c) => c.tmdb_id === 'horror2'), 'no excluded genre');
+      // every row is pre-resolved.
+      assert.ok(out.every((c) => c.imdb_id), 'every row pre-resolved (imdb_id)');
+      assert.strictEqual(out[0].imdb_id, 'ttgood1');
+      // stats are filled.
+      assert.strictEqual(ctx.stats.seeds, 1, 'stats.seeds = 1');
+      assert.strictEqual(ctx.stats.raw, 4, 'stats.raw = 4');
+      assert.strictEqual(ctx.stats.strong, 4, 'stats.strong = 4');
+      assert.strictEqual(ctx.stats.passed, 1, 'stats.passed = 1');
+      assert.strictEqual(ctx.stats.kept, 1, 'stats.kept = 1');
+      // the summary line is logged.
+      assert.ok(logs.some((l) => l.startsWith('[marquee-tv]') && l.includes('seeds 1') && l.includes('raw 4') && l.includes('passed 1') && l.includes('stored 1')), 'summary line logged');
+      // (2) generate(movie) → [].
+      const movieOut = await marqueeTv.generate(profile, 'movie', ctx);
+      assert.deepStrictEqual(movieOut, [], 'generate(movie) → []');
+      // (3) registry: get exists; isEnabled false by default; resolveFor →
+      //     Genesis while disabled, marquee-tv once enabled.
+      assert.ok(engines.get('marquee-tv'), 'engines.get(marquee-tv) exists');
+      assert.strictEqual(engines.isEnabled('marquee-tv'), false, 'isEnabled false by default');
+      assert.strictEqual(engines.resolveFor(profile, 'series').id, 'genesis', 'resolveFor → Genesis while disabled');
+      settings.updateSettings({ engines: { 'marquee-tv': true } });
+      assert.strictEqual(engines.resolveFor(profile, 'series').id, 'marquee-tv', 'resolveFor → marquee-tv once enabled');
+    } finally {
+      settings.updateSettings({ engines: { 'marquee-tv': false } });
+      config.removeProfile(p.id);
+      watchedStore.deleteForProfile(p.id);
+    }
+  });
+
+  // ── TV-2 E2: the series bench runs marquee-tv alongside genesis ──
+  // The reviewer's backtest is `bench-engines.js <profile> --type series
+  // --engines genesis,marquee-tv`. E2 proves that plumbing hermetically: a temp
+  // DB with series history (no watched series rows, so genesis returns [] with
+  // no network), the REAL genesis + marquee-tv engines through runBench, with
+  // marquee-tv's network fetchers stubbed via the ctx.marqueeTvFetchers seam.
+  // Both engines must complete and report metrics.
+  await it('TV-2 E2: series bench runs marquee-tv + genesis — both engines report', async () => {
+    const pipeline = require('../src/engines/pipeline');
+    const p = config.addProfile('INT-TV2-E2');
+    const nowMs = Date.parse('2026-10-02T00:00:00Z');
+    const DAY = 86400e3;
+    // 11 qualifying series_progress rows (holdout 1 needs 1+10). No watched
+    // series rows → genesis's seed list is empty → it returns [] with no network.
+    const mk = (i) => ({
+      simkl_id: i, kind: 'show', imdb_id: 'tt' + i, tmdb_id: 'e2' + i, title: 'Show ' + i, year: 2020,
+      status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0,
+      last_watched_at: nowMs - i * DAY, first_watched_at: nowMs - i * DAY,
+      first_real_at: nowMs - i * DAY, last_real_at: nowMs - i * DAY,
+      stamps: 10, real_stamps: 10, eps_per_week: null,
+    });
+    const rows = Array.from({ length: 11 }, (_, i) => mk(i + 1));
+
+    // Stub fetchers for marquee-tv (M6 seam): one Simkl rec, everything else empty.
+    const tvMeta = (apiKey, ids) => {
+      const m = new Map();
+      for (const id of ids) {
+        m.set(id, { tmdb_id: id, imdb_id: 'tt' + id, type: 'series', title: 'Show ' + id, year: 2024, genres: ['Drama'], keywords: [], tvType: 'Scripted', status: 'Returning Series', vote_average: 8, vote_count: 1000, popularity: 5, certAU: null, certUS: null, first_air_date: '2024-01-01', last_air_date: '2026-01-01', number_of_episodes: 20, number_of_seasons: 1 });
+      }
+      return m;
+    };
+    const simklRecs = async () => [{ tmdb_id: 'e2good1', imdb_id: 'tte2good1', title: 'Good Show', year: 2024 }];
+    const tmdbRecs = () => [];
+    const discover = () => [];
+    const trending = () => [];
+    const imdbRatings = () => new Map();
+
+    // The pipeline's else branch (genesis is not preResolved) calls tmdb.getGenreMap
+    // even with zero candidates — stub it so the bench stays hermetic.
+    const realGetGenreMap = tmdb.getGenreMap;
+    tmdb.getGenreMap = async () => ({ 18: 'Drama', 10000: 'Action' });
+    try {
+      config.updateProfile(p.id, {
+        filters: { engine_series: 'marquee-tv', excluded_genres: ['Horror'], min_year: 2010, min_rating: 7, vote_count_floor: 50, age_limit: 0 },
+        keys: { tmdb_api_key: 'itest-tmdb' },
+        simkl_auth: { access_token: 'tok' },
+      });
+      watchedStore.upsertSeriesProgress(p.id, rows);
+      const results = await bench.runBench({
+        profile: config.getProfile(p.id),
+        engineIds: ['genesis', 'marquee-tv'],
+        holdout: 1,
+        type: 'series',
+        deps: {
+          engines, pipeline, rs, watchedStore, db, settings,
+          selectServe: rs.selectServe, log: quiet,
+          ctxExtras: { marqueeTvFetchers: { tvMeta, simklRecs, tmdbRecs, discover, trending, imdbRatings } },
+        },
+      });
+      // Both engines report.
+      assert.ok(results.engines.genesis, 'genesis reported');
+      assert.ok(results.engines['marquee-tv'], 'marquee-tv reported');
+      // genesis: no watched series → 0 stored.
+      assert.strictEqual(results.engines.genesis.metrics.stored, 0, 'genesis stored 0 (no watched series)');
+      // marquee-tv: its stub Simkl rec is stored (pre-resolved, pre-filtered).
+      assert.ok(results.engines['marquee-tv'].metrics.stored >= 1, 'marquee-tv stored its candidate');
+    } finally {
+      tmdb.getGenreMap = realGetGenreMap;
+      config.removeProfile(p.id);
+      rs.deleteForProfile(p.id);
+      watchedStore.deleteForProfile(p.id);
+    }
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();
