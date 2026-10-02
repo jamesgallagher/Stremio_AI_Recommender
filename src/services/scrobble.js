@@ -148,18 +148,36 @@ async function syncProfile(profile, log = console, { full = false } = {}) {
   if (skippedBackoff) log.log(`[scrobble] ${profile.name}: ${skippedBackoff} movie(s) skipped (Simkl couldn't match — retrying weekly)`);
 
   // Normal sync excludes movies already known-watched on Simkl (from the local
-  // watched store) and episodes this app already pushed (the scrobble ledger —
-  // without it every hourly run re-sent the whole episode history). full=true
-  // ignores both and pushes everything (Simkl de-dupes re-marks).
-  const watchedMovieIds = full ? new Set() : watchedStore.watchedIdSets(profile.id).imdb;
+  // watched store) AND movies this app already pushed (the movie ledger —
+  // without it a film whose Simkl id differs from the provider's id would be
+  // re-sent every hour), and episodes this app already pushed (the episode
+  // ledger — without it every hourly run re-sent the whole episode history).
+  // full=true ignores both ledgers and pushes everything (Simkl de-dupes
+  // re-marks).
+  const watchedImdbSet = watchedStore.watchedIdSets(profile.id).imdb;
+  const movieLedger = full ? new Set() : watchedStore.pushedMovieIds(profile.id);
+  const watchedMovieIds = full ? new Set() : (() => {
+    const set = new Set(watchedImdbSet);
+    for (const id of movieLedger) set.add(id);
+    return set;
+  })();
   const pushedEpisodes = full ? new Set() : watchedStore.pushedEpisodeKeys(profile.id);
   const body = computeDelta(items, watchedMovieIds, pushedEpisodes);
+  // Ledger-only skips: provider movies in the movie ledger but NOT in the
+  // watched store (a watched-store exclusion is the existing behaviour).
+  if (movieLedger.size) {
+    let skipped = 0;
+    for (const it of items) {
+      if (it.type === 'movie' && it.imdbId && movieLedger.has(it.imdbId) && !watchedImdbSet.has(it.imdbId)) skipped += 1;
+    }
+    if (skipped) log.log(`[scrobble] ${profile.name}: ${skipped} movie(s) skipped (already sent to Simkl)`);
+  }
 
   // Part A (S3): a recorded film that now appears in the local watched store
   // (a later Simkl sync found it) is cleared — independent of whether there's
   // a body this run (the film may be in backoff and skipped above, so the
   // early return must not bypass this).
-  const watchedImdb = watchedStore.watchedIdSets(profile.id).imdb;
+  const watchedImdb = watchedImdbSet;
   {
     const clearIds = new Set();
     for (const r of watchedStore.listUnmatched(profile.id)) {
@@ -222,6 +240,21 @@ async function syncProfile(profile, log = console, { full = false } = {}) {
   for (const imdb of stillNf) {
     watchedStore.recordUnmatched(profile.id, { imdbId: imdb, tmdbId: resolved.get(imdb) || null }, now);
   }
+
+  // Movie ledger: remember the movies Simkl just accepted — the main body's
+  // movies minus the still-not-found, plus the retry's matched-on-retry films.
+  // Only reached after the first addToHistory succeeded (a thrown write
+  // records nothing).
+  const accepted = new Set();
+  for (const m of body.movies) {
+    const imdb = m.ids.imdb;
+    if (imdb && !stillNf.has(imdb)) accepted.add(imdb);
+  }
+  for (const m of (retryBody && retryBody.movies) || []) {
+    const imdb = m.ids.imdb;
+    if (imdb && !stillNf.has(imdb)) accepted.add(imdb);
+  }
+  if (accepted.size) watchedStore.recordPushedMovies(profile.id, [...accepted], now);
 
   // Part A (S3): clear the films that matched this run (not in stillNf) —
   // from both the main body and the retry body. (Any recorded film found in

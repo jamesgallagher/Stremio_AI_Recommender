@@ -5454,6 +5454,171 @@ async function main() {
     }
   });
 
+  await it('Scrobble D1: not-found movie matched on retry → ledgered; the next run re-sends nothing (skip log)', async () => {
+    const scrobble = require('../src/services/scrobble');
+    const nuvio = require('../src/services/nuvio');
+    const crypto = require('../src/services/crypto');
+    const profile = { id: 'p-d1', name: 'T', keys: { simkl_client_id: 'c', tmdb_api_key: 'k' }, simkl_auth: { access_token: 't' }, scrobble: { enabled: true, provider: 'nuvio', email: 'a@b.c', password_enc: crypto.encrypt('pw') } };
+    const origPull = nuvio.pullWatched; const origAdd = simkl.addToHistory; const origFind = tmdb.findByImdbId;
+    const calls = [];
+    const logLines = [];
+    const log = { log: (m) => logLines.push(m), warn() {}, error() {} };
+    simkl.addToHistory = async (_p, body) => {
+      calls.push(body);
+      return calls.length === 1 ? { not_found: { movies: [{ ids: { imdb: 'ttA' } }] } } : {};
+    };
+    tmdb.findByImdbId = async (_key, _type, imdb) => (imdb === 'ttA' ? 12600 : null);
+    try {
+      nuvio.pullWatched = async () => [{ type: 'movie', imdbId: 'ttA', watchedAtMs: 1000 }];
+      // Run 1: not found → retry with the TMDB id → matched (the Conor case).
+      const res = await scrobble.syncProfile(profile, log);
+      assert.strictEqual(calls.length, 2, 'two POSTs (main + retry)');
+      assert.strictEqual(res.matchedOnRetry, 1, 'matched on retry');
+      assert.ok(watchedStore.pushedMovieIds(profile.id).has('ttA'), 'the movie is ledgered');
+      // Run 2: the ledger skips it — no POSTs, and the skip log appears.
+      await scrobble.syncProfile(profile, log);
+      assert.strictEqual(calls.length, 2, 'no re-send on the next run');
+      assert.ok(logLines.some((l) => l.includes('1 movie(s) skipped (already sent to Simkl)')), 'the skip log appears');
+    } finally {
+      nuvio.pullWatched = origPull; simkl.addToHistory = origAdd; tmdb.findByImdbId = origFind;
+      watchedStore.deleteForProfile(profile.id);
+    }
+  });
+
+  await it('Scrobble D2: accepted on the first POST → ledgered; the next run skips; full re-sends', async () => {
+    const scrobble = require('../src/services/scrobble');
+    const nuvio = require('../src/services/nuvio');
+    const crypto = require('../src/services/crypto');
+    const profile = { id: 'p-d2', name: 'T', keys: { simkl_client_id: 'c', tmdb_api_key: 'k' }, simkl_auth: { access_token: 't' }, scrobble: { enabled: true, provider: 'nuvio', email: 'a@b.c', password_enc: crypto.encrypt('pw') } };
+    const origPull = nuvio.pullWatched; const origAdd = simkl.addToHistory; const origFind = tmdb.findByImdbId;
+    const calls = [];
+    const logLines = [];
+    const log = { log: (m) => logLines.push(m), warn() {}, error() {} };
+    simkl.addToHistory = async (_p, body) => { calls.push(body); return {}; };
+    tmdb.findByImdbId = async () => null;
+    try {
+      nuvio.pullWatched = async () => [{ type: 'movie', imdbId: 'ttB', watchedAtMs: 1000 }];
+      await scrobble.syncProfile(profile, log);
+      assert.strictEqual(calls.length, 1, 'one POST');
+      assert.ok(watchedStore.pushedMovieIds(profile.id).has('ttB'), 'ledgered');
+      await scrobble.syncProfile(profile, log);
+      assert.strictEqual(calls.length, 1, 'no re-send on the next run');
+      assert.ok(logLines.some((l) => l.includes('1 movie(s) skipped (already sent to Simkl)')), 'the skip log appears');
+      // full: re-sends despite the ledger.
+      await scrobble.syncProfile(profile, log, { full: true });
+      assert.strictEqual(calls.length, 2, 'full re-sends');
+      assert.deepStrictEqual(calls[1].movies.map((m) => m.ids.imdb), ['ttB']);
+    } finally {
+      nuvio.pullWatched = origPull; simkl.addToHistory = origAdd; tmdb.findByImdbId = origFind;
+      watchedStore.deleteForProfile(profile.id);
+    }
+  });
+
+  await it('Scrobble D3: a thrown first POST → nothing ledgered; the next run re-sends', async () => {
+    const scrobble = require('../src/services/scrobble');
+    const nuvio = require('../src/services/nuvio');
+    const crypto = require('../src/services/crypto');
+    const profile = { id: 'p-d3', name: 'T', keys: { simkl_client_id: 'c', tmdb_api_key: 'k' }, simkl_auth: { access_token: 't' }, scrobble: { enabled: true, provider: 'nuvio', email: 'a@b.c', password_enc: crypto.encrypt('pw') } };
+    const origPull = nuvio.pullWatched; const origAdd = simkl.addToHistory; const origFind = tmdb.findByImdbId;
+    const calls = [];
+    const log = { log() {}, warn() {}, error() {} };
+    simkl.addToHistory = async (_p, body) => {
+      calls.push(body);
+      if (calls.length === 1) throw new Error('Simkl down');
+      return {};
+    };
+    tmdb.findByImdbId = async () => null;
+    try {
+      nuvio.pullWatched = async () => [{ type: 'movie', imdbId: 'ttC', watchedAtMs: 1000 }];
+      await assert.rejects(() => scrobble.syncProfile(profile, log), /Simkl down/);
+      assert.strictEqual(watchedStore.pushedMovieIds(profile.id).size, 0, 'nothing ledgered');
+      // Next run: re-sends (the film was never accepted).
+      await scrobble.syncProfile(profile, log);
+      assert.strictEqual(calls.length, 2, 're-sent on the next run');
+      assert.ok(watchedStore.pushedMovieIds(profile.id).has('ttC'), 'ledgered after the successful run');
+    } finally {
+      nuvio.pullWatched = origPull; simkl.addToHistory = origAdd; tmdb.findByImdbId = origFind;
+      watchedStore.deleteForProfile(profile.id);
+    }
+  });
+
+  await it('Scrobble D4: still not found after the retry → NOT ledgered; in the scrobble_unmatched backoff', async () => {
+    const scrobble = require('../src/services/scrobble');
+    const nuvio = require('../src/services/nuvio');
+    const crypto = require('../src/services/crypto');
+    const profile = { id: 'p-d4', name: 'T', keys: { simkl_client_id: 'c', tmdb_api_key: 'k' }, simkl_auth: { access_token: 't' }, scrobble: { enabled: true, provider: 'nuvio', email: 'a@b.c', password_enc: crypto.encrypt('pw') } };
+    const origPull = nuvio.pullWatched; const origAdd = simkl.addToHistory; const origFind = tmdb.findByImdbId;
+    const calls = [];
+    const log = { log() {}, warn() {}, error() {} };
+    simkl.addToHistory = async (_p, body) => { calls.push(body); return { not_found: { movies: [{ ids: { imdb: 'ttD' } }] } }; };
+    tmdb.findByImdbId = async (_key, _type, imdb) => (imdb === 'ttD' ? 12600 : null);
+    try {
+      nuvio.pullWatched = async () => [{ type: 'movie', imdbId: 'ttD', watchedAtMs: 1000 }];
+      const res = await scrobble.syncProfile(profile, log);
+      assert.strictEqual(calls.length, 2, 'main + retry POSTs');
+      assert.strictEqual(res.unmatched, 1, 'still not found');
+      assert.strictEqual(res.matchedOnRetry, 0);
+      assert.strictEqual(watchedStore.pushedMovieIds(profile.id).size, 0, 'not ledgered');
+      const rows = watchedStore.listUnmatched(profile.id);
+      assert.strictEqual(rows.length, 1);
+      assert.strictEqual(rows[0].imdb_id, 'ttD');
+      assert.strictEqual(rows[0].tmdb_id, '12600');
+      // Next run: in backoff — no re-send.
+      await scrobble.syncProfile(profile, log);
+      assert.strictEqual(calls.length, 2, 'in backoff — no re-send');
+    } finally {
+      nuvio.pullWatched = origPull; simkl.addToHistory = origAdd; tmdb.findByImdbId = origFind;
+      watchedStore.deleteForProfile(profile.id);
+    }
+  });
+
+  await it('Scrobble D5: unwatch clears the ledger entry + sets the block; an older provider watch is skipped, a newer one is pushed and re-ledgered', async () => {
+    const scrobble = require('../src/services/scrobble');
+    const nuvio = require('../src/services/nuvio');
+    const crypto = require('../src/services/crypto');
+    const trainer = require('../src/trainer');
+    const profile = { id: 'p-d5', name: 'T', keys: { simkl_client_id: 'c', tmdb_api_key: 'k' }, simkl_auth: { access_token: 't' }, scrobble: { enabled: true, provider: 'nuvio', email: 'a@b.c', password_enc: crypto.encrypt('pw') } };
+    const origPull = nuvio.pullWatched; const origAdd = simkl.addToHistory; const origFind = tmdb.findByImdbId; const origRemove = simkl.removeFromHistory;
+    const calls = [];
+    const logLines = [];
+    const log = { log: (m) => logLines.push(m), warn() {}, error() {} };
+    simkl.addToHistory = async (_p, body) => { calls.push(body); return {}; };
+    tmdb.findByImdbId = async () => null;
+    try {
+      nuvio.pullWatched = async () => [{ type: 'movie', imdbId: 'ttE', watchedAtMs: 1000 }];
+      // (a) The movie is ledgered, then watched in the local store.
+      await scrobble.syncProfile(profile, log);
+      assert.ok(watchedStore.pushedMovieIds(profile.id).has('ttE'), 'ledgered');
+      watchedStore.upsertMany(profile.id, [{ simkl_id: 1, type: 'movie', imdb_id: 'ttE', tmdb_id: '12600', title: 'E', year: 2017, watched_at: '2026-01-01T00:00:00Z' }]);
+      // (b) markUnwatched: the ledger entry is cleared and the block is set.
+      const deps = {
+        simkl: { removeFromHistory: async () => {}, removeRatings: async () => {} },
+        now: () => 5000,
+        log: quiet,
+      };
+      const res = await trainer.markUnwatched(profile, { type: 'movie', tmdb_id: '12600' }, deps);
+      assert.strictEqual(res.ok, true);
+      assert.strictEqual(watchedStore.pushedMovieIds(profile.id).size, 0, 'ledger entry cleared');
+      assert.ok(watchedStore.unwatchedBlocks(profile.id, 'movie').has('ttE'), 'block set');
+      // (c) An older provider watch (≤ the block time) is skipped by the block.
+      logLines.length = 0;
+      const before = calls.length;
+      await scrobble.syncProfile(profile, log);
+      assert.strictEqual(calls.length, before, 'no POST — skipped by the block');
+      assert.ok(logLines.some((l) => l.includes('1 movie(s) skipped (unwatched by the user)')), 'the block skip log');
+      // (d) A newer provider watch (a genuine rewatch) is pushed and re-ledgered.
+      nuvio.pullWatched = async () => [{ type: 'movie', imdbId: 'ttE', watchedAtMs: 9000 }];
+      await scrobble.syncProfile(profile, log);
+      assert.strictEqual(calls.length, before + 1, 'the rewatch is pushed');
+      assert.deepStrictEqual(calls[calls.length - 1].movies.map((m) => m.ids.imdb), ['ttE']);
+      assert.ok(watchedStore.pushedMovieIds(profile.id).has('ttE'), 're-ledgered');
+      assert.ok(!watchedStore.unwatchedBlocks(profile.id, 'movie').has('ttE'), 'block cleared by the rewatch');
+    } finally {
+      nuvio.pullWatched = origPull; simkl.addToHistory = origAdd; tmdb.findByImdbId = origFind; simkl.removeFromHistory = origRemove;
+      watchedStore.deleteForProfile(profile.id);
+    }
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();
