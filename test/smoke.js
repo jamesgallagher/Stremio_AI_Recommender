@@ -5208,6 +5208,80 @@ async function httpTests() {
     console.log('  ✓ jobs: global queue serializes, reports progress, dedups');
   }
 
+  // ENG-1 J1: jobs.enqueue afterActive — a settings/engine change queues a NEW
+  // build behind a running job (never joins it), and replaces an already-queued
+  // duplicate's run. Hermetic: deferred promises, no timers.
+  {
+    const jobs = require('../src/jobs');
+
+    // (a) no option + a running same job → returns the running promise; exactly one run.
+    jobs._reset();
+    {
+      let enteredResolve; const entered = new Promise((res) => { enteredResolve = res; });
+      let release; const block = new Promise((res) => { release = res; });
+      const runs = [];
+      const p1 = jobs.enqueue('p1', 'recs', async () => { runs.push('run'); enteredResolve(); await block; return { n: 1 }; });
+      await entered; // first job is running (entered)
+      const p2 = jobs.enqueue('p1', 'recs', async () => { runs.push('run'); return { n: 2 }; });
+      assert.strictEqual(p2, p1, 'dedup: same in-flight promise');
+      release();
+      await p1;
+      assert.strictEqual(runs.length, 1, 'exactly one run');
+    }
+
+    // (b) afterActive + a running same job → a second run, after the first resolves;
+    //     the progress state stays 'running' (not 'queued') while the first runs.
+    jobs._reset();
+    {
+      let enteredResolve; const entered = new Promise((res) => { enteredResolve = res; });
+      let release; const block = new Promise((res) => { release = res; });
+      const order = [];
+      const p1 = jobs.enqueue('p1', 'recs', async () => { order.push('first'); enteredResolve(); await block; return { n: 1 }; });
+      await entered; // first job is running
+      const p2 = jobs.enqueue('p1', 'recs', async () => { order.push('second'); return { n: 2 }; }, { afterActive: true });
+      assert.strictEqual(jobs.snapshot('p1').state, 'running', 'progress stays running while the first runs');
+      release();
+      await Promise.all([p1, p2]);
+      assert.deepStrictEqual(order, ['first', 'second'], 'second run after the first resolves');
+    }
+
+    // (c) afterActive + an already queued same job → no third job; the queued job
+    //     runs the newer run, once.
+    jobs._reset();
+    {
+      let holderEnteredResolve; const holderEntered = new Promise((res) => { holderEnteredResolve = res; });
+      let releaseHolder; const holderBlock = new Promise((res) => { releaseHolder = res; });
+      const holder = jobs.enqueue('holder', 'recs', async () => { holderEnteredResolve(); await holderBlock; return { which: 'holder' }; });
+      await holderEntered; // holder is running, so the target job is queued behind it
+      const order = [];
+      const p1 = jobs.enqueue('p1', 'recs', async () => { order.push('run-1'); return { n: 1 }; });
+      const p2 = jobs.enqueue('p1', 'recs', async () => { order.push('run-2'); return { n: 2 }; }, { afterActive: true });
+      assert.strictEqual(p2, p1, 'same promise (the queued job), no third job');
+      releaseHolder();
+      await Promise.all([holder, p1, p2]);
+      assert.deepStrictEqual(order, ['run-2'], 'the queued job ran the newer run, once');
+    }
+
+    // (d) different profiles/kinds are unaffected (FIFO, one at a time).
+    jobs._reset();
+    {
+      let live = 0; let maxLive = 0;
+      const order = [];
+      let releaseA; const aBlock = new Promise((res) => { releaseA = res; });
+      let aEnteredResolve; const aEntered = new Promise((res) => { aEnteredResolve = res; });
+      const pA = jobs.enqueue('p1', 'recs', async () => { live++; maxLive = Math.max(maxLive, live); aEnteredResolve(); await aBlock; order.push('p1:recs'); live--; return { jid: 'p1' }; });
+      await aEntered; // pA is running
+      const pB = jobs.enqueue('p2', 'extras', async () => { live++; maxLive = Math.max(maxLive, live); order.push('p2:extras'); live--; return { jid: 'p2' }; });
+      releaseA();
+      await Promise.all([pA, pB]);
+      assert.strictEqual(maxLive, 1, 'never ran concurrently');
+      assert.deepStrictEqual(order, ['p1:recs', 'p2:extras'], 'FIFO, one at a time');
+    }
+
+    jobs._reset();
+    console.log('  ✓ jobs: afterActive queues behind a running job (a–d)');
+  }
+
   // Circuit breaker: a service that opts in (jikan) trips after N failures and
   // then fails fast without touching the network; a service without a breaker
   // (tmdb) never opens. This is what stops us pounding a down Jikan.

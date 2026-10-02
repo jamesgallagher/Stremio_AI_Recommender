@@ -239,7 +239,7 @@ router.put('/profiles/:id', (req, res) => {
   // polls status/job). dont_recommend is engine-independent and survives.
   if (engineChanged.length) {
     for (const t of engineChanged) recommendationStore.clearType(profile.id, t);
-    recommendationStore.ensureBuilt(profile)
+    recommendationStore.rebuildAfterChange(profile.id)
       .catch((err) => console.warn(`[rec] ${profile.name}: engine-change rebuild failed — ${err.message}`));
   }
   // Rule: extra-catalog caches can be built "from the configure" — when the
@@ -492,7 +492,7 @@ router.post('/profiles/:id/recommend/build', (req, res) => {
   const profile = config.getProfile(req.params.id);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
   const jobs = require('./jobs');
-  jobs.enqueue(profile.id, 'recs', (progress) => recommendationStore.buildPool(profile, console, progress))
+  recommendationStore.rebuildAfterChange(profile.id)
     .catch((err) => console.warn(`[rec] ${profile.name}: pool build failed — ${err.message}`));
   res.status(202).json({ started: true, job: jobs.snapshot(profile.id) });
 });
@@ -854,7 +854,7 @@ function revertDisabledEngines(disabledIds) {
     const { profile, engineChanged } = config.updateProfile(p.id, { filters: filtersPatch });
     if (!profile || !engineChanged.length) continue;
     for (const t of engineChanged) recommendationStore.clearType(profile.id, t);
-    recommendationStore.ensureBuilt(profile)
+    recommendationStore.rebuildAfterChange(profile.id)
       .catch((err) => console.warn(`[engines] ${profile.name}: disable-revert rebuild failed — ${err.message}`));
   }
 }
@@ -872,7 +872,7 @@ function rebuildGlassProfiles() {
     const types = ['movie', 'series'].filter((t) => recommendationStore && require('./engines').resolveFor(p, t).id === 'glass');
     if (!types.length) continue;
     for (const t of types) recommendationStore.clearType(p.id, t);
-    recommendationStore.ensureBuilt(p)
+    recommendationStore.rebuildAfterChange(p.id)
       .catch((err) => console.warn(`[glass] ${p.name}: Tier-2 config rebuild failed — ${err.message}`));
   }
 }
@@ -885,7 +885,7 @@ function rebuildMarqueeProfiles() {
   for (const p of config.listProfiles()) {
     if (require('./engines').resolveFor(p, 'movie').id !== 'marquee') continue;
     recommendationStore.clearType(p.id, 'movie');
-    recommendationStore.ensureBuilt(p)
+    recommendationStore.rebuildAfterChange(p.id)
       .catch((err) => console.warn(`[marquee] ${p.name}: Tier-2 config rebuild failed — ${err.message}`));
   }
 }

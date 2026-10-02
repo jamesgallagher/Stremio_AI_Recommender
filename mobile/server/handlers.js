@@ -377,7 +377,7 @@ function settingsPostHandler(req, res) {
   // here — only an explicit engine_movie/engine_series swap.
   if (engineChanged.length) {
     for (const t of engineChanged) recommendationStore.clearType(updated.id, t);
-    recommendationStore.ensureBuilt(updated)
+    recommendationStore.rebuildAfterChange(updated.id)
       .catch((err) => console.warn(`[rec] ${updated.name}: engine-change rebuild failed — ${err.message}`));
   }
   res.json({ ok: true, ...companionSettings(updated) });

@@ -8,6 +8,15 @@
 // running joins the in-flight job instead of stacking a duplicate — opening two
 // tabs and hitting Build twice does not queue two scans. Different kinds (a
 // pool build vs a scrobble re-push) DO queue separately and run in turn.
+//
+// afterActive (ENG-1): a SETTINGS/ENGINE change must always take effect, even
+// while a build for the same (profile, kind) is running. With afterActive the
+// change does NOT join the in-flight job — it queues a NEW build that runs
+// AFTER it (the running build holds the profile captured when it started, so
+// joining it would silently drop the change). For an already-queued duplicate it
+// replaces the queued job's run with the newer one (still one job, never a
+// third). Routine builds (ensureBuilt, the addon's background build, the
+// scheduled tick) omit the option and keep the join behaviour.
 
 const queue = [];          // [{ profileId, kind, run, resolve, reject }]
 let active = null;         // the running job, or null
@@ -36,16 +45,22 @@ function queuePosition(profileId) {
 // Enqueue a job. `run(progress)` does the work; call progress(pct, label) to
 // report. Returns a promise that settles when the job finishes. A duplicate
 // (same profile+kind, already queued/running) returns the in-flight promise.
-function enqueue(profileId, kind, run) {
+// With `afterActive` a settings/engine change never joins the in-flight job —
+// it queues a NEW build behind it (see the file-top dedup note).
+function enqueue(profileId, kind, run, { afterActive = false } = {}) {
   const existing = queue.find((j) => j.profileId === profileId && j.kind === kind);
-  if (existing) return existing.promise;
-  if (active && active.profileId === profileId && active.kind === kind) return active.promise;
+  if (existing) {
+    if (afterActive) existing.run = run;
+    return existing.promise;
+  }
+  const runningSame = !!active && active.profileId === profileId && active.kind === kind;
+  if (runningSame && !afterActive) return active.promise;
 
   let resolve; let reject;
   const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
   const job = { profileId, kind, run, resolve, reject, promise };
   queue.push(job);
-  setProgress(profileId, { kind, state: 'queued', pct: 0, label: 'Queued…', queued_at: Date.now(), error: null });
+  if (!runningSame) setProgress(profileId, { kind, state: 'queued', pct: 0, label: 'Queued…', queued_at: Date.now(), error: null });
   pump();
   return promise;
 }
