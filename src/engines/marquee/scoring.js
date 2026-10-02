@@ -59,9 +59,11 @@ async function scoreCandidates(profile, ctx, candidates, {
   await animeMap.ensureLoaded(log).catch(() => {});
 
   const decayedCount = decayedCollectionCounts(profile.id);
-  // m2: seed agreement, normalised to the strongest candidate in this build.
-  let maxSeedAff = 0;
-  for (const c of candidates) maxSeedAff = Math.max(maxSeedAff, features.seedAffinityRaw(c));
+  // m4 (spec §17): genre-fair agreement — the seed affinity and consensus
+  // features blend the global normalisation with a within-genre one. β=0
+  // reproduces m3 exactly (the off-switch: settings.marquee.agreement).
+  const agreementBlend = cfg.agreement?.genre_blend ?? 0;
+  const agreementMinSize = cfg.agreement?.min_genre_size ?? 5;
   // m2 diagnostics (see sources.js): record where a looked-up title is lost.
   const trace = ctx.marqueeTrace || null;
 
@@ -92,6 +94,41 @@ async function scoreCandidates(profile, ctx, candidates, {
     }));
     onProgress(Math.round((Math.min(i + cfg.lookup_chunk, candidates.length) / (candidates.length || 1)) * 100), `Looked up ${Math.min(i + cfg.lookup_chunk, candidates.length)}/${candidates.length} candidate(s)`);
   }
+
+  // m4 (spec §17): the genre-fair agreement normalisations, built over the
+  // SCORED candidates (the same set the m3 global max used). The genre group
+  // is the deep-meta primary genre; a candidate whose lookup failed has no
+  // group (global normalisation only).
+  const metaOf = new Map(looked.map(({ cand, meta }) => [cand.tmdb_id, meta]));
+  const groupOf = (c) => {
+    const meta = metaOf.get(c.tmdb_id);
+    if (!meta) return null;
+    return (meta.genres || [])[0] || 'Other';
+  };
+  const saNorm = features.genreRelativeNormalizer(candidates, features.seedAffinityRaw, groupOf,
+    { blend: agreementBlend, minGroupSize: agreementMinSize });
+  // m4: consensus is NOT global-normalised in m3, so its within-genre term
+  // divides by the group max and falls back to the RAW value (not a global
+  // normalisation) — β=0 stays exact (spec §17).
+  const consensusRaw = (c) => features.consensus(c.sources, c.seeds);
+  const consensusGroupMax = {};
+  const consensusGroupSize = {};
+  for (const c of candidates) {
+    const v = consensusRaw(c);
+    const g = groupOf(c);
+    if (g != null) {
+      if (v > (consensusGroupMax[g] || 0)) consensusGroupMax[g] = v;
+      consensusGroupSize[g] = (consensusGroupSize[g] || 0) + 1;
+    }
+  }
+  const consNorm = (c) => {
+    const raw = consensusRaw(c);
+    const g = groupOf(c);
+    const genreNorm = (g != null && (consensusGroupSize[g] || 0) >= agreementMinSize && (consensusGroupMax[g] || 0) > 0)
+      ? Math.min(1, raw / consensusGroupMax[g])
+      : raw;
+    return (1 - agreementBlend) * raw + agreementBlend * genreNorm;
+  };
 
   // 3. One IMDb-rating call for the whole build (I4: the engine never writes
   // the column; the value lives only in scoreComponents.inputs). A failure
@@ -131,9 +168,11 @@ async function scoreCandidates(profile, ctx, candidates, {
       // MD-2: trending only lifts films that already fit the viewer.
       trending_eff: trendingRaw * features.tasteGate(tm.score, cfg.trending_gate),
       quality: features.quality({ imdbRating, voteAverage: meta.vote_average, voteCount: meta.vote_count }, cfg.quality_prior),
-      consensus: features.consensus(cand.sources, cand.seeds),
+      // m4 (spec §17): genre-fair agreement — both features blend the global
+      // normalisation with the within-genre one (β = cfg.agreement.genre_blend).
+      consensus: consNorm(cand),
       // m2: Genesis's recency-weighted seed agreement, normalised per build.
-      seed_affinity: maxSeedAff > 0 ? Math.min(1, features.seedAffinityRaw(cand) / maxSeedAff) : 0,
+      seed_affinity: saNorm(cand),
       freshness: features.freshness(meta.year, { nowYear, maxAgeYears: recency.maxAgeOf(filters, nowYear), defaultWindow: cfg.freshness_default_window, floor: cfg.freshness_floor }),
     };
     // llm_fit is always absent here (P4 adds it); trending_eff is absent when
@@ -177,6 +216,9 @@ async function scoreCandidates(profile, ctx, candidates, {
         features: feat, weights: w, penalty, matched: tm.matched,
         sources: [...cand.sources], seeds: [...cand.seeds],
         trending: { ...cand.trending },
+        // m4 (spec §17): the genre-fair agreement trace — which genre group
+        // the candidate was judged in, and the blend actually applied.
+        agreement: { group: groupOf(cand) || 'Other', blend: agreementBlend },
         // I4: the imdb rating lives ONLY here, never as a top-level key.
         inputs: { imdb_rating: imdbRating, collection_id: meta.collection?.id ?? null, cert, availability: meta.availability },
       },

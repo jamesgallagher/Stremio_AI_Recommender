@@ -2155,7 +2155,7 @@ ok('marquee ME-04: config copies Glass values independently + resolveConfig deep
   assert.deepStrictEqual(marqueeCfg.DEFAULTS.brief, { input_cap: 60 });
   // collab_reserve added in review round 1 (F1): the S2 collaborative reserve.
   assert.deepStrictEqual(marqueeCfg.DEFAULTS.simkl, { recs_max_uncached: 40, recs_ttl_days: 30, ratings_resolve_cap: 50, collab_reserve: 40 });
-  assert.strictEqual(marqueeCfg.ALGORITHM_VERSION, 'marquee-m3');
+  assert.strictEqual(marqueeCfg.ALGORITHM_VERSION, 'marquee-m4');
   // resolveConfig: deep clone — mutating the result must not touch DEFAULTS
   const resolved = marqueeCfg.resolveConfig({});
   resolved.half_life_days.movie.recent = 999;

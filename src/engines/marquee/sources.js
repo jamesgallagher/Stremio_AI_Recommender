@@ -524,9 +524,13 @@ async function gatherCandidates(profile, ctx, {
 
   // Pre-score + truncate to the MI-5 resolve budget.
   // m2: seed agreement is normalised to this build's strongest title.
-  let maxSeedAff = 0;
-  for (const c of merged) maxSeedAff = Math.max(maxSeedAff, features.seedAffinityRaw(c));
-  for (const c of merged) c._preScore = features.preScore(c, taste, { weekN, dayN, maxSeedAff, weights: cfg.prescore });
+  // m4 (spec §17): the seed affinity is genre-fair — the global normalisation
+  // blended with the within-genre normalisation (cfg.agreement.genre_blend),
+  // so a strong film in a small genre can compete with a hub film in a big one.
+  // β=0 reproduces the m2 global normalisation exactly.
+  const saNorm = features.genreRelativeNormalizer(merged, features.seedAffinityRaw, features.primaryGenreOf,
+    { blend: cfg.agreement?.genre_blend ?? 0, minGroupSize: cfg.agreement?.min_genre_size ?? 5 });
+  for (const c of merged) c._preScore = features.preScore(c, taste, { weekN, dayN, seedAffinityNorm: saNorm(c), weights: cfg.prescore });
   const nonExplore = merged.filter((c) => !c.sources.has('exploration'));
   nonExplore.sort((a, b) => (b._preScore - a._preScore) || (a.tmdb_id < b.tmdb_id ? -1 : 1));
 

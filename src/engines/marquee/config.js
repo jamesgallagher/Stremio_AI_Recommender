@@ -12,7 +12,7 @@
 // gated trending intake. See spec §15.
 // Trainer T2: the Marquee taste model now acts on the Trainer feedback store
 // (ignore, Loved tier, neutral abandoned) — see docs/trainer/.
-const ALGORITHM_VERSION = 'marquee-m3';
+const ALGORITHM_VERSION = 'marquee-m4';
 
 const DEFAULTS = {
   // ── Copies of Glass's taste-model knobs (spec §4.5) ──
@@ -92,6 +92,14 @@ const DEFAULTS = {
   // agreement leads; trending only counts in proportion to genre fit
   // (trending_genre_gate), so off-taste blockbusters stop crowding the budget.
   prescore: { seed_affinity: 0.35, genre: 0.30, trending: 0.15, quality: 0.10, sources: 0.10, trending_genre_gate: 0.5 },
+  // m4 (spec §17): genre-fair agreement — the seed affinity and consensus
+  // features blend the global normalisation with a within-genre one
+  // (value = (1 − β)·global + β·genre), so a strong film in a small genre
+  // can compete with a hub film in a big one. β=0 reproduces m3 exactly
+  // (Tier-2 off-switch: settings.marquee.agreement.genre_blend). A genre
+  // group with fewer than min_genre_size candidates uses the global
+  // normalisation only.
+  agreement: { genre_blend: 0.5, min_genre_size: 5 },
   trending_gate: 0.35,
   quality_prior: { m: 2000, C: 6.5 },
   freshness_default_window: 30,
