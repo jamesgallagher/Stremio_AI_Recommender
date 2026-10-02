@@ -1,4 +1,7 @@
-# Marquee Engine — Technical Design Spec
+# Marquee Cinema — Technical Design Spec
+
+> **Name (2 October 2026):** this engine is now called **Marquee Cinema** (movies only). Its id stays `marquee`, its settings stay under `settings.marquee`, and stored rows keep `marquee-m*` versions. The separate shows engine is **Marquee TV** (`docs/engine-marquee-tv/`).
+
 
 **Version:** 0.2 · **Status:** BUILT (MVP) — registered, globally disabled
 **Kind:** a *candidate-producer* engine, `supportedTypes: ['movie']`

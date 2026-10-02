@@ -89,7 +89,7 @@
     const movieEngines = (engines.available && engines.available.movie) || [];
     const engine = movieEngines.find((e) => e.id === engineMovie);
     const engineName = engine ? engine.name : (engineMovie || 'another engine');
-    const fullText = "Ratings still save to Simkl, but this profile's movies come from " + engineName + ", so your ratings won't change its recommendations. Switch the Movies engine to Marquee in Filters.";
+    const fullText = "Ratings still save to Simkl, but this profile's movies come from " + engineName + ", so your ratings won't change its recommendations. Switch the Movies engine to Marquee Cinema in Filters.";
     // K2.3: in Quick mode the notice is one line with a "More" button; List
     // keeps the full text.
     if (st.mode === 'quick') {

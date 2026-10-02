@@ -1,4 +1,4 @@
-# Marquee Engine — scope cards
+# Marquee Cinema — scope cards
 
 **Status:** **Built (v7.16.5-beta, algorithm `marquee-m2`), ships globally disabled.** Backtest + m2 tuning: spec §14–§15. A **movie-only**
 candidate-producer engine behind the engine abstraction. It fixes four gaps shared by Genesis/Glass: filters are
