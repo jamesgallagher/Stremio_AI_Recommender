@@ -2742,6 +2742,36 @@ ok('trainer r1: star wrap has glyph, fill, two hit areas; no clip-path', () => {
   assert.ok(!html.includes('clip-path'));
 });
 
+ok('TV-R T9: rowHtml — a series row shows progress + Love/Ignore, no unwatch/finished; a film row is unchanged', () => {
+  const now = Date.parse('2026-03-15T12:00:00Z');
+  const film = { key: '1', type: 'movie', simkl_id: 11, tmdb_id: '1', imdb_id: 'tt1', title: 'The Film', year: 2024, genre: 'Drama', poster: 'https://img.example/p.jpg', watched_at: '2026-03-10T12:00:00Z', rating: null, loved: false, ignored: false, status: 'watched', percent: 100 };
+  const show = { key: '1786', type: 'series', simkl_id: 241, tmdb_id: '1786', imdb_id: 'tt0090501', title: 'The Show', year: 1998, genre: 'Drama', poster: null, watched_at: '2026-03-10T12:00:00Z', rating: 7, loved: false, ignored: false, status: 'watched', percent: null, progress: { watched_eps: 12, aired_eps: 24 } };
+  // The progress cell: watched / aired eps + the last-watched time, with the
+  // showProgress tip as the cell's title.
+  let html = TrainerUI.rowHtml(show, { canRate: true, now });
+  assert.ok(html.includes('12 / 24 eps · 5 days ago'), 'progress cell');
+  assert.ok(html.includes('title="Episodes you&#39;ve watched out of those aired so far"'), 'progress cell title');
+  // Actions: ♥ Love and Ignore — no Unwatch, no "I finished it".
+  assert.ok(html.includes('data-act="love"'), 'Love');
+  assert.ok(html.includes('data-act="ignore"'), 'Ignore');
+  assert.ok(!html.includes('data-act="unwatch"'), 'no unwatch');
+  assert.ok(!html.includes('data-act="finished"'), 'no finished');
+  // Aired unknown → '?'.
+  html = TrainerUI.rowHtml({ ...show, progress: { watched_eps: 3, aired_eps: null } }, { canRate: true, now });
+  assert.ok(html.includes('3 / ? eps · 5 days ago'), 'aired unknown');
+  // Ignored show: Unignore only (no unwatch).
+  html = TrainerUI.rowHtml({ ...show, ignored: true }, { canRate: true, now });
+  assert.ok(html.includes('data-act="unignore"'), 'Unignore');
+  assert.ok(!html.includes('data-act="unwatch"'), 'no unwatch when ignored');
+  assert.ok(!html.includes('data-act="finished"'), 'no finished when ignored');
+  // A film item renders exactly as before: unwatch present, no progress cell.
+  const filmHtml = TrainerUI.rowHtml(film, { canRate: true, now });
+  assert.ok(filmHtml.includes('data-act="unwatch"'), 'film keeps unwatch');
+  assert.ok(filmHtml.includes('5 days ago'), 'film when cell unchanged');
+  assert.ok(!filmHtml.includes('eps ·'), 'film has no progress');
+  assert.ok(!filmHtml.includes('Episodes you&#39;ve watched'), 'film has no progress title');
+});
+
 ok('trainer: bannerHtml — empty, about M min, due within the hour, rebuilding', () => {
   const now = 1_700_000_000_000;
   const none = { changes_since_build: 0, changed_at: null, rebuild_due_at: null, built_changed_at: null };
@@ -6507,6 +6537,33 @@ async function httpTests() {
     assert.ok(body.includes("onclick=\"switchTab(this,'trainer')\">Ratings</button>") && !body.includes('>Trainer</button>'), 'the tab is labelled Ratings (UI rename)');
     assert.ok(body.includes('color: var(--star-empty)') && body.includes('--star-empty: #6b7184'), 'empty stars use the --star-empty token (contrast tidy-up)');
     console.log('  ✓ trainer portal UI: trainer-ui.js served + tab wiring in index.html');
+  }
+
+  // TV-R T8: the portal Ratings tab — Films | Shows toggle, type on every
+  // trainer call, the exact show notice, the Unfinished chip hidden for shows.
+  {
+    const body = await (await fetch(`${BASE}/configure/`)).text();
+    // The toggle exists (trainerDraw renders it; per-profile state st.type, default movie).
+    assert.ok(body.includes('type: \'movie\', // TV-R §5: Films | Shows toggle'), 'st.type default movie');
+    assert.ok(body.includes('data-type="movie"') && body.includes('data-type="series"'), 'toggle buttons');
+    assert.ok(body.includes('aria-pressed="${st.type === \'series\'}">Shows</button>'), 'toggle renders Shows');
+    // Every trainer call sends the current type (the hard-coded 'movie' is gone).
+    assert.ok(body.includes('/trainer?type=${st.type}&view='), 'GET /trainer sends type');
+    assert.ok(body.includes('body: { type: st.type, tmdb_id: key, rating }'), 'rate sends type');
+    assert.ok(body.includes('body: { type: st.type, tmdb_id: key, ignored: true }'), 'ignore sends type');
+    assert.ok(body.includes('body: { type: st.type, tmdb_id: key, ignored: false }'), 'unignore sends type');
+    assert.ok(body.includes('body: { type: st.type, tmdb_id: key, imdb_id: item.imdb_id }'), 'unwatched/finished send type');
+    assert.ok(!body.includes("body: { type: 'movie'"), 'no hard-coded movie type left in trainer calls');
+    // The show notice text, exactly (TV-R §5).
+    assert.ok(body.includes("Ratings still save to Simkl, but this profile's shows come from ${esc(engineSeries ? engineSeries.name : (p.filters.engine_series || 'another engine'))}, so your ratings won't change its recommendations. Switch the Series engine to Marquee TV in Filters."), 'show notice text exact');
+    // The Unfinished chip is hidden for shows: the flag is passed to chipsHtml,
+    // and chipsHtml honours it (the film chips are unchanged without it).
+    assert.ok((body.match(/hideUnfinished: st\.type === 'series'/g) || []).length >= 2, 'hideUnfinished passed in draw + refreshMeta');
+    const counts = { all: 10, unrated: 4, rated: 3, loved: 1, ignored: 2, unfinished: 5 };
+    assert.ok(TrainerUI.chipsHtml(counts, 'all').includes('data-view="unfinished"'), 'film chips keep Unfinished');
+    assert.ok(!TrainerUI.chipsHtml(counts, 'all', { hideUnfinished: true }).includes('data-view="unfinished"'), 'show chips hide Unfinished');
+    assert.ok(TrainerUI.chipsHtml(counts, 'all', { hideUnfinished: true }).includes('data-view="loved"'), 'other chips untouched');
+    console.log('  ✓ TV-R T8: portal Films | Shows toggle, type on every call, show notice, Unfinished chip hidden');
   }
 
   // T3.1 U6: the served index.html has no _undoT/6000 auto-refresh left (R1).
