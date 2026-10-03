@@ -297,11 +297,13 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
     preScored.push({ id, c, p, trendingRaw });
   }
   preScored.sort((a, b) => b.p - a.p);
-  // T7 (TV-3 §3.2): the llm candidates take lookup slots first; the rest of
-  // the cap is filled by the pre-score order.
-  const llmFirst = preScored.filter((k) => k.c.sources.has('llm'));
-  const rest = preScored.filter((k) => !k.c.sources.has('llm'));
-  const kept = [...llmFirst, ...rest].slice(0, cfg.lookup_cap);
+  // T7 (TV-3 §3.2): the llm candidates are ADDITIONAL to the lookup cap —
+  // the cap keeps the top non-llm candidates in pre-score order, and every
+  // llm candidate joins them (≤ suggest.count), so LLM suggestions never
+  // displace pre-scored candidates.
+  const llmCands = preScored.filter((k) => k.c.sources.has('llm'));
+  const others   = preScored.filter((k) => !k.c.sources.has('llm')).slice(0, cfg.lookup_cap);
+  const kept     = [...others, ...llmCands];          // lookup = lookup_cap + all llm (≤ suggest.count)
 
   // 5. Look up each kept candidate's TV meta (§5.2, cached) + IMDb ratings.
   const keptIds = kept.map((k) => k.id);

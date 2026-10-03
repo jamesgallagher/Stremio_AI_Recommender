@@ -7559,9 +7559,10 @@ async function main() {
   // line, the avoid list), resolve called sequentially once per suggestion,
   // duds cached as tmdb_id:null, a second build a cache hit (zero chat, zero
   // resolve), the N5 regex, and — through the orchestrator — llm candidates
-  // always looked up (pre-score 0, a full lookup_cap) and a resolved anime
-  // suggestion dropped by the hard filter (N6).
-  await it('TV-3 B2: tvSuggest — exact prompt, sequential resolve, duds cached, cache hit, llm-first lookup, anime dropped, N5', async () => {
+  // are additional to the lookup cap (never displacing pre-scored
+  // candidates) and a resolved anime suggestion dropped by the hard filter
+  // (N6).
+  await it('TV-3 B2: tvSuggest — exact prompt, sequential resolve, duds cached, cache hit, llm additional (not displacing), anime dropped, N5', async () => {
     const llmMod = require('../src/engines/marqueeTv/llm');
     const marqueeTv = require('../src/engines/marqueeTv');
     const cfg = require('../src/engines/marqueeTv/config').DEFAULTS;
@@ -7653,9 +7654,9 @@ async function main() {
       // wording (the full card regex — no "engaged" in the suggest prompt).
       assert.ok(!/age|suitab|child|kid|classif|rated (G|PG|M)/i.test(calls[0].messages[0].content), 'N5: no age/suitability/child/classification wording');
 
-      // (c) + (d) the orchestrator: llm candidates are always looked up
-      // (pre-score 0, a full lookup_cap) and a resolved anime suggestion is
-      // dropped by the hard filter (N6).
+      // (c) + (d) the orchestrator: llm candidates are additional to the
+      // lookup cap (pre-score 0, never displacing pre-scored candidates)
+      // and a resolved anime suggestion is dropped by the hard filter (N6).
       watchedStore.upsertSeriesProgress(p2.id, seriesRows);
       const rawBrief = JSON.stringify(brief);
       const chatCalls = [];
@@ -7689,7 +7690,7 @@ async function main() {
       };
       const logs = [];
       const ctx2 = {
-        settings: { llm: {}, marquee_tv: { lookup_cap: 2 } }, // the cap is FULL of non-llm candidates
+        settings: { llm: {}, marquee_tv: { lookup_cap: 2 } }, // the cap keeps the non-llm candidates; llm is additional
         nowMs,
         filters: { excluded_genres: ['Horror'], min_year: 2015, min_rating: 7, vote_count_floor: 50, age_limit: 0 },
         tmdbKey: 'itest-tmdb',
@@ -7704,20 +7705,123 @@ async function main() {
         marqueeTvFetchers: { tvMeta, simklRecs, tmdbRecs: () => [], discover: () => [], trending: () => [], imdbRatings: () => new Map() },
       };
       const outO = await marqueeTv.generate(profile2, 'series', ctx2);
-      // (c) the llm candidates take the lookup slots first: pre-score 0, and
-      //     the cap (2) is full of the higher pre-scored non-llm candidates.
-      assert.deepStrictEqual(tvMetaCalls[1], ['9001', '9002'], 'llm candidates always looked up (pre-score 0, full lookup_cap)');
-      assert.ok(!tvMetaCalls[1].includes('good1'), 'the non-llm candidate fills no slot');
+      // (c) the llm candidates are additional to the lookup cap: pre-score
+      //     0, and the non-llm candidate good1 keeps its own slot.
+      assert.deepStrictEqual(tvMetaCalls[1], ['good1', '9001', '9002'], 'non-llm fills the cap, llm candidates additional');
       // (d) the resolved anime suggestion is dropped by the hard filter.
-      assert.deepStrictEqual(outO.map((c) => c.tmdb_id), ['9001'], '9001 stored, the anime 9002 dropped');
+      assert.deepStrictEqual(outO.map((c) => c.tmdb_id).sort(), ['9001', 'good1'], '9001 and good1 stored, the anime 9002 dropped');
       assert.strictEqual(ctx2.stats.llm.brief, true, 'the brief was built');
       assert.deepStrictEqual(ctx2.stats.llm.suggest, { resolved: 2, total: 3 }, 'the suggest stats');
-      assert.strictEqual(ctx2.stats.passed, 1, 'one candidate passed the hard filter');
+      assert.strictEqual(ctx2.stats.passed, 2, 'two candidates passed the hard filter');
     } finally {
       config.removeProfile(p.id);
       config.removeProfile(p2.id);
       watchedStore.deleteForProfile(p.id);
       watchedStore.deleteForProfile(p2.id);
+    }
+  });
+
+  // ── TV-3 r1 R3: the lookup cut — suggestions are additional, not
+  // displacing (review round 1, F2) ──
+  // lookup_cap 3 with 5 non-llm candidates and 2 llm candidates → 5 looked
+  // up (the top 3 non-llm + both llm); the 3 best non-llm are all present.
+  await it('TV-3 R3: the lookup cut — non-llm fill the cap, llm candidates are additional', async () => {
+    const marqueeTv = require('../src/engines/marqueeTv');
+    const nowMs = Date.parse('2026-10-02T00:00:00Z');
+    const DAY = 86400e3;
+    const p = config.addProfile('INT-TV3-R3');
+    config.updateProfile(p.id, {
+      filters: { engine_series: 'marquee-tv', excluded_genres: ['Horror'], min_year: 2015, min_rating: 7, vote_count_floor: 50, age_limit: 0 },
+      keys: { tmdb_api_key: 'itest-tmdb' },
+      simkl_auth: { access_token: 'tok' },
+    });
+    const profile = config.getProfile(p.id);
+    const seriesRows = [
+      { simkl_id: 100, kind: 'show', imdb_id: 'ttseed1', tmdb_id: 'seed1', title: 'Seed Show', year: 2020, status: 'completed', watched_eps: 20, total_eps: 20, not_aired_eps: 0, last_watched_at: nowMs - DAY, first_watched_at: nowMs - 10 * DAY, first_real_at: nowMs - DAY, last_real_at: nowMs - DAY, stamps: 20, real_stamps: 20, eps_per_week: null },
+    ];
+    const brief = { loves: ['drama'], avoids: [], moods: ['tense'], eras: ['2010s'], standout_titles: ['Seed Show'] };
+    const suggestions = [
+      { title: 'Suggestion A', year: 2024 },
+      { title: 'Suggestion B', year: 2023 },
+    ];
+    const chain = [{ type: 'custom', name: 'local', uri: 'http://localhost:11434/v1', apiKey: '' }];
+    const stubChat = async (c, messages, opts) => {
+      const content = messages[0].content;
+      if (content.startsWith('You are summarising')) return opts.validate(JSON.stringify(brief));
+      if (content.startsWith('You are suggesting')) return opts.validate(JSON.stringify(suggestions));
+      if (content.startsWith('You are judging')) {
+        const ids = [...content.matchAll(/- id (\d+):/g)].map((m) => m[1]);
+        return opts.validate(JSON.stringify(ids.map((id) => ({ id, fit: 8, reason: 'good fit' }))));
+      }
+      throw new Error('unexpected prompt');
+    };
+    const resolve = async (title) => {
+      if (title === 'Suggestion A') return { _tmdb_id: 9001, _genre_ids: [18], _vote_average: 8, _vote_count: 1000 };
+      if (title === 'Suggestion B') return { _tmdb_id: 9002, _genre_ids: [18], _vote_average: 8, _vote_count: 1000 };
+      return null;
+    };
+    const tvMetaCalls = [];
+    const tvMeta = (apiKey, ids) => {
+      tvMetaCalls.push(ids.slice());
+      const m = new Map();
+      for (const id of ids) {
+        const base = { tmdb_id: id, imdb_id: 'tt' + id, type: 'series', title: 'Show ' + id, year: 2024, genres: ['Drama'], keywords: [], tvType: 'Scripted', status: 'Returning Series', vote_average: 8, vote_count: 1000, popularity: 5, certAU: null, certUS: null, first_air_date: '2024-01-01', last_air_date: '2026-01-01', number_of_episodes: 20, number_of_seasons: 1 };
+        // The five non-llm candidates get distinct vote_average → a
+        // deterministic pre-score order (the top 3 are good5, good4, good3).
+        if (id === 'good1') base.vote_average = 5;
+        if (id === 'good2') base.vote_average = 6;
+        if (id === 'good3') base.vote_average = 7;
+        if (id === 'good4') base.vote_average = 8;
+        if (id === 'good5') base.vote_average = 9;
+        m.set(id, base);
+      }
+      return m;
+    };
+    const simklRecs = async (profile, ids) => {
+      const m = new Map();
+      for (const id of ids) {
+        if (id !== 100) continue;
+        // Distinct vote_average on the recs (mergePool carries them onto the
+        // candidate, and the pre-score runs BEFORE the meta lookup) → a
+        // deterministic pre-score order (the top 3 are good5, good4, good3).
+        m.set(id, [
+          { tmdb_id: 'good1', imdb_id: 'ttgood1', title: 'Good Show 1', year: 2024, vote_average: 5 },
+          { tmdb_id: 'good2', imdb_id: 'ttgood2', title: 'Good Show 2', year: 2024, vote_average: 6 },
+          { tmdb_id: 'good3', imdb_id: 'ttgood3', title: 'Good Show 3', year: 2024, vote_average: 7 },
+          { tmdb_id: 'good4', imdb_id: 'ttgood4', title: 'Good Show 4', year: 2024, vote_average: 8 },
+          { tmdb_id: 'good5', imdb_id: 'ttgood5', title: 'Good Show 5', year: 2024, vote_average: 9 },
+        ]);
+      }
+      return m;
+    };
+    const ctx = {
+      settings: { llm: {}, marquee_tv: { lookup_cap: 3 } },
+      nowMs,
+      filters: { excluded_genres: ['Horror'], min_year: 2015, min_rating: 7, vote_count_floor: 50, age_limit: 0 },
+      tmdbKey: 'itest-tmdb',
+      mdblistKey: '',
+      log: { log: () => {}, warn: () => {}, error: () => {} },
+      stats: {},
+      watchedIds: { imdb: new Set(), tmdb: new Set() },
+      dont: new Set(),
+      marqueeTvChain: chain,
+      marqueeTvChat: stubChat,
+      marqueeTvResolve: resolve,
+      marqueeTvFetchers: { tvMeta, simklRecs, tmdbRecs: () => [], discover: () => [], trending: () => [], imdbRatings: () => new Map() },
+    };
+    try {
+      watchedStore.upsertSeriesProgress(p.id, seriesRows);
+      await marqueeTv.generate(profile, 'series', ctx);
+      // The candidate lookup (the second tvMeta call — the first is the
+      // history meta): exactly 5 — the top 3 non-llm + both llm.
+      assert.ok(tvMetaCalls.length >= 2, 'history + candidate meta calls');
+      assert.deepStrictEqual(tvMetaCalls[1].slice().sort(), ['9001', '9002', 'good3', 'good4', 'good5'], '5 looked up: the top 3 non-llm + both llm');
+      assert.ok(tvMetaCalls[1].includes('good3') && tvMetaCalls[1].includes('good4') && tvMetaCalls[1].includes('good5'), 'the 3 best non-llm are all present');
+      assert.ok(!tvMetaCalls[1].includes('good1') && !tvMetaCalls[1].includes('good2'), 'the two weakest non-llm are cut');
+      assert.strictEqual(ctx.stats.strong, 5, 'stats.strong = kept.length (5)');
+    } finally {
+      config.removeProfile(p.id);
+      watchedStore.deleteForProfile(p.id);
     }
   });
 
