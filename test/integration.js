@@ -7419,6 +7419,173 @@ async function main() {
     }
   });
 
+  // ── TV-3 B2: the suggestions (T7) ──
+  // The exact prompt (the rules present or omitted correctly, the formats
+  // line, the avoid list), resolve called sequentially once per suggestion,
+  // duds cached as tmdb_id:null, a second build a cache hit (zero chat, zero
+  // resolve), the N5 regex, and — through the orchestrator — llm candidates
+  // always looked up (pre-score 0, a full lookup_cap) and a resolved anime
+  // suggestion dropped by the hard filter (N6).
+  await it('TV-3 B2: tvSuggest — exact prompt, sequential resolve, duds cached, cache hit, llm-first lookup, anime dropped, N5', async () => {
+    const llmMod = require('../src/engines/marqueeTv/llm');
+    const marqueeTv = require('../src/engines/marqueeTv');
+    const cfg = require('../src/engines/marqueeTv/config').DEFAULTS;
+    const now = 1_700_000_000_000;
+    const nowMs = Date.parse('2026-10-02T00:00:00Z');
+    const nowYear = new Date(nowMs).getFullYear();
+    const DAY = 86400e3;
+    const p = config.addProfile('INT-TV3-B2');
+    const log = { log: () => {}, warn: () => {}, error: () => {} };
+    const chain = [{ type: 'custom', name: 'local', uri: 'http://localhost:11434/v1', apiKey: '' }];
+    const brief = { loves: ['space opera'], avoids: ['reality'], moods: ['wistful'], eras: ['1990s'], standout_titles: ['Seed Show'] };
+    const rawSuggestions = JSON.stringify([
+      { title: 'Good Suggestion', year: 2024 },
+      { title: 'Dud Suggestion', year: 2023 },
+      { title: 'Anime Suggestion', year: 2022 },
+    ]);
+    const calls = [];
+    const goodChat = async (c, messages, opts) => { calls.push({ messages, opts }); return opts.validate(rawSuggestions); };
+    const resolveCalls = [];
+    const resolve = async (title, year) => {
+      resolveCalls.push({ title, year });
+      if (title === 'Good Suggestion') return { _tmdb_id: 9001, _genre_ids: [35], _vote_average: 0, _vote_count: 1000 };
+      if (title === 'Anime Suggestion') return { _tmdb_id: 9002, _genre_ids: [16], _vote_average: 0, _vote_count: 100 };
+      return null; // the dud
+    };
+    const p2 = config.addProfile('INT-TV3-B2O');
+    config.updateProfile(p2.id, {
+      filters: { engine_series: 'marquee-tv', excluded_genres: ['Horror'], min_year: 2015, min_rating: 7, vote_count_floor: 50, age_limit: 0 },
+      keys: { tmdb_api_key: 'itest-tmdb' },
+      simkl_auth: { access_token: 'tok' },
+    });
+    const profile2 = config.getProfile(p2.id);
+    const seriesRows = [
+      { simkl_id: 100, kind: 'show', imdb_id: 'ttseed1', tmdb_id: 'seed1', title: 'Seed Show', year: 2020, status: 'completed', watched_eps: 20, total_eps: 20, not_aired_eps: 0, last_watched_at: nowMs - DAY, first_watched_at: nowMs - 10 * DAY, first_real_at: nowMs - DAY, last_real_at: nowMs - DAY, stamps: 20, real_stamps: 20, eps_per_week: null },
+      { simkl_id: 200, kind: 'show', imdb_id: 'ttrecent1', tmdb_id: 'recent1', title: 'Recent Show', year: 2024, status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0, last_watched_at: nowMs, first_watched_at: nowMs - 5 * DAY, first_real_at: nowMs, last_real_at: nowMs, stamps: 10, real_stamps: 10, eps_per_week: null },
+      { simkl_id: 300, kind: 'show', imdb_id: 'ttold1', tmdb_id: 'old1', title: 'Old Show', year: 2020, status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0, last_watched_at: nowMs - 90 * DAY, first_watched_at: nowMs - 90 * DAY, first_real_at: nowMs - 90 * DAY, last_real_at: nowMs - 90 * DAY, stamps: 10, real_stamps: 10, eps_per_week: null },
+      { simkl_id: 400, kind: 'anime', imdb_id: 'ttanime1', tmdb_id: 'anime1', title: 'Anime Show', year: 2020, status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0, last_watched_at: nowMs, first_watched_at: nowMs, first_real_at: nowMs, last_real_at: nowMs, stamps: 10, real_stamps: 10, eps_per_week: null },
+    ];
+    try {
+      // (a) the exact prompt: the rules present or omitted correctly, the
+      // formats line, the avoid list (most recent last_watched_at first; the
+      // anime row is excluded by kind).
+      watchedStore.upsertSeriesProgress(p.id, seriesRows);
+      const profile = config.getProfile(p.id);
+      const ctx = { filters: { min_year: 2015, min_rating: 7, excluded_genres: ['Horror', 'Reality'] } };
+      const formatsAllowed = new Set(['scripted', 'reality']);
+      const out = await llmMod.tvSuggest(profile, ctx, cfg, { brief, briefHash: llmMod.briefHash(brief), chain, chat: goodChat, resolve, formatsAllowed, nowYear, log, now });
+      assert.strictEqual(calls.length, 1, 'one chat call');
+      const expected = [
+        'You are suggesting TV series for a recommendation engine.',
+        "The viewer's taste profile:",
+        JSON.stringify(brief),
+        '',
+        'Rules for every suggestion:',
+        '- a TV series, not a film',
+        '- still airing, or last aired in or after 2015',
+        '- rated at least 7 on IMDb',
+        '- not these genres: Horror, Reality',
+        '- not anime and not Japanese animation',
+        '- only these formats: reality series, scripted series and miniseries',
+        '',
+        'Do not suggest these shows (already watched):',
+        '- Recent Show (2024)',
+        '- Seed Show (2020)',
+        '- Old Show (2020)',
+        '',
+        'Respond with a JSON array of 40 objects, each exactly {"title": "...", "year": 2019} (year = the first-air year).',
+        'Output ONLY the JSON array.',
+      ].join('\n');
+      assert.strictEqual(calls[0].messages[0].content, expected, 'the exact prompt');
+      assert.strictEqual(calls[0].opts.temperature, 0.3, 'temperature 0.3');
+      assert.ok(calls[0].opts.timeoutMs > 0, 'the timeout is set');
+
+      // resolve is called sequentially, once per suggestion.
+      assert.deepStrictEqual(resolveCalls.map((r) => r.title), ['Good Suggestion', 'Dud Suggestion', 'Anime Suggestion'], 'resolve once per suggestion, in order');
+      assert.deepStrictEqual(out, [
+        { title: 'Good Suggestion', year: 2024, tmdb_id: '9001', genre_ids: [35], vote_average: 0, vote_count: 1000 },
+        { title: 'Dud Suggestion', year: 2023, tmdb_id: null },
+        { title: 'Anime Suggestion', year: 2022, tmdb_id: '9002', genre_ids: [16], vote_average: 0, vote_count: 100 },
+      ], 'the resolved list, duds as tmdb_id: null');
+
+      // (b) a second build is a cache hit — zero chat, zero resolve.
+      const out2 = await llmMod.tvSuggest(profile, ctx, cfg, { brief, briefHash: llmMod.briefHash(brief), chain, chat: goodChat, resolve, formatsAllowed, nowYear, log, now: now + 1000 });
+      assert.strictEqual(calls.length, 1, 'cache hit: no new chat call');
+      assert.strictEqual(resolveCalls.length, 3, 'cache hit: no new resolve call');
+      assert.deepStrictEqual(out2, out, 'the cached list');
+
+      // (f) N5: the prompt carries no age/suitability/child/classification
+      // wording (the full card regex — no "engaged" in the suggest prompt).
+      assert.ok(!/age|suitab|child|kid|classif|rated (G|PG|M)/i.test(calls[0].messages[0].content), 'N5: no age/suitability/child/classification wording');
+
+      // (c) + (d) the orchestrator: llm candidates are always looked up
+      // (pre-score 0, a full lookup_cap) and a resolved anime suggestion is
+      // dropped by the hard filter (N6).
+      watchedStore.upsertSeriesProgress(p2.id, seriesRows);
+      const rawBrief = JSON.stringify(brief);
+      const chatCalls = [];
+      const stubChat = async (c, messages, opts) => {
+        const content = messages[0].content;
+        chatCalls.push(content);
+        if (content.startsWith('You are summarising')) return opts.validate(rawBrief);
+        if (content.startsWith('You are suggesting')) return opts.validate(rawSuggestions);
+        throw new Error('unexpected prompt');
+      };
+      const tvMetaCalls = [];
+      const tvMeta = (apiKey, ids) => {
+        tvMetaCalls.push(ids.slice());
+        const m = new Map();
+        for (const id of ids) {
+          const base = { tmdb_id: id, imdb_id: 'tt' + id, type: 'series', title: 'Show ' + id, year: 2024, genres: ['Drama'], keywords: [], tvType: 'Scripted', status: 'Returning Series', vote_average: 8, vote_count: 1000, popularity: 5, certAU: null, certUS: null, first_air_date: '2024-01-01', last_air_date: '2026-01-01', number_of_episodes: 20, number_of_seasons: 1 };
+          if (id === '9001') { base.title = 'Good Suggestion'; base.genres = ['Comedy']; base.first_air_date = '2024-01-01'; }
+          if (id === '9002') { base.title = 'Anime Suggestion'; base.genres = ['Animation']; base.simklType = 'anime'; base.vote_average = 7; base.vote_count = 100; base.first_air_date = '2022-01-01'; }
+          m.set(id, base);
+        }
+        return m;
+      };
+      // Batch fetcher (L2, TV-3 §5): (profile, simklIds) → Map<simkl_id, recs[]>.
+      const simklRecs = async (profile, ids) => {
+        const m = new Map();
+        for (const id of ids) {
+          if (id !== 100) continue;
+          m.set(id, [{ tmdb_id: 'good1', imdb_id: 'ttgood1', title: 'Good Show', year: 2024 }]);
+        }
+        return m;
+      };
+      const logs = [];
+      const ctx2 = {
+        settings: { llm: {}, marquee_tv: { lookup_cap: 2 } }, // the cap is FULL of non-llm candidates
+        nowMs,
+        filters: { excluded_genres: ['Horror'], min_year: 2015, min_rating: 7, vote_count_floor: 50, age_limit: 0 },
+        tmdbKey: 'itest-tmdb',
+        mdblistKey: '',
+        log: { log: (msg) => logs.push(msg), warn: () => {}, error: () => {} },
+        stats: {},
+        watchedIds: { imdb: new Set(), tmdb: new Set() },
+        dont: new Set(),
+        marqueeTvChain: chain,
+        marqueeTvChat: stubChat,
+        marqueeTvResolve: resolve,
+        marqueeTvFetchers: { tvMeta, simklRecs, tmdbRecs: () => [], discover: () => [], trending: () => [], imdbRatings: () => new Map() },
+      };
+      const outO = await marqueeTv.generate(profile2, 'series', ctx2);
+      // (c) the llm candidates take the lookup slots first: pre-score 0, and
+      //     the cap (2) is full of the higher pre-scored non-llm candidates.
+      assert.deepStrictEqual(tvMetaCalls[1], ['9001', '9002'], 'llm candidates always looked up (pre-score 0, full lookup_cap)');
+      assert.ok(!tvMetaCalls[1].includes('good1'), 'the non-llm candidate fills no slot');
+      // (d) the resolved anime suggestion is dropped by the hard filter.
+      assert.deepStrictEqual(outO.map((c) => c.tmdb_id), ['9001'], '9001 stored, the anime 9002 dropped');
+      assert.strictEqual(ctx2.stats.llm.brief, true, 'the brief was built');
+      assert.deepStrictEqual(ctx2.stats.llm.suggest, { resolved: 2, total: 3 }, 'the suggest stats');
+      assert.strictEqual(ctx2.stats.passed, 1, 'one candidate passed the hard filter');
+    } finally {
+      config.removeProfile(p.id);
+      config.removeProfile(p2.id);
+      watchedStore.deleteForProfile(p.id);
+      watchedStore.deleteForProfile(p2.id);
+    }
+  });
+
   // ── TV-2 E1: the full orchestrator (hermetic; stubbed network fetchers) ──
   // A temp DB with series_progress rows (a normal seed, an anime row, a Reality
   // show seen only as sampled_left) + Glass meta + stubs for every network

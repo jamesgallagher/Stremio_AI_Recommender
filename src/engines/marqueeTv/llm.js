@@ -16,6 +16,8 @@ const crypto = require('crypto');
 const llmCache = require('../marquee/llmCache');
 const llm = require('../../services/llm');
 const tasteFeedback = require('../../tasteFeedback');
+const watchedStore = require('../../watchedStore');
+const recency = require('../../recency');
 const filters = require('./filters');
 
 // VERBATIM copy of Cinema's parseBrief (marquee/taste.js): extract the first
@@ -133,4 +135,134 @@ async function tvBrief(profileId, ladderEntries, metaById, { chain = [], chat = 
   }
 }
 
-module.exports = { parseBrief, briefHash, rungWords, buildBriefPrompt, tvBrief };
+// ── §3.2 Suggestions (T7) ──
+
+// VERBATIM copy of Cinema's parseSuggestions (marquee/sources.js): llm.extractArray,
+// then keep only items with a non-empty string title (≤ 120 chars) and an
+// optional integer year in 1900..nowYear+1, dedupe by lowercased title + year.
+// Throw if no valid items remain (makes chat try the next model/provider).
+function parseSuggestions(text, { nowYear = new Date().getFullYear() } = {}) {
+  const arr = llm.extractArray(text);
+  const seen = new Set();
+  const out = [];
+  for (const it of arr) {
+    if (!it || typeof it !== 'object') continue;
+    const title = typeof it.title === 'string' ? it.title.trim() : '';
+    if (!title || title.length > 120) continue;
+    let year = null;
+    if (it.year != null) {
+      const y = Number(it.year);
+      if (!Number.isInteger(y) || y < 1900 || y > nowYear + 1) continue; // invalid year → dropped
+      year = y;
+    }
+    const key = title.toLowerCase() + '|' + (year == null ? '' : year);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ title, year });
+  }
+  if (!out.length) throw new Error('no valid suggestions');
+  return out;
+}
+
+// §3.2 format words: the allowed format families, in the prompt's words.
+const FORMAT_WORDS = {
+  scripted: 'scripted series and miniseries',
+  reality: 'reality series',
+  documentary: 'documentary series',
+  talk: 'talk shows',
+  news: 'news shows',
+  video: 'web video series',
+};
+function formatWords(families) {
+  return [...(families || [])].sort().map((f) => FORMAT_WORDS[f] || f).join(', ');
+}
+
+// §3.2 the prompt, exactly: the taste profile, the filter rules in words
+// (a rule line is omitted when its value is empty or 0), the format words,
+// and the already-watched shows to avoid. Says nothing about age,
+// suitability, children, classification or ratings boards (N5 / I1).
+function buildSuggestPrompt({ brief, minYear, minRating, excludedGenres, formatWords: fw, avoidList, count }) {
+  const lines = [];
+  lines.push('You are suggesting TV series for a recommendation engine.');
+  lines.push("The viewer's taste profile:");
+  lines.push(brief ? JSON.stringify(brief) : '(no profile)');
+  lines.push('');
+  lines.push('Rules for every suggestion:');
+  lines.push('- a TV series, not a film');
+  if (minYear) lines.push(`- still airing, or last aired in or after ${minYear}`);
+  if (minRating > 0) lines.push(`- rated at least ${minRating} on IMDb`);
+  if (excludedGenres && excludedGenres.length) lines.push(`- not these genres: ${excludedGenres.join(', ')}`);
+  lines.push('- not anime and not Japanese animation');
+  if (fw) lines.push(`- only these formats: ${fw}`);
+  lines.push('');
+  if (avoidList && avoidList.length) {
+    lines.push('Do not suggest these shows (already watched):');
+    for (const t of avoidList) lines.push(`- ${t.title} (${t.year == null ? 'n.d.' : t.year})`);
+  }
+  lines.push('');
+  lines.push(`Respond with a JSON array of ${count} objects, each exactly {"title": "...", "year": 2019} (year = the first-air year).`);
+  lines.push('Output ONLY the JSON array.');
+  return lines.join('\n');
+}
+
+// §3.2 the cached LLM suggestions. Only when a brief exists, the chain is
+// non-empty and cfg.suggest.enabled. The cache key is sha256(briefHash + '|'
+// + filterKey) (kind 'tv_suggest', TTL cfg.suggest.ttl_days); the cached
+// value is the RESOLVED list, including tmdb_id:null duds, so a dud is not
+// re-searched. On a miss: build the prompt, call chat, then resolve each
+// suggestion SEQUENTIALLY through TMDB (N6: untrusted LLM output — only
+// title + year are taken). A failed suggestion call is NEVER cached.
+async function tvSuggest(profile, ctx, cfg, { brief, briefHash, chain = [], chat = llm.chat, resolve, formatsAllowed, nowYear, log = console, now = Date.now() } = {}) {
+  if (!brief || !chain || !chain.length || !cfg.suggest.enabled) return [];
+  const filters = (ctx && ctx.filters) || profile.filters || {};
+  const filterKey = JSON.stringify({
+    min_rating: filters.min_rating || 0,
+    min_year: recency.minYearOf(filters, nowYear),
+    excluded_genres: (filters.excluded_genres || []).slice().sort(),
+    formats: [...(formatsAllowed || new Set())].sort(),
+  });
+  const key = crypto.createHash('sha256').update(briefHash + '|' + filterKey).digest('hex');
+  const cached = llmCache.get(profile.id, 'tv_suggest', key, { ttlMs: cfg.suggest.ttl_days * 86400e3, now });
+  if (cached) return cached;
+  // The avoid list: the profile's series_progress shows (non-anime), most
+  // recent last_watched_at first, the first cfg.suggest.avoid_recent.
+  const avoidList = watchedStore.getSeriesProgress(profile.id, { kind: 'show' })
+    .sort((a, b) => String(b.last_watched_at || '').localeCompare(String(a.last_watched_at || '')))
+    .slice(0, cfg.suggest.avoid_recent)
+    .map((w) => ({ title: w.title, year: w.year }));
+  const prompt = buildSuggestPrompt({
+    brief,
+    minYear: recency.minYearOf(filters, nowYear),
+    minRating: filters.min_rating || 0,
+    excludedGenres: filters.excluded_genres || [],
+    formatWords: formatWords(formatsAllowed),
+    avoidList,
+    count: cfg.suggest.count,
+  });
+  const timeoutMs = Number(process.env.MARQUEE_LLM_TIMEOUT_MS) || cfg.llm_timeout_ms;
+  let suggestions;
+  try {
+    suggestions = await chat(chain, [{ role: 'user', content: prompt }], {
+      temperature: 0.3, timeoutMs, validate: (t) => parseSuggestions(t, { nowYear }),
+    }, log);
+  } catch (err) {
+    log.warn(`[marquee-tv] suggestions failed: ${err.message} — no suggestions this build (never cached)`);
+    return [];
+  }
+  // Resolve sequentially (N6): only title + year from the LLM, resolved
+  // through TMDB; a miss is kept as tmdb_id:null (cached, not re-searched).
+  const resolved = [];
+  for (const s of suggestions) {
+    let meta = null;
+    try { meta = await resolve(s.title, s.year); } catch { meta = null; }
+    if (meta && meta._tmdb_id != null) {
+      resolved.push({ title: s.title, year: s.year, tmdb_id: String(meta._tmdb_id), genre_ids: meta._genre_ids || [], vote_average: meta._vote_average || 0, vote_count: meta._vote_count || 0 });
+    } else {
+      resolved.push({ title: s.title, year: s.year, tmdb_id: null });
+    }
+  }
+  llmCache.put(profile.id, 'tv_suggest', key, resolved, now);
+  return resolved;
+}
+
+module.exports = { parseBrief, briefHash, rungWords, buildBriefPrompt, tvBrief, parseSuggestions, formatWords, buildSuggestPrompt, tvSuggest };

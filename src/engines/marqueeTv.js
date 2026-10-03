@@ -219,9 +219,10 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
   // (custom chain; N3), cached per history key, null when no chain or on a
   // failure (the build continues without it; N4 / MI-3).
   const tvLlmChain = ctx.marqueeTvChain || settings.llmChain(ctx.settings).filter((p) => p.type === 'custom');
+  const llmChat = ctx.marqueeTvChat || llm.chat;
   const brief = await tvLlm.tvBrief(profile.id, ladderEntries, historyMeta, {
     chain: tvLlmChain,
-    chat: ctx.marqueeTvChat || llm.chat,
+    chat: llmChat,
     cfg, log, now: nowMs, isAnimeRow,
   });
   ctx.stats.llm = { brief: !!brief };
@@ -236,6 +237,22 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
   const trendingItems = sources.sourceTrending(sctx, { fetcher: f.trending });
   raws.push(...trendingItems);
   raws.push(...(await sources.sourceAiring(sctx, tasteGenresTop, { fetcher: f.discover, cfg, now: nowMs, log })));
+  // T7 (TV-3 §3.2): the local-LLM suggestions — only when a brief exists;
+  // the resolved candidates join the pool with group 'llm' (N6: untrusted
+  // output, resolved through TMDB, then the same hard filter).
+  const llmRecs = await tvLlm.tvSuggest(profile, sctx, cfg, {
+    brief,
+    briefHash: brief ? tvLlm.briefHash(brief) : null,
+    chain: tvLlmChain,
+    chat: llmChat,
+    resolve: ctx.marqueeTvResolve || ((title, year) => tmdb.resolveTitle(ctx.tmdbKey, 'series', title, year, log)),
+    formatsAllowed,
+    nowYear,
+    log,
+    now: nowMs,
+  });
+  for (const r of llmRecs) raws.push({ item: r, group: 'llm' });
+  ctx.stats.llm.suggest = { resolved: llmRecs.filter((r) => r.tmdb_id != null).length, total: llmRecs.length };
   const trendingN = trendingItems.length;
 
   const pool = mergePool(raws);
@@ -274,7 +291,11 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
     preScored.push({ id, c, p, trendingRaw });
   }
   preScored.sort((a, b) => b.p - a.p);
-  const kept = preScored.slice(0, cfg.lookup_cap);
+  // T7 (TV-3 §3.2): the llm candidates take lookup slots first; the rest of
+  // the cap is filled by the pre-score order.
+  const llmFirst = preScored.filter((k) => k.c.sources.has('llm'));
+  const rest = preScored.filter((k) => !k.c.sources.has('llm'));
+  const kept = [...llmFirst, ...rest].slice(0, cfg.lookup_cap);
 
   // 5. Look up each kept candidate's TV meta (§5.2, cached) + IMDb ratings.
   const keptIds = kept.map((k) => k.id);
