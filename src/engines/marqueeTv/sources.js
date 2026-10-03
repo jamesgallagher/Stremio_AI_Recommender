@@ -66,20 +66,25 @@ const TV_GENRE_IDS = { 'Action & Adventure': 10759, Animation: 16, Comedy: 35, C
 // per-candidate seedHits (Map<seedTmdbId, Set<group>>) and sources (group list).
 // Every network call goes through the ctx.marqueeTvFetchers seam (M6).
 
-// T1: Simkl users_recs per seed (group 'simkl'). `fetcher` is
-// (profile, simklId) → recs[] (the §5.3 ensureShowRecs fetcher).
+// T1: Simkl users_recs per seed (group 'simkl'). `fetcher` is a BATCH fetcher
+// (profile, simklIds) → Map<simkl_id, recs[]> (the §5.3 ensureShowRecs fetcher),
+// called once with all the seeds' Simkl ids — the uncached cap is per build
+// (L2, TV-3 §5).
 async function sourceSimklRecs(ctx, seeds, { fetcher, log = console } = {}) {
+  const ids = [...new Set(seeds.map((s) => s.row.simkl_id).filter((id) => id != null))];
+  if (!ids.length) return [];
+  let bySeed;
+  try {
+    bySeed = await fetcher(ctx.profile, ids);
+  } catch (err) {
+    log.warn(`[marquee-tv] T1 simkl recs failed: ${err.message}`);
+    return [];
+  }
   const out = [];
   for (const s of seeds) {
-    if (s.row.simkl_id == null) continue;
-    let recs;
-    try {
-      recs = await fetcher(ctx.profile, s.row.simkl_id);
-    } catch (err) {
-      log.warn(`[marquee-tv] T1 simkl recs failed for seed ${s.row.tmdb_id}: ${err.message}`);
-      continue;
-    }
-    for (const r of recs || []) out.push({ item: r, group: 'simkl', seed: String(s.row.tmdb_id) });
+    const recs = bySeed.get(s.row.simkl_id);
+    if (!recs) continue;
+    for (const r of recs) out.push({ item: r, group: 'simkl', seed: String(s.row.tmdb_id) });
   }
   return out;
 }

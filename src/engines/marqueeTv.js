@@ -32,6 +32,9 @@ const taste = require('./marqueeTv/taste');
 const filters = require('./marqueeTv/filters');
 const sources = require('./marqueeTv/sources');
 const scoring = require('./marqueeTv/scoring');
+const tvLlm = require('./marqueeTv/llm');
+const llm = require('../services/llm');
+const serveCalibration = require('../serveCalibration');
 const { tierFor } = require('../ageVerification/tiers');
 const mqFeatures = require('./marquee/features');
 
@@ -47,10 +50,8 @@ function defaultFetchers(ctx, profile, cfg, nowMs, log) {
   return {
     ladder: (profileId) => seriesEngagement.ladderFor(profileId, { now: nowMs, kind: 'show' }),
     tvMeta: (apiKey, ids) => meta.ensureTvMeta(apiKey, ids, { now: nowMs, log }),
-    simklRecs: async (p, id) => {
-      const m = await simklRecs.ensureShowRecs(p, [id], { cap: cfg.t1_uncached_cap, now: nowMs, log });
-      return m.get(id) || [];
-    },
+    // L2 (TV-3 §5): one batch call per build — the uncached cap is per build.
+    simklRecs: (p, ids) => simklRecs.ensureShowRecs(p, ids, { cap: cfg.t1_uncached_cap, now: nowMs, log }),
     tmdbRecs: (apiKey, tmdbId) => tmdb.getRecommendations(apiKey, 'series', tmdbId),
     discover: (apiKey, params, opts) => tmdb.discoverTv(apiKey, params, opts),
     trending: (lt) => simklTrending.getList(lt),
@@ -70,19 +71,34 @@ function comfortOf(ladderEntries, isAnimeRow, cfg) {
   return totals.length % 2 ? totals[mid] : (totals[mid - 1] + totals[mid]) / 2;
 }
 
-// The candidate's list-payload genre names (tvGenres-split): from its genre
-// names (trending) or genre_ids (TMDB list items) → the split genre names.
+// L1 (TV-3 §5): Simkl trending genre names → TMDB raw TV genre names. The
+// pre-score genre affinity must use raw names because taste.dims.genres is
+// keyed by raw names (Sci-Fi & Fantasy, Action & Adventure, …); the other
+// trending names pass through unchanged. The hard filter and output genres
+// are unchanged (they still use tvGenres).
+const SIMKL_TRENDING_GENRE_MAP = {
+  'Science-Fiction': 'Sci-Fi & Fantasy',
+  'Fantasy': 'Sci-Fi & Fantasy',
+  'Action': 'Action & Adventure',
+  'Adventure': 'Action & Adventure',
+  'War': 'War & Politics',
+  'Politics': 'War & Politics',
+  'Children': 'Kids',
+};
+
+// The candidate's list-payload genre names (raw names): from its genre names
+// (trending) or genre_ids (TMDB list items) → the raw genre names.
 function listGenreNames(c) {
   const names = new Set();
   if (Array.isArray(c.genres) && c.genres.length) {
-    for (const g of c.genres) names.add(g);
+    for (const g of c.genres) names.add(SIMKL_TRENDING_GENRE_MAP[g] || g);
   } else if (Array.isArray(c.genre_ids) && c.genre_ids.length) {
     for (const id of c.genre_ids) {
       const name = GENRE_ID_TO_NAME[id];
       if (name) names.add(name);
     }
   }
-  return filters.tvGenres({ genres: [...names] });
+  return [...names];
 }
 
 // Merge the raw source payloads into a single pool keyed by tmdb_id, keeping
@@ -134,12 +150,17 @@ function mergePool(raws) {
   return pool;
 }
 
-// §3 summary line, exactly this shape:
+// §7 summary line, exactly this shape (the TV-2 line + the LLM tail):
 // [marquee-tv] <name>: seeds <n> → raw <n> → looked up <n> → passed <n> → stored <n>
-//   (dropped: anime <n>, format <n>, genre <n>, recency <n>, rating <n>, votes <n>, age-floor <n>, no_imdb <n>)
+//   (dropped: …) · llm: brief on|off, suggest <resolved>/<total> resolved, fit <scored> (<cached> cached)
+// `brief off` when there's no brief; `suggest 0/0` and `fit 0 (0 cached)` when skipped.
 function summaryLine(profile, stats, dropped) {
   const d = (k) => dropped[k] || 0;
-  return `[marquee-tv] ${profile.name}: seeds ${stats.seeds ?? 0} → raw ${stats.raw ?? 0} → looked up ${stats.strong ?? 0} → passed ${stats.passed ?? 0} → stored ${stats.kept ?? 0} (dropped: anime ${d('anime')}, format ${d('format')}, genre ${d('genre')}, recency ${d('recency')}, rating ${d('rating')}, votes ${d('votes')}, age-floor ${d('age_floor')}, no_imdb ${d('no_imdb')})`;
+  const llm = stats.llm || {};
+  const briefPart = llm.brief ? 'brief on' : 'brief off';
+  const suggestPart = `suggest ${llm.suggest?.resolved ?? 0}/${llm.suggest?.total ?? 0} resolved`;
+  const fitPart = `fit ${llm.fit?.scored ?? 0} (${llm.fit?.cached ?? 0} cached)`;
+  return `[marquee-tv] ${profile.name}: seeds ${stats.seeds ?? 0} → raw ${stats.raw ?? 0} → looked up ${stats.strong ?? 0} → passed ${stats.passed ?? 0} → stored ${stats.kept ?? 0} (dropped: anime ${d('anime')}, format ${d('format')}, genre ${d('genre')}, recency ${d('recency')}, rating ${d('rating')}, votes ${d('votes')}, age-floor ${d('age_floor')}, no_imdb ${d('no_imdb')}) · llm: ${briefPart}, ${suggestPart}, ${fitPart}`;
 }
 
 async function generate(profile, type, ctx, onProgress = () => {}) {
@@ -199,6 +220,19 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
   ctx.stats = ctx.stats || {};
   ctx.stats.seeds = seedList.length;
 
+  // TV-3 §3.1 (the §7 order, step 5): the taste brief — LOCAL LLM only
+  // (custom chain; N3), cached per history key, null when no chain or on a
+  // failure (the build continues without it; N4 / MI-3).
+  const tvLlmChain = ctx.marqueeTvChain || settings.llmChain(ctx.settings).filter((p) => p.type === 'custom');
+  const llmChat = ctx.marqueeTvChat || llm.chat;
+  const brief = await tvLlm.tvBrief(profile.id, ladderEntries, historyMeta, {
+    chain: tvLlmChain,
+    chat: llmChat,
+    cfg, log, now: nowMs, isAnimeRow,
+    filters: profileFilters,
+  });
+  ctx.stats.llm = { brief: !!brief };
+
   // 3. Gather (§5.4): T1/T2/T3/T5/T6, merged by tmdb_id.
   const sctx = { ...ctx, profile, apiKey: ctx.tmdbKey };
   const tasteGenresTop = glassTaste.topGenres(tasteModel, 6);
@@ -209,6 +243,22 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
   const trendingItems = sources.sourceTrending(sctx, { fetcher: f.trending });
   raws.push(...trendingItems);
   raws.push(...(await sources.sourceAiring(sctx, tasteGenresTop, { fetcher: f.discover, cfg, now: nowMs, log })));
+  // T7 (TV-3 §3.2): the local-LLM suggestions — only when a brief exists;
+  // the resolved candidates join the pool with group 'llm' (N6: untrusted
+  // output, resolved through TMDB, then the same hard filter).
+  const llmRecs = await tvLlm.tvSuggest(profile, sctx, cfg, {
+    brief,
+    briefHash: brief ? tvLlm.briefHash(brief) : null,
+    chain: tvLlmChain,
+    chat: llmChat,
+    resolve: ctx.marqueeTvResolve || ((title, year) => tmdb.resolveTitle(ctx.tmdbKey, 'series', title, year, log)),
+    formatsAllowed,
+    nowYear,
+    log,
+    now: nowMs,
+  });
+  for (const r of llmRecs) raws.push({ item: r, group: 'llm' });
+  ctx.stats.llm.suggest = { resolved: llmRecs.filter((r) => r.tmdb_id != null).length, total: llmRecs.length };
   const trendingN = trendingItems.length;
 
   const pool = mergePool(raws);
@@ -247,7 +297,13 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
     preScored.push({ id, c, p, trendingRaw });
   }
   preScored.sort((a, b) => b.p - a.p);
-  const kept = preScored.slice(0, cfg.lookup_cap);
+  // T7 (TV-3 §3.2): the llm candidates are ADDITIONAL to the lookup cap —
+  // the cap keeps the top non-llm candidates in pre-score order, and every
+  // llm candidate joins them (≤ suggest.count), so LLM suggestions never
+  // displace pre-scored candidates.
+  const llmCands = preScored.filter((k) => k.c.sources.has('llm'));
+  const others   = preScored.filter((k) => !k.c.sources.has('llm')).slice(0, cfg.lookup_cap);
+  const kept     = [...others, ...llmCands];          // lookup = lookup_cap + all llm (≤ suggest.count)
 
   // 5. Look up each kept candidate's TV meta (§5.2, cached) + IMDb ratings.
   const keptIds = kept.map((k) => k.id);
@@ -266,7 +322,7 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
   // 6. Hard filter (§4.3). Rejected candidates are counted by reason.
   const tier = tierFor(profileFilters);
   const filter = filters.compileTvFilter(profileFilters, { nowYear, formatsAllowed, tier });
-  const scored = [];
+  let scored = [];
   for (const k of kept) {
     const m = metaById.get(k.id);
     if (!m) continue; // no meta → can't filter/score
@@ -280,22 +336,58 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
       nowMs,
       cfg,
     });
-    scored.push({ id: k.id, c, pool: k.c, features, penalty, score });
+    // The because-seed reason (the §7 step-11 row carries it so the fit fold
+    // (step 12) can keep it when the LLM gives no reason of its own).
+    const becauseId = sources.becauseSeed(k.c, seedValue, cfg.source_weights);
+    const reason = becauseId ? (seedTitles.get(becauseId) || null) : null;
+    scored.push({
+      tmdb_id: k.id,
+      c,
+      pool: k.c,
+      rankScore: score,
+      reason,
+      scoreComponents: { features, weights: cfg.weights, penalty },
+    });
   }
   ctx.stats.passed = scored.length;
 
-  // Sort by score, cut to store_cap, emit pre-resolved candidates (§4.8).
-  scored.sort((a, b) => b.score - a.score);
+  // TV-3 §3.3 (the §7 order, step 12): the LLM fit fold — only when a brief
+  // exists, the local chain is non-empty and the feature is enabled; otherwise
+  // the rows pass through unchanged (same array, no re-sort; N4 / MI-3).
+  scored = await tvLlm.tvFit(profile.id, scored, {
+    brief,
+    briefHash: brief ? tvLlm.briefHash(brief) : null,
+    cfg,
+    chain: tvLlmChain,
+    chat: llmChat,
+    log,
+    onProgress,
+    now: nowMs,
+  });
+  // The fit stats for the summary line (step 16): the rows the fold scored
+  // (the candidate cap) and how many came from the cache.
+  if (brief && tvLlmChain.length && cfg.llm_fit.enabled !== false) {
+    const top = scored.slice(0, cfg.llm_fit.candidate_cap);
+    ctx.stats.llm.fit = {
+      scored: top.length,
+      cached: top.filter((r) => r.scoreComponents.llm && r.scoreComponents.llm.cached).length,
+    };
+  } else {
+    ctx.stats.llm.fit = { scored: 0, cached: 0 };
+  }
+
+  // Sort by rankScore (the fold already re-sorted when it ran — the same
+  // comparator keeps that order), cut to store_cap, emit pre-resolved
+  // candidates (§4.8).
+  scored.sort((a, b) => (b.rankScore - a.rankScore) || (a.tmdb_id < b.tmdb_id ? -1 : 1));
   const final = scored.slice(0, cfg.store_cap);
   const out = final.map((s) => {
-    const m = metaById.get(s.id);
+    const m = metaById.get(s.tmdb_id);
     const genres = filters.tvGenres(m);
-    const becauseId = sources.becauseSeed(s.pool, seedValue, cfg.source_weights);
-    const becauseTitle = becauseId ? (seedTitles.get(becauseId) || null) : null;
     const seedTitlesList = [...s.pool.seedHits.keys()].map((id) => seedTitles.get(id) || null).filter(Boolean);
     return {
       type: 'series',
-      tmdb_id: s.id,
+      tmdb_id: s.tmdb_id,
       imdb_id: m.imdb_id,
       title: m.title || s.pool.title,
       year: m.year,
@@ -307,12 +399,10 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
       popularity: m.popularity,
       imdb_rating: s.c.imdb_rating,
       certification: m.certAU || m.certUS || null,
-      rankScore: s.score,
-      reason: becauseTitle,
+      rankScore: s.rankScore,
+      reason: s.reason,
       scoreComponents: {
-        features: s.features,
-        weights: cfg.weights,
-        penalty: s.penalty,
+        ...s.scoreComponents,
         sources: [...s.pool.sources],
         seeds: seedTitlesList,
         format: m.tvType,
@@ -324,6 +414,29 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
   });
 
   ctx.stats.kept = out.length;
+
+  // TV-3 §4: the calibrated serve target — only when rows are stored. Built
+  // from the same SPLIT genre names the served rows carry (tvGenres). A
+  // failure only logs — it never fails the build.
+  if (out.length > 0) {
+    try {
+      const shows = [];
+      for (const e of ladderEntries) {
+        if (e.value <= 0 || isAnimeRow(e.row)) continue;
+        const m = historyMeta.get(String(e.row.tmdb_id));
+        if (!m) continue;
+        const genres = filters.tvGenres(m); // SPLIT names — the same names the served rows carry
+        if (genres.length) shows.push({ genres, weight: e.value });
+      }
+      const target = serveCalibration.computeTarget(shows);
+      serveCalibration.setTarget(profile.id, 'series', 'marquee-tv', target, shows.length, nowMs);
+      const top = Object.entries(target).slice(0, 3).map(([g, v]) => `${g} ${Math.round(v * 100)}%`);
+      log.log(`[marquee-tv] ${profile.name}: serve target from ${shows.length} shows — top: ${top.join(', ')}${Object.keys(target).length > 3 ? ' …' : ''}`);
+    } catch (err) {
+      log.warn(`[marquee-tv] serve target failed: ${err.message}`);
+    }
+  }
+
   log.log(summaryLine(profile, ctx.stats, filter.stats()));
   return out;
 }
@@ -341,8 +454,13 @@ module.exports = {
   capabilities: {
     providesRankScore: true,
     preResolved: true,          // §4.8 carries imdb_id/poster/genres → the pipeline skips its own resolve
-    serveOrder: 'affinity',
+    serveOrder: 'calibrated',   // TV-3 §4: the served genre mix is calibrated to the profile's taste
     unrestricted: false,         // M5: age-GATED, safe for any profile via the shared age gate
+  },
+  // Calibrated serving (TV-3 §4): the serve-time tunables, read from the
+  // resolved Marquee TV config (Tier-1 defaults + Tier-2 settings.marquee_tv.serve).
+  serveOptions(settings) {
+    return marqueeTvConfig.resolveConfig(settings).serve;
   },
   // Exactly Marquee Cinema's: TMDB key + Simkl connection (MDBList + a local
   // LLM are optional and deliberately NOT listed).
@@ -354,4 +472,6 @@ module.exports = {
   },
   generate,
   ALGORITHM_VERSION: marqueeTvConfig.ALGORITHM_VERSION,
+  // Exported for the L1 test (TV-3 §5).
+  listGenreNames,
 };

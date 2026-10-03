@@ -4860,6 +4860,54 @@ ok('TV-2 F9: scoreTv — features × weights sum + Canceled+1-season penalty (sp
   assert.strictEqual(p2, 0, 'Canceled + 2 seasons → no penalty');
 });
 
+ok('TV-3 L1: raw-name genre affinity — genre_ids via GENRE_ID_TO_NAME, Simkl trending names via the fixed map, hard filter still sees the split names (spec §5)', () => {
+  const marqueeTv = require('../src/engines/marqueeTv');
+  const { genreAff } = require('../src/engines/marqueeTv/sources');
+  const { compileTvFilter, tvGenres } = require('../src/engines/marqueeTv/filters');
+  const taste = { dims: { genres: { 'Sci-Fi & Fantasy': 0.5, 'Action & Adventure': 0.3, Drama: 0.2 } } };
+  // genre_ids [10765] → Sci-Fi & Fantasy → non-zero genreAff.
+  const names = marqueeTv.listGenreNames({ genre_ids: [10765] });
+  assert.deepStrictEqual(names, ['Sci-Fi & Fantasy']);
+  assert.strictEqual(genreAff(names, taste), 0.5, 'genreAff from taste.dims.genres[Sci-Fi & Fantasy]');
+  // Simkl trending genre names map via the fixed map; the others pass through unchanged.
+  assert.deepStrictEqual(marqueeTv.listGenreNames({ genres: ['Science-Fiction'] }), ['Sci-Fi & Fantasy']);
+  assert.deepStrictEqual(marqueeTv.listGenreNames({ genres: ['Fantasy', 'Action', 'War', 'Children', 'Drama'] }),
+    ['Sci-Fi & Fantasy', 'Action & Adventure', 'War & Politics', 'Kids', 'Drama']);
+  assert.deepStrictEqual(marqueeTv.listGenreNames({ genres: ['Adventure', 'Politics'] }), ['Action & Adventure', 'War & Politics']);
+  // The hard filter still sees the split names: a Science Fiction exclusion still drops it.
+  const f = compileTvFilter({ excluded_genres: ['Science Fiction'] }, { nowYear: 2026, formatsAllowed: new Set(['scripted']), tier: null });
+  const split = tvGenres({ genres: marqueeTv.listGenreNames({ genres: ['Science-Fiction'] }) });
+  assert.deepStrictEqual(split, ['Science Fiction', 'Fantasy'], 'split names for the hard filter');
+  assert.deepStrictEqual(f.check({ imdb_id: 'tt1', tvType: 'Scripted', genres: split, keywords: [], vote_count: 100, vote_average: 8, first_air_date: '2015-01-01', last_air_date: '2020-01-01' }), { ok: false, reason: 'genre' });
+});
+
+okAsync('TV-3 L2: T1 Simkl batch fetcher — one call with all the seeds\' Simkl ids (spec §5)', async () => {
+  const { sourceSimklRecs } = require('../src/engines/marqueeTv/sources');
+  const calls = [];
+  const fetcher = async (profile, ids) => {
+    calls.push(ids);
+    const m = new Map();
+    for (const id of ids) m.set(id, [{ tmdb_id: 'r' + id, title: 'Rec ' + id, year: 2024 }]);
+    return m;
+  };
+  const seeds = Array.from({ length: 50 }, (_, i) => ({ row: { simkl_id: 1000 + i, tmdb_id: 's' + i } }));
+  const out = await sourceSimklRecs({ profile: { id: 'p' } }, seeds, { fetcher, log: { warn: () => {} } });
+  assert.strictEqual(calls.length, 1, 'the T1 fetcher is called once');
+  assert.deepStrictEqual(calls[0], Array.from({ length: 50 }, (_, i) => 1000 + i), 'with all 50 Simkl ids');
+  assert.strictEqual(out.length, 50, '50 recs (one per seed)');
+  assert.ok(out.every((o) => o.group === 'simkl'), 'group simkl');
+  // A throwing fetcher → [] (degraded, not thrown).
+  const out2 = await sourceSimklRecs({ profile: { id: 'p' } }, seeds, { fetcher: async () => { throw new Error('simkl down'); }, log: { warn: () => {} } });
+  assert.deepStrictEqual(out2, []);
+});
+
+ok('TV-3 S1: the descriptor — serveOrder calibrated + serveOptions returns the §6 serve defaults (spec §4)', () => {
+  const marqueeTv = require('../src/engines/marqueeTv');
+  assert.strictEqual(marqueeTv.capabilities.serveOrder, 'calibrated', 'serveOrder calibrated');
+  const cfg = require('../src/engines/marqueeTv/config').DEFAULTS;
+  assert.deepStrictEqual(marqueeTv.serveOptions({}), cfg.serve, 'serveOptions({}) = the §6 serve defaults');
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');
