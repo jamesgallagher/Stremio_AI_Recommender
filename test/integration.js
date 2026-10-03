@@ -7586,6 +7586,255 @@ async function main() {
     }
   });
 
+  // ── TV-3 B3: the fit score (the §3.3 fold) ──
+  // Sequential batches of cfg.llm_fit.batch, cached items skip the call, an
+  // omitted item → neutral 5 (not cached), a throwing batch → its items 5
+  // (not cached) and the next batch still runs, the fold recomputes
+  // rankScore = weightedSum(feat, renormalize) − penalty, re-sorts, keeps the
+  // LLM reason when present, and the N5 regex.
+  await it('TV-3 B3: tvFit — sequential batches, cached skip, omitted/failed → 5 uncached, fold math, re-sort, reason, N5', async () => {
+    const llmMod = require('../src/engines/marqueeTv/llm');
+    const llmCache = require('../src/engines/marquee/llmCache');
+    const mqFeatures = require('../src/engines/marquee/features');
+    const cfg = require('../src/engines/marqueeTv/config').DEFAULTS;
+    const now = 1_700_000_000_000;
+    const p = config.addProfile('INT-TV3-B3');
+    const log = { log: () => {}, warn: () => {}, error: () => {} };
+    const chain = [{ type: 'custom', name: 'local', uri: 'http://localhost:11434/v1', apiKey: '' }];
+    const brief = { loves: ['space opera'], avoids: ['reality'], moods: ['wistful'], eras: ['1990s'], standout_titles: ['Seed Show'] };
+    const briefHash = llmMod.briefHash(brief);
+    const mkRow = (i) => ({
+      tmdb_id: String(100 + i),
+      c: {
+        tmdb_id: String(100 + i), title: 'Show ' + i, year: 2024, networks: ['Netflix'],
+        tvType: 'Scripted', status: 'Returning Series', number_of_seasons: 2, number_of_episodes: 20,
+        genres: ['Drama'], overview: 'A drama about ' + i, keywords: ['k' + i],
+      },
+      pool: { seedHits: new Map(), sources: new Set(['simkl_recs']) },
+      rankScore: 0.5,
+      reason: 'Seed Show',
+      scoreComponents: {
+        features: {
+          taste: (i % 10) / 10, collab: ((i + 3) % 10) / 10, quality: ((i + 6) % 10) / 10,
+          trending: ((i + 1) % 10) / 10, commitment: ((i + 4) % 10) / 10, airing: ((i + 7) % 10) / 10,
+        },
+        weights: cfg.weights,
+        penalty: 0.05 * (i % 3),
+      },
+    });
+    // 40 rows → top 150 = all 40. Two pre-cached (100, 101); 38 uncached →
+    // batches of 15: [102–116], [117–131], [132–139].
+    const scored = Array.from({ length: 40 }, (_, i) => mkRow(i));
+    llmCache.put(p.id, 'tv_fit', '100:' + briefHash, { fit: 9, reason: 'cached reason' }, now);
+    llmCache.put(p.id, 'tv_fit', '101:' + briefHash, { fit: 7, reason: 'cached reason 2' }, now);
+    const chatCalls = [];
+    const chat = async (c, messages, opts) => {
+      chatCalls.push(messages[0].content);
+      const n = chatCalls.length;
+      if (n === 1) { // batch 1: 102–116; omit 116.
+        const items = [];
+        for (let i = 102; i <= 115; i++) items.push({ id: String(i), fit: 8, reason: 'fits well' });
+        return opts.validate(JSON.stringify(items));
+      }
+      if (n === 2) throw new Error('GPU timeout'); // batch 2: 117–131; throw.
+      if (n === 3) { // batch 3: 132–139; return all 8.
+        const items = [];
+        for (let i = 132; i <= 139; i++) items.push({ id: String(i), fit: 6, reason: 'decent fit' });
+        return opts.validate(JSON.stringify(items));
+      }
+      throw new Error('unexpected batch');
+    };
+    try {
+      const result = await llmMod.tvFit(p.id, scored, { brief, briefHash, cfg, chain, chat, log, now });
+      // Three batches, sequential.
+      assert.strictEqual(chatCalls.length, 3, 'three batches');
+      assert.ok(chatCalls[0].includes('- id 102:'), 'batch 1 first');
+      assert.ok(chatCalls[1].includes('- id 117:'), 'batch 2 second');
+      assert.ok(chatCalls[2].includes('- id 132:'), 'batch 3 third');
+      // Cached items skip the call.
+      assert.ok(!chatCalls.some((c) => c.includes('- id 100:')), 'cached 100 not in any prompt');
+      assert.ok(!chatCalls.some((c) => c.includes('- id 101:')), 'cached 101 not in any prompt');
+      // The exact fit prompt (batch 1): the brief lines, the per-item lines,
+      // the JSON footer.
+      const expectedPrompt1 = [
+        "You are judging how well each TV series fits a TV viewer's profile.",
+        '',
+        'Profile brief:',
+        '- loves: space opera',
+        '- avoids: reality',
+        '- moods: wistful',
+        '- eras: 1990s',
+        '- standout_titles: Seed Show',
+        '',
+        'For each series below, return a fit score 0-10 (10 = perfect fit) and a short reason (at most 14 words).',
+        '',
+        ...Array.from({ length: 15 }, (_, k) => {
+          const id = 102 + k;
+          const idx = id - 100;
+          return [
+            `- id ${id}: "Show ${idx}" (2024) — Netflix; Scripted; 2 seasons, 20 episodes; Returning Series`,
+            '  Genres: Drama',
+            `  Overview: A drama about ${idx}`,
+            `  Keywords: k${idx}`,
+          ];
+        }).flat(),
+        '',
+        'Respond with a JSON array: [{"id": "<id>", "fit": 0-10, "reason": "<= 14 words"}]',
+        'Output ONLY the JSON array.',
+      ].join('\n');
+      assert.strictEqual(chatCalls[0], expectedPrompt1, 'the exact fit prompt (batch 1)');
+      // Cached rows: the fit from the cache, cached: true.
+      const r100 = result.find((r) => r.tmdb_id === '100');
+      assert.deepStrictEqual(r100.scoreComponents.llm, { fit: 9, reason: 'cached reason', cached: true });
+      const r101 = result.find((r) => r.tmdb_id === '101');
+      assert.deepStrictEqual(r101.scoreComponents.llm, { fit: 7, reason: 'cached reason 2', cached: true });
+      // The omitted item (116): neutral 5, reason falls back to the
+      // because-seed reason, NOT cached.
+      const r116 = result.find((r) => r.tmdb_id === '116');
+      assert.deepStrictEqual(r116.scoreComponents.llm, { fit: 5, reason: null, cached: false });
+      assert.strictEqual(r116.reason, 'Seed Show', 'omitted row keeps the because-seed reason');
+      assert.strictEqual(llmCache.get(p.id, 'tv_fit', '116:' + briefHash, { now: now + 1 }), null, 'omitted row not cached');
+      // The throwing batch (117–131): every item 5, NOT cached.
+      for (let i = 117; i <= 131; i++) {
+        const r = result.find((r) => r.tmdb_id === String(i));
+        assert.deepStrictEqual(r.scoreComponents.llm, { fit: 5, reason: null, cached: false });
+        assert.strictEqual(llmCache.get(p.id, 'tv_fit', String(i) + ':' + briefHash, { now: now + 1 }), null, `failed-batch row ${i} not cached`);
+      }
+      // The next batch (132–139) still ran: its items cached.
+      for (let i = 132; i <= 139; i++) {
+        const r = result.find((r) => r.tmdb_id === String(i));
+        assert.deepStrictEqual(r.scoreComponents.llm, { fit: 6, reason: 'decent fit', cached: false });
+        assert.deepStrictEqual(llmCache.get(p.id, 'tv_fit', String(i) + ':' + briefHash, { now: now + 1 }), { fit: 6, reason: 'decent fit' }, `batch-3 row ${i} cached`);
+      }
+      // The fold: rankScore = weightedSum(feat, renormalize) − penalty.
+      for (const r of result) {
+        const expected = mqFeatures.weightedSum(r.scoreComponents.features, r.scoreComponents.weights) - r.scoreComponents.penalty;
+        assert.ok(Math.abs(r.rankScore - expected) < 1e-12, `rankScore math for ${r.tmdb_id}`);
+      }
+      // Re-sorted by rankScore desc, ties by tmdb_id.
+      for (let i = 1; i < result.length; i++) {
+        const a = result[i - 1], b = result[i];
+        assert.ok(a.rankScore > b.rankScore || (a.rankScore === b.rankScore && a.tmdb_id < b.tmdb_id), 'sorted by rankScore desc, ties by tmdb_id');
+      }
+      // The LLM reason when present.
+      const r102 = result.find((r) => r.tmdb_id === '102');
+      assert.strictEqual(r102.reason, 'fits well', 'LLM reason when present');
+      // N5: the fit prompt carries no age/suitability/child/classification
+      // wording (the full card regex — no "engaged" in the fit prompt).
+      for (const content of chatCalls) {
+        assert.ok(!/age|suitab|child|kid|classif|rated (G|PG|M)/i.test(content), 'N5: no age/suitability/child/classification wording');
+      }
+    } finally {
+      config.removeProfile(p.id);
+    }
+  });
+
+  // ── TV-3 B4: degradation identity ──
+  // No chain (or the feature disabled) → tvFit returns the SAME array
+  // (identity, no re-sort), zero chat calls; through the orchestrator, no
+  // chain → the deterministic TV-2 scores (weightedSum − penalty, no
+  // llm_fit feature, no llm sub-object), zero chat calls.
+  await it('TV-3 B4: degradation identity — no chain/disabled → same array, deterministic scores, zero chat', async () => {
+    const llmMod = require('../src/engines/marqueeTv/llm');
+    const marqueeTv = require('../src/engines/marqueeTv');
+    const mqFeatures = require('../src/engines/marquee/features');
+    const cfg = require('../src/engines/marqueeTv/config').DEFAULTS;
+    const now = 1_700_000_000_000;
+    const nowMs = Date.parse('2026-10-02T00:00:00Z');
+    const brief = { loves: ['space opera'], avoids: ['reality'], moods: ['wistful'], eras: ['1990s'], standout_titles: ['Seed Show'] };
+    const briefHash = llmMod.briefHash(brief);
+    const p = config.addProfile('INT-TV3-B4');
+    const log = { log: () => {}, warn: () => {}, error: () => {} };
+    const mkRow = (i) => ({
+      tmdb_id: String(100 + i),
+      c: { tmdb_id: String(100 + i), title: 'Show ' + i, year: 2024, networks: ['Netflix'], tvType: 'Scripted', status: 'Returning Series', number_of_seasons: 2, number_of_episodes: 20, genres: ['Drama'], overview: 'A drama about ' + i, keywords: ['k' + i] },
+      pool: { seedHits: new Map(), sources: new Set(['simkl_recs']) },
+      rankScore: 0.5,
+      reason: 'Seed Show',
+      scoreComponents: {
+        features: { taste: (i % 10) / 10, collab: ((i + 3) % 10) / 10, quality: ((i + 6) % 10) / 10, trending: ((i + 1) % 10) / 10, commitment: ((i + 4) % 10) / 10, airing: ((i + 7) % 10) / 10 },
+        weights: cfg.weights,
+        penalty: 0.05 * (i % 3),
+      },
+    });
+    const chatCalls = [];
+    const chat = async () => { chatCalls.push('called'); throw new Error('should not be called'); };
+    const p2 = config.addProfile('INT-TV3-B4O');
+    config.updateProfile(p2.id, {
+      filters: { engine_series: 'marquee-tv', excluded_genres: ['Horror'], min_year: 2015, min_rating: 7, vote_count_floor: 50, age_limit: 0 },
+      keys: { tmdb_api_key: 'itest-tmdb' },
+      simkl_auth: { access_token: 'tok' },
+    });
+    const profile2 = config.getProfile(p2.id);
+    const DAY = 86400e3;
+    const seriesRows = [
+      { simkl_id: 100, kind: 'show', imdb_id: 'ttseed1', tmdb_id: 'seed1', title: 'Seed Show', year: 2020, status: 'completed', watched_eps: 20, total_eps: 20, not_aired_eps: 0, last_watched_at: nowMs - DAY, first_watched_at: nowMs - 10 * DAY, first_real_at: nowMs - DAY, last_real_at: nowMs - DAY, stamps: 20, real_stamps: 20, eps_per_week: null },
+    ];
+    try {
+      // (a) no chain → same array (identity), zero chat.
+      const scored = [mkRow(0), mkRow(1), mkRow(2)];
+      const out = await llmMod.tvFit(p.id, scored, { brief, briefHash, cfg, chain: [], chat, log, now });
+      assert.strictEqual(out, scored, 'no chain → same array (identity)');
+      assert.strictEqual(chatCalls.length, 0, 'no chain → zero chat calls');
+      // (b) disabled → same array (identity), zero chat.
+      const scored2 = [mkRow(0), mkRow(1)];
+      const out2 = await llmMod.tvFit(p.id, scored2, { brief, briefHash, cfg: { ...cfg, llm_fit: { ...cfg.llm_fit, enabled: false } }, chain: [{ type: 'custom' }], chat, log, now });
+      assert.strictEqual(out2, scored2, 'disabled → same array (identity)');
+      assert.strictEqual(chatCalls.length, 0, 'disabled → zero chat calls');
+      // (c) orchestrator: no chain → deterministic TV-2 scores, no llm_fit,
+      //     no llm sub-object, zero chat calls.
+      watchedStore.upsertSeriesProgress(p2.id, seriesRows);
+      const tvMeta = (apiKey, ids) => {
+        const m = new Map();
+        for (const id of ids) {
+          m.set(id, { tmdb_id: id, imdb_id: 'tt' + id, type: 'series', title: 'Show ' + id, year: 2024, genres: ['Drama'], keywords: [], tvType: 'Scripted', status: 'Returning Series', vote_average: 8, vote_count: 1000, popularity: 5, certAU: null, certUS: null, first_air_date: '2024-01-01', last_air_date: '2026-01-01', number_of_episodes: 20, number_of_seasons: 1 });
+        }
+        return m;
+      };
+      const simklRecs = async (profile, ids) => {
+        const m = new Map();
+        for (const id of ids) {
+          if (id !== 100) continue;
+          m.set(id, [
+            { tmdb_id: 'good1', imdb_id: 'ttgood1', title: 'Good Show', year: 2024 },
+            { tmdb_id: 'good2', imdb_id: 'ttgood2', title: 'Good Show 2', year: 2024 },
+          ]);
+        }
+        return m;
+      };
+      const chatCalls2 = [];
+      const stubChat = async (c, messages, opts) => { chatCalls2.push(messages[0].content); throw new Error('should not be called'); };
+      const ctx = {
+        settings: { llm: {} }, // no LLM providers → no chain (N4)
+        nowMs,
+        filters: { excluded_genres: ['Horror'], min_year: 2015, min_rating: 7, vote_count_floor: 50, age_limit: 0 },
+        tmdbKey: 'itest-tmdb',
+        mdblistKey: '',
+        log: { log: () => {}, warn: () => {}, error: () => {} },
+        stats: {},
+        watchedIds: { imdb: new Set(), tmdb: new Set() },
+        dont: new Set(),
+        marqueeTvChat: stubChat,
+        marqueeTvFetchers: { tvMeta, simklRecs, tmdbRecs: () => [], discover: () => [], trending: () => [], imdbRatings: () => new Map() },
+      };
+      const outO = await marqueeTv.generate(profile2, 'series', ctx);
+      assert.strictEqual(chatCalls2.length, 0, 'no chain → zero chat calls (orchestrator)');
+      assert.ok(outO.length >= 1, 'candidates stored');
+      for (const c of outO) {
+        assert.ok(!('llm_fit' in c.scoreComponents.features), 'no llm_fit feature');
+        assert.ok(!('llm' in c.scoreComponents), 'no llm sub-object');
+        const expected = mqFeatures.weightedSum(c.scoreComponents.features, c.scoreComponents.weights) - c.scoreComponents.penalty;
+        assert.ok(Math.abs(c.rankScore - expected) < 1e-12, 'rankScore = deterministic weighted sum − penalty');
+        assert.strictEqual(c.algorithmVersion, 'marquee-tv-t2', 'algorithmVersion = marquee-tv-t2');
+      }
+      assert.deepStrictEqual(ctx.stats.llm, { brief: false, suggest: { resolved: 0, total: 0 }, fit: { scored: 0, cached: 0 } }, 'llm stats: all skipped');
+    } finally {
+      config.removeProfile(p.id);
+      config.removeProfile(p2.id);
+      watchedStore.deleteForProfile(p2.id);
+    }
+  });
+
   // ── TV-2 E1: the full orchestrator (hermetic; stubbed network fetchers) ──
   // A temp DB with series_progress rows (a normal seed, an anime row, a Reality
   // show seen only as sampled_left) + Glass meta + stubs for every network

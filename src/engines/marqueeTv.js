@@ -314,7 +314,7 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
   // 6. Hard filter (§4.3). Rejected candidates are counted by reason.
   const tier = tierFor(profileFilters);
   const filter = filters.compileTvFilter(profileFilters, { nowYear, formatsAllowed, tier });
-  const scored = [];
+  let scored = [];
   for (const k of kept) {
     const m = metaById.get(k.id);
     if (!m) continue; // no meta → can't filter/score
@@ -328,22 +328,58 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
       nowMs,
       cfg,
     });
-    scored.push({ id: k.id, c, pool: k.c, features, penalty, score });
+    // The because-seed reason (the §7 step-11 row carries it so the fit fold
+    // (step 12) can keep it when the LLM gives no reason of its own).
+    const becauseId = sources.becauseSeed(k.c, seedValue, cfg.source_weights);
+    const reason = becauseId ? (seedTitles.get(becauseId) || null) : null;
+    scored.push({
+      tmdb_id: k.id,
+      c,
+      pool: k.c,
+      rankScore: score,
+      reason,
+      scoreComponents: { features, weights: cfg.weights, penalty },
+    });
   }
   ctx.stats.passed = scored.length;
 
-  // Sort by score, cut to store_cap, emit pre-resolved candidates (§4.8).
-  scored.sort((a, b) => b.score - a.score);
+  // TV-3 §3.3 (the §7 order, step 12): the LLM fit fold — only when a brief
+  // exists, the local chain is non-empty and the feature is enabled; otherwise
+  // the rows pass through unchanged (same array, no re-sort; N4 / MI-3).
+  scored = await tvLlm.tvFit(profile.id, scored, {
+    brief,
+    briefHash: brief ? tvLlm.briefHash(brief) : null,
+    cfg,
+    chain: tvLlmChain,
+    chat: llmChat,
+    log,
+    onProgress,
+    now: nowMs,
+  });
+  // The fit stats for the summary line (step 16): the rows the fold scored
+  // (the candidate cap) and how many came from the cache.
+  if (brief && tvLlmChain.length && cfg.llm_fit.enabled !== false) {
+    const top = scored.slice(0, cfg.llm_fit.candidate_cap);
+    ctx.stats.llm.fit = {
+      scored: top.length,
+      cached: top.filter((r) => r.scoreComponents.llm && r.scoreComponents.llm.cached).length,
+    };
+  } else {
+    ctx.stats.llm.fit = { scored: 0, cached: 0 };
+  }
+
+  // Sort by rankScore (the fold already re-sorted when it ran — the same
+  // comparator keeps that order), cut to store_cap, emit pre-resolved
+  // candidates (§4.8).
+  scored.sort((a, b) => (b.rankScore - a.rankScore) || (a.tmdb_id < b.tmdb_id ? -1 : 1));
   const final = scored.slice(0, cfg.store_cap);
   const out = final.map((s) => {
-    const m = metaById.get(s.id);
+    const m = metaById.get(s.tmdb_id);
     const genres = filters.tvGenres(m);
-    const becauseId = sources.becauseSeed(s.pool, seedValue, cfg.source_weights);
-    const becauseTitle = becauseId ? (seedTitles.get(becauseId) || null) : null;
     const seedTitlesList = [...s.pool.seedHits.keys()].map((id) => seedTitles.get(id) || null).filter(Boolean);
     return {
       type: 'series',
-      tmdb_id: s.id,
+      tmdb_id: s.tmdb_id,
       imdb_id: m.imdb_id,
       title: m.title || s.pool.title,
       year: m.year,
@@ -355,12 +391,10 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
       popularity: m.popularity,
       imdb_rating: s.c.imdb_rating,
       certification: m.certAU || m.certUS || null,
-      rankScore: s.score,
-      reason: becauseTitle,
+      rankScore: s.rankScore,
+      reason: s.reason,
       scoreComponents: {
-        features: s.features,
-        weights: cfg.weights,
-        penalty: s.penalty,
+        ...s.scoreComponents,
         sources: [...s.pool.sources],
         seeds: seedTitlesList,
         format: m.tvType,

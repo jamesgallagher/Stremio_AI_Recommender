@@ -19,6 +19,8 @@ const tasteFeedback = require('../../tasteFeedback');
 const watchedStore = require('../../watchedStore');
 const recency = require('../../recency');
 const filters = require('./filters');
+const mqFeatures = require('../marquee/features');
+const llmFit = require('../marquee/llmFit');
 
 // VERBATIM copy of Cinema's parseBrief (marquee/taste.js): extract the first
 // JSON object (tolerating code fences / leading prose), keep only the five
@@ -265,4 +267,128 @@ async function tvSuggest(profile, ctx, cfg, { brief, briefHash, chain = [], chat
   return resolved;
 }
 
-module.exports = { parseBrief, briefHash, rungWords, buildBriefPrompt, tvBrief, parseSuggestions, formatWords, buildSuggestPrompt, tvSuggest };
+// ── §3.3 The fit score ──
+
+// §3.3 the fit prompt, exactly: the profile brief (one line per non-empty
+// key), the per-item lines, the JSON array footer. Omits any brief line whose
+// array is empty, and the Overview / Keywords lines when they're empty.
+// Says nothing about age, suitability, children, classification or ratings
+// boards (N5 / I1).
+function buildFitPrompt(brief, items) {
+  const lines = [
+    "You are judging how well each TV series fits a TV viewer's profile.",
+    '',
+  ];
+  lines.push('Profile brief:');
+  for (const key of ['loves', 'avoids', 'moods', 'eras', 'standout_titles']) {
+    const v = brief[key];
+    if (v && v.length) lines.push(`- ${key}: ${v.join(', ')}`);
+  }
+  lines.push('');
+  lines.push('For each series below, return a fit score 0-10 (10 = perfect fit) and a short reason (at most 14 words).');
+  lines.push('');
+  for (const it of items) {
+    lines.push(`- id ${it.id}: "${it.title}" (${it.year == null ? 'n.d.' : it.year}) — ${it.networks && it.networks.length ? it.networks.join(', ') : 'unknown network'}; ${it.tvType}; ${it.seasons} seasons, ${it.episodes} episodes; ${it.status}`);
+    lines.push(`  Genres: ${it.genres.join(', ')}`);
+    if (it.overview) lines.push(`  Overview: ${it.overview}`);
+    if (it.keywords && it.keywords.length) lines.push(`  Keywords: ${it.keywords.join(', ')}`);
+  }
+  lines.push('');
+  lines.push('Respond with a JSON array: [{"id": "<id>", "fit": 0-10, "reason": "<= 14 words"}]');
+  lines.push('Output ONLY the JSON array.');
+  return lines.join('\n');
+}
+
+// §3.3 the cached LLM fit score, folded into the deterministic score as the
+// llm_fit feature. LOCAL LLM only — if `chain` is empty (no local LLM), no
+// brief, or the feature is disabled, return `scored` UNCHANGED (same array,
+// order, scores — NOT a re-sort; N4 / MI-3). The top `candidate_cap` rows are
+// scored; the fold applies to EVERY row (a neutral 5 for rows below the cap
+// and for items the LLM omitted — never cached). Cache kind 'tv_fit', key
+// `${tmdb_id}:${briefHash}`, TTL cfg.llm_fit.ttl_days.
+async function tvFit(profileId, scored, { brief, briefHash, cfg, chain = [], chat = llm.chat, log = console, onProgress = () => {}, now = Date.now() } = {}) {
+  if (!brief || !chain || !chain.length || cfg.llm_fit.enabled === false) return scored;
+
+  const top = scored.slice(0, cfg.llm_fit.candidate_cap);
+
+  // One cache lookup for the whole top set (kind 'tv_fit', keyed tmdb_id:briefHash).
+  const cached = llmCache.getMany(profileId, 'tv_fit', top.map((r) => `${r.tmdb_id}:${briefHash}`), {
+    ttlMs: cfg.llm_fit.ttl_days * 86400e3, now,
+  });
+  const fitOf = new Map(); // tmdb_id → { fit, reason, cached }
+  const uncached = [];
+  for (const r of top) {
+    const c = cached.get(`${r.tmdb_id}:${briefHash}`);
+    if (c && typeof c === 'object' && typeof c.fit === 'number') {
+      fitOf.set(r.tmdb_id, { fit: c.fit, reason: c.reason ?? null, cached: true });
+    } else {
+      uncached.push(r);
+    }
+  }
+
+  // Batches of cfg.llm_fit.batch, SEQUENTIAL (single GPU — parallel just
+  // times out). A batch that throws/times out → every item in it fit 5,
+  // uncached; the next batch still runs.
+  const batches = [];
+  for (let i = 0; i < uncached.length; i += cfg.llm_fit.batch) batches.push(uncached.slice(i, i + cfg.llm_fit.batch));
+  const timeoutMs = Number(process.env.MARQUEE_LLM_TIMEOUT_MS) || cfg.llm_timeout_ms;
+  let done = 0;
+  for (const b of batches) {
+    const items = b.map((r) => {
+      const m = r.c || {};
+      return {
+        id: r.tmdb_id,
+        title: m.title ?? r.title,
+        year: m.year ?? r.year,
+        networks: m.networks,
+        tvType: m.tvType,
+        seasons: m.number_of_seasons,
+        episodes: m.number_of_episodes,
+        status: m.status,
+        genres: filters.tvGenres(m),
+        overview: m.overview ? String(m.overview).slice(0, 200) : null,
+        keywords: (m.keywords || []).slice(0, 5),
+      };
+    });
+    try {
+      const arr = await chat(chain, [{ role: 'user', content: buildFitPrompt(brief, items) }], {
+        temperature: 0, timeoutMs, validate: llm.extractArray,
+      }, log);
+      const parsed = llmFit.parseFit(arr, b.map((r) => r.tmdb_id));
+      for (const r of b) {
+        const p = parsed.get(r.tmdb_id);
+        if (p) {
+          fitOf.set(r.tmdb_id, { fit: p.fit, reason: p.reason, cached: false });
+          llmCache.put(profileId, 'tv_fit', `${r.tmdb_id}:${briefHash}`, { fit: p.fit, reason: p.reason }, now);
+        }
+        // missing item → fit 5, reason null, NOT cached (the next build retries)
+      }
+    } catch (err) {
+      log.warn(`[marquee-tv] fit batch ${done + 1}/${batches.length} failed: ${err.message}`);
+    }
+    done += 1;
+    onProgress(Math.round((done / batches.length) * 100), `LLM fit ${done}/${batches.length} batch(es)`);
+  }
+
+  // Fold in: llm_fit = fit/10 for EVERY row (neutral 5 below the cap and for
+  // missing items — the feature set stays uniform), weights renormalized over
+  // the existing weight keys ∪ llm_fit, rankScore recomputed.
+  const result = scored.map((r) => {
+    const f = fitOf.get(r.tmdb_id);
+    const fit = f ? f.fit : 5;
+    const reason = f ? f.reason : null;
+    const feat = { ...r.scoreComponents.features, llm_fit: fit / 10 };
+    const w = mqFeatures.renormalize({ ...cfg.weights, llm_fit: cfg.llm_fit.weight }, [...Object.keys(cfg.weights), 'llm_fit']);
+    const rankScore = mqFeatures.weightedSum(feat, w) - r.scoreComponents.penalty;
+    return {
+      ...r,
+      rankScore,
+      reason: reason ?? r.reason,
+      scoreComponents: { ...r.scoreComponents, features: feat, weights: w, llm: { fit, reason, cached: f ? f.cached : false } },
+    };
+  });
+  result.sort((a, b) => (b.rankScore - a.rankScore) || (a.tmdb_id < b.tmdb_id ? -1 : 1));
+  return result;
+}
+
+module.exports = { parseBrief, briefHash, rungWords, buildBriefPrompt, tvBrief, parseSuggestions, formatWords, buildSuggestPrompt, tvSuggest, buildFitPrompt, tvFit };
