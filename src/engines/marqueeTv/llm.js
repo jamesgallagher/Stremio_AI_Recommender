@@ -73,6 +73,10 @@ function rungWords(rung, rating) {
   return w;
 }
 
+// F2: Anime ≠ all animation — the exact note appended to the brief and fit
+// prompts so the LLM never marks Western animation down as "Anime is avoided".
+const ANIME_NOTE = 'Note: "Anime" means Japanese animation only; Western animated series are not anime.';
+
 // §3.1 the prompt, exactly: the shows most-engaged first (rung words, genres,
 // networks), the dropped shows (the "avoids" evidence), the excluded genres,
 // and the grounded-avoids instruction. Says nothing about age, suitability,
@@ -93,6 +97,7 @@ function buildBriefPrompt(shows, dropped, excludedGenres) {
     lines.push('Shows they tried and then dropped: none');
   }
   lines.push(`Genres they chose to exclude: ${excludedGenres.length ? excludedGenres.join(', ') : 'none'}`);
+  lines.push(ANIME_NOTE);
   lines.push('');
   lines.push('Return a JSON object with exactly these keys, each an array of short strings (at most 8 each):');
   lines.push('{"loves": [...], "avoids": [...], "moods": [...], "eras": [...], "standout_titles": [...]}');
@@ -319,6 +324,7 @@ function buildFitPrompt(brief, items) {
     const v = brief[key];
     if (v && v.length) lines.push(`- ${key}: ${v.join(', ')}`);
   }
+  lines.push(ANIME_NOTE);
   lines.push('');
   lines.push('For each series below, return a fit score 0-10 (10 = perfect fit) and a short reason (at most 14 words).');
   lines.push('');
@@ -346,14 +352,15 @@ async function tvFit(profileId, scored, { brief, briefHash, cfg, chain = [], cha
 
   const top = scored.slice(0, cfg.llm_fit.candidate_cap);
 
-  // One cache lookup for the whole top set (kind 'tv_fit', keyed tmdb_id:briefHash).
-  const cached = llmCache.getMany(profileId, 'tv_fit', top.map((r) => `${r.tmdb_id}:${briefHash}`), {
+  // One cache lookup for the whole top set (kind 'tv_fit', keyed tmdb_id:briefHash:v2 —
+  // the :v2 suffix (F2) bypasses the old cached fits after the anime note landed).
+  const cached = llmCache.getMany(profileId, 'tv_fit', top.map((r) => `${r.tmdb_id}:${briefHash}:v2`), {
     ttlMs: cfg.llm_fit.ttl_days * 86400e3, now,
   });
   const fitOf = new Map(); // tmdb_id → { fit, reason, cached }
   const uncached = [];
   for (const r of top) {
-    const c = cached.get(`${r.tmdb_id}:${briefHash}`);
+    const c = cached.get(`${r.tmdb_id}:${briefHash}:v2`);
     if (c && typeof c === 'object' && typeof c.fit === 'number') {
       fitOf.set(r.tmdb_id, { fit: c.fit, reason: c.reason ?? null, cached: true });
     } else {
@@ -394,7 +401,7 @@ async function tvFit(profileId, scored, { brief, briefHash, cfg, chain = [], cha
         const p = parsed.get(r.tmdb_id);
         if (p) {
           fitOf.set(r.tmdb_id, { fit: p.fit, reason: p.reason, cached: false });
-          llmCache.put(profileId, 'tv_fit', `${r.tmdb_id}:${briefHash}`, { fit: p.fit, reason: p.reason }, now);
+          llmCache.put(profileId, 'tv_fit', `${r.tmdb_id}:${briefHash}:v2`, { fit: p.fit, reason: p.reason }, now);
         }
         // missing item → fit 5, reason null, NOT cached (the next build retries)
       }

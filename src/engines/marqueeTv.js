@@ -22,6 +22,7 @@ const simklTrending = require('../services/simklTrending');
 const seriesEngagement = require('../seriesEngagement');
 const recommendationStore = require('../recommendationStore');
 const watchedStore = require('../watchedStore');
+const tasteFeedback = require('../tasteFeedback');
 const animeMap = require('../services/animeMap');
 const glassTaste = require('./glass/tasteModel');
 const glassConfig = require('./glass/config');
@@ -178,12 +179,24 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
     ...(ctx.marqueeTvFetchers || {}),
   };
 
+  // TV-R §4: pull show ratings made elsewhere before the history is read, so the
+  // ladder (which joins taste_ratings type='series') sees them. Skipped by the
+  // bench (ctx.marqueeSkipSync). A failure only logs — the build continues.
+  if (!ctx.marqueeSkipSync) {
+    try { await tasteFeedback.syncRatings(profile, { type: 'series', log }); }
+    catch (err) { log.warn(`[marquee-tv] show ratings sync failed: ${err.message}`); }
+  }
+
   // 1. History: the engagement ladder (kind 'show' excludes anime by kind; §4.2
   //    is applied to every row too). Never throws for a missing input.
   let ladder = new Map();
   try { ladder = await f.ladder(profile.id); }
   catch (err) { log.warn(`[marquee-tv] ladder failed: ${err.message}`); }
-  const ladderEntries = [...ladder.values()];
+  // TV-R §4: ignored shows are removed from Marquee TV's history (taste, seeds,
+  // brief, format history, comfort, serve target). They're still watched, so
+  // they're never candidates.
+  const ignoredShows = tasteFeedback.ignoredSet(profile.id, 'series');
+  const ladderEntries = [...ladder.values()].filter((e) => !ignoredShows.has(String(e.row.tmdb_id)));
 
   // Anime detection needs the map loaded once per build (M3).
   try { await animeMap.ensureLoaded(log).catch(() => {}); } catch { /* detection off */ }

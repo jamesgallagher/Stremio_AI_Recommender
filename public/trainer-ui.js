@@ -34,6 +34,7 @@ TrainerUI.TIPS = {
   chip_loved: 'Films you rated 10/10',
   chip_ignored: 'Films you told the recommender to ignore',
   chip_unfinished: 'Films you started but stopped before halfway — never recommended back',
+  showProgress: "Episodes you've watched out of those aired so far",
 };
 
 // Same mapping as index.html's esc. null/undefined → ''.
@@ -161,15 +162,20 @@ TrainerUI.bindStarScrub = (groupEl, { getRects, isEnabled, onPreview, onCommit, 
 };
 
 // Filter chips with counts; only the active one carries aria-pressed="true".
-TrainerUI.chipsHtml = (counts, active) =>
-  TrainerUI.VIEWS.map(([id, label]) =>
+// `hideUnfinished` drops the Unfinished chip (TV-R §5: shows never have it —
+// there is no unfinished view for series).
+TrainerUI.chipsHtml = (counts, active, { hideUnfinished = false } = {}) =>
+  TrainerUI.VIEWS.filter(([id]) => !(hideUnfinished && id === 'unfinished')).map(([id, label]) =>
     `<button class="tr-chip" data-view="${id}" title="${TrainerUI.esc(TrainerUI.TIPS['chip_' + id])}" aria-pressed="${id === active ? 'true' : 'false'}">${label} <span class="tr-count">${counts[id] || 0}</span></button>`
   ).join('');
 
 // One row of the history table. `now` feeds whenText. canRate=false (no Simkl)
 // disables every rating control (stars, ♥, clear, finished) — ignore stays on.
+// A series row (TV-R §5) shows progress in the "when" cell and offers only
+// ♥ Love and Ignore/Unignore — no Unwatch, no "I finished it".
 TrainerUI.rowHtml = (item, { canRate, now }) => {
   const esc = TrainerUI.esc;
+  const isSeries = item.type === 'series';
   const thumb = item.poster
     ? `<img class="tr-thumb" src="${esc(item.poster)}" alt="">`
     : '<span class="tr-thumb"></span>';
@@ -177,7 +183,9 @@ TrainerUI.rowHtml = (item, { canRate, now }) => {
   const genre = esc(item.genre || '—');
   const when = item.status === 'unfinished'
     ? `Stopped at ${esc(item.percent)}%`
-    : TrainerUI.whenText(item.watched_at, now);
+    : isSeries
+      ? `${item.progress.watched_eps} / ${item.progress.aired_eps ?? '?'} eps · ${TrainerUI.whenText(item.watched_at, now)}`
+      : TrainerUI.whenText(item.watched_at, now);
   const starsCell = () => {
     const levels = TrainerUI.starsFromRating(item.rating);
     const wraps = [];
@@ -204,12 +212,12 @@ TrainerUI.rowHtml = (item, { canRate, now }) => {
   const acts = item.status === 'unfinished'
     ? `<button class="ghost mini" data-act="finished" aria-label="Mark finished" title="${esc(!canRate ? 'Connect Simkl to rate' : TrainerUI.TIPS.finished)}"${canRate ? '' : ' disabled'}>I finished it</button> <button class="ghost mini" data-act="ignore" aria-label="Ignore" title="${esc(TrainerUI.TIPS.ignore)}">Ignore</button>`
     : item.ignored
-      ? `<button class="ghost mini" data-act="unignore" aria-label="Undo ignore" title="${esc(TrainerUI.TIPS.unignore)}">Unignore</button> ${unwatchBtn()}`
-      : `<button class="ghost mini tr-heart" data-act="love" aria-pressed="${item.loved ? 'true' : 'false'}" aria-label="Love" title="${esc(!canRate ? 'Connect Simkl to rate' : (item.loved ? TrainerUI.TIPS.unlove : TrainerUI.TIPS.love))}"${canRate ? '' : ' disabled'}>♥</button> <button class="ghost mini" data-act="ignore" aria-label="Ignore" title="${esc(TrainerUI.TIPS.ignore)}">Ignore</button> ${unwatchBtn()}`;
+      ? `<button class="ghost mini" data-act="unignore" aria-label="Undo ignore" title="${esc(TrainerUI.TIPS.unignore)}">Unignore</button> ${isSeries ? '' : unwatchBtn()}`
+      : `<button class="ghost mini tr-heart" data-act="love" aria-pressed="${item.loved ? 'true' : 'false'}" aria-label="Love" title="${esc(!canRate ? 'Connect Simkl to rate' : (item.loved ? TrainerUI.TIPS.unlove : TrainerUI.TIPS.love))}"${canRate ? '' : ' disabled'}>♥</button> <button class="ghost mini" data-act="ignore" aria-label="Ignore" title="${esc(TrainerUI.TIPS.ignore)}">Ignore</button> ${isSeries ? '' : unwatchBtn()}`;
   return `<div class="tr-row" data-key="${esc(item.key)}">
     <div class="tr-cell tr-title">${thumb}<span class="tr-tt">${title}</span></div>
     <div class="tr-cell">${genre}</div>
-    <div class="tr-cell">${when}</div>
+    <div class="tr-cell"${isSeries ? ` title="${esc(TrainerUI.TIPS.showProgress)}"` : ''}>${when}</div>
     <div class="tr-cell tr-rating">${item.status === 'unfinished' ? '—' : starsCell()}</div>
     <div class="tr-cell tr-acts">${acts}</div>
   </div>`;

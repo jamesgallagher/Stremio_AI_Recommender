@@ -47,8 +47,8 @@ function init() {
 
 // Trainer T1: moved from simklCache (statement for statement; see §5.2). The
 // storage is scoped by `type`; the `activity` column replaces `ratings_activity`.
-// `type === 'series'` throws (the ONLY throw — v1 is movies only); otherwise it
-// never throws, exactly as the Marquee sync did (MI-3).
+// `type` is 'movie' or 'series' (TV-R §3); otherwise it never throws, exactly
+// as the Marquee sync did (MI-3).
 async function syncRatings(profile, {
   type = 'movie',
   fetchActivities = simkl.getActivities,
@@ -59,15 +59,18 @@ async function syncRatings(profile, {
   force = false,
   resolveCap = 50,
 } = {}) {
-  if (type === 'series') throw new Error('not-supported');
   init();
   const profileId = profile.id;
-  const resolver = resolveTmdb || ((imdbId) => tmdb.findByImdbId(settings.keyFor(profile, 'tmdb_api_key'), 'movie', imdbId));
+  // TV-R §3: 'series' pulls the Simkl 'shows' section (gate activities.tv_shows.rated_at);
+  // everything else (movies) pulls 'movies' (gate activities.movies.rated_at).
+  const kind = type === 'series' ? 'shows' : 'movies';
+  const sectionName = type === 'series' ? 'tv_shows' : 'movies';
+  const resolver = resolveTmdb || ((imdbId) => tmdb.findByImdbId(settings.keyFor(profile, 'tmdb_api_key'), type === 'series' ? 'series' : 'movie', imdbId));
   try {
     const activities = await fetchActivities(profile);
-    const movies = activities && typeof activities === 'object' ? activities.movies : null;
-    const hasKey = movies && typeof movies === 'object' && Object.prototype.hasOwnProperty.call(movies, 'rated_at');
-    const ratedAt = hasKey ? (movies.rated_at == null ? null : String(movies.rated_at)) : null;
+    const section = activities && typeof activities === 'object' ? activities[sectionName] : null;
+    const hasKey = section && typeof section === 'object' && Object.prototype.hasOwnProperty.call(section, 'rated_at');
+    const ratedAt = hasKey ? (section.rated_at == null ? null : String(section.rated_at)) : null;
 
     const prev = db.get().prepare('SELECT activity, synced_at, degraded_synced_at FROM taste_ratings_sync WHERE profile_id = ? AND type = ?').get(profileId, type);
     if (!force) {
@@ -80,13 +83,13 @@ async function syncRatings(profile, {
         // §4.2(5): the rated_at key itself is absent — no reliable gate, so pull
         // at most once per 24 h (degraded_synced_at tracks the last DEGRADED pull,
         // independent of the hasKey syncs above).
-        log.warn('[trainer] ratings gate degraded (activities.movies.rated_at key absent) — pulling at most once per 24 h');
+        log.warn(`[trainer] ratings gate degraded (activities.${sectionName}.rated_at key absent) — pulling at most once per 24 h`);
         return { ok: true, skipped: 'gate-degraded' };
       }
     }
 
     // One GET for the whole account (spec §4.2(3): ~hundreds of entries).
-    const ratings = await fetchRatings(profile, 'movies');
+    const ratings = await fetchRatings(profile, kind);
 
     // Resolve all imdb-only entries to a tmdb id BEFORE the transaction. The
     // shared db.get() connection must never have a transaction open across an

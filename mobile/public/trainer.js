@@ -14,6 +14,7 @@
   // One state object for the whole view.
   const st = {
     mode: 'quick', // 'quick' | 'list'
+    type: 'movie', // TV-R §5: Films | Shows toggle (list mode); quick stays films
     view: 'all', q: '', page: 1, data: null,
     confirmed: new Map(), shown: new Map(),
     rebuilding: false,
@@ -61,7 +62,9 @@
   async function postRate(key, rating, o) {
     // F1: pass keepalive through to fetch (apiFetch spreads opts into fetch), so
     // a flush on page-hide can send the rating even as the page closes.
-    return api('/trainer/rate', { method: 'POST', body: { type: 'movie', tmdb_id: key, rating }, keepalive: !!(o && o.keepalive) });
+    // TV-R §5: quick-swipe stays films only (forced 'movie'); list mode sends
+    // the current Films | Shows type.
+    return api('/trainer/rate', { method: 'POST', body: { type: st.mode === 'quick' ? 'movie' : st.type, tmdb_id: key, rating }, keepalive: !!(o && o.keepalive) });
   }
 
   // ---- open() ----
@@ -80,16 +83,27 @@
     drawMode();
   }
 
-  // ---- P8 notice ----
+  // ---- P8 notice (TV-R §5: per type — films unchanged; shows only when the
+  // Series engine is not Marquee TV) ----
   function drawNotice() {
     if (!st.settings) { els.notice.innerHTML = ''; return; }
-    const engineMovie = st.settings.filters && st.settings.filters.engine_movie;
-    if (engineMovie === 'marquee') { els.notice.innerHTML = ''; return; }
+    const filters = st.settings.filters || {};
     const engines = st.settings.engines || {};
-    const movieEngines = (engines.available && engines.available.movie) || [];
-    const engine = movieEngines.find((e) => e.id === engineMovie);
-    const engineName = engine ? engine.name : (engineMovie || 'another engine');
-    const fullText = "Ratings still save to Simkl, but this profile's movies come from " + engineName + ", so your ratings won't change its recommendations. Switch the Movies engine to Marquee Cinema in Filters.";
+    let engineName, fullText;
+    if (st.mode === 'list' && st.type === 'series') {
+      if (filters.engine_series === 'marquee-tv') { els.notice.innerHTML = ''; return; }
+      const seriesEngines = (engines.available && engines.available.series) || [];
+      const engine = seriesEngines.find((e) => e.id === filters.engine_series);
+      engineName = engine ? engine.name : (filters.engine_series || 'another engine');
+      fullText = "Ratings still save to Simkl, but this profile's shows come from " + engineName + ", so your ratings won't change its recommendations. Switch the Series engine to Marquee TV in Filters.";
+    } else {
+      const engineMovie = filters.engine_movie;
+      if (engineMovie === 'marquee') { els.notice.innerHTML = ''; return; }
+      const movieEngines = (engines.available && engines.available.movie) || [];
+      const engine = movieEngines.find((e) => e.id === engineMovie);
+      engineName = engine ? engine.name : (engineMovie || 'another engine');
+      fullText = "Ratings still save to Simkl, but this profile's movies come from " + engineName + ", so your ratings won't change its recommendations. Switch the Movies engine to Marquee Cinema in Filters.";
+    }
     // K2.3: in Quick mode the notice is one line with a "More" button; List
     // keeps the full text.
     if (st.mode === 'quick') {
@@ -131,7 +145,7 @@
   async function loadList() {
     els.list.innerHTML = '<span class="muted">Loading…</span>';
     try {
-      const d = await api('/trainer?view=' + st.view + '&q=' + encodeURIComponent(st.q) + '&page=' + st.page + '&page_size=25');
+      const d = await api('/trainer?type=' + st.type + '&view=' + st.view + '&q=' + encodeURIComponent(st.q) + '&page=' + st.page + '&page_size=25');
       st.data = d;
       d.items.forEach((item) => {
         if (!st.confirmed.has(item.key)) st.confirmed.set(item.key, item);
@@ -149,9 +163,15 @@
     const now = Date.now();
     const rows = d.items.length
       ? d.items.map((item) => T.rowHtml(item, { canRate: st.canRate, now })).join('')
-      : '<div class="muted">No films in this view yet.</div>';
+      : '<div class="muted">' + (st.type === 'series' ? 'No shows in this view yet.' : 'No films in this view yet.') + '</div>';
     const pages = Math.max(1, Math.ceil(d.total / d.pageSize));
-    els.list.innerHTML = '<div class="tr-chips">' + T.chipsHtml(d.counts, st.view) + '</div>'
+    // TV-R §5: the Films | Shows toggle (list mode only — quick stays films).
+    const typeToggle = '<div class="segmented trainer-type" role="tablist" aria-label="Ratings type">'
+      + '<button class="seg' + (st.type === 'movie' ? ' active' : '') + '" data-type="movie">Films</button>'
+      + '<button class="seg' + (st.type === 'series' ? ' active' : '') + '" data-type="series">Shows</button>'
+      + '</div>';
+    els.list.innerHTML = typeToggle
+      + '<div class="tr-chips">' + T.chipsHtml(d.counts, st.view, { hideUnfinished: st.type === 'series' }) + '</div>'
       + '<div class="tr-search-row"><input type="search" class="tr-search" placeholder="Search titles…" value="' + esc(st.q) + '"></div>'
       + '<div class="tr-table">' + rows + '</div>'
       + '<div class="tr-pager">'
@@ -167,11 +187,11 @@
   async function refreshMeta() {
     if (!st.data) return;
     try {
-      const d = await api('/trainer?view=' + st.view + '&q=' + encodeURIComponent(st.q) + '&page=' + st.page + '&page_size=25');
+      const d = await api('/trainer?type=' + st.type + '&view=' + st.view + '&q=' + encodeURIComponent(st.q) + '&page=' + st.page + '&page_size=25');
       st.data.counts = d.counts;
       st.data.training = d.training;
       const chips = els.list.querySelector('.tr-chips');
-      if (chips) chips.innerHTML = T.chipsHtml(d.counts, st.view);
+      if (chips) chips.innerHTML = T.chipsHtml(d.counts, st.view, { hideUnfinished: st.type === 'series' });
       els.banner.innerHTML = T.bannerHtml(d.training, Date.now(), { rebuilding: st.rebuilding });
     } catch (e) { /* quiet — leave the rows alone */ }
   }
@@ -189,6 +209,16 @@
   }
 
   function listClick(e) {
+    // TV-R §5: the Films | Shows toggle — switching resets view/page/q and reloads.
+    const typeBtn = e.target.closest('button[data-type]');
+    if (typeBtn) {
+      st.type = typeBtn.dataset.type;
+      st.view = 'all';
+      st.q = '';
+      st.page = 1;
+      loadList();
+      return;
+    }
     const chip = e.target.closest('.tr-chip');
     if (chip) {
       st.view = chip.dataset.view;
@@ -279,7 +309,7 @@
 
   async function doIgnore(key, item, ignored) {
     try {
-      const r = await api('/trainer/ignore', { method: 'POST', body: { type: 'movie', tmdb_id: key, ignored } });
+      const r = await api('/trainer/ignore', { method: 'POST', body: { type: st.type, tmdb_id: key, ignored } });
       st.confirmed.set(key, r.item);
       if (ignored) {
         const row = els.list.querySelector('.tr-row[data-key="' + esc(key) + '"]');
@@ -302,7 +332,7 @@
   async function doUnwatch(key, item) {
     if (!item || !confirm('Remove "' + item.title + '" from your Simkl watch history?\n\nUse this if it was marked watched by mistake. It can be recommended to you again.')) return;
     try {
-      const r = await api('/trainer/unwatched', { method: 'POST', body: { type: 'movie', tmdb_id: key, imdb_id: item.imdb_id } });
+      const r = await api('/trainer/unwatched', { method: 'POST', body: { type: st.type, tmdb_id: key, imdb_id: item.imdb_id } });
       st.confirmed.set(key, r.item);
       const row = els.list.querySelector('.tr-row[data-key="' + esc(key) + '"]');
       if (row) {
@@ -321,7 +351,7 @@
   async function doFinished(key, item) {
     if (!item || !confirm('Mark this film as watched on Simkl?')) return;
     try {
-      await api('/trainer/finished', { method: 'POST', body: { type: 'movie', tmdb_id: key, imdb_id: item.imdb_id } });
+      await api('/trainer/finished', { method: 'POST', body: { type: st.type, tmdb_id: key, imdb_id: item.imdb_id } });
       const row = els.list.querySelector('.tr-row[data-key="' + esc(key) + '"]');
       if (row) {
         row.classList.add('tr-dim');

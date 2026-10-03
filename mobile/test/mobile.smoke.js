@@ -678,13 +678,14 @@ async function unitTests() {
       assert.strictEqual(tasteFeedback.getRating(pid, 'movie', '603'), 7, 'local row unchanged after a failed write');
       simkl.setRatings = origSet;
 
-      // rate — bad-rating (0) → 400; series → not-supported → 400; not-in-history → 404.
+      // rate — bad-rating (0) → 400; series is supported (TV-R §2) but this
+      // profile has no series_progress rows → not-in-history → 404; not-in-history → 404.
       res = fakeRes();
       await handlers.trainerRateHandler({ profile: prof, body: { type: 'movie', tmdb_id: '603', rating: 0 } }, res);
       assert.strictEqual(res.statusCode, 400);
       res = fakeRes();
       await handlers.trainerRateHandler({ profile: prof, body: { type: 'series', tmdb_id: '603', rating: 5 } }, res);
-      assert.strictEqual(res.statusCode, 400);
+      assert.strictEqual(res.statusCode, 404);
       res = fakeRes();
       await handlers.trainerRateHandler({ profile: prof, body: { type: 'movie', tmdb_id: '999999', rating: 5 } }, res);
       assert.strictEqual(res.statusCode, 404);
@@ -1265,6 +1266,26 @@ async function httpTests() {
     assert.ok(js.includes('page_size=25'), 'Quick fetches page_size=25');
     assert.ok(!js.includes('page_size=50'), 'Quick no longer fetches page_size=50');
     console.log('  ✓ F3a: GET /mobile/trainer.js fetches page_size=25 (not 50)');
+  }
+
+  // TV-R §5: the companion's Films | Shows toggle (list mode) — every call
+  // sends the type; quick-swipe stays films only; the show notice is exact.
+  {
+    const js = await (await fetch(`${BASE}/mobile/trainer.js`)).text();
+    // The toggle is rendered in list mode (drawList), per-session state st.type.
+    assert.ok(js.includes("type: 'movie', // TV-R §5: Films | Shows toggle (list mode); quick stays films"), 'st.type default movie');
+    assert.ok(js.includes('data-type="movie"') && js.includes('data-type="series"'), 'toggle buttons');
+    // Every list-mode call sends the current type.
+    assert.ok(js.includes("'/trainer?type=' + st.type + '&view='"), 'GET /trainer sends type');
+    assert.ok(js.includes('body: { type: st.type, tmdb_id: key, ignored }'), 'ignore sends type');
+    assert.ok(js.includes('body: { type: st.type, tmdb_id: key, imdb_id: item.imdb_id }'), 'unwatched/finished send type');
+    // Quick-swipe stays films only: the rate path forces 'movie' in quick mode.
+    assert.ok(js.includes("type: st.mode === 'quick' ? 'movie' : st.type"), 'quick rate forces movie');
+    assert.ok(js.includes("body: { type: 'movie', tmdb_id: item.key, ignored: true }"), 'quick ignore stays movie');
+    // The show notice text, exactly (built by concatenation in drawNotice).
+    assert.ok(js.includes("Ratings still save to Simkl, but this profile's shows come from "), 'show notice start');
+    assert.ok(js.includes(", so your ratings won't change its recommendations. Switch the Series engine to Marquee TV in Filters."), 'show notice end');
+    console.log('  ✓ TV-R §5: companion Films | Shows toggle (list), quick stays films, show notice');
   }
 
   // Config endpoint (public) returns app name + version.
