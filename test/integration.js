@@ -7835,6 +7835,135 @@ async function main() {
     }
   });
 
+  // ── TV-3 E1: the full orchestrator end-to-end (hermetic; stubbed chat +
+  // network fetchers) ──
+  // The §7 order (brief → gather + T7 → lookup → hard filter → deterministic
+  // score → fit fold → emit → serve target → summary line), the §7 summary
+  // line shape (the LLM tail), the stored rows carry marquee-tv-t2, and the
+  // serve target is set.
+  await it('TV-3 E1: generate(series) end-to-end — §7 order, summary line LLM tail, marquee-tv-t2, serve target set', async () => {
+    const marqueeTv = require('../src/engines/marqueeTv');
+    const serveCalibration = require('../src/serveCalibration');
+    const nowMs = Date.parse('2026-10-02T00:00:00Z');
+    const DAY = 86400e3;
+    const p = config.addProfile('INT-TV3-E1');
+    config.updateProfile(p.id, {
+      filters: { engine_series: 'marquee-tv', excluded_genres: ['Horror'], min_year: 2015, min_rating: 7, vote_count_floor: 50, age_limit: 0 },
+      keys: { tmdb_api_key: 'itest-tmdb' },
+      simkl_auth: { access_token: 'tok' },
+    });
+    const profile = config.getProfile(p.id);
+    const seriesRows = [
+      { simkl_id: 100, kind: 'show', imdb_id: 'ttseed1', tmdb_id: 'seed1', title: 'Seed Show', year: 2020, status: 'completed', watched_eps: 20, total_eps: 20, not_aired_eps: 0, last_watched_at: nowMs - DAY, first_watched_at: nowMs - 10 * DAY, first_real_at: nowMs - DAY, last_real_at: nowMs - DAY, stamps: 20, real_stamps: 20, eps_per_week: null },
+      { simkl_id: 200, kind: 'show', imdb_id: 'ttrecent1', tmdb_id: 'recent1', title: 'Recent Show', year: 2024, status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0, last_watched_at: nowMs, first_watched_at: nowMs - 5 * DAY, first_real_at: nowMs, last_real_at: nowMs, stamps: 10, real_stamps: 10, eps_per_week: null },
+      { simkl_id: 400, kind: 'anime', imdb_id: 'ttanime1', tmdb_id: 'anime1', title: 'Anime Show', year: 2020, status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0, last_watched_at: nowMs, first_watched_at: nowMs, first_real_at: nowMs, last_real_at: nowMs, stamps: 10, real_stamps: 10, eps_per_week: null },
+    ];
+    const brief = { loves: ['space opera'], avoids: ['reality'], moods: ['wistful'], eras: ['1990s'], standout_titles: ['Seed Show'] };
+    const suggestions = [
+      { title: 'Suggestion A', year: 2024 },
+      { title: 'Suggestion B', year: 2023 },
+      { title: 'Suggestion C', year: 2022 }, // the dud
+      { title: 'Suggestion D', year: 2021 }, // the anime
+      { title: 'Suggestion E', year: 2020 },
+    ];
+    const events = [];
+    const chain = [{ type: 'custom', name: 'local', uri: 'http://localhost:11434/v1', apiKey: '' }];
+    const stubChat = async (c, messages, opts) => {
+      const content = messages[0].content;
+      if (content.startsWith('You are summarising')) { events.push('brief'); return opts.validate(JSON.stringify(brief)); }
+      if (content.startsWith('You are suggesting')) { events.push('suggest'); return opts.validate(JSON.stringify(suggestions)); }
+      if (content.startsWith('You are judging')) {
+        events.push('fit');
+        const ids = [...content.matchAll(/- id (\d+):/g)].map((m) => m[1]);
+        return opts.validate(JSON.stringify(ids.map((id) => ({ id, fit: 8, reason: 'good fit' }))));
+      }
+      throw new Error('unexpected prompt');
+    };
+    const resolve = async (title) => {
+      if (title === 'Suggestion A') return { _tmdb_id: 9001, _genre_ids: [18], _vote_average: 8, _vote_count: 1000 };
+      if (title === 'Suggestion B') return { _tmdb_id: 9002, _genre_ids: [35], _vote_average: 8, _vote_count: 1000 };
+      if (title === 'Suggestion C') return null; // the dud
+      if (title === 'Suggestion D') return { _tmdb_id: 9003, _genre_ids: [16], _vote_average: 7, _vote_count: 100 };
+      if (title === 'Suggestion E') return { _tmdb_id: 9004, _genre_ids: [18], _vote_average: 8, _vote_count: 1000 };
+      return null;
+    };
+    const tvMeta = (apiKey, ids) => {
+      if (ids.includes('seed1')) events.push('history-meta');
+      else events.push('candidate-meta');
+      const m = new Map();
+      for (const id of ids) {
+        const base = { tmdb_id: id, imdb_id: 'tt' + id, type: 'series', title: 'Show ' + id, year: 2024, genres: ['Drama'], keywords: [], tvType: 'Scripted', status: 'Returning Series', vote_average: 8, vote_count: 1000, popularity: 5, certAU: null, certUS: null, first_air_date: '2024-01-01', last_air_date: '2026-01-01', number_of_episodes: 20, number_of_seasons: 1 };
+        if (id === '9003') { base.simklType = 'anime'; base.genres = ['Animation']; }
+        if (id === 'anime1') { base.simklType = 'anime'; base.genres = ['Animation']; }
+        m.set(id, base);
+      }
+      return m;
+    };
+    const simklRecs = async (profile, ids) => {
+      events.push('simkl-recs');
+      const m = new Map();
+      for (const id of ids) {
+        if (id !== 100) continue;
+        m.set(id, [
+          { tmdb_id: '8001', imdb_id: 'tt8001', title: 'Good Show 1', year: 2024 },
+          { tmdb_id: '8002', imdb_id: 'tt8002', title: 'Good Show 2', year: 2024 },
+        ]);
+      }
+      return m;
+    };
+    const logs = [];
+    const ctx = {
+      settings: { llm: {} }, // no providers in settings; the chain comes from the seam
+      nowMs,
+      filters: { excluded_genres: ['Horror'], min_year: 2015, min_rating: 7, vote_count_floor: 50, age_limit: 0 },
+      tmdbKey: 'itest-tmdb',
+      mdblistKey: '',
+      log: { log: (msg) => logs.push(msg), warn: () => {}, error: () => {} },
+      stats: {},
+      watchedIds: { imdb: new Set(), tmdb: new Set() },
+      dont: new Set(),
+      marqueeTvChain: chain,
+      marqueeTvChat: stubChat,
+      marqueeTvResolve: resolve,
+      marqueeTvFetchers: { tvMeta, simklRecs, tmdbRecs: () => [], discover: () => [], trending: () => [], imdbRatings: () => new Map() },
+    };
+    try {
+      watchedStore.upsertSeriesProgress(p.id, seriesRows);
+      const out = await marqueeTv.generate(profile, 'series', ctx);
+      // The §7 order: brief (step 5) → gather (step 6: simkl-recs then
+      // suggest) → candidate lookup (step 9) → fit fold (step 12).
+      const iBrief = events.indexOf('brief');
+      const iSimkl = events.indexOf('simkl-recs');
+      const iSuggest = events.indexOf('suggest');
+      const iCandMeta = events.indexOf('candidate-meta');
+      const iFit = events.indexOf('fit');
+      assert.ok(iBrief >= 0 && iBrief < iSimkl, 'brief (step 5) before gather (step 6)');
+      assert.ok(iSimkl < iSuggest, 'simkl-recs before suggest (both step 6)');
+      assert.ok(iSuggest < iCandMeta, 'suggest (step 6) before candidate lookup (step 9)');
+      assert.ok(iCandMeta < iFit, 'candidate lookup (step 9) before fit fold (step 12)');
+      // The candidates: 8001, 8002 (Simkl) + 9001, 9002, 9004 (LLM); the dud
+      // (C) is absent, the anime (9003) is dropped by the hard filter.
+      assert.deepStrictEqual(out.map((c) => c.tmdb_id).sort(), ['8001', '8002', '9001', '9002', '9004'], 'the five candidates');
+      // Every stored row carries marquee-tv-t2 and the llm sub-object.
+      assert.ok(out.every((c) => c.algorithmVersion === 'marquee-tv-t2'), 'every row marquee-tv-t2');
+      assert.ok(out.every((c) => c.scoreComponents.llm && c.scoreComponents.llm.fit === 8), 'the fit fold applied');
+      // The §7 summary line shape: the LLM tail.
+      const summary = logs.find((l) => l.startsWith('[marquee-tv]') && l.includes('· llm:'));
+      assert.ok(summary, 'the summary line is logged');
+      assert.ok(summary.includes('· llm: brief on'), 'brief on');
+      assert.ok(summary.includes('suggest 4/5 resolved'), 'suggest 4/5 resolved');
+      assert.ok(summary.includes('fit 5 (0 cached)'), 'fit 5 (0 cached)');
+      // The serve target is set (engine_id marquee-tv, split genre names).
+      const target = serveCalibration.getTarget(p.id, 'series');
+      assert.ok(target, 'the serve target is set');
+      assert.strictEqual(target.engine_id, 'marquee-tv', 'serve target engine_id');
+    } finally {
+      serveCalibration.deleteForProfile(p.id);
+      config.removeProfile(p.id);
+      watchedStore.deleteForProfile(p.id);
+    }
+  });
+
   // ── TV-2 E1: the full orchestrator (hermetic; stubbed network fetchers) ──
   // A temp DB with series_progress rows (a normal seed, an anime row, a Reality
   // show seen only as sampled_left) + Glass meta + stubs for every network

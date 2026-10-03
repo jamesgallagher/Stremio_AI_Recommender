@@ -352,3 +352,15 @@ TV-2 (v7.30.0-beta) builds the Marquee TV engine core — the orchestrator, the 
 - **`src/services/tmdb.js`** (additive) — `discoverTv` (`GET discover/tv`) + `tvDetailsFull` (append `credits,keywords,external_ids,content_ratings`).
 - **`src/bench/engineBench.js`, `scripts/bench-engines.js`** — the series bench runs `marquee-tv` alongside Genesis (E2); the series report file name (C3); `removeSeriesHoldout` also clears `pending_watched` by IMDb id (C5).
 - **Tests:** `test/smoke.js` F1–F9 (pure); `test/integration.js` N1–N3 (adapters, fetch-level), E1 (orchestrator end-to-end + registry dark), E2 (series bench runs both engines).
+
+## 12. TV-3 build notes
+
+TV-3 (v7.32.0-beta) adds the local-LLM layer (taste brief, suggestions T7, fit score), calibrated serving for series, and the three TV-2 leftovers (L1 raw-name genre affinity, L2 per-build Simkl cap, L3 served order). It ships on the same globally-disabled engine (M1) — no user-visible change until an admin enables it.
+
+- **`src/engines/marqueeTv/llm.js`** (new) — `tvBrief` (§3.1, kind `tv_brief`), `tvSuggest` (§3.2, kind `tv_suggest`), `tvFit` (§3.3, kind `tv_fit`), the TV prompts, and the verbatim copies of Cinema's `parseBrief` / `parseSuggestions` (N2). Local LLM only (N3); graceful degradation — no chain / a failed brief / a failed batch never fails the build, and a failure is never cached (N4).
+- **`src/engines/marqueeTv.js`** — wires the brief (step 5), T7 (step 6), the fit fold (step 12), the calibrated serve target (step 15), and the §7 summary-line LLM tail; the descriptor gains `serveOrder 'calibrated'` + `serveOptions`.
+- **`src/engines/marqueeTv/config.js`** — the §6 `DEFAULTS` sections (`llm_timeout_ms`, `brief`, `suggest`, `llm_fit`, `serve`); `ALGORITHM_VERSION 'marquee-tv-t2'`.
+- **`src/engines/marqueeTv/sources.js`** — the T7 group plumbing (the `llm` group, llm-first lookup cut), L1 (`listGenreNames` raw names), L2 (batched T1 fetcher).
+- **`src/engines/marqueeTv/scoring.js`** — unchanged (the fit fold reads `scoreComponents.features` / `penalty` directly; no change needed).
+- **N5 (I1):** no prompt mentions age, suitability, children, classification or ratings boards — the prompts pass `/age|suitab|child|kid|classif|rated (G|PG|M)/i`.
+- **Tests:** `test/integration.js` L1, L2 (leftovers), S1, S2 (calibrated serving), B1 (brief), B2 (suggestions), B3 (fit), B4 (degradation identity), E1 (end-to-end order + summary line + serve target).

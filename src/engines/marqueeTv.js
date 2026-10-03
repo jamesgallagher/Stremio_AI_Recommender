@@ -150,12 +150,17 @@ function mergePool(raws) {
   return pool;
 }
 
-// §3 summary line, exactly this shape:
+// §7 summary line, exactly this shape (the TV-2 line + the LLM tail):
 // [marquee-tv] <name>: seeds <n> → raw <n> → looked up <n> → passed <n> → stored <n>
-//   (dropped: anime <n>, format <n>, genre <n>, recency <n>, rating <n>, votes <n>, age-floor <n>, no_imdb <n>)
+//   (dropped: …) · llm: brief on|off, suggest <resolved>/<total> resolved, fit <scored> (<cached> cached)
+// `brief off` when there's no brief; `suggest 0/0` and `fit 0 (0 cached)` when skipped.
 function summaryLine(profile, stats, dropped) {
   const d = (k) => dropped[k] || 0;
-  return `[marquee-tv] ${profile.name}: seeds ${stats.seeds ?? 0} → raw ${stats.raw ?? 0} → looked up ${stats.strong ?? 0} → passed ${stats.passed ?? 0} → stored ${stats.kept ?? 0} (dropped: anime ${d('anime')}, format ${d('format')}, genre ${d('genre')}, recency ${d('recency')}, rating ${d('rating')}, votes ${d('votes')}, age-floor ${d('age_floor')}, no_imdb ${d('no_imdb')})`;
+  const llm = stats.llm || {};
+  const briefPart = llm.brief ? 'brief on' : 'brief off';
+  const suggestPart = `suggest ${llm.suggest?.resolved ?? 0}/${llm.suggest?.total ?? 0} resolved`;
+  const fitPart = `fit ${llm.fit?.scored ?? 0} (${llm.fit?.cached ?? 0} cached)`;
+  return `[marquee-tv] ${profile.name}: seeds ${stats.seeds ?? 0} → raw ${stats.raw ?? 0} → looked up ${stats.strong ?? 0} → passed ${stats.passed ?? 0} → stored ${stats.kept ?? 0} (dropped: anime ${d('anime')}, format ${d('format')}, genre ${d('genre')}, recency ${d('recency')}, rating ${d('rating')}, votes ${d('votes')}, age-floor ${d('age_floor')}, no_imdb ${d('no_imdb')}) · llm: ${briefPart}, ${suggestPart}, ${fitPart}`;
 }
 
 async function generate(profile, type, ctx, onProgress = () => {}) {
