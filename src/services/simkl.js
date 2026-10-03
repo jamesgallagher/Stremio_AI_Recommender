@@ -121,25 +121,27 @@ async function getActivities(profile) {
 // only rated ones; unrated entries carry user_rating null.
 async function getRatings(profile, kind = 'movies') {
   const body = await authedGet(profile, `/sync/ratings/${kind}`);
-  return parseRatings(body);
+  return parseRatings(body, kind);
 }
 
 // PURE (spec §4.1): parse a /sync/ratings/{kind} body into
 // [{ tmdb_id, imdb_id, simkl_id, rating, rated_at }]. §12 L1: ids sit at
-// entry.movie.ids (tmdb a string); keep only entries whose user_rating is an
-// integer 1–10; tolerate a bare array; drop entries with no id; never throws
-// (MI-3) — malformed entries just come back as fewer items.
-function parseRatings(body) {
+// entry.movie.ids (kind 'movies') or entry.show.ids (kind 'shows') (tmdb a
+// string), else entry.ids; keep only entries whose user_rating is an integer
+// 1–10; tolerate a bare array; drop entries with no id; never throws (MI-3) —
+// malformed entries just come back as fewer items.
+function parseRatings(body, kind = 'movies') {
   let entries;
   if (Array.isArray(body)) entries = body;
-  else if (body && typeof body === 'object') entries = body.movies || [];
+  else if (body && typeof body === 'object') entries = body[kind] || [];
   else entries = [];
   const out = [];
   for (const e of entries) {
     if (!e || typeof e !== 'object') continue;
     const rating = e.user_rating;
     if (!Number.isInteger(rating) || rating < 1 || rating > 10) continue; // unrated / out of range
-    const ids = (e.movie && e.movie.ids) || e.ids || {};
+    const media = kind === 'shows' ? e.show : e.movie;
+    const ids = (media && media.ids) || e.ids || {};
     const tmdb = ids.tmdb != null ? String(ids.tmdb) : null;
     const imdb = ids.imdb != null ? String(ids.imdb) : null;
     const simkl = ids.simkl != null ? Number(ids.simkl) : null;

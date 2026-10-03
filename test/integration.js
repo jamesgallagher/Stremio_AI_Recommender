@@ -1359,7 +1359,7 @@ async function main() {
     }
   });
 
-  await it('Trainer T1: tasteFeedback.syncRatings — type-scoped, series throws not-supported, movie never touches series rows (test 3)', async () => {
+  await it('Trainer T1: tasteFeedback.syncRatings — type-scoped, series syncs the Simkl "shows" section, movie never touches series rows (test 3)', async () => {
     const tasteFeedback = require('../src/tasteFeedback');
     const simkl = require('../src/services/simkl');
     const db = require('../src/db');
@@ -1380,8 +1380,62 @@ async function main() {
     // A second movie sync with the same gate → unchanged (null === null).
     res = await tasteFeedback.syncRatings(profile, { type: 'movie', fetchActivities: async () => ({ movies: { rated_at: null } }), fetchRatings, now: 2000, log: quiet });
     assert.deepStrictEqual(res, { ok: true, skipped: 'unchanged' });
-    // series → not-supported (the ONLY throw in the store).
-    await assert.rejects(() => tasteFeedback.syncRatings(profile, { type: 'series', fetchActivities: async () => ({ movies: { rated_at: null } }), fetchRatings, now: 3000, log: quiet }), /not-supported/);
+    // series sync (TV-R §3): gate on tv_shows.rated_at, fetch 'shows', write type='series' rows only.
+    res = await tasteFeedback.syncRatings(profile, { type: 'series', fetchActivities: async () => ({ tv_shows: { rated_at: null } }), fetchRatings: (_p, kind) => simkl.parseRatings({ shows: [
+      { user_rating: 7, user_rated_at: '2026-03-01T00:00:00Z', show: { title: 'S', ids: { simkl: 3, imdb: 'tt3', tmdb: '3' } } },
+    ] }, kind), now: 3000, log: quiet, force: true });
+    assert.deepStrictEqual(res, { ok: true, synced: 1, unresolved: 0 });
+    // the seeded series row was replaced (type='series' rows only).
+    assert.deepStrictEqual([...tasteFeedback.getRatingsMap('p-tf', 'series').entries()], [['3', 7]]);
+    // the movie rows are untouched.
+    assert.deepStrictEqual([...tasteFeedback.getRatingsMap('p-tf', 'movie').entries()], [['1', 9], ['2', 5]]);
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ratings_sync');
+  });
+
+  await it('TV-R T5: parseRatings(body, kind) — shows ids from e.show.ids; film parse byte-identical; series sync gates/fetches/resolves/writes type="series" only', async () => {
+    const tasteFeedback = require('../src/tasteFeedback');
+    const simkl = require('../src/services/simkl');
+    const db = require('../src/db');
+    const profile = { id: 'p-tvr-t5', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    tasteFeedback.init();
+    // (a) parseRatings(body, 'shows') on the verified live shape keeps only rated entries, ids from e.show.ids.
+    const liveShows = { shows: [
+      { user_rating: 8, user_rated_at: '2026-10-02T00:00:00Z', show: { title: 'Breaking Bad', ids: { simkl: 241, imdb: 'tt0090501', tmdb: '1786' } } },
+      { user_rating: null, user_rated_at: null, show: { title: 'Unrated', ids: { simkl: 999, imdb: 'tt999', tmdb: '999' } } },
+      { user_rating: 5, user_rated_at: '2026-10-02T00:00:00Z', show: { title: 'Unbreakable', ids: { simkl: 242, imdb: 'tt011', tmdb: '1787' } } },
+    ] };
+    assert.deepStrictEqual(simkl.parseRatings(liveShows, 'shows'), [
+      { tmdb_id: '1786', imdb_id: 'tt0090501', simkl_id: 241, rating: 8, rated_at: '2026-10-02T00:00:00Z' },
+      { tmdb_id: '1787', imdb_id: 'tt011', simkl_id: 242, rating: 5, rated_at: '2026-10-02T00:00:00Z' },
+    ]);
+    // (b) film parse unchanged (byte-identical output on an existing fixture).
+    const filmBody = { movies: [
+      { user_rating: 9, user_rated_at: '2026-01-01T00:00:00Z', movie: { title: 'A', ids: { simkl: 1, imdb: 'tt1', tmdb: '1' } } },
+      { user_rating: null, movie: { title: 'B', ids: { tmdb: '2' } } },
+    ] };
+    assert.deepStrictEqual(simkl.parseRatings(filmBody), [
+      { tmdb_id: '1', imdb_id: 'tt1', simkl_id: 1, rating: 9, rated_at: '2026-01-01T00:00:00Z' },
+    ]);
+    // (c) syncRatings({ type: 'series' }) gates on tv_shows.rated_at; fetches 'shows'; resolves an imdb-only entry; writes type='series' rows only.
+    let fetchCalls = [];
+    const fetchRatings = (_p, kind) => { fetchCalls.push(kind); return simkl.parseRatings({ shows: [
+      { user_rating: 7, user_rated_at: '2026-03-01T00:00:00Z', show: { title: 'S', ids: { simkl: 3, imdb: 'tt3', tmdb: '3' } } },
+      { user_rating: 6, user_rated_at: '2026-03-01T00:00:00Z', show: { title: 'OnlyImdb', ids: { imdb: 'tt4' } } },
+    ] }, kind); };
+    // Seed a film row that must stay untouched.
+    db.get().prepare("INSERT INTO taste_ratings (profile_id, type, tmdb_id, rating) VALUES (?, ?, ?, ?)").run('p-tvr-t5', 'movie', '77', 4);
+    // First series sync (force) → fetch 'shows', resolve the imdb-only entry, write type='series' rows only.
+    let res = await tasteFeedback.syncRatings(profile, { type: 'series', fetchActivities: async () => ({ tv_shows: { rated_at: '2026-03-01T00:00:00Z' } }), fetchRatings, resolveTmdb: async (imdb) => (imdb === 'tt4' ? '4' : null), now: 1000, log: quiet, force: true });
+    assert.deepStrictEqual(res, { ok: true, synced: 2, unresolved: 0 });
+    assert.deepStrictEqual(fetchCalls, ['shows']);
+    assert.deepStrictEqual([...tasteFeedback.getRatingsMap('p-tvr-t5', 'series').entries()], [['3', 7], ['4', 6]]);
+    // the film row is untouched.
+    assert.deepStrictEqual([...tasteFeedback.getRatingsMap('p-tvr-t5', 'movie').entries()], [['77', 4]]);
+    // Second series sync with the same gate → unchanged (no fetch).
+    fetchCalls = [];
+    res = await tasteFeedback.syncRatings(profile, { type: 'series', fetchActivities: async () => ({ tv_shows: { rated_at: '2026-03-01T00:00:00Z' } }), fetchRatings, now: 2000, log: quiet });
+    assert.deepStrictEqual(res, { ok: true, skipped: 'unchanged' });
+    assert.deepStrictEqual(fetchCalls, []);
     db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ratings_sync');
   });
 
