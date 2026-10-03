@@ -229,6 +229,7 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
     chain: tvLlmChain,
     chat: llmChat,
     cfg, log, now: nowMs, isAnimeRow,
+    filters: profileFilters,
   });
   ctx.stats.llm = { brief: !!brief };
 

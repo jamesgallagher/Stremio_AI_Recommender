@@ -73,10 +73,11 @@ function rungWords(rung, rating) {
   return w;
 }
 
-// §3.1 the prompt, exactly: the shows most-engaged first, each with rung
-// words, genres (split names) and networks. Says nothing about age,
-// suitability, children, classification or ratings boards (N5 / I1).
-function buildBriefPrompt(shows) {
+// §3.1 the prompt, exactly: the shows most-engaged first (rung words, genres,
+// networks), the dropped shows (the "avoids" evidence), the excluded genres,
+// and the grounded-avoids instruction. Says nothing about age, suitability,
+// children, classification or ratings boards (N5 / I1).
+function buildBriefPrompt(shows, dropped, excludedGenres) {
   const lines = [
     "You are summarising a TV viewer's taste from the shows they watched.",
     'Shows, most engaged first — "Title" (first-air year): how far they got; genres; network:',
@@ -84,9 +85,19 @@ function buildBriefPrompt(shows) {
   for (const s of shows) {
     lines.push(`- "${s.title}" (${s.year ?? 'n.d.'}): ${s.rungWords}; ${s.genres.join(', ')}; ${s.networks.length ? s.networks.join(', ') : 'unknown network'}`);
   }
+  lines.push('');
+  if (dropped.length) {
+    lines.push('Shows they tried and then dropped (one or two episodes, not continued):');
+    for (const d of dropped) lines.push(`- "${d.title}" (${d.year ?? 'n.d.'}): ${d.genres.length ? d.genres.join(', ') : 'genres unknown'}`);
+  } else {
+    lines.push('Shows they tried and then dropped: none');
+  }
+  lines.push(`Genres they chose to exclude: ${excludedGenres.length ? excludedGenres.join(', ') : 'none'}`);
+  lines.push('');
   lines.push('Return a JSON object with exactly these keys, each an array of short strings (at most 8 each):');
   lines.push('{"loves": [...], "avoids": [...], "moods": [...], "eras": [...], "standout_titles": [...]}');
-  lines.push('"loves" and "avoids" are themes, genres, formats or styles; "moods" are tones; "eras" are periods; "standout_titles" are the 3–8 shows that best define this taste.');
+  lines.push('"loves" are themes, genres, formats or styles shown by the shows they watched; "moods" are tones; "eras" are periods; "standout_titles" are the 3–8 shows that best define this taste.');
+  lines.push('"avoids" must ONLY name themes clearly shown by the dropped shows or the excluded genres above — never anything that appears in the shows they finished or engaged with. If there is no such evidence, "avoids" must be an empty array.');
   lines.push('Output ONLY the JSON object.');
   return lines.join('\n');
 }
@@ -94,22 +105,46 @@ function buildBriefPrompt(shows) {
 // §3.1 the cached taste brief. LOCAL LLM only — if `chain` is empty (no local
 // LLM) return null WITHOUT any network call (N4). The cache key is a SHA-256
 // over the sorted list of "<tmdb_id>:<rung>:<rating or ''>" over ALL
-// non-anime value > 0 ladder entries (not just the top 40), so any history
-// change refreshes the brief. Cached in marquee_llm_cache (kind 'tv_brief'),
-// no TTL (the key changes when the history changes). A failed brief is NEVER
-// cached (the next build retries).
-async function tvBrief(profileId, ladderEntries, metaById, { chain = [], chat = llm.chat, cfg, log = console, now = Date.now(), isAnimeRow = () => false } = {}) {
+// non-anime value > 0 ladder entries (not just the top 40), extended with
+// "<tmdb_id>:sampled_left" for each dropped show and one
+// "excluded:<sorted excluded genres>" part — so any change to the "avoids"
+// evidence refreshes the brief. Cached in marquee_llm_cache (kind
+// 'tv_brief'), no TTL (the key changes when the history or the evidence
+// changes). A failed brief is NEVER cached (the next build retries).
+async function tvBrief(profileId, ladderEntries, metaById, { chain = [], chat = llm.chat, cfg, log = console, now = Date.now(), isAnimeRow = () => false, filters: profileFilters = {} } = {}) {
   if (!chain || !chain.length) return null; // no local LLM → no brief, no network (N4)
   const ratings = tasteFeedback.getRatingsMap(profileId, 'series');
-  const keyParts = ladderEntries
-    .filter((e) => e.value > 0 && e.row.tmdb_id && !isAnimeRow(e.row))
-    .map((e) => [String(e.row.tmdb_id), e.rung, String(ratings.get(String(e.row.tmdb_id)) ?? '')]);
-  keyParts.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  const keyParts = [];
+  for (const e of ladderEntries) {
+    if (!e.row.tmdb_id || isAnimeRow(e.row)) continue;
+    if (e.value > 0) {
+      keyParts.push(`${e.row.tmdb_id}:${e.rung}:${String(ratings.get(String(e.row.tmdb_id)) ?? '')}`);
+    } else if (e.rung === 'sampled_left') {
+      keyParts.push(`${e.row.tmdb_id}:sampled_left`);
+    }
+  }
+  keyParts.push(`excluded:${[...(profileFilters.excluded_genres || [])].sort().join(', ')}`);
+  keyParts.sort();
   const keyHash = crypto.createHash('sha256');
-  for (const p of keyParts) keyHash.update(p.join(':') + '\n');
+  for (const p of keyParts) keyHash.update(p + '\n');
   const key = keyHash.digest('hex');
   const cached = llmCache.get(profileId, 'tv_brief', key, { now });
   if (cached) return cached;
+  // The "avoids" evidence: the shows they tried and then dropped (non-anime
+  // sampled_left, most recently watched first, capped at cfg.brief.dropped_cap).
+  const dropped = ladderEntries
+    .filter((e) => e.rung === 'sampled_left' && e.row.tmdb_id && !isAnimeRow(e.row))
+    .sort((a, b) => (b.row.last_watched_at ?? 0) - (a.row.last_watched_at ?? 0))
+    .slice(0, cfg.brief.dropped_cap)
+    .map((e) => {
+      const m = metaById.get(String(e.row.tmdb_id));
+      return {
+        title: m ? (m.title || e.row.title) : e.row.title,
+        year: m && m.year != null ? m.year : e.row.year,
+        genres: m ? filters.tvGenres(m) : [],
+      };
+    });
+  const excludedGenres = [...(profileFilters.excluded_genres || [])];
   const top = ladderEntries
     .filter((e) => e.value > 0 && e.row.tmdb_id && !isAnimeRow(e.row) && metaById.has(String(e.row.tmdb_id)))
     .sort((a, b) => b.value - a.value)
@@ -127,7 +162,7 @@ async function tvBrief(profileId, ladderEntries, metaById, { chain = [], chat = 
     });
   const timeoutMs = Number(process.env.MARQUEE_LLM_TIMEOUT_MS) || cfg.llm_timeout_ms;
   try {
-    const brief = await chat(chain, [{ role: 'user', content: buildBriefPrompt(top) }], { temperature: 0, timeoutMs, validate: parseBrief }, log);
+    const brief = await chat(chain, [{ role: 'user', content: buildBriefPrompt(top, dropped, excludedGenres) }], { temperature: 0, timeoutMs, validate: parseBrief }, log);
     const stored = { ...brief, hash: key };
     llmCache.put(profileId, 'tv_brief', key, stored, now);
     return stored;

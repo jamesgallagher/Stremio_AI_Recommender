@@ -23,7 +23,7 @@ const DEFAULTS = {
   cancelled_one_season_penalty: 0.05,
   default_comfort_eps: 20,
   llm_timeout_ms: 60000,
-  brief:   { top_shows: 40 },
+  brief:   { top_shows: 40, dropped_cap: 20 },
   suggest: { enabled: true, count: 40, avoid_recent: 40, ttl_days: 7 },
   llm_fit: { enabled: true, weight: 0.15, candidate_cap: 150, batch: 15, ttl_days: 14 },
   serve:   { strategy: 'calibrated', lambda: 0.85, window_factor: 3, kl_alpha: 0.01,

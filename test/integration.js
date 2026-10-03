@@ -7362,7 +7362,10 @@ async function main() {
       const goodChat = async (c, messages, opts) => { calls.push({ messages, opts }); return opts.validate(rawBrief); };
       const badChat = async () => { throw new Error('local LLM down'); };
 
-      // (a) the exact prompt: rung words, the rated suffix, split genres, networks.
+      // (a) the exact prompt: rung words, the rated suffix, split genres,
+      //     networks, the dropped-shows block (row 400 has no year and no
+      //     meta → "n.d." and "genres unknown"), the excluded line (no
+      //     filters passed → none), the grounded-avoids instruction.
       const brief = await llmMod.tvBrief(p.id, ladderEntries, metaById, { chain, chat: goodChat, cfg, log, now });
       assert.strictEqual(calls.length, 1, 'one chat call');
       const expected = [
@@ -7371,9 +7374,15 @@ async function main() {
         '- "Alpha Show" (2020): finished, rated 8/10; Science Fiction, Fantasy; Netflix',
         '- "Beta Show" (2019): watched most of it; Drama; unknown network',
         '- "Gamma Show" (2021): tried a few episodes; Action, Adventure, Horror; BBC, Channel 4',
+        '',
+        'Shows they tried and then dropped (one or two episodes, not continued):',
+        '- "Left Show" (n.d.): genres unknown',
+        'Genres they chose to exclude: none',
+        '',
         'Return a JSON object with exactly these keys, each an array of short strings (at most 8 each):',
         '{"loves": [...], "avoids": [...], "moods": [...], "eras": [...], "standout_titles": [...]}',
-        '"loves" and "avoids" are themes, genres, formats or styles; "moods" are tones; "eras" are periods; "standout_titles" are the 3–8 shows that best define this taste.',
+        '"loves" are themes, genres, formats or styles shown by the shows they watched; "moods" are tones; "eras" are periods; "standout_titles" are the 3–8 shows that best define this taste.',
+        '"avoids" must ONLY name themes clearly shown by the dropped shows or the excluded genres above — never anything that appears in the shows they finished or engaged with. If there is no such evidence, "avoids" must be an empty array.',
         'Output ONLY the JSON object.',
       ].join('\n');
       assert.strictEqual(calls[0].messages[0].content, expected, 'the exact prompt');
@@ -7415,6 +7424,132 @@ async function main() {
       assert.ok(!/\bage\b|suitab|child|kid|classif|rated (G|PG|M)/i.test(prompt), 'N5: no age/suitability/child/classification wording');
     } finally {
       tasteFeedback.deleteForProfile(p.id);
+      config.removeProfile(p.id);
+    }
+  });
+
+  // ── TV-3 r1 R1: the grounded-avoids brief prompt (review round 1, F1) ──
+  // The exact new prompt: the shows block as before, the dropped-shows block
+  // (genres from the meta when present), the excluded-genres line, the
+  // grounded-avoids instruction; the two `none` lines when there is no
+  // evidence; the N5 regex (word-bounded age, as in B1).
+  await it('TV-3 R1: the brief prompt — grounded avoids (dropped shows + excluded genres), the none lines, N5', async () => {
+    const llmMod = require('../src/engines/marqueeTv/llm');
+    const cfg = require('../src/engines/marqueeTv/config').DEFAULTS;
+    const now = 1_700_000_000_000;
+    const p = config.addProfile('INT-TV3-R1');
+    const log = { log: () => {}, warn: () => {}, error: () => {} };
+    try {
+      const ladderEntries = [
+        { row: { tmdb_id: '100', title: 'Alpha Show', year: 2020 }, rung: 'finished', value: 3.0 },
+        { row: { tmdb_id: '200', title: 'Beta Show', year: 2019 }, rung: 'finished', value: 2.0 },
+        { row: { tmdb_id: '300', title: 'Left Show', year: 2018 }, rung: 'sampled_left', value: 0, last_watched_at: now - 86400e3 },
+      ];
+      const metaById = new Map([
+        ['100', { title: 'Alpha Show', year: 2020, genres: ['Drama'], keywords: [], networks: ['Netflix'] }],
+        ['200', { title: 'Beta Show', year: 2019, genres: ['Crime'], keywords: [], networks: [] }],
+        ['300', { title: 'Left Show', year: 2018, genres: ['Sci-Fi & Fantasy'], keywords: [], networks: ['BBC'] }],
+      ]);
+      const chain = [{ type: 'custom', name: 'local', uri: 'http://localhost:11434/v1', apiKey: '' }];
+      const rawBrief = JSON.stringify({ loves: ['drama'], avoids: ['science fiction'], moods: ['tense'], eras: ['2010s'], standout_titles: ['Alpha Show'] });
+      const calls = [];
+      const goodChat = async (c, messages, opts) => { calls.push({ messages, opts }); return opts.validate(rawBrief); };
+
+      // (a) the exact new prompt: the shows block as today, the dropped block
+      //     (genres from the meta), the excluded line, the grounded-avoids line.
+      await llmMod.tvBrief(p.id, ladderEntries, metaById, { chain, chat: goodChat, cfg, log, now, filters: { excluded_genres: ['Horror'] } });
+      assert.strictEqual(calls.length, 1, 'one chat call');
+      const expected = [
+        "You are summarising a TV viewer's taste from the shows they watched.",
+        'Shows, most engaged first — "Title" (first-air year): how far they got; genres; network:',
+        '- "Alpha Show" (2020): finished; Drama; Netflix',
+        '- "Beta Show" (2019): finished; Crime; unknown network',
+        '',
+        'Shows they tried and then dropped (one or two episodes, not continued):',
+        '- "Left Show" (2018): Science Fiction, Fantasy',
+        'Genres they chose to exclude: Horror',
+        '',
+        'Return a JSON object with exactly these keys, each an array of short strings (at most 8 each):',
+        '{"loves": [...], "avoids": [...], "moods": [...], "eras": [...], "standout_titles": [...]}',
+        '"loves" are themes, genres, formats or styles shown by the shows they watched; "moods" are tones; "eras" are periods; "standout_titles" are the 3–8 shows that best define this taste.',
+        '"avoids" must ONLY name themes clearly shown by the dropped shows or the excluded genres above — never anything that appears in the shows they finished or engaged with. If there is no such evidence, "avoids" must be an empty array.',
+        'Output ONLY the JSON object.',
+      ].join('\n');
+      assert.strictEqual(calls[0].messages[0].content, expected, 'the exact new brief prompt');
+
+      // (b) no dropped shows and no exclusions → the two `none` lines.
+      const calls2 = [];
+      const goodChat2 = async (c, messages, opts) => { calls2.push({ messages, opts }); return opts.validate(rawBrief); };
+      const ladderNoDropped = ladderEntries.slice(0, 2);
+      const brief2 = await llmMod.tvBrief(p.id, ladderNoDropped, metaById, { chain, chat: goodChat2, cfg, log, now: now + 1000 });
+      assert.strictEqual(calls2.length, 1, 'a different history → a new key → one chat call');
+      const prompt2 = calls2[0].messages[0].content;
+      assert.ok(prompt2.includes('Shows they tried and then dropped: none'), 'the dropped none line');
+      assert.ok(prompt2.includes('Genres they chose to exclude: none'), 'the excluded none line');
+      assert.ok(!prompt2.includes('(one or two episodes, not continued)'), 'no dropped block when there is none');
+
+      // (c) parseBrief accepts an empty avoids (another key has content).
+      const rawEmpty = JSON.stringify({ loves: ['drama'], avoids: [], moods: ['tense'], eras: ['2010s'], standout_titles: ['Alpha Show'] });
+      const calls3 = [];
+      const goodChat3 = async (c, messages, opts) => { calls3.push({ messages, opts }); return opts.validate(rawEmpty); };
+      const brief3 = await llmMod.tvBrief(p.id, ladderNoDropped, metaById, { chain, chat: goodChat3, cfg, log, now: now + 2000, filters: { excluded_genres: ['Horror'] } });
+      assert.deepStrictEqual(brief3.avoids, [], 'an empty avoids is accepted');
+      assert.deepStrictEqual(brief2.avoids, ['science fiction'], 'the (b) brief parsed');
+
+      // (d) N5: the word-bounded age regex (the card's literal /age/i also
+      //     matches "engaged"; the intent is age WORDS — as in B1).
+      for (const content of [calls[0].messages[0].content, prompt2]) {
+        assert.ok(!/\bage\b|suitab|child|kid|classif|rated (G|PG|M)/i.test(content), 'N5: no age/suitability/child/classification wording');
+      }
+    } finally {
+      config.removeProfile(p.id);
+    }
+  });
+
+  // ── TV-3 r1 R2: the brief cache key (review round 1, F1) ──
+  // The key extends the sorted history list with the dropped evidence
+  // (<tmdb_id>:sampled_left) and excluded:<sorted excluded joined ",">, so a
+  // new sampled_left show or an excluded_genres change refreshes the brief
+  // (one new chat call each); an unchanged history is a hit. Existing rows
+  // are simply not hit again — never deleted.
+  await it('TV-3 R2: the brief cache key — a sampled_left show or an excluded_genres change → one new call; unchanged → hit', async () => {
+    const llmMod = require('../src/engines/marqueeTv/llm');
+    const cfg = require('../src/engines/marqueeTv/config').DEFAULTS;
+    const now = 1_700_000_000_000;
+    const p = config.addProfile('INT-TV3-R2');
+    const log = { log: () => {}, warn: () => {}, error: () => {} };
+    try {
+      const ladderBase = [
+        { row: { tmdb_id: '100', title: 'Alpha Show', year: 2020 }, rung: 'finished', value: 3.0 },
+        { row: { tmdb_id: '200', title: 'Beta Show', year: 2019 }, rung: 'committed', value: 2.0 },
+      ];
+      const metaById = new Map([
+        ['100', { title: 'Alpha Show', year: 2020, genres: ['Drama'], keywords: [], networks: ['Netflix'] }],
+        ['200', { title: 'Beta Show', year: 2019, genres: ['Crime'], keywords: [], networks: [] }],
+      ]);
+      const chain = [{ type: 'custom', name: 'local', uri: 'http://localhost:11434/v1', apiKey: '' }];
+      const rawBrief = JSON.stringify({ loves: ['drama'], avoids: [], moods: ['tense'], eras: ['2010s'], standout_titles: ['Alpha Show'] });
+      const calls = [];
+      const goodChat = async (c, messages, opts) => { calls.push({ messages, opts }); return opts.validate(rawBrief); };
+      const filtersBase = { excluded_genres: ['Horror'] };
+
+      // (a) the first call.
+      await llmMod.tvBrief(p.id, ladderBase, metaById, { chain, chat: goodChat, cfg, log, now, filters: filtersBase });
+      assert.strictEqual(calls.length, 1, 'first call');
+      // (b) unchanged history + filters → a cache hit.
+      await llmMod.tvBrief(p.id, ladderBase, metaById, { chain, chat: goodChat, cfg, log, now: now + 1000, filters: filtersBase });
+      assert.strictEqual(calls.length, 1, 'unchanged → cache hit');
+      // (c) a sampled_left show appears → one new call.
+      const ladderDropped = [...ladderBase, { row: { tmdb_id: '300', title: 'Left Show', year: 2018 }, rung: 'sampled_left', value: 0, last_watched_at: now - 86400e3 }];
+      await llmMod.tvBrief(p.id, ladderDropped, metaById, { chain, chat: goodChat, cfg, log, now: now + 2000, filters: filtersBase });
+      assert.strictEqual(calls.length, 2, 'sampled_left appears → new key → one new call');
+      // (d) excluded_genres changes → one new call.
+      await llmMod.tvBrief(p.id, ladderDropped, metaById, { chain, chat: goodChat, cfg, log, now: now + 3000, filters: { excluded_genres: ['Horror', 'Crime'] } });
+      assert.strictEqual(calls.length, 3, 'excluded_genres change → new key → one new call');
+      // (e) unchanged again → a hit.
+      await llmMod.tvBrief(p.id, ladderDropped, metaById, { chain, chat: goodChat, cfg, log, now: now + 4000, filters: { excluded_genres: ['Horror', 'Crime'] } });
+      assert.strictEqual(calls.length, 3, 'unchanged → cache hit');
+    } finally {
       config.removeProfile(p.id);
     }
   });
