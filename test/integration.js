@@ -1359,7 +1359,7 @@ async function main() {
     }
   });
 
-  await it('Trainer T1: tasteFeedback.syncRatings — type-scoped, series throws not-supported, movie never touches series rows (test 3)', async () => {
+  await it('Trainer T1: tasteFeedback.syncRatings — type-scoped, series syncs the Simkl "shows" section, movie never touches series rows (test 3)', async () => {
     const tasteFeedback = require('../src/tasteFeedback');
     const simkl = require('../src/services/simkl');
     const db = require('../src/db');
@@ -1380,8 +1380,62 @@ async function main() {
     // A second movie sync with the same gate → unchanged (null === null).
     res = await tasteFeedback.syncRatings(profile, { type: 'movie', fetchActivities: async () => ({ movies: { rated_at: null } }), fetchRatings, now: 2000, log: quiet });
     assert.deepStrictEqual(res, { ok: true, skipped: 'unchanged' });
-    // series → not-supported (the ONLY throw in the store).
-    await assert.rejects(() => tasteFeedback.syncRatings(profile, { type: 'series', fetchActivities: async () => ({ movies: { rated_at: null } }), fetchRatings, now: 3000, log: quiet }), /not-supported/);
+    // series sync (TV-R §3): gate on tv_shows.rated_at, fetch 'shows', write type='series' rows only.
+    res = await tasteFeedback.syncRatings(profile, { type: 'series', fetchActivities: async () => ({ tv_shows: { rated_at: null } }), fetchRatings: (_p, kind) => simkl.parseRatings({ shows: [
+      { user_rating: 7, user_rated_at: '2026-03-01T00:00:00Z', show: { title: 'S', ids: { simkl: 3, imdb: 'tt3', tmdb: '3' } } },
+    ] }, kind), now: 3000, log: quiet, force: true });
+    assert.deepStrictEqual(res, { ok: true, synced: 1, unresolved: 0 });
+    // the seeded series row was replaced (type='series' rows only).
+    assert.deepStrictEqual([...tasteFeedback.getRatingsMap('p-tf', 'series').entries()], [['3', 7]]);
+    // the movie rows are untouched.
+    assert.deepStrictEqual([...tasteFeedback.getRatingsMap('p-tf', 'movie').entries()], [['1', 9], ['2', 5]]);
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ratings_sync');
+  });
+
+  await it('TV-R T5: parseRatings(body, kind) — shows ids from e.show.ids; film parse byte-identical; series sync gates/fetches/resolves/writes type="series" only', async () => {
+    const tasteFeedback = require('../src/tasteFeedback');
+    const simkl = require('../src/services/simkl');
+    const db = require('../src/db');
+    const profile = { id: 'p-tvr-t5', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    tasteFeedback.init();
+    // (a) parseRatings(body, 'shows') on the verified live shape keeps only rated entries, ids from e.show.ids.
+    const liveShows = { shows: [
+      { user_rating: 8, user_rated_at: '2026-10-02T00:00:00Z', show: { title: 'Breaking Bad', ids: { simkl: 241, imdb: 'tt0090501', tmdb: '1786' } } },
+      { user_rating: null, user_rated_at: null, show: { title: 'Unrated', ids: { simkl: 999, imdb: 'tt999', tmdb: '999' } } },
+      { user_rating: 5, user_rated_at: '2026-10-02T00:00:00Z', show: { title: 'Unbreakable', ids: { simkl: 242, imdb: 'tt011', tmdb: '1787' } } },
+    ] };
+    assert.deepStrictEqual(simkl.parseRatings(liveShows, 'shows'), [
+      { tmdb_id: '1786', imdb_id: 'tt0090501', simkl_id: 241, rating: 8, rated_at: '2026-10-02T00:00:00Z' },
+      { tmdb_id: '1787', imdb_id: 'tt011', simkl_id: 242, rating: 5, rated_at: '2026-10-02T00:00:00Z' },
+    ]);
+    // (b) film parse unchanged (byte-identical output on an existing fixture).
+    const filmBody = { movies: [
+      { user_rating: 9, user_rated_at: '2026-01-01T00:00:00Z', movie: { title: 'A', ids: { simkl: 1, imdb: 'tt1', tmdb: '1' } } },
+      { user_rating: null, movie: { title: 'B', ids: { tmdb: '2' } } },
+    ] };
+    assert.deepStrictEqual(simkl.parseRatings(filmBody), [
+      { tmdb_id: '1', imdb_id: 'tt1', simkl_id: 1, rating: 9, rated_at: '2026-01-01T00:00:00Z' },
+    ]);
+    // (c) syncRatings({ type: 'series' }) gates on tv_shows.rated_at; fetches 'shows'; resolves an imdb-only entry; writes type='series' rows only.
+    let fetchCalls = [];
+    const fetchRatings = (_p, kind) => { fetchCalls.push(kind); return simkl.parseRatings({ shows: [
+      { user_rating: 7, user_rated_at: '2026-03-01T00:00:00Z', show: { title: 'S', ids: { simkl: 3, imdb: 'tt3', tmdb: '3' } } },
+      { user_rating: 6, user_rated_at: '2026-03-01T00:00:00Z', show: { title: 'OnlyImdb', ids: { imdb: 'tt4' } } },
+    ] }, kind); };
+    // Seed a film row that must stay untouched.
+    db.get().prepare("INSERT INTO taste_ratings (profile_id, type, tmdb_id, rating) VALUES (?, ?, ?, ?)").run('p-tvr-t5', 'movie', '77', 4);
+    // First series sync (force) → fetch 'shows', resolve the imdb-only entry, write type='series' rows only.
+    let res = await tasteFeedback.syncRatings(profile, { type: 'series', fetchActivities: async () => ({ tv_shows: { rated_at: '2026-03-01T00:00:00Z' } }), fetchRatings, resolveTmdb: async (imdb) => (imdb === 'tt4' ? '4' : null), now: 1000, log: quiet, force: true });
+    assert.deepStrictEqual(res, { ok: true, synced: 2, unresolved: 0 });
+    assert.deepStrictEqual(fetchCalls, ['shows']);
+    assert.deepStrictEqual([...tasteFeedback.getRatingsMap('p-tvr-t5', 'series').entries()], [['3', 7], ['4', 6]]);
+    // the film row is untouched.
+    assert.deepStrictEqual([...tasteFeedback.getRatingsMap('p-tvr-t5', 'movie').entries()], [['77', 4]]);
+    // Second series sync with the same gate → unchanged (no fetch).
+    fetchCalls = [];
+    res = await tasteFeedback.syncRatings(profile, { type: 'series', fetchActivities: async () => ({ tv_shows: { rated_at: '2026-03-01T00:00:00Z' } }), fetchRatings, now: 2000, log: quiet });
+    assert.deepStrictEqual(res, { ok: true, skipped: 'unchanged' });
+    assert.deepStrictEqual(fetchCalls, []);
     db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ratings_sync');
   });
 
@@ -1535,9 +1589,10 @@ async function main() {
     // not-in-history (unknown ref).
     res = await trainer.setIgnored(profile, { type: 'movie', tmdb_id: '999' }, true, deps);
     assert.deepStrictEqual(res, { ok: false, reason: 'not-in-history' });
-    // bad-type (series → not-supported).
+    // series is supported (TV-R §2): this profile has no series_progress rows,
+    // so the ref is not-in-history (the old not-supported is gone).
     res = await trainer.setIgnored(profile, { type: 'series', tmdb_id: '1' }, true, deps);
-    assert.deepStrictEqual(res, { ok: false, reason: 'not-supported' });
+    assert.deepStrictEqual(res, { ok: false, reason: 'not-in-history' });
     db.get().exec('DELETE FROM taste_ignore; DELETE FROM taste_changes');
     watchedStore.deleteForProfile(profile.id);
   });
@@ -1636,11 +1691,14 @@ async function main() {
     assert.strictEqual(res.total, 2);
     res = await trainer.listHistory(profile, { type: 'movie', page: 2, pageSize: 1 }, deps);
     assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['1']); // Alpha (2nd page)
-    // bad-view / bad-type / not-supported.
+    // bad-view / bad-type.
     res = await trainer.listHistory(profile, { type: 'movie', view: 'bogus' }, deps);
     assert.deepStrictEqual(res, { ok: false, reason: 'bad-view' });
+    // series is supported (TV-R §2): this profile has no series_progress rows,
+    // so the listing is empty (the old not-supported is gone).
     res = await trainer.listHistory(profile, { type: 'series' }, deps);
-    assert.deepStrictEqual(res, { ok: false, reason: 'not-supported' });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.total, 0);
     res = await trainer.listHistory(profile, { type: 'bogus' }, deps);
     assert.deepStrictEqual(res, { ok: false, reason: 'bad-type' });
     // dedupe: a newer watch of the same tmdb_id → keep the newest.
@@ -1688,9 +1746,10 @@ async function main() {
     assert.deepStrictEqual(res, { ok: false, reason: 'bad-rating' });
     res = await trainer.rate(profile, { type: 'movie', tmdb_id: '1' }, undefined, deps);
     assert.deepStrictEqual(res, { ok: false, reason: 'bad-rating' });
-    // 'series' → not-supported; 'anime' → bad-type.
+    // series is supported (TV-R §2): this profile has no series_progress rows,
+    // so the ref is not-in-history (the old not-supported is gone); 'anime' → bad-type.
     res = await trainer.rate(profile, { type: 'series', tmdb_id: '1' }, 5, deps);
-    assert.deepStrictEqual(res, { ok: false, reason: 'not-supported' });
+    assert.deepStrictEqual(res, { ok: false, reason: 'not-in-history' });
     res = await trainer.rate(profile, { type: 'anime', tmdb_id: '1' }, 5, deps);
     assert.deepStrictEqual(res, { ok: false, reason: 'bad-type' });
     // not-in-history: a ref that belongs to ANOTHER profile's history.
@@ -1901,6 +1960,170 @@ async function main() {
     assert.ok(!enrichCalls.includes('1')); // tmdb 1 served from the cache, so enrich skipped it
     db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ignore; DELETE FROM taste_changes');
     metaStore._clear();
+    watchedStore.deleteForProfile(profile.id);
+  });
+
+  await it('TV-R T1: listHistory — series (kind show only), the §2 DTO, progress, order, views, search', async () => {
+    const trainer = require('../src/trainer');
+    const watchedStore = require('../src/watchedStore');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const db = require('../src/db');
+    const profile = { id: 'p-tvr-list', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    // 3 kind 'show' rows + 1 kind 'anime' row → the anime row is excluded (R4);
+    // a 4th show row is ignored so the 'ignored' view can be exercised.
+    watchedStore.upsertSeriesProgress(profile.id, [
+      { simkl_id: 1, kind: 'show', imdb_id: 'tt1', tmdb_id: '1', title: 'Alpha Show', year: 2020, status: 'ongoing', watched_eps: 12, total_eps: 24, not_aired_eps: 4, last_watched_at: 3000, first_watched_at: 1000, first_real_at: 1000, last_real_at: 3000, stamps: 12, real_stamps: 12, eps_per_week: 4 },
+      { simkl_id: 2, kind: 'show', imdb_id: 'tt2', tmdb_id: '2', title: 'Beta Show', year: 2021, status: 'ongoing', watched_eps: 5, total_eps: null, not_aired_eps: null, last_watched_at: 2000, first_watched_at: 1000, first_real_at: 1000, last_real_at: 2000, stamps: 5, real_stamps: 5, eps_per_week: null },
+      { simkl_id: 3, kind: 'show', imdb_id: 'tt3', tmdb_id: '3', title: 'Gamma Show', year: 2022, status: 'completed', watched_eps: 10, total_eps: 10, not_aired_eps: 0, last_watched_at: 1000, first_watched_at: 1000, first_real_at: 1000, last_real_at: 1000, stamps: 10, real_stamps: 10, eps_per_week: 5 },
+      { simkl_id: 4, kind: 'show', imdb_id: 'tt4', tmdb_id: '4', title: 'Delta Show', year: 2023, status: 'ongoing', watched_eps: 2, total_eps: 8, not_aired_eps: 1, last_watched_at: 500, first_watched_at: 400, first_real_at: 400, last_real_at: 500, stamps: 2, real_stamps: 2, eps_per_week: null },
+      { simkl_id: 5, kind: 'anime', imdb_id: 'tta1', tmdb_id: '100', title: 'An Anime', year: 2023, status: 'ongoing', watched_eps: 3, total_eps: 12, not_aired_eps: 2, last_watched_at: 4000, first_watched_at: 3000, first_real_at: 3000, last_real_at: 4000, stamps: 3, real_stamps: 3, eps_per_week: null },
+    ]);
+    tasteFeedback.upsertRating(profile.id, { type: 'series', tmdb_id: '1', rating: 10 }); // loved
+    tasteFeedback.upsertRating(profile.id, { type: 'series', tmdb_id: '2', rating: 7 }); // rated
+    tasteFeedback.setIgnored(profile.id, { type: 'series', tmdb_id: '4' }, true, 5000);
+    const deps = { now: () => 5000, log: quiet };
+    // the 'all' view has 3 items (Delta is ignored, the anime row is excluded);
+    // ordered by last_watched_at DESC.
+    let res = await trainer.listHistory(profile, { type: 'series' }, deps);
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.total, 3);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['1', '2', '3']);
+    // the §2 series DTO, exactly.
+    const alpha = res.items.find((i) => i.tmdb_id === '1');
+    assert.deepStrictEqual(alpha, {
+      key: '1', type: 'series', simkl_id: 1, tmdb_id: '1', imdb_id: 'tt1',
+      title: 'Alpha Show', year: 2020, genre: null, poster: null,
+      watched_at: new Date(3000).toISOString(),
+      rating: 10, loved: true, ignored: false, status: 'watched', percent: null,
+      progress: { watched_eps: 12, aired_eps: 20 }, // 24 - 4
+    });
+    // aired = null when total is unknown.
+    const beta = res.items.find((i) => i.tmdb_id === '2');
+    assert.deepStrictEqual(beta.progress, { watched_eps: 5, aired_eps: null });
+    // counts: unfinished is 0 for series.
+    assert.deepStrictEqual(res.counts, { all: 3, unrated: 1, rated: 2, loved: 1, ignored: 1, unfinished: 0, unresolved: 0 });
+    // views.
+    res = await trainer.listHistory(profile, { type: 'series', view: 'unrated' }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['3']);
+    res = await trainer.listHistory(profile, { type: 'series', view: 'rated' }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['1', '2']);
+    res = await trainer.listHistory(profile, { type: 'series', view: 'loved' }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['1']);
+    res = await trainer.listHistory(profile, { type: 'series', view: 'ignored' }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['4']);
+    // unfinished → bad-view for series.
+    res = await trainer.listHistory(profile, { type: 'series', view: 'unfinished' }, deps);
+    assert.deepStrictEqual(res, { ok: false, reason: 'bad-view' });
+    // search (case-insensitive title substring).
+    res = await trainer.listHistory(profile, { type: 'series', q: 'beta' }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['2']);
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ignore; DELETE FROM taste_changes');
+    watchedStore.deleteForProfile(profile.id);
+  });
+
+  await it('TV-R T2: rate — series (Simkl first, local row after, clear, throw, recordChange)', async () => {
+    const trainer = require('../src/trainer');
+    const watchedStore = require('../src/watchedStore');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const simkl = require('../src/services/simkl');
+    const db = require('../src/db');
+    const profile = { id: 'p-tvr-rate', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    watchedStore.upsertSeriesProgress(profile.id, [
+      { simkl_id: 1, kind: 'show', imdb_id: 'tt1', tmdb_id: '1', title: 'Alpha Show', year: 2020, status: 'ongoing', watched_eps: 12, total_eps: 24, not_aired_eps: 4, last_watched_at: 3000, first_watched_at: 1000, first_real_at: 1000, last_real_at: 3000, stamps: 12, real_stamps: 12, eps_per_week: 4 },
+    ]);
+    const simklCalls = [];
+    const deps = {
+      simkl: {
+        setRatings: async (_p, items) => { simklCalls.push(['set', items]); },
+        removeRatings: async (_p, items) => { simklCalls.push(['remove', items]); },
+      },
+      now: () => 5000,
+      log: quiet,
+    };
+    // rate → setRatings with the series item; the real buildRatingsBody shows[0] has ids.simkl + rating.
+    let res = await trainer.rate(profile, { type: 'series', tmdb_id: '1' }, 8, deps);
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.item.rating, 8);
+    assert.deepStrictEqual(simklCalls, [['set', [{ type: 'series', simkl_id: 1, imdb_id: 'tt1', tmdb_id: '1', rating: 8 }]]]);
+    assert.deepStrictEqual(simkl.buildRatingsBody(simklCalls[0][1]), { movies: [], shows: [{ ids: { simkl: 1, imdb: 'tt1', tmdb: '1' }, rating: 8 }] });
+    // the local row is written after the Simkl call.
+    assert.strictEqual(tasteFeedback.getRating(profile.id, 'series', '1'), 8);
+    // recordChange is bumped.
+    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 5000, changes_since_build: 1, built_changed_at: null });
+    // a throwing setRatings → no local row (unchanged).
+    const before = tasteFeedback.getRating(profile.id, 'series', '1');
+    await assert.rejects(() => trainer.rate(profile, { type: 'series', tmdb_id: '1' }, 9, {
+      ...deps,
+      simkl: { setRatings: async () => { throw new Error('Simkl POST /sync/ratings failed (500)'); }, removeRatings: async () => { throw new Error('Simkl POST /sync/ratings/remove failed (500)'); } },
+    }));
+    assert.strictEqual(tasteFeedback.getRating(profile.id, 'series', '1'), before);
+    // a clear → removeRatings and the row deleted.
+    simklCalls.length = 0;
+    res = await trainer.rate(profile, { type: 'series', tmdb_id: '1' }, null, deps);
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.item.rating, null);
+    assert.deepStrictEqual(simklCalls, [['remove', [{ type: 'series', simkl_id: 1, imdb_id: 'tt1', tmdb_id: '1' }]]]);
+    assert.strictEqual(tasteFeedback.getRating(profile.id, 'series', '1'), null);
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ignore; DELETE FROM taste_changes');
+    watchedStore.deleteForProfile(profile.id);
+  });
+
+  await it('TV-R T3: setIgnored — series is local only (zero Simkl calls); un-ignore works', async () => {
+    const trainer = require('../src/trainer');
+    const watchedStore = require('../src/watchedStore');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const db = require('../src/db');
+    const profile = { id: 'p-tvr-ignore', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    watchedStore.upsertSeriesProgress(profile.id, [
+      { simkl_id: 1, kind: 'show', imdb_id: 'tt1', tmdb_id: '1', title: 'Alpha Show', year: 2020, status: 'ongoing', watched_eps: 12, total_eps: 24, not_aired_eps: 4, last_watched_at: 3000, first_watched_at: 1000, first_real_at: 1000, last_real_at: 3000, stamps: 12, real_stamps: 12, eps_per_week: 4 },
+    ]);
+    const simklCalls = [];
+    const deps = {
+      simkl: { setRatings: async () => { simklCalls.push('set'); }, removeRatings: async () => { simklCalls.push('remove'); } },
+      now: () => 5000,
+      log: quiet,
+    };
+    // ignore → local row written, NO Simkl call.
+    let res = await trainer.setIgnored(profile, { type: 'series', tmdb_id: '1' }, true, deps);
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.item.ignored, true);
+    assert.strictEqual(simklCalls.length, 0);
+    assert.ok(tasteFeedback.ignoredSet(profile.id, 'series').has('1'));
+    // un-ignore → local row removed.
+    res = await trainer.setIgnored(profile, { type: 'series', tmdb_id: '1' }, false, deps);
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.item.ignored, false);
+    assert.strictEqual(tasteFeedback.ignoredSet(profile.id, 'series').size, 0);
+    assert.strictEqual(simklCalls.length, 0); // still zero Simkl calls
+    db.get().exec('DELETE FROM taste_ignore; DELETE FROM taste_changes');
+    watchedStore.deleteForProfile(profile.id);
+  });
+
+  await it('TV-R T4: markFinished / markUnwatched — series → not-supported (400), zero Simkl calls', async () => {
+    const trainer = require('../src/trainer');
+    const watchedStore = require('../src/watchedStore');
+    const db = require('../src/db');
+    const profile = { id: 'p-tvr-notsup', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    watchedStore.upsertSeriesProgress(profile.id, [
+      { simkl_id: 1, kind: 'show', imdb_id: 'tt1', tmdb_id: '1', title: 'Alpha Show', year: 2020, status: 'ongoing', watched_eps: 12, total_eps: 24, not_aired_eps: 4, last_watched_at: 3000, first_watched_at: 1000, first_real_at: 1000, last_real_at: 3000, stamps: 12, real_stamps: 12, eps_per_week: 4 },
+    ]);
+    const simklCalls = [];
+    const deps = {
+      simkl: { setRatings: async () => { simklCalls.push('set'); }, removeRatings: async () => { simklCalls.push('remove'); }, removeFromHistory: async () => { simklCalls.push('removeHistory'); } },
+      markWatched: async () => { simklCalls.push('markWatched'); return { ok: true }; },
+      now: () => 5000,
+      log: quiet,
+    };
+    // markFinished → not-supported, zero Simkl calls.
+    let res = await trainer.markFinished(profile, { type: 'series', tmdb_id: '1' }, deps);
+    assert.deepStrictEqual(res, { ok: false, reason: 'not-supported' });
+    assert.strictEqual(simklCalls.length, 0);
+    // markUnwatched → not-supported, zero Simkl calls.
+    res = await trainer.markUnwatched(profile, { type: 'series', tmdb_id: '1' }, deps);
+    assert.deepStrictEqual(res, { ok: false, reason: 'not-supported' });
+    assert.strictEqual(simklCalls.length, 0);
+    // the httpStatus mapping is 400.
+    assert.strictEqual(trainer.httpStatus(res), 400);
     watchedStore.deleteForProfile(profile.id);
   });
 
@@ -7328,6 +7551,317 @@ async function main() {
     }
   });
 
+  // ── TV-R T6: Marquee TV honours Ignore ──
+  // An ignored show that is a strong seed is removed from Marquee TV's history:
+  // the taste events, the seeds, the serve target, and it never appears as a
+  // candidate. The non-ignored show is untouched.
+  await it('TV-R T6: Marquee TV — an ignored strong seed leaves the seeds, taste events, serve target; never a candidate', async () => {
+    const marqueeTv = require('../src/engines/marqueeTv');
+    const taste = require('../src/engines/marqueeTv/taste');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const serveCalibration = require('../src/serveCalibration');
+    const config = require('../src/config');
+    const watchedStore = require('../src/watchedStore');
+    const settings = require('../src/settings');
+    const nowMs = Date.parse('2026-10-02T00:00:00Z');
+    // Two engaged (seed-eligible) shows: seed1 (the strong seed we'll ignore)
+    // and seed2 (the control).
+    const mkLadder = (pid) => [
+      { simkl_id: 100, kind: 'show', imdb_id: 'ttseed1', tmdb_id: 'seed1', title: 'SciFi Show', year: 2020, status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0, last_watched_at: nowMs, first_watched_at: nowMs, first_real_at: nowMs, last_real_at: nowMs, stamps: 10, real_stamps: 10, eps_per_week: null },
+      { simkl_id: 110, kind: 'show', imdb_id: 'ttseed2', tmdb_id: 'seed2', title: 'Drama Show', year: 2020, status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0, last_watched_at: nowMs - 86400e3, first_watched_at: nowMs - 86400e3, first_real_at: nowMs - 86400e3, last_real_at: nowMs - 86400e3, stamps: 10, real_stamps: 10, eps_per_week: null },
+    ];
+    const tvMeta = (apiKey, ids) => {
+      const m = new Map();
+      for (const id of ids) {
+        const base = { tmdb_id: id, imdb_id: 'tt' + id, type: 'series', title: 'Show ' + id, year: 2024, genres: ['Drama'], keywords: [], tvType: 'Scripted', status: 'Returning Series', vote_average: 8, vote_count: 1000, popularity: 5, certAU: null, certUS: null, first_air_date: '2024-01-01', last_air_date: '2026-01-01', number_of_episodes: 20, number_of_seasons: 1 };
+        if (id === 'seed1') base.genres = ['Sci-Fi & Fantasy'];
+        m.set(id, base);
+      }
+      return m;
+    };
+    let seedIds = [];
+    const mkCtx = (profile, filters) => ({
+      settings: { llm: {} },
+      nowMs,
+      filters,
+      tmdbKey: 'itest-tmdb',
+      mdblistKey: '',
+      log: { log: () => {}, warn: () => {}, error: () => {} },
+      stats: {},
+      watchedIds: { imdb: new Set(), tmdb: new Set() },
+      dont: new Set(),
+      marqueeSkipSync: true, // focus on the ignore filter, not the sync
+      marqueeTvFetchers: {
+        tvMeta,
+        simklRecs: async (p, ids) => { seedIds = [...ids]; const m = new Map(); for (const id of ids) m.set(id, [{ tmdb_id: 'good1', imdb_id: 'ttgood1', title: 'Good Show', year: 2024 }]); return m; },
+        tmdbRecs: () => [], discover: () => [], trending: () => [], imdbRatings: () => new Map(),
+      },
+    });
+    const p = config.addProfile('INT-TV-R-T6');
+    const realTasteEvents = taste.tasteEvents;
+    let tasteEventEntries = null;
+    taste.tasteEvents = (ladderEntries, ...rest) => { tasteEventEntries = ladderEntries; return realTasteEvents(ladderEntries, ...rest); };
+    try {
+      config.updateProfile(p.id, {
+        filters: { engine_series: 'marquee-tv', excluded_genres: [], min_year: 2010, min_rating: 7, vote_count_floor: 50, age_limit: 0 },
+        keys: { tmdb_api_key: 'itest-tmdb' },
+        simkl_auth: { access_token: 'tok' },
+      });
+      const profile = config.getProfile(p.id);
+      watchedStore.upsertSeriesProgress(p.id, mkLadder(p.id));
+      // Ignore the strong seed (seed1).
+      tasteFeedback.setIgnored(p.id, { type: 'series', tmdb_id: 'seed1', simkl_id: 100 }, true, nowMs);
+      settings.updateSettings({ engines: { 'marquee-tv': true } });
+      const out = await marqueeTv.generate(profile, 'series', mkCtx(profile, profile.filters));
+      assert.ok(out.length > 0, 'the build stored rows (so the serve target is set)');
+      // (a) the taste events input excludes the ignored show.
+      assert.ok(Array.isArray(tasteEventEntries), 'tasteEvents called');
+      assert.ok(!tasteEventEntries.some((e) => e.row.tmdb_id === 'seed1'), 'the ignored show is not in the taste events');
+      assert.ok(tasteEventEntries.some((e) => e.row.tmdb_id === 'seed2'), 'the non-ignored show is in the taste events');
+      // (b) the seeds exclude the ignored show (the simkl recs fetcher's ids).
+      assert.ok(!seedIds.includes(100), 'the ignored show is not a seed');
+      assert.ok(seedIds.includes(110), 'the non-ignored show is a seed');
+      // (c) the serve target excludes the ignored show's genres (split names).
+      const t = serveCalibration.getTarget(p.id, 'series');
+      assert.ok(t, 'target stored');
+      assert.ok(Object.keys(t.target).includes('Drama'), 'the non-ignored show genre is in the target');
+      assert.ok(!Object.keys(t.target).some((g) => ['Science Fiction', 'Fantasy'].includes(g)), 'the ignored show genres are NOT in the target');
+      // (d) the ignored show never appears as a candidate.
+      assert.ok(!out.some((r) => r.tmdb_id === 'seed1'), 'the ignored show is not a candidate');
+    } finally {
+      taste.tasteEvents = realTasteEvents;
+      settings.updateSettings({ engines: { 'marquee-tv': false } });
+      config.removeProfile(p.id);
+      watchedStore.deleteForProfile(p.id);
+      serveCalibration.deleteForProfile(p.id);
+      tasteFeedback.deleteForProfile(p.id);
+    }
+  });
+
+  // ── TV-R T7: Marquee TV sync + rebuild on rating changes ──
+  // With marqueeSkipSync false, syncRatings is called once with type 'series';
+  // with true, it isn't. needsBuild is true for a Marquee TV profile after a
+  // show rating change and false after markTrainingBuilt; a Genesis-series,
+  // Genesis-movie profile is unaffected; the Marquee Cinema result is unchanged.
+  await it('TV-R T7: Marquee TV — syncRatings once (type series) when marqueeSkipSync false, none when true; needsBuild Marquee TV + Marquee Cinema unchanged', async () => {
+    const marqueeTv = require('../src/engines/marqueeTv');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const config = require('../src/config');
+    const watchedStore = require('../src/watchedStore');
+    const rs = require('../src/recommendationStore');
+    const settings = require('../src/settings');
+    const db = require('../src/db');
+    const nowMs = Date.parse('2026-10-02T00:00:00Z');
+    const mkLadder = (pid) => [
+      { simkl_id: 100, kind: 'show', imdb_id: 'ttseed1', tmdb_id: 'seed1', title: 'SciFi Show', year: 2020, status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0, last_watched_at: nowMs, first_watched_at: nowMs, first_real_at: nowMs, last_real_at: nowMs, stamps: 10, real_stamps: 10, eps_per_week: null },
+    ];
+    const tvMeta = (apiKey, ids) => {
+      const m = new Map();
+      for (const id of ids) m.set(id, { tmdb_id: id, imdb_id: 'tt' + id, type: 'series', title: 'Show ' + id, year: 2024, genres: ['Drama'], keywords: [], tvType: 'Scripted', status: 'Returning Series', vote_average: 8, vote_count: 1000, popularity: 5, certAU: null, certUS: null, first_air_date: '2024-01-01', last_air_date: '2026-01-01', number_of_episodes: 20, number_of_seasons: 1 });
+      return m;
+    };
+    const mkCtx = (profile, filters, skipSync) => ({
+      settings: { llm: {} },
+      nowMs,
+      filters,
+      tmdbKey: 'itest-tmdb',
+      mdblistKey: '',
+      log: { log: () => {}, warn: () => {}, error: () => {} },
+      stats: {},
+      watchedIds: { imdb: new Set(), tmdb: new Set() },
+      dont: new Set(),
+      marqueeSkipSync: skipSync,
+      marqueeTvFetchers: { tvMeta, simklRecs: async () => new Map(), tmdbRecs: () => [], discover: () => [], trending: () => [], imdbRatings: () => new Map() },
+    });
+    const p = config.addProfile('INT-TV-R-T7');
+    const realSync = tasteFeedback.syncRatings;
+    let syncCalls = [];
+    tasteFeedback.syncRatings = async (profile, opts) => { syncCalls.push(opts); return { ok: true, skipped: 'unchanged' }; };
+    const T0 = 1_000_000;
+    const min = 60e3;
+    try {
+      config.updateProfile(p.id, {
+        filters: { engine_series: 'marquee-tv', excluded_genres: [], min_year: 2010, min_rating: 7, vote_count_floor: 50, age_limit: 0 },
+        keys: { tmdb_api_key: 'itest-tmdb' },
+        simkl_auth: { access_token: 'tok' },
+      });
+      const profile = config.getProfile(p.id);
+      watchedStore.upsertSeriesProgress(p.id, mkLadder(p.id));
+      // (a) marqueeSkipSync false → syncRatings called once with type 'series'.
+      syncCalls = [];
+      await marqueeTv.generate(profile, 'series', mkCtx(profile, profile.filters, false));
+      assert.strictEqual(syncCalls.length, 1, 'syncRatings called once');
+      assert.strictEqual(syncCalls[0].type, 'series', 'syncRatings called with type series');
+      // (b) marqueeSkipSync true → syncRatings NOT called.
+      syncCalls = [];
+      await marqueeTv.generate(profile, 'series', mkCtx(profile, profile.filters, true));
+      assert.strictEqual(syncCalls.length, 0, 'syncRatings NOT called (marqueeSkipSync)');
+      // (c) needsBuild: Marquee TV profile → true after a show rating change, false after markTrainingBuilt.
+      rs.upsertCandidates(p.id, [{ type: 'series', tmdb_id: 't7', imdb_id: 'ttt7', title: 'T', year: 2020, vote_average: 7, vote_count: 1000, affinity: 0.5, rec_count: 1, popularity: 5 }]);
+      rs.setBuiltAt(p.id, T0);
+      settings.updateSettings({ engines: { 'marquee-tv': true } });
+      tasteFeedback.recordChange(p.id, T0 + 5 * min);
+      assert.strictEqual(rs.needsBuild(p.id, { profile, now: T0 + 9 * min }), false, 'inside the quiet period');
+      assert.strictEqual(rs.needsBuild(p.id, { profile, now: T0 + 15 * min }), true, 'quiet period elapsed (Marquee TV)');
+      tasteFeedback.markTrainingBuilt(p.id, T0 + 5 * min);
+      assert.strictEqual(rs.needsBuild(p.id, { profile, now: T0 + 15 * min }), false, 'the build covered the change');
+      // (d) Genesis-series, Genesis-movie profile is unaffected.
+      const pG = config.addProfile('INT-TV-R-T7G');
+      config.updateProfile(pG.id, { filters: { engine_movie: 'genesis', engine_series: 'genesis' }, keys: { tmdb_api_key: 'itest-tmdb' }, simkl_auth: { access_token: 'tok' } });
+      const profileG = config.getProfile(pG.id);
+      rs.upsertCandidates(pG.id, [{ type: 'series', tmdb_id: 't7g', imdb_id: 'ttt7g', title: 'T', year: 2020, vote_average: 7, vote_count: 1000, affinity: 0.5, rec_count: 1, popularity: 5 }]);
+      rs.setBuiltAt(pG.id, T0);
+      tasteFeedback.recordChange(pG.id, T0 + 5 * min);
+      assert.strictEqual(rs.needsBuild(pG.id, { profile: profileG, now: T0 + 15 * min }), false, 'Genesis-series/Genesis-movie unaffected');
+      config.removeProfile(pG.id);
+      rs.deleteForProfile(pG.id);
+    } finally {
+      tasteFeedback.syncRatings = realSync;
+      settings.updateSettings({ engines: { 'marquee-tv': false } });
+      config.removeProfile(p.id);
+      watchedStore.deleteForProfile(p.id);
+      rs.deleteForProfile(p.id);
+      tasteFeedback.deleteForProfile(p.id);
+      db.get().prepare('DELETE FROM taste_changes WHERE profile_id = ?').run(p.id);
+    }
+  });
+
+  // ── TV-R T10: F1 — status() reports the pool per type ──
+  // status() no longer reads the retired v5 cache: per type it reports the
+  // served count, the pool size, the resolved engine (name + id), and the last
+  // build stamp; an empty pool → null. The header line renders
+  // "count shown from pool (engine, built age)".
+  await it('TV-R T10: F1 — status() reports the pool per type (count, pool, engine, generated_at, source); empty pool → null', async () => {
+    const rebuild = require('../src/rebuild');
+    const rs = require('../src/recommendationStore');
+    const engines = require('../src/engines');
+    const config = require('../src/config');
+    const settings = require('../src/settings');
+    const p = config.addProfile('INT-TV-R-T10');
+    const T0 = 1_700_000_000_000;
+    try {
+      config.updateProfile(p.id, {
+        filters: { engine_series: 'marquee-tv', excluded_genres: [], min_year: 2010, min_rating: 0, vote_count_floor: 0, age_limit: 0 },
+        keys: { tmdb_api_key: 'itest-tmdb' },
+        simkl_auth: { access_token: 'tok' },
+      });
+      const profile = config.getProfile(p.id);
+      settings.updateSettings({ engines: { 'marquee-tv': true } });
+      // Series pool: 3 servable rows (imdb_id) + 1 non-servable row (no imdb_id).
+      rs.upsertCandidates(p.id, [
+        { type: 'series', tmdb_id: 's1', imdb_id: 'tts1', title: 'S1', year: 2020, vote_average: 8, vote_count: 1000, affinity: 0.9, rec_count: 1, popularity: 5 },
+        { type: 'series', tmdb_id: 's2', imdb_id: 'tts2', title: 'S2', year: 2021, vote_average: 8, vote_count: 1000, affinity: 0.8, rec_count: 1, popularity: 5 },
+        { type: 'series', tmdb_id: 's3', imdb_id: 'tts3', title: 'S3', year: 2022, vote_average: 8, vote_count: 1000, affinity: 0.7, rec_count: 1, popularity: 5 },
+        { type: 'series', tmdb_id: 's4', imdb_id: null, title: 'S4', year: 2023, vote_average: 8, vote_count: 1000, affinity: 0.6, rec_count: 1, popularity: 5 },
+      ]);
+      // Movie pool: 2 servable rows.
+      rs.upsertCandidates(p.id, [
+        { type: 'movie', tmdb_id: 'm1', imdb_id: 'ttm1', title: 'M1', year: 2020, vote_average: 8, vote_count: 1000, affinity: 0.9, rec_count: 1, popularity: 5 },
+        { type: 'movie', tmdb_id: 'm2', imdb_id: 'ttm2', title: 'M2', year: 2021, vote_average: 8, vote_count: 1000, affinity: 0.8, rec_count: 1, popularity: 5 },
+      ]);
+      rs.setBuiltAt(p.id, T0);
+      const st = rebuild.status(profile);
+      // Series: 3 served (s4 has no imdb_id → not servable), 4 pool rows, Marquee TV.
+      assert.strictEqual(st.series.count, 3, 'series served count');
+      assert.strictEqual(st.series.pool, 4, 'series pool rows');
+      assert.strictEqual(st.series.engine, 'Marquee TV', 'series engine name');
+      assert.strictEqual(st.series.source, 'marquee-tv', 'series engine id');
+      assert.strictEqual(st.series.generated_at, T0, 'series generated_at = built_at');
+      // Movie: 2 served, 2 pool rows, the resolved movie engine.
+      const movieEngine = engines.resolveFor(profile, 'movie');
+      assert.strictEqual(st.movie.count, 2, 'movie served count');
+      assert.strictEqual(st.movie.pool, 2, 'movie pool rows');
+      assert.strictEqual(st.movie.engine, movieEngine.name, 'movie engine name');
+      assert.strictEqual(st.movie.source, movieEngine.id, 'movie engine id');
+      assert.strictEqual(st.movie.generated_at, T0, 'movie generated_at = built_at');
+      // The kept fields are still present.
+      assert.ok('last_attempt_at' in st && 'rebuilding' in st && 'stale' in st && 'last_results' in st, 'kept fields present');
+      assert.strictEqual(st.rebuilding, false, 'not rebuilding');
+      // The header line renders "count shown from pool (engine, built age)".
+      const line = `📺 Series: ${st.series.count} shown from ${st.series.pool} (${st.series.engine}, built ${st.series.generated_at > 0 ? '…' : '—'})`;
+      assert.ok(line.startsWith('📺 Series: 3 shown from 4 (Marquee TV, built '), 'the line format');
+      // A type with an empty pool → null.
+      const p2 = config.addProfile('INT-TV-R-T10E');
+      config.updateProfile(p2.id, { filters: { engine_series: 'marquee-tv' }, keys: { tmdb_api_key: 'itest-tmdb' }, simkl_auth: { access_token: 'tok' } });
+      const profile2 = config.getProfile(p2.id);
+      const st2 = rebuild.status(profile2);
+      assert.strictEqual(st2.movie, null, 'empty movie pool → null');
+      assert.strictEqual(st2.series, null, 'empty series pool → null');
+      config.removeProfile(p2.id);
+    } finally {
+      settings.updateSettings({ engines: { 'marquee-tv': false } });
+      config.removeProfile(p.id);
+      rs.deleteForProfile(p.id);
+    }
+  });
+
+  // ── TV-R T11: F2 — the anime note + the fit cache key v2 ──
+  // The brief and fit prompts carry the exact anime note; the old tmdb:hash
+  // fit cache row is NOT hit (the key is now tmdb:hash:v2); the N5 regex still
+  // passes on both prompts.
+  await it('TV-R T11: F2 — the anime note in the brief + fit prompts; the old tmdb:hash fit cache row is not hit; N5 still passes', async () => {
+    const llmMod = require('../src/engines/marqueeTv/llm');
+    const llmCache = require('../src/engines/marquee/llmCache');
+    const config = require('../src/config');
+    const cfg = require('../src/engines/marqueeTv/config').DEFAULTS;
+    const now = 1_700_000_000_000;
+    const p = config.addProfile('INT-TV-R-T11');
+    const log = { log: () => {}, warn: () => {}, error: () => {} };
+    const chain = [{ type: 'custom', name: 'local', uri: 'http://localhost:11434/v1', apiKey: '' }];
+    const brief = { loves: ['space opera'], avoids: ['reality'], moods: ['wistful'], eras: ['1990s'], standout_titles: ['Seed Show'] };
+    const briefHash = llmMod.briefHash(brief);
+    const NOTE = 'Note: "Anime" means Japanese animation only; Western animated series are not anime.';
+    try {
+      // (a) the brief prompt contains the note exactly, right after the excluded-genres line.
+      const briefPrompt = llmMod.buildBriefPrompt(
+        [{ title: 'Alpha Show', year: 2020, rungWords: 'finished', genres: ['Drama'], networks: ['Netflix'] }],
+        [],
+        ['Anime'],
+      );
+      assert.ok(briefPrompt.includes(NOTE), 'brief prompt contains the note');
+      const briefLines = briefPrompt.split('\n');
+      const excludedIdx = briefLines.findIndex((l) => l.startsWith('Genres they chose to exclude:'));
+      assert.ok(excludedIdx !== -1, 'the excluded-genres line is present');
+      assert.strictEqual(briefLines[excludedIdx + 1], NOTE, 'the note is right after the excluded-genres line');
+      // (b) the fit prompt contains the note exactly, right after the profile brief block.
+      const fitPrompt = llmMod.buildFitPrompt(brief, [
+        { id: '100', title: 'Show 100', year: 2024, networks: ['Netflix'], tvType: 'Scripted', seasons: 2, episodes: 20, status: 'Returning Series', genres: ['Drama'], overview: null, keywords: [] },
+      ]);
+      assert.ok(fitPrompt.includes(NOTE), 'fit prompt contains the note');
+      const fitLines = fitPrompt.split('\n');
+      const standoutIdx = fitLines.findIndex((l) => l.startsWith('- standout_titles:'));
+      assert.ok(standoutIdx !== -1, 'the standout_titles line is present');
+      assert.strictEqual(fitLines[standoutIdx + 1], NOTE, 'the note is right after the profile brief block');
+      // (c) the old tmdb:hash fit cache row is NOT hit (the key is now :v2) → a fresh chat.
+      llmCache.put(p.id, 'tv_fit', '100:' + briefHash, { fit: 9, reason: 'old cached fit' }, now);
+      const scored = [{
+        tmdb_id: '100',
+        c: { tmdb_id: '100', title: 'Show 100', year: 2024, networks: ['Netflix'], tvType: 'Scripted', status: 'Returning Series', number_of_seasons: 2, number_of_episodes: 20, genres: ['Drama'], overview: 'A drama', keywords: ['k1'] },
+        pool: { seedHits: new Map(), sources: new Set(['simkl_recs']) },
+        rankScore: 0.5, reason: 'Seed Show',
+        scoreComponents: { features: { taste: 0.5, collab: 0.5, quality: 0.5, trending: 0.5, commitment: 0.5, airing: 0.5 }, weights: cfg.weights, penalty: 0 },
+      }];
+      const chatCalls = [];
+      const chat = async (c, messages, opts) => {
+        chatCalls.push(messages[0].content);
+        return opts.validate(JSON.stringify([{ id: '100', fit: 7, reason: 'fresh fit' }]));
+      };
+      const out = await llmMod.tvFit(p.id, scored, { brief, briefHash, cfg, chain, chat, log, now });
+      assert.strictEqual(chatCalls.length, 1, 'the old cache row was not hit → a fresh chat call');
+      const r100 = out.find((r) => r.tmdb_id === '100');
+      assert.strictEqual(r100.scoreComponents.llm.fit, 7, 'the fresh fit, not the old cached 9');
+      assert.strictEqual(r100.scoreComponents.llm.cached, false, 'not from the old cache');
+      // (d) N5 still passes on both prompts. The brief prompt carries the
+      //     word "engaged" (the card's literal /age/i also matches it), so the
+      //     brief uses the word-bounded age regex (as in B1/R1); the fit prompt
+      //     has no "engaged", so the card's literal /age/i applies (as in B3).
+      assert.ok(!/\bage\b|suitab|child|kid|classif|rated (G|PG|M)/i.test(briefPrompt), 'N5: brief prompt');
+      assert.ok(!/age|suitab|child|kid|classif|rated (G|PG|M)/i.test(fitPrompt), 'N5: fit prompt');
+    } finally {
+      config.removeProfile(p.id);
+    }
+  });
+
   // ── TV-3 B1: the taste brief (local LLM) ──
   // The exact prompt (rung words, rated suffix, split genres, networks), a
   // second call is a cache hit, a rung change changes the key, a failure →
@@ -7378,6 +7912,7 @@ async function main() {
         'Shows they tried and then dropped (one or two episodes, not continued):',
         '- "Left Show" (n.d.): genres unknown',
         'Genres they chose to exclude: none',
+        'Note: "Anime" means Japanese animation only; Western animated series are not anime.',
         '',
         'Return a JSON object with exactly these keys, each an array of short strings (at most 8 each):',
         '{"loves": [...], "avoids": [...], "moods": [...], "eras": [...], "standout_titles": [...]}',
@@ -7468,6 +8003,7 @@ async function main() {
         'Shows they tried and then dropped (one or two episodes, not continued):',
         '- "Left Show" (2018): Science Fiction, Fantasy',
         'Genres they chose to exclude: Horror',
+        'Note: "Anime" means Japanese animation only; Western animated series are not anime.',
         '',
         'Return a JSON object with exactly these keys, each an array of short strings (at most 8 each):',
         '{"loves": [...], "avoids": [...], "moods": [...], "eras": [...], "standout_titles": [...]}',
@@ -7864,8 +8400,8 @@ async function main() {
     // 40 rows → top 150 = all 40. Two pre-cached (100, 101); 38 uncached →
     // batches of 15: [102–116], [117–131], [132–139].
     const scored = Array.from({ length: 40 }, (_, i) => mkRow(i));
-    llmCache.put(p.id, 'tv_fit', '100:' + briefHash, { fit: 9, reason: 'cached reason' }, now);
-    llmCache.put(p.id, 'tv_fit', '101:' + briefHash, { fit: 7, reason: 'cached reason 2' }, now);
+    llmCache.put(p.id, 'tv_fit', '100:' + briefHash + ':v2', { fit: 9, reason: 'cached reason' }, now);
+    llmCache.put(p.id, 'tv_fit', '101:' + briefHash + ':v2', { fit: 7, reason: 'cached reason 2' }, now);
     const chatCalls = [];
     const chat = async (c, messages, opts) => {
       chatCalls.push(messages[0].content);
@@ -7904,6 +8440,7 @@ async function main() {
         '- moods: wistful',
         '- eras: 1990s',
         '- standout_titles: Seed Show',
+        'Note: "Anime" means Japanese animation only; Western animated series are not anime.',
         '',
         'For each series below, return a fit score 0-10 (10 = perfect fit) and a short reason (at most 14 words).',
         '',
@@ -7932,18 +8469,18 @@ async function main() {
       const r116 = result.find((r) => r.tmdb_id === '116');
       assert.deepStrictEqual(r116.scoreComponents.llm, { fit: 5, reason: null, cached: false });
       assert.strictEqual(r116.reason, 'Seed Show', 'omitted row keeps the because-seed reason');
-      assert.strictEqual(llmCache.get(p.id, 'tv_fit', '116:' + briefHash, { now: now + 1 }), null, 'omitted row not cached');
+      assert.strictEqual(llmCache.get(p.id, 'tv_fit', '116:' + briefHash + ':v2', { now: now + 1 }), null, 'omitted row not cached');
       // The throwing batch (117–131): every item 5, NOT cached.
       for (let i = 117; i <= 131; i++) {
         const r = result.find((r) => r.tmdb_id === String(i));
         assert.deepStrictEqual(r.scoreComponents.llm, { fit: 5, reason: null, cached: false });
-        assert.strictEqual(llmCache.get(p.id, 'tv_fit', String(i) + ':' + briefHash, { now: now + 1 }), null, `failed-batch row ${i} not cached`);
+        assert.strictEqual(llmCache.get(p.id, 'tv_fit', String(i) + ':' + briefHash + ':v2', { now: now + 1 }), null, `failed-batch row ${i} not cached`);
       }
       // The next batch (132–139) still ran: its items cached.
       for (let i = 132; i <= 139; i++) {
         const r = result.find((r) => r.tmdb_id === String(i));
         assert.deepStrictEqual(r.scoreComponents.llm, { fit: 6, reason: 'decent fit', cached: false });
-        assert.deepStrictEqual(llmCache.get(p.id, 'tv_fit', String(i) + ':' + briefHash, { now: now + 1 }), { fit: 6, reason: 'decent fit' }, `batch-3 row ${i} cached`);
+        assert.deepStrictEqual(llmCache.get(p.id, 'tv_fit', String(i) + ':' + briefHash + ':v2', { now: now + 1 }), { fit: 6, reason: 'decent fit' }, `batch-3 row ${i} cached`);
       }
       // The fold: rankScore = weightedSum(feat, renormalize) − penalty.
       for (const r of result) {

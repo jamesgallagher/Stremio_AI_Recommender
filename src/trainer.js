@@ -56,11 +56,12 @@ function mergeDeps(deps) {
   return { ...defaultDeps, ...(deps || {}) };
 }
 
-// v1 is movies only (M4): 'movie' ok, 'series' → not-supported, else → bad-type.
+// 'movie' and 'series' are ok; anything else → bad-type. Shows are rated per
+// SHOW (Q9), never per episode; the series source is series_progress rows with
+// kind 'show' (R4: anime is out of scope).
 function resolveType(type) {
   const t = type || 'movie';
-  if (t === 'movie') return { ok: true, type: t };
-  if (t === 'series') return { ok: false, reason: 'not-supported' };
+  if (t === 'movie' || t === 'series') return { ok: true, type: t };
   return { ok: false, reason: 'bad-type' };
 }
 
@@ -108,12 +109,45 @@ function toItem(row, status, { ratings, ignored, meta }) {
   };
 }
 
+// The series DTO (spec §2): the same 15 keys as films, plus `progress`.
+// `loved` is computed, never stored (M3). `meta` is metaGet('series', tmdbId)
+// (the Glass metaStore Marquee TV fills); it may be absent, then those fields
+// are null.
+function toSeriesItem(row, { ratings, ignored, meta }) {
+  const tmdbId = row.tmdb_id != null ? String(row.tmdb_id) : null;
+  const rating = tmdbId != null && ratings.has(tmdbId) ? ratings.get(tmdbId) : null;
+  const simkl_id = row.simkl_id != null ? row.simkl_id : null;
+  const imdb_id = row.imdb_id != null ? row.imdb_id : null;
+  return {
+    key: tmdbId,
+    type: 'series',
+    simkl_id,
+    tmdb_id: tmdbId,
+    imdb_id,
+    title: row.title || meta?.title || null,
+    year: row.year ?? meta?.year ?? null,
+    genre: (meta && (meta.primary_genre || (meta.genres && meta.genres[0]))) || null,
+    poster: meta ? meta.poster : null,
+    watched_at: row.last_watched_at != null ? new Date(row.last_watched_at).toISOString() : null,
+    rating,
+    loved: rating === 10,
+    ignored: tmdbId != null ? ignored.has(tmdbId) : false,
+    status: 'watched',
+    percent: null,
+    progress: {
+      watched_eps: row.watched_eps,
+      aired_eps: row.total_eps != null ? Math.max(0, row.total_eps - (row.not_aired_eps || 0)) : null,
+    },
+  };
+}
+
 // Build the full DTO for an action's resolved row (F8: rate/setIgnored return
 // the same shape as listHistory, so the two surfaces can't drift).
 function buildItem(D, profile, type, row, status = 'watched') {
   const ratings = D.tasteFeedback.getRatingsMap(profile.id, type);
   const ignored = D.tasteFeedback.ignoredSet(profile.id, type);
   const meta = row.tmdb_id != null ? D.metaGet(type, row.tmdb_id) : null;
+  if (type === 'series') return toSeriesItem(row, { ratings, ignored, meta });
   return toItem(row, status, { ratings, ignored, meta });
 }
 
@@ -129,6 +163,50 @@ function resolveWatchedRow(profileId, type, ref, watchedStore) {
     const tmdbId = r.tmdb_id != null ? String(r.tmdb_id) : null;
     if (tmdbId && !byTmdb.has(tmdbId)) byTmdb.set(tmdbId, r);
   }
+  if (ref.simkl_id != null) {
+    const r = rows.find((x) => x.simkl_id != null && String(x.simkl_id) === String(ref.simkl_id));
+    const tmdbId = r && r.tmdb_id != null ? String(r.tmdb_id) : null;
+    if (tmdbId) return byTmdb.get(tmdbId) || null;
+  }
+  if (ref.tmdb_id != null && ref.tmdb_id !== '') {
+    return byTmdb.get(String(ref.tmdb_id)) || null;
+  }
+  if (ref.imdb_id) {
+    const r = rows.find((x) => x.imdb_id === ref.imdb_id);
+    const tmdbId = r && r.tmdb_id != null ? String(r.tmdb_id) : null;
+    return tmdbId ? byTmdb.get(tmdbId) : null;
+  }
+  return null;
+}
+
+// The series source (spec §2): watchedStore.getSeriesProgress(kind 'show'),
+// deduplicated by tmdb_id keeping the row with the newest last_watched_at.
+// Rows without a tmdb_id are skipped (R4: kind 'show' only — anime is out of
+// scope). Returns { rows, unresolved }.
+function seriesSource(profileId, watchedStore) {
+  const rows = watchedStore.getSeriesProgress(profileId, { kind: 'show' });
+  const byTmdb = new Map();
+  let unresolved = 0;
+  for (const r of rows) {
+    const tmdbId = r.tmdb_id != null ? String(r.tmdb_id) : null;
+    if (!tmdbId) { unresolved += 1; continue; }
+    const existing = byTmdb.get(tmdbId);
+    if (!existing
+      || (r.last_watched_at != null && (existing.last_watched_at == null || r.last_watched_at > existing.last_watched_at))) {
+      byTmdb.set(tmdbId, r);
+    }
+  }
+  return { rows: [...byTmdb.values()], unresolved };
+}
+
+// Resolve a ref against THIS profile's series source (spec §2), same rules as
+// resolveWatchedRow: simkl_id → tmdb_id → imdb_id, each compared as normalized
+// strings. Returns the row or null.
+function resolveSeriesRow(profileId, ref, watchedStore) {
+  if (!ref || typeof ref !== 'object') return null;
+  const { rows } = seriesSource(profileId, watchedStore);
+  const byTmdb = new Map();
+  for (const r of rows) byTmdb.set(String(r.tmdb_id), r);
   if (ref.simkl_id != null) {
     const r = rows.find((x) => x.simkl_id != null && String(x.simkl_id) === String(ref.simkl_id));
     const tmdbId = r && r.tmdb_id != null ? String(r.tmdb_id) : null;
@@ -189,6 +267,88 @@ function resolveUnfinishedRow(profileId, type, ref, D) {
   return null;
 }
 
+// listHistory for series (spec §2): the series source (kind 'show'), the
+// series DTO, views all/unrated/rated/loved/ignored (unfinished → bad-view),
+// counts.unfinished = 0, order last_watched_at DESC (ties by title), and the
+// case-insensitive title search.
+async function listSeriesHistory(D, profile, { view, q, page, pageSize }) {
+  const type = 'series';
+  if (view === 'unfinished') return { ok: false, reason: 'bad-view' };
+  const ratings = D.tasteFeedback.getRatingsMap(profile.id, type);
+  const ignored = D.tasteFeedback.ignoredSet(profile.id, type);
+  const { rows, unresolved } = seriesSource(profile.id, D.watchedStore);
+  const items = [];
+  for (const row of rows) {
+    const item = toSeriesItem(row, { ratings, ignored, meta: null });
+    item._sortMs = row.last_watched_at != null ? row.last_watched_at : 0;
+    items.push(item);
+  }
+  // Counts (filter chips) — over the whole universe, per view.
+  const counts = {
+    all: items.filter((i) => !i.ignored).length,
+    unrated: items.filter((i) => !i.ignored && i.rating == null).length,
+    rated: items.filter((i) => !i.ignored && i.rating != null).length,
+    loved: items.filter((i) => !i.ignored && i.rating === 10).length,
+    ignored: items.filter((i) => i.ignored).length,
+    unfinished: 0,
+    unresolved,
+  };
+  // The current view.
+  let viewItems;
+  switch (view) {
+    case 'all': viewItems = items.filter((i) => !i.ignored); break;
+    case 'unrated': viewItems = items.filter((i) => !i.ignored && i.rating == null); break;
+    case 'rated': viewItems = items.filter((i) => !i.ignored && i.rating != null); break;
+    case 'loved': viewItems = items.filter((i) => !i.ignored && i.rating === 10); break;
+    case 'ignored': viewItems = items.filter((i) => i.ignored); break;
+    default: viewItems = [];
+  }
+  // Case-insensitive title search (as for films).
+  const qStr = q == null ? '' : String(q).trim();
+  if (qStr) {
+    const needle = qStr.toLowerCase();
+    viewItems = viewItems.filter((i) => i.title && String(i.title).toLowerCase().includes(needle));
+  }
+  // Sort: last_watched_at DESC, ties by title.
+  viewItems.sort((a, b) => {
+    if (b._sortMs !== a._sortMs) return b._sortMs - a._sortMs;
+    const ta = a.title || '', tb = b.title || '';
+    if (ta < tb) return 1;
+    if (ta > tb) return -1;
+    return 0;
+  });
+  const total = viewItems.length;
+  const pageItems = viewItems.slice((page - 1) * pageSize, page * pageSize);
+  // Fill poster/genre/title/year from the meta cache (no network).
+  for (const item of pageItems) {
+    if (item.tmdb_id != null) {
+      const meta = D.metaGet(type, item.tmdb_id);
+      if (meta) {
+        if (item.title == null) item.title = meta.title;
+        if (item.year == null) item.year = meta.year;
+        if (item.genre == null) item.genre = meta.primary_genre || (meta.genres && meta.genres[0]) || null;
+        if (item.poster == null) item.poster = meta.poster;
+      }
+    }
+  }
+  for (const item of pageItems) { delete item._sortMs; }
+  const training = D.tasteFeedback.getTraining(profile.id);
+  let rebuildDueAt = null;
+  if (training.changed_at != null
+    && !(training.built_changed_at != null && training.changed_at <= training.built_changed_at)) {
+    rebuildDueAt = training.changed_at + D.tasteFeedback.REBUILD_DEBOUNCE_MS;
+  }
+  return {
+    ok: true,
+    items: pageItems,
+    page,
+    pageSize,
+    total,
+    counts,
+    training: { changes_since_build: training.changes_since_build, changed_at: training.changed_at, rebuild_due_at: rebuildDueAt, built_changed_at: training.built_changed_at },
+  };
+}
+
 // listHistory — the per-profile watch-history listing (spec §6). Returns
 // { ok:true, items, page, pageSize, total, counts, training } on success, or
 // { ok:false, reason } on a bad type/view.
@@ -201,6 +361,8 @@ async function listHistory(profile, { type: typeIn, view = 'all', q = null, page
   if (!VIEWS.includes(v)) return { ok: false, reason: 'bad-view' };
   const ps = Math.min(100, Math.max(1, Math.floor(Number(pageSize)) || 25));
   const pg = Math.max(1, Math.floor(Number(page)) || 1);
+
+  if (type === 'series') return listSeriesHistory(D, profile, { view: v, q, page: pg, pageSize: ps });
 
   const ratings = D.tasteFeedback.getRatingsMap(profile.id, type);
   const ignored = D.tasteFeedback.ignoredSet(profile.id, type);
@@ -341,7 +503,9 @@ async function rate(profile, ref, rating, deps = {}) {
     return { ok: false, reason: 'bad-rating' };
   }
   if (!hasSimkl(profile)) return { ok: false, reason: 'no-simkl' };
-  const row = resolveWatchedRow(profile.id, type, ref, D.watchedStore);
+  const row = type === 'series'
+    ? resolveSeriesRow(profile.id, ref, D.watchedStore)
+    : resolveWatchedRow(profile.id, type, ref, D.watchedStore);
   if (!row) return { ok: false, reason: 'not-in-history' };
   // F4 no-op: same value (both null counts too) → no Simkl call, no change.
   const current = D.tasteFeedback.getRating(profile.id, type, row.tmdb_id);
@@ -374,13 +538,18 @@ async function setIgnored(profile, ref, ignored, deps = {}) {
   if (!t.ok) return { ok: false, reason: t.reason };
   const type = t.type;
   if (typeof ignored !== 'boolean') return { ok: false, reason: 'bad-value' };
-  let row = resolveWatchedRow(profile.id, type, ref, D.watchedStore);
+  let row;
   let status = 'watched';
-  if (!row) {
-    row = resolveUnfinishedRow(profile.id, type, ref, D);
-    status = 'unfinished';
-    if (!row) return { ok: false, reason: 'not-in-history' };
+  if (type === 'series') {
+    row = resolveSeriesRow(profile.id, ref, D.watchedStore);
+  } else {
+    row = resolveWatchedRow(profile.id, type, ref, D.watchedStore);
+    if (!row) {
+      row = resolveUnfinishedRow(profile.id, type, ref, D);
+      status = 'unfinished';
+    }
   }
+  if (!row) return { ok: false, reason: 'not-in-history' };
   const tmdbId = String(row.tmdb_id);
   const now = D.now();
   const changed = D.tasteFeedback.setIgnored(profile.id, { type, tmdb_id: tmdbId, simkl_id: row.simkl_id, imdb_id: row.imdb_id }, ignored, now);
@@ -397,6 +566,7 @@ async function markFinished(profile, ref, deps = {}) {
   const t = resolveType(ref && ref.type);
   if (!t.ok) return { ok: false, reason: t.reason };
   const type = t.type;
+  if (type === 'series') return { ok: false, reason: 'not-supported' };
   const row = resolveUnfinishedRow(profile.id, type, ref, D);
   if (!row) return { ok: false, reason: 'not-in-history' };
   const meta = row.tmdb_id != null ? D.metaGet(type, row.tmdb_id) : null;
@@ -420,6 +590,7 @@ async function markUnwatched(profile, ref, deps = {}) {
   const t = resolveType(ref && ref.type);
   if (!t.ok) return { ok: false, reason: t.reason };
   const type = t.type;
+  if (type === 'series') return { ok: false, reason: 'not-supported' };
   if (!hasSimkl(profile)) return { ok: false, reason: 'no-simkl' };
   const row = resolveWatchedRow(profile.id, type, ref, D.watchedStore);
   if (!row) return { ok: false, reason: 'not-in-history' };
