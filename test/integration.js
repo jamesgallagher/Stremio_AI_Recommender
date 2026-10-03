@@ -7726,6 +7726,142 @@ async function main() {
     }
   });
 
+  // ── TV-R T10: F1 — status() reports the pool per type ──
+  // status() no longer reads the retired v5 cache: per type it reports the
+  // served count, the pool size, the resolved engine (name + id), and the last
+  // build stamp; an empty pool → null. The header line renders
+  // "count shown from pool (engine, built age)".
+  await it('TV-R T10: F1 — status() reports the pool per type (count, pool, engine, generated_at, source); empty pool → null', async () => {
+    const rebuild = require('../src/rebuild');
+    const rs = require('../src/recommendationStore');
+    const engines = require('../src/engines');
+    const config = require('../src/config');
+    const settings = require('../src/settings');
+    const p = config.addProfile('INT-TV-R-T10');
+    const T0 = 1_700_000_000_000;
+    try {
+      config.updateProfile(p.id, {
+        filters: { engine_series: 'marquee-tv', excluded_genres: [], min_year: 2010, min_rating: 0, vote_count_floor: 0, age_limit: 0 },
+        keys: { tmdb_api_key: 'itest-tmdb' },
+        simkl_auth: { access_token: 'tok' },
+      });
+      const profile = config.getProfile(p.id);
+      settings.updateSettings({ engines: { 'marquee-tv': true } });
+      // Series pool: 3 servable rows (imdb_id) + 1 non-servable row (no imdb_id).
+      rs.upsertCandidates(p.id, [
+        { type: 'series', tmdb_id: 's1', imdb_id: 'tts1', title: 'S1', year: 2020, vote_average: 8, vote_count: 1000, affinity: 0.9, rec_count: 1, popularity: 5 },
+        { type: 'series', tmdb_id: 's2', imdb_id: 'tts2', title: 'S2', year: 2021, vote_average: 8, vote_count: 1000, affinity: 0.8, rec_count: 1, popularity: 5 },
+        { type: 'series', tmdb_id: 's3', imdb_id: 'tts3', title: 'S3', year: 2022, vote_average: 8, vote_count: 1000, affinity: 0.7, rec_count: 1, popularity: 5 },
+        { type: 'series', tmdb_id: 's4', imdb_id: null, title: 'S4', year: 2023, vote_average: 8, vote_count: 1000, affinity: 0.6, rec_count: 1, popularity: 5 },
+      ]);
+      // Movie pool: 2 servable rows.
+      rs.upsertCandidates(p.id, [
+        { type: 'movie', tmdb_id: 'm1', imdb_id: 'ttm1', title: 'M1', year: 2020, vote_average: 8, vote_count: 1000, affinity: 0.9, rec_count: 1, popularity: 5 },
+        { type: 'movie', tmdb_id: 'm2', imdb_id: 'ttm2', title: 'M2', year: 2021, vote_average: 8, vote_count: 1000, affinity: 0.8, rec_count: 1, popularity: 5 },
+      ]);
+      rs.setBuiltAt(p.id, T0);
+      const st = rebuild.status(profile);
+      // Series: 3 served (s4 has no imdb_id → not servable), 4 pool rows, Marquee TV.
+      assert.strictEqual(st.series.count, 3, 'series served count');
+      assert.strictEqual(st.series.pool, 4, 'series pool rows');
+      assert.strictEqual(st.series.engine, 'Marquee TV', 'series engine name');
+      assert.strictEqual(st.series.source, 'marquee-tv', 'series engine id');
+      assert.strictEqual(st.series.generated_at, T0, 'series generated_at = built_at');
+      // Movie: 2 served, 2 pool rows, the resolved movie engine.
+      const movieEngine = engines.resolveFor(profile, 'movie');
+      assert.strictEqual(st.movie.count, 2, 'movie served count');
+      assert.strictEqual(st.movie.pool, 2, 'movie pool rows');
+      assert.strictEqual(st.movie.engine, movieEngine.name, 'movie engine name');
+      assert.strictEqual(st.movie.source, movieEngine.id, 'movie engine id');
+      assert.strictEqual(st.movie.generated_at, T0, 'movie generated_at = built_at');
+      // The kept fields are still present.
+      assert.ok('last_attempt_at' in st && 'rebuilding' in st && 'stale' in st && 'last_results' in st, 'kept fields present');
+      assert.strictEqual(st.rebuilding, false, 'not rebuilding');
+      // The header line renders "count shown from pool (engine, built age)".
+      const line = `📺 Series: ${st.series.count} shown from ${st.series.pool} (${st.series.engine}, built ${st.series.generated_at > 0 ? '…' : '—'})`;
+      assert.ok(line.startsWith('📺 Series: 3 shown from 4 (Marquee TV, built '), 'the line format');
+      // A type with an empty pool → null.
+      const p2 = config.addProfile('INT-TV-R-T10E');
+      config.updateProfile(p2.id, { filters: { engine_series: 'marquee-tv' }, keys: { tmdb_api_key: 'itest-tmdb' }, simkl_auth: { access_token: 'tok' } });
+      const profile2 = config.getProfile(p2.id);
+      const st2 = rebuild.status(profile2);
+      assert.strictEqual(st2.movie, null, 'empty movie pool → null');
+      assert.strictEqual(st2.series, null, 'empty series pool → null');
+      config.removeProfile(p2.id);
+    } finally {
+      settings.updateSettings({ engines: { 'marquee-tv': false } });
+      config.removeProfile(p.id);
+      rs.deleteForProfile(p.id);
+    }
+  });
+
+  // ── TV-R T11: F2 — the anime note + the fit cache key v2 ──
+  // The brief and fit prompts carry the exact anime note; the old tmdb:hash
+  // fit cache row is NOT hit (the key is now tmdb:hash:v2); the N5 regex still
+  // passes on both prompts.
+  await it('TV-R T11: F2 — the anime note in the brief + fit prompts; the old tmdb:hash fit cache row is not hit; N5 still passes', async () => {
+    const llmMod = require('../src/engines/marqueeTv/llm');
+    const llmCache = require('../src/engines/marquee/llmCache');
+    const config = require('../src/config');
+    const cfg = require('../src/engines/marqueeTv/config').DEFAULTS;
+    const now = 1_700_000_000_000;
+    const p = config.addProfile('INT-TV-R-T11');
+    const log = { log: () => {}, warn: () => {}, error: () => {} };
+    const chain = [{ type: 'custom', name: 'local', uri: 'http://localhost:11434/v1', apiKey: '' }];
+    const brief = { loves: ['space opera'], avoids: ['reality'], moods: ['wistful'], eras: ['1990s'], standout_titles: ['Seed Show'] };
+    const briefHash = llmMod.briefHash(brief);
+    const NOTE = 'Note: "Anime" means Japanese animation only; Western animated series are not anime.';
+    try {
+      // (a) the brief prompt contains the note exactly, right after the excluded-genres line.
+      const briefPrompt = llmMod.buildBriefPrompt(
+        [{ title: 'Alpha Show', year: 2020, rungWords: 'finished', genres: ['Drama'], networks: ['Netflix'] }],
+        [],
+        ['Anime'],
+      );
+      assert.ok(briefPrompt.includes(NOTE), 'brief prompt contains the note');
+      const briefLines = briefPrompt.split('\n');
+      const excludedIdx = briefLines.findIndex((l) => l.startsWith('Genres they chose to exclude:'));
+      assert.ok(excludedIdx !== -1, 'the excluded-genres line is present');
+      assert.strictEqual(briefLines[excludedIdx + 1], NOTE, 'the note is right after the excluded-genres line');
+      // (b) the fit prompt contains the note exactly, right after the profile brief block.
+      const fitPrompt = llmMod.buildFitPrompt(brief, [
+        { id: '100', title: 'Show 100', year: 2024, networks: ['Netflix'], tvType: 'Scripted', seasons: 2, episodes: 20, status: 'Returning Series', genres: ['Drama'], overview: null, keywords: [] },
+      ]);
+      assert.ok(fitPrompt.includes(NOTE), 'fit prompt contains the note');
+      const fitLines = fitPrompt.split('\n');
+      const standoutIdx = fitLines.findIndex((l) => l.startsWith('- standout_titles:'));
+      assert.ok(standoutIdx !== -1, 'the standout_titles line is present');
+      assert.strictEqual(fitLines[standoutIdx + 1], NOTE, 'the note is right after the profile brief block');
+      // (c) the old tmdb:hash fit cache row is NOT hit (the key is now :v2) → a fresh chat.
+      llmCache.put(p.id, 'tv_fit', '100:' + briefHash, { fit: 9, reason: 'old cached fit' }, now);
+      const scored = [{
+        tmdb_id: '100',
+        c: { tmdb_id: '100', title: 'Show 100', year: 2024, networks: ['Netflix'], tvType: 'Scripted', status: 'Returning Series', number_of_seasons: 2, number_of_episodes: 20, genres: ['Drama'], overview: 'A drama', keywords: ['k1'] },
+        pool: { seedHits: new Map(), sources: new Set(['simkl_recs']) },
+        rankScore: 0.5, reason: 'Seed Show',
+        scoreComponents: { features: { taste: 0.5, collab: 0.5, quality: 0.5, trending: 0.5, commitment: 0.5, airing: 0.5 }, weights: cfg.weights, penalty: 0 },
+      }];
+      const chatCalls = [];
+      const chat = async (c, messages, opts) => {
+        chatCalls.push(messages[0].content);
+        return opts.validate(JSON.stringify([{ id: '100', fit: 7, reason: 'fresh fit' }]));
+      };
+      const out = await llmMod.tvFit(p.id, scored, { brief, briefHash, cfg, chain, chat, log, now });
+      assert.strictEqual(chatCalls.length, 1, 'the old cache row was not hit → a fresh chat call');
+      const r100 = out.find((r) => r.tmdb_id === '100');
+      assert.strictEqual(r100.scoreComponents.llm.fit, 7, 'the fresh fit, not the old cached 9');
+      assert.strictEqual(r100.scoreComponents.llm.cached, false, 'not from the old cache');
+      // (d) N5 still passes on both prompts. The brief prompt carries the
+      //     word "engaged" (the card's literal /age/i also matches it), so the
+      //     brief uses the word-bounded age regex (as in B1/R1); the fit prompt
+      //     has no "engaged", so the card's literal /age/i applies (as in B3).
+      assert.ok(!/\bage\b|suitab|child|kid|classif|rated (G|PG|M)/i.test(briefPrompt), 'N5: brief prompt');
+      assert.ok(!/age|suitab|child|kid|classif|rated (G|PG|M)/i.test(fitPrompt), 'N5: fit prompt');
+    } finally {
+      config.removeProfile(p.id);
+    }
+  });
+
   // ── TV-3 B1: the taste brief (local LLM) ──
   // The exact prompt (rung words, rated suffix, split genres, networks), a
   // second call is a cache hit, a rung change changes the key, a failure →
@@ -7776,6 +7912,7 @@ async function main() {
         'Shows they tried and then dropped (one or two episodes, not continued):',
         '- "Left Show" (n.d.): genres unknown',
         'Genres they chose to exclude: none',
+        'Note: "Anime" means Japanese animation only; Western animated series are not anime.',
         '',
         'Return a JSON object with exactly these keys, each an array of short strings (at most 8 each):',
         '{"loves": [...], "avoids": [...], "moods": [...], "eras": [...], "standout_titles": [...]}',
@@ -7866,6 +8003,7 @@ async function main() {
         'Shows they tried and then dropped (one or two episodes, not continued):',
         '- "Left Show" (2018): Science Fiction, Fantasy',
         'Genres they chose to exclude: Horror',
+        'Note: "Anime" means Japanese animation only; Western animated series are not anime.',
         '',
         'Return a JSON object with exactly these keys, each an array of short strings (at most 8 each):',
         '{"loves": [...], "avoids": [...], "moods": [...], "eras": [...], "standout_titles": [...]}',
@@ -8262,8 +8400,8 @@ async function main() {
     // 40 rows → top 150 = all 40. Two pre-cached (100, 101); 38 uncached →
     // batches of 15: [102–116], [117–131], [132–139].
     const scored = Array.from({ length: 40 }, (_, i) => mkRow(i));
-    llmCache.put(p.id, 'tv_fit', '100:' + briefHash, { fit: 9, reason: 'cached reason' }, now);
-    llmCache.put(p.id, 'tv_fit', '101:' + briefHash, { fit: 7, reason: 'cached reason 2' }, now);
+    llmCache.put(p.id, 'tv_fit', '100:' + briefHash + ':v2', { fit: 9, reason: 'cached reason' }, now);
+    llmCache.put(p.id, 'tv_fit', '101:' + briefHash + ':v2', { fit: 7, reason: 'cached reason 2' }, now);
     const chatCalls = [];
     const chat = async (c, messages, opts) => {
       chatCalls.push(messages[0].content);
@@ -8302,6 +8440,7 @@ async function main() {
         '- moods: wistful',
         '- eras: 1990s',
         '- standout_titles: Seed Show',
+        'Note: "Anime" means Japanese animation only; Western animated series are not anime.',
         '',
         'For each series below, return a fit score 0-10 (10 = perfect fit) and a short reason (at most 14 words).',
         '',
@@ -8330,18 +8469,18 @@ async function main() {
       const r116 = result.find((r) => r.tmdb_id === '116');
       assert.deepStrictEqual(r116.scoreComponents.llm, { fit: 5, reason: null, cached: false });
       assert.strictEqual(r116.reason, 'Seed Show', 'omitted row keeps the because-seed reason');
-      assert.strictEqual(llmCache.get(p.id, 'tv_fit', '116:' + briefHash, { now: now + 1 }), null, 'omitted row not cached');
+      assert.strictEqual(llmCache.get(p.id, 'tv_fit', '116:' + briefHash + ':v2', { now: now + 1 }), null, 'omitted row not cached');
       // The throwing batch (117–131): every item 5, NOT cached.
       for (let i = 117; i <= 131; i++) {
         const r = result.find((r) => r.tmdb_id === String(i));
         assert.deepStrictEqual(r.scoreComponents.llm, { fit: 5, reason: null, cached: false });
-        assert.strictEqual(llmCache.get(p.id, 'tv_fit', String(i) + ':' + briefHash, { now: now + 1 }), null, `failed-batch row ${i} not cached`);
+        assert.strictEqual(llmCache.get(p.id, 'tv_fit', String(i) + ':' + briefHash + ':v2', { now: now + 1 }), null, `failed-batch row ${i} not cached`);
       }
       // The next batch (132–139) still ran: its items cached.
       for (let i = 132; i <= 139; i++) {
         const r = result.find((r) => r.tmdb_id === String(i));
         assert.deepStrictEqual(r.scoreComponents.llm, { fit: 6, reason: 'decent fit', cached: false });
-        assert.deepStrictEqual(llmCache.get(p.id, 'tv_fit', String(i) + ':' + briefHash, { now: now + 1 }), { fit: 6, reason: 'decent fit' }, `batch-3 row ${i} cached`);
+        assert.deepStrictEqual(llmCache.get(p.id, 'tv_fit', String(i) + ':' + briefHash + ':v2', { now: now + 1 }), { fit: 6, reason: 'decent fit' }, `batch-3 row ${i} cached`);
       }
       // The fold: rankScore = weightedSum(feat, renormalize) − penalty.
       for (const r of result) {

@@ -61,14 +61,24 @@ function isStale(catalog) {
 }
 
 function status(profile) {
+  const rs = require('./recommendationStore');   // lazy — heavy module, avoids a load cycle
+  const engines = require('./engines');          // lazy — avoids a load cycle
   const cache = store.loadCache(profile.id);
+  const perType = (type) => {
+    const pool = rs.getRecommended(profile.id, { type, limit: 100000 });
+    if (!pool.length) return null;
+    const engine = engines.resolveFor(profile, type);
+    return {
+      count: rs.serveRecommendations(profile, type, { record: false }).length,
+      pool: pool.length,
+      engine: engine.name,
+      generated_at: rs.getBuiltAt(profile.id) || null,
+      source: engine.id,
+    };
+  };
   return {
-    movie: cache.movie
-      ? { generated_at: cache.movie.generated_at, count: cache.movie.metas.length, source: cache.movie.source }
-      : null,
-    series: cache.series
-      ? { generated_at: cache.series.generated_at, count: cache.series.metas.length, source: cache.series.source }
-      : null,
+    movie: perType('movie'),
+    series: perType('series'),
     last_attempt_at: cache.last_attempt_at || 0,
     rebuilding: locks.has(profile.id),
     stale: isStale(cache.movie) || isStale(cache.series),

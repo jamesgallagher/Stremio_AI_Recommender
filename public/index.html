@@ -295,8 +295,7 @@ function fmtAge(ms) {
 
 function catalogLine(label, entry) {
   if (!entry) return `${label}: <span style="color:var(--warn)">not generated yet</span>`;
-  const src = entry.source === 'discover' ? 'popular picks' : 'picked for you';
-  return `${label}: ${entry.count} titles (${src}, ${fmtAge(entry.generated_at)})`;
+  return `${label}: ${entry.count} shown from ${entry.pool} (${esc(entry.engine)}, built ${fmtAge(entry.generated_at)})`;
 }
 
 // Volatile status badge + line — recomputed by the non-destructive poll so the
