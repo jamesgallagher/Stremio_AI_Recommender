@@ -1535,9 +1535,10 @@ async function main() {
     // not-in-history (unknown ref).
     res = await trainer.setIgnored(profile, { type: 'movie', tmdb_id: '999' }, true, deps);
     assert.deepStrictEqual(res, { ok: false, reason: 'not-in-history' });
-    // bad-type (series → not-supported).
+    // series is supported (TV-R §2): this profile has no series_progress rows,
+    // so the ref is not-in-history (the old not-supported is gone).
     res = await trainer.setIgnored(profile, { type: 'series', tmdb_id: '1' }, true, deps);
-    assert.deepStrictEqual(res, { ok: false, reason: 'not-supported' });
+    assert.deepStrictEqual(res, { ok: false, reason: 'not-in-history' });
     db.get().exec('DELETE FROM taste_ignore; DELETE FROM taste_changes');
     watchedStore.deleteForProfile(profile.id);
   });
@@ -1636,11 +1637,14 @@ async function main() {
     assert.strictEqual(res.total, 2);
     res = await trainer.listHistory(profile, { type: 'movie', page: 2, pageSize: 1 }, deps);
     assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['1']); // Alpha (2nd page)
-    // bad-view / bad-type / not-supported.
+    // bad-view / bad-type.
     res = await trainer.listHistory(profile, { type: 'movie', view: 'bogus' }, deps);
     assert.deepStrictEqual(res, { ok: false, reason: 'bad-view' });
+    // series is supported (TV-R §2): this profile has no series_progress rows,
+    // so the listing is empty (the old not-supported is gone).
     res = await trainer.listHistory(profile, { type: 'series' }, deps);
-    assert.deepStrictEqual(res, { ok: false, reason: 'not-supported' });
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.total, 0);
     res = await trainer.listHistory(profile, { type: 'bogus' }, deps);
     assert.deepStrictEqual(res, { ok: false, reason: 'bad-type' });
     // dedupe: a newer watch of the same tmdb_id → keep the newest.
@@ -1688,9 +1692,10 @@ async function main() {
     assert.deepStrictEqual(res, { ok: false, reason: 'bad-rating' });
     res = await trainer.rate(profile, { type: 'movie', tmdb_id: '1' }, undefined, deps);
     assert.deepStrictEqual(res, { ok: false, reason: 'bad-rating' });
-    // 'series' → not-supported; 'anime' → bad-type.
+    // series is supported (TV-R §2): this profile has no series_progress rows,
+    // so the ref is not-in-history (the old not-supported is gone); 'anime' → bad-type.
     res = await trainer.rate(profile, { type: 'series', tmdb_id: '1' }, 5, deps);
-    assert.deepStrictEqual(res, { ok: false, reason: 'not-supported' });
+    assert.deepStrictEqual(res, { ok: false, reason: 'not-in-history' });
     res = await trainer.rate(profile, { type: 'anime', tmdb_id: '1' }, 5, deps);
     assert.deepStrictEqual(res, { ok: false, reason: 'bad-type' });
     // not-in-history: a ref that belongs to ANOTHER profile's history.
@@ -1901,6 +1906,170 @@ async function main() {
     assert.ok(!enrichCalls.includes('1')); // tmdb 1 served from the cache, so enrich skipped it
     db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ignore; DELETE FROM taste_changes');
     metaStore._clear();
+    watchedStore.deleteForProfile(profile.id);
+  });
+
+  await it('TV-R T1: listHistory — series (kind show only), the §2 DTO, progress, order, views, search', async () => {
+    const trainer = require('../src/trainer');
+    const watchedStore = require('../src/watchedStore');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const db = require('../src/db');
+    const profile = { id: 'p-tvr-list', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    // 3 kind 'show' rows + 1 kind 'anime' row → the anime row is excluded (R4);
+    // a 4th show row is ignored so the 'ignored' view can be exercised.
+    watchedStore.upsertSeriesProgress(profile.id, [
+      { simkl_id: 1, kind: 'show', imdb_id: 'tt1', tmdb_id: '1', title: 'Alpha Show', year: 2020, status: 'ongoing', watched_eps: 12, total_eps: 24, not_aired_eps: 4, last_watched_at: 3000, first_watched_at: 1000, first_real_at: 1000, last_real_at: 3000, stamps: 12, real_stamps: 12, eps_per_week: 4 },
+      { simkl_id: 2, kind: 'show', imdb_id: 'tt2', tmdb_id: '2', title: 'Beta Show', year: 2021, status: 'ongoing', watched_eps: 5, total_eps: null, not_aired_eps: null, last_watched_at: 2000, first_watched_at: 1000, first_real_at: 1000, last_real_at: 2000, stamps: 5, real_stamps: 5, eps_per_week: null },
+      { simkl_id: 3, kind: 'show', imdb_id: 'tt3', tmdb_id: '3', title: 'Gamma Show', year: 2022, status: 'completed', watched_eps: 10, total_eps: 10, not_aired_eps: 0, last_watched_at: 1000, first_watched_at: 1000, first_real_at: 1000, last_real_at: 1000, stamps: 10, real_stamps: 10, eps_per_week: 5 },
+      { simkl_id: 4, kind: 'show', imdb_id: 'tt4', tmdb_id: '4', title: 'Delta Show', year: 2023, status: 'ongoing', watched_eps: 2, total_eps: 8, not_aired_eps: 1, last_watched_at: 500, first_watched_at: 400, first_real_at: 400, last_real_at: 500, stamps: 2, real_stamps: 2, eps_per_week: null },
+      { simkl_id: 5, kind: 'anime', imdb_id: 'tta1', tmdb_id: '100', title: 'An Anime', year: 2023, status: 'ongoing', watched_eps: 3, total_eps: 12, not_aired_eps: 2, last_watched_at: 4000, first_watched_at: 3000, first_real_at: 3000, last_real_at: 4000, stamps: 3, real_stamps: 3, eps_per_week: null },
+    ]);
+    tasteFeedback.upsertRating(profile.id, { type: 'series', tmdb_id: '1', rating: 10 }); // loved
+    tasteFeedback.upsertRating(profile.id, { type: 'series', tmdb_id: '2', rating: 7 }); // rated
+    tasteFeedback.setIgnored(profile.id, { type: 'series', tmdb_id: '4' }, true, 5000);
+    const deps = { now: () => 5000, log: quiet };
+    // the 'all' view has 3 items (Delta is ignored, the anime row is excluded);
+    // ordered by last_watched_at DESC.
+    let res = await trainer.listHistory(profile, { type: 'series' }, deps);
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.total, 3);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['1', '2', '3']);
+    // the §2 series DTO, exactly.
+    const alpha = res.items.find((i) => i.tmdb_id === '1');
+    assert.deepStrictEqual(alpha, {
+      key: '1', type: 'series', simkl_id: 1, tmdb_id: '1', imdb_id: 'tt1',
+      title: 'Alpha Show', year: 2020, genre: null, poster: null,
+      watched_at: new Date(3000).toISOString(),
+      rating: 10, loved: true, ignored: false, status: 'watched', percent: null,
+      progress: { watched_eps: 12, aired_eps: 20 }, // 24 - 4
+    });
+    // aired = null when total is unknown.
+    const beta = res.items.find((i) => i.tmdb_id === '2');
+    assert.deepStrictEqual(beta.progress, { watched_eps: 5, aired_eps: null });
+    // counts: unfinished is 0 for series.
+    assert.deepStrictEqual(res.counts, { all: 3, unrated: 1, rated: 2, loved: 1, ignored: 1, unfinished: 0, unresolved: 0 });
+    // views.
+    res = await trainer.listHistory(profile, { type: 'series', view: 'unrated' }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['3']);
+    res = await trainer.listHistory(profile, { type: 'series', view: 'rated' }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['1', '2']);
+    res = await trainer.listHistory(profile, { type: 'series', view: 'loved' }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['1']);
+    res = await trainer.listHistory(profile, { type: 'series', view: 'ignored' }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['4']);
+    // unfinished → bad-view for series.
+    res = await trainer.listHistory(profile, { type: 'series', view: 'unfinished' }, deps);
+    assert.deepStrictEqual(res, { ok: false, reason: 'bad-view' });
+    // search (case-insensitive title substring).
+    res = await trainer.listHistory(profile, { type: 'series', q: 'beta' }, deps);
+    assert.deepStrictEqual(res.items.map((i) => i.tmdb_id), ['2']);
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ignore; DELETE FROM taste_changes');
+    watchedStore.deleteForProfile(profile.id);
+  });
+
+  await it('TV-R T2: rate — series (Simkl first, local row after, clear, throw, recordChange)', async () => {
+    const trainer = require('../src/trainer');
+    const watchedStore = require('../src/watchedStore');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const simkl = require('../src/services/simkl');
+    const db = require('../src/db');
+    const profile = { id: 'p-tvr-rate', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    watchedStore.upsertSeriesProgress(profile.id, [
+      { simkl_id: 1, kind: 'show', imdb_id: 'tt1', tmdb_id: '1', title: 'Alpha Show', year: 2020, status: 'ongoing', watched_eps: 12, total_eps: 24, not_aired_eps: 4, last_watched_at: 3000, first_watched_at: 1000, first_real_at: 1000, last_real_at: 3000, stamps: 12, real_stamps: 12, eps_per_week: 4 },
+    ]);
+    const simklCalls = [];
+    const deps = {
+      simkl: {
+        setRatings: async (_p, items) => { simklCalls.push(['set', items]); },
+        removeRatings: async (_p, items) => { simklCalls.push(['remove', items]); },
+      },
+      now: () => 5000,
+      log: quiet,
+    };
+    // rate → setRatings with the series item; the real buildRatingsBody shows[0] has ids.simkl + rating.
+    let res = await trainer.rate(profile, { type: 'series', tmdb_id: '1' }, 8, deps);
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.item.rating, 8);
+    assert.deepStrictEqual(simklCalls, [['set', [{ type: 'series', simkl_id: 1, imdb_id: 'tt1', tmdb_id: '1', rating: 8 }]]]);
+    assert.deepStrictEqual(simkl.buildRatingsBody(simklCalls[0][1]), { movies: [], shows: [{ ids: { simkl: 1, imdb: 'tt1', tmdb: '1' }, rating: 8 }] });
+    // the local row is written after the Simkl call.
+    assert.strictEqual(tasteFeedback.getRating(profile.id, 'series', '1'), 8);
+    // recordChange is bumped.
+    assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 5000, changes_since_build: 1, built_changed_at: null });
+    // a throwing setRatings → no local row (unchanged).
+    const before = tasteFeedback.getRating(profile.id, 'series', '1');
+    await assert.rejects(() => trainer.rate(profile, { type: 'series', tmdb_id: '1' }, 9, {
+      ...deps,
+      simkl: { setRatings: async () => { throw new Error('Simkl POST /sync/ratings failed (500)'); }, removeRatings: async () => { throw new Error('Simkl POST /sync/ratings/remove failed (500)'); } },
+    }));
+    assert.strictEqual(tasteFeedback.getRating(profile.id, 'series', '1'), before);
+    // a clear → removeRatings and the row deleted.
+    simklCalls.length = 0;
+    res = await trainer.rate(profile, { type: 'series', tmdb_id: '1' }, null, deps);
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.item.rating, null);
+    assert.deepStrictEqual(simklCalls, [['remove', [{ type: 'series', simkl_id: 1, imdb_id: 'tt1', tmdb_id: '1' }]]]);
+    assert.strictEqual(tasteFeedback.getRating(profile.id, 'series', '1'), null);
+    db.get().exec('DELETE FROM taste_ratings; DELETE FROM taste_ignore; DELETE FROM taste_changes');
+    watchedStore.deleteForProfile(profile.id);
+  });
+
+  await it('TV-R T3: setIgnored — series is local only (zero Simkl calls); un-ignore works', async () => {
+    const trainer = require('../src/trainer');
+    const watchedStore = require('../src/watchedStore');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const db = require('../src/db');
+    const profile = { id: 'p-tvr-ignore', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    watchedStore.upsertSeriesProgress(profile.id, [
+      { simkl_id: 1, kind: 'show', imdb_id: 'tt1', tmdb_id: '1', title: 'Alpha Show', year: 2020, status: 'ongoing', watched_eps: 12, total_eps: 24, not_aired_eps: 4, last_watched_at: 3000, first_watched_at: 1000, first_real_at: 1000, last_real_at: 3000, stamps: 12, real_stamps: 12, eps_per_week: 4 },
+    ]);
+    const simklCalls = [];
+    const deps = {
+      simkl: { setRatings: async () => { simklCalls.push('set'); }, removeRatings: async () => { simklCalls.push('remove'); } },
+      now: () => 5000,
+      log: quiet,
+    };
+    // ignore → local row written, NO Simkl call.
+    let res = await trainer.setIgnored(profile, { type: 'series', tmdb_id: '1' }, true, deps);
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.item.ignored, true);
+    assert.strictEqual(simklCalls.length, 0);
+    assert.ok(tasteFeedback.ignoredSet(profile.id, 'series').has('1'));
+    // un-ignore → local row removed.
+    res = await trainer.setIgnored(profile, { type: 'series', tmdb_id: '1' }, false, deps);
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.item.ignored, false);
+    assert.strictEqual(tasteFeedback.ignoredSet(profile.id, 'series').size, 0);
+    assert.strictEqual(simklCalls.length, 0); // still zero Simkl calls
+    db.get().exec('DELETE FROM taste_ignore; DELETE FROM taste_changes');
+    watchedStore.deleteForProfile(profile.id);
+  });
+
+  await it('TV-R T4: markFinished / markUnwatched — series → not-supported (400), zero Simkl calls', async () => {
+    const trainer = require('../src/trainer');
+    const watchedStore = require('../src/watchedStore');
+    const db = require('../src/db');
+    const profile = { id: 'p-tvr-notsup', name: 'T', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
+    watchedStore.upsertSeriesProgress(profile.id, [
+      { simkl_id: 1, kind: 'show', imdb_id: 'tt1', tmdb_id: '1', title: 'Alpha Show', year: 2020, status: 'ongoing', watched_eps: 12, total_eps: 24, not_aired_eps: 4, last_watched_at: 3000, first_watched_at: 1000, first_real_at: 1000, last_real_at: 3000, stamps: 12, real_stamps: 12, eps_per_week: 4 },
+    ]);
+    const simklCalls = [];
+    const deps = {
+      simkl: { setRatings: async () => { simklCalls.push('set'); }, removeRatings: async () => { simklCalls.push('remove'); }, removeFromHistory: async () => { simklCalls.push('removeHistory'); } },
+      markWatched: async () => { simklCalls.push('markWatched'); return { ok: true }; },
+      now: () => 5000,
+      log: quiet,
+    };
+    // markFinished → not-supported, zero Simkl calls.
+    let res = await trainer.markFinished(profile, { type: 'series', tmdb_id: '1' }, deps);
+    assert.deepStrictEqual(res, { ok: false, reason: 'not-supported' });
+    assert.strictEqual(simklCalls.length, 0);
+    // markUnwatched → not-supported, zero Simkl calls.
+    res = await trainer.markUnwatched(profile, { type: 'series', tmdb_id: '1' }, deps);
+    assert.deepStrictEqual(res, { ok: false, reason: 'not-supported' });
+    assert.strictEqual(simklCalls.length, 0);
+    // the httpStatus mapping is 400.
+    assert.strictEqual(trainer.httpStatus(res), 400);
     watchedStore.deleteForProfile(profile.id);
   });
 

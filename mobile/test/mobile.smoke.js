@@ -678,13 +678,14 @@ async function unitTests() {
       assert.strictEqual(tasteFeedback.getRating(pid, 'movie', '603'), 7, 'local row unchanged after a failed write');
       simkl.setRatings = origSet;
 
-      // rate — bad-rating (0) → 400; series → not-supported → 400; not-in-history → 404.
+      // rate — bad-rating (0) → 400; series is supported (TV-R §2) but this
+      // profile has no series_progress rows → not-in-history → 404; not-in-history → 404.
       res = fakeRes();
       await handlers.trainerRateHandler({ profile: prof, body: { type: 'movie', tmdb_id: '603', rating: 0 } }, res);
       assert.strictEqual(res.statusCode, 400);
       res = fakeRes();
       await handlers.trainerRateHandler({ profile: prof, body: { type: 'series', tmdb_id: '603', rating: 5 } }, res);
-      assert.strictEqual(res.statusCode, 400);
+      assert.strictEqual(res.statusCode, 404);
       res = fakeRes();
       await handlers.trainerRateHandler({ profile: prof, body: { type: 'movie', tmdb_id: '999999', rating: 5 } }, res);
       assert.strictEqual(res.statusCode, 404);

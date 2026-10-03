@@ -6442,11 +6442,13 @@ async function httpTests() {
     } finally {
       simkl.setRatings = origSet;
     }
-    // 400: bad-type, not-supported, bad-rating (no Simkl involved).
+    // 400: bad-type, bad-rating (no Simkl involved).
     res = await fetch(`${BASE}/api/profiles/${prof.id}/trainer/rate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'bogus', tmdb_id: '1', rating: 5 }) });
     assert.strictEqual(res.status, 400);
+    // series is supported (TV-R §2): this profile has no series_progress rows,
+    // so the ref is not-in-history (the old not-supported 400 is gone).
     res = await fetch(`${BASE}/api/profiles/${prof.id}/trainer/rate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'series', tmdb_id: '1', rating: 5 }) });
-    assert.strictEqual(res.status, 400);
+    assert.strictEqual(res.status, 404);
     res = await fetch(`${BASE}/api/profiles/${prof.id}/trainer/rate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'movie', tmdb_id: '1', rating: 11 }) });
     assert.strictEqual(res.status, 400);
     // 404: not-in-history (unknown title).
