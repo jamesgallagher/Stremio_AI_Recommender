@@ -7249,7 +7249,7 @@ async function main() {
       return m;
     };
     const mkCtx = (profile, filters) => ({
-      settings: {},
+      settings: { llm: {} }, // no LLM providers → no chain → TV-2-identical scores (N4)
       nowMs,
       filters,
       tmdbKey: 'itest-tmdb',
@@ -7328,6 +7328,97 @@ async function main() {
     }
   });
 
+  // ── TV-3 B1: the taste brief (local LLM) ──
+  // The exact prompt (rung words, rated suffix, split genres, networks), a
+  // second call is a cache hit, a rung change changes the key, a failure →
+  // null and is never cached, and the prompt carries no age/suitability/
+  // child/classification wording (N5 / I1).
+  await it('TV-3 B1: tvBrief — exact prompt, cache hit, key change, failure never cached, N5', async () => {
+    const llmMod = require('../src/engines/marqueeTv/llm');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const cfg = require('../src/engines/marqueeTv/config').DEFAULTS;
+    const now = 1_700_000_000_000;
+    const p = config.addProfile('INT-TV3-B1');
+    const log = { log: () => {}, warn: () => {}, error: () => {} };
+    try {
+      // '100' is rated 8 → the rated suffix; the others are unrated.
+      tasteFeedback.upsertRating(p.id, { type: 'series', tmdb_id: '100', rating: 8 });
+      const ladderEntries = [
+        { row: { tmdb_id: '100', title: 'Alpha Show' }, rung: 'finished', value: 3.0 },
+        { row: { tmdb_id: '200', title: 'Beta Show' }, rung: 'committed', value: 2.0 },
+        { row: { tmdb_id: '300', title: 'Gamma Show' }, rung: 'tried', value: 1.0 },
+        { row: { tmdb_id: 'anime1', title: 'Anime Show' }, rung: 'finished', value: 5.0 }, // anime → excluded
+        { row: { tmdb_id: '400', title: 'Left Show' }, rung: 'sampled_left', value: 0 }, // value 0 → excluded
+      ];
+      const metaById = new Map([
+        ['100', { title: 'Alpha Show', year: 2020, genres: ['Sci-Fi & Fantasy'], keywords: [], networks: ['Netflix'] }],
+        ['200', { title: 'Beta Show', year: 2019, genres: ['Drama'], keywords: [], networks: [] }],
+        ['300', { title: 'Gamma Show', year: 2021, genres: ['Action & Adventure'], keywords: ['zombie'], networks: ['BBC', 'Channel 4'] }],
+      ]);
+      const chain = [{ type: 'custom', name: 'local', uri: 'http://localhost:11434/v1', apiKey: '' }];
+      const rawBrief = JSON.stringify({ loves: ['space opera'], avoids: ['reality'], moods: ['wistful'], eras: ['1990s'], standout_titles: ['Alpha Show'] });
+      const calls = [];
+      // The stub mirrors the real transport: it returns validate(content).
+      const goodChat = async (c, messages, opts) => { calls.push({ messages, opts }); return opts.validate(rawBrief); };
+      const badChat = async () => { throw new Error('local LLM down'); };
+
+      // (a) the exact prompt: rung words, the rated suffix, split genres, networks.
+      const brief = await llmMod.tvBrief(p.id, ladderEntries, metaById, { chain, chat: goodChat, cfg, log, now });
+      assert.strictEqual(calls.length, 1, 'one chat call');
+      const expected = [
+        "You are summarising a TV viewer's taste from the shows they watched.",
+        'Shows, most engaged first — "Title" (first-air year): how far they got; genres; network:',
+        '- "Alpha Show" (2020): finished, rated 8/10; Science Fiction, Fantasy; Netflix',
+        '- "Beta Show" (2019): watched most of it; Drama; unknown network',
+        '- "Gamma Show" (2021): tried a few episodes; Action, Adventure, Horror; BBC, Channel 4',
+        'Return a JSON object with exactly these keys, each an array of short strings (at most 8 each):',
+        '{"loves": [...], "avoids": [...], "moods": [...], "eras": [...], "standout_titles": [...]}',
+        '"loves" and "avoids" are themes, genres, formats or styles; "moods" are tones; "eras" are periods; "standout_titles" are the 3–8 shows that best define this taste.',
+        'Output ONLY the JSON object.',
+      ].join('\n');
+      assert.strictEqual(calls[0].messages[0].content, expected, 'the exact prompt');
+      assert.strictEqual(calls[0].opts.temperature, 0, 'temperature 0');
+      assert.ok(calls[0].opts.timeoutMs > 0, 'the timeout is set');
+      assert.deepStrictEqual(brief.loves, ['space opera'], 'the parsed brief');
+      assert.ok(brief.hash, 'the stored hash');
+
+      // (b) a second call is a cache hit — zero chat calls.
+      const brief2 = await llmMod.tvBrief(p.id, ladderEntries, metaById, { chain, chat: goodChat, cfg, log, now: now + 1000 });
+      assert.strictEqual(calls.length, 1, 'cache hit: no new chat call');
+      assert.deepStrictEqual(brief2, brief, 'the cached brief');
+
+      // (c) changing one show's rung changes the key — one new call.
+      const changed = ladderEntries.map((e) => (e.row.tmdb_id === '100' ? { ...e, rung: 'committed' } : e));
+      await llmMod.tvBrief(p.id, changed, metaById, { chain, chat: goodChat, cfg, log, now: now + 2000 });
+      assert.strictEqual(calls.length, 2, 'rung change → new key → one new call');
+
+      // (d) a chat failure → null, nothing cached (a fresh key).
+      const variant = ladderEntries.map((e) => (e.row.tmdb_id === '200' ? { ...e, rung: 'engaged' } : e));
+      const failed = await llmMod.tvBrief(p.id, variant, metaById, { chain, chat: badChat, cfg, log, now: now + 3000 });
+      assert.strictEqual(failed, null, 'failure → null');
+      const n = calls.length;
+      const retry = await llmMod.tvBrief(p.id, variant, metaById, { chain, chat: goodChat, cfg, log, now: now + 4000 });
+      assert.strictEqual(calls.length, n + 1, 'the failure was not cached — the retry calls again');
+      assert.ok(retry, 'the retry succeeds');
+
+      // (e) no chain → null, zero network (N4).
+      const noChain = await llmMod.tvBrief(p.id, ladderEntries, metaById, { chain: [], chat: goodChat, cfg, log, now });
+      assert.strictEqual(noChain, null, 'no chain → null');
+      assert.strictEqual(calls.length, n + 1, 'no chain → no chat call');
+
+      // (f) N5: the prompt carries no age/suitability/child/classification
+      // wording. Assumption (flagged in the hand-back): the card's literal
+      // /age/i also matches the substring "age" inside the card's own rung
+      // word "engaged"; the intent is to forbid age WORDS, so "age" is
+      // asserted with word boundaries.
+      const prompt = calls[0].messages[0].content;
+      assert.ok(!/\bage\b|suitab|child|kid|classif|rated (G|PG|M)/i.test(prompt), 'N5: no age/suitability/child/classification wording');
+    } finally {
+      tasteFeedback.deleteForProfile(p.id);
+      config.removeProfile(p.id);
+    }
+  });
+
   // ── TV-2 E1: the full orchestrator (hermetic; stubbed network fetchers) ──
   // A temp DB with series_progress rows (a normal seed, an anime row, a Reality
   // show seen only as sampled_left) + Glass meta + stubs for every network
@@ -7394,7 +7485,7 @@ async function main() {
 
     const logs = [];
     const ctx = {
-      settings: {},
+      settings: { llm: {} }, // no LLM providers → no chain → TV-2-identical scores (N4)
       nowMs,
       filters: { excluded_genres: ['Horror'], min_year: 2010, min_rating: 7, vote_count_floor: 50, age_limit: 0 },
       tmdbKey: 'itest-tmdb',

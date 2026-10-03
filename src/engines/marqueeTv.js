@@ -32,6 +32,8 @@ const taste = require('./marqueeTv/taste');
 const filters = require('./marqueeTv/filters');
 const sources = require('./marqueeTv/sources');
 const scoring = require('./marqueeTv/scoring');
+const tvLlm = require('./marqueeTv/llm');
+const llm = require('../services/llm');
 const serveCalibration = require('../serveCalibration');
 const { tierFor } = require('../ageVerification/tiers');
 const mqFeatures = require('./marquee/features');
@@ -212,6 +214,17 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
 
   ctx.stats = ctx.stats || {};
   ctx.stats.seeds = seedList.length;
+
+  // TV-3 §3.1 (the §7 order, step 5): the taste brief — LOCAL LLM only
+  // (custom chain; N3), cached per history key, null when no chain or on a
+  // failure (the build continues without it; N4 / MI-3).
+  const tvLlmChain = ctx.marqueeTvChain || settings.llmChain(ctx.settings).filter((p) => p.type === 'custom');
+  const brief = await tvLlm.tvBrief(profile.id, ladderEntries, historyMeta, {
+    chain: tvLlmChain,
+    chat: ctx.marqueeTvChat || llm.chat,
+    cfg, log, now: nowMs, isAnimeRow,
+  });
+  ctx.stats.llm = { brief: !!brief };
 
   // 3. Gather (§5.4): T1/T2/T3/T5/T6, merged by tmdb_id.
   const sctx = { ...ctx, profile, apiKey: ctx.tmdbKey };
