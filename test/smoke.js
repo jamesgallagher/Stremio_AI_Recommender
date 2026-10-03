@@ -6566,6 +6566,17 @@ async function httpTests() {
     console.log('  ✓ TV-R T8: portal Films | Shows toggle, type on every call, show notice, Unfinished chip hidden');
   }
 
+  // TV-R r1 B1: the view-chips refresh must not overwrite the Films | Shows
+  // toggle — trainerRefreshMeta selects the view row's own hook (.tr-views),
+  // not the first .tr-chips (which is now the toggle).
+  {
+    const body = await (await fetch(`${BASE}/configure/`)).text();
+    assert.ok(body.includes('panel.querySelector(\'.tr-chips.tr-views\')'), 'trainerRefreshMeta selects the view chips row');
+    assert.ok(body.includes('<div class="tr-chips tr-views">'), 'the view chips row in trainerDraw carries tr-views');
+    assert.ok(!body.includes('tr-chips tr-type tr-views'), 'the type toggle div does not carry tr-views');
+    console.log('  ✓ TV-R r1 B1: view-chips refresh no longer overwrites the Films|Shows toggle');
+  }
+
   // T3.1 U6: the served index.html has no _undoT/6000 auto-refresh left (R1).
   {
     const body = await (await fetch(`${BASE}/configure/`)).text();
