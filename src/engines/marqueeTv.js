@@ -32,6 +32,7 @@ const taste = require('./marqueeTv/taste');
 const filters = require('./marqueeTv/filters');
 const sources = require('./marqueeTv/sources');
 const scoring = require('./marqueeTv/scoring');
+const serveCalibration = require('../serveCalibration');
 const { tierFor } = require('../ageVerification/tiers');
 const mqFeatures = require('./marquee/features');
 
@@ -337,6 +338,29 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
   });
 
   ctx.stats.kept = out.length;
+
+  // TV-3 §4: the calibrated serve target — only when rows are stored. Built
+  // from the same SPLIT genre names the served rows carry (tvGenres). A
+  // failure only logs — it never fails the build.
+  if (out.length > 0) {
+    try {
+      const shows = [];
+      for (const e of ladderEntries) {
+        if (e.value <= 0 || isAnimeRow(e.row)) continue;
+        const m = historyMeta.get(String(e.row.tmdb_id));
+        if (!m) continue;
+        const genres = filters.tvGenres(m); // SPLIT names — the same names the served rows carry
+        if (genres.length) shows.push({ genres, weight: e.value });
+      }
+      const target = serveCalibration.computeTarget(shows);
+      serveCalibration.setTarget(profile.id, 'series', 'marquee-tv', target, shows.length, nowMs);
+      const top = Object.entries(target).slice(0, 3).map(([g, v]) => `${g} ${Math.round(v * 100)}%`);
+      log.log(`[marquee-tv] ${profile.name}: serve target from ${shows.length} shows — top: ${top.join(', ')}${Object.keys(target).length > 3 ? ' …' : ''}`);
+    } catch (err) {
+      log.warn(`[marquee-tv] serve target failed: ${err.message}`);
+    }
+  }
+
   log.log(summaryLine(profile, ctx.stats, filter.stats()));
   return out;
 }
@@ -354,8 +378,13 @@ module.exports = {
   capabilities: {
     providesRankScore: true,
     preResolved: true,          // §4.8 carries imdb_id/poster/genres → the pipeline skips its own resolve
-    serveOrder: 'affinity',
+    serveOrder: 'calibrated',   // TV-3 §4: the served genre mix is calibrated to the profile's taste
     unrestricted: false,         // M5: age-GATED, safe for any profile via the shared age gate
+  },
+  // Calibrated serving (TV-3 §4): the serve-time tunables, read from the
+  // resolved Marquee TV config (Tier-1 defaults + Tier-2 settings.marquee_tv.serve).
+  serveOptions(settings) {
+    return marqueeTvConfig.resolveConfig(settings).serve;
   },
   // Exactly Marquee Cinema's: TMDB key + Simkl connection (MDBList + a local
   // LLM are optional and deliberately NOT listed).

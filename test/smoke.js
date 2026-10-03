@@ -4901,6 +4901,13 @@ okAsync('TV-3 L2: T1 Simkl batch fetcher — one call with all the seeds\' Simkl
   assert.deepStrictEqual(out2, []);
 });
 
+ok('TV-3 S1: the descriptor — serveOrder calibrated + serveOptions returns the §6 serve defaults (spec §4)', () => {
+  const marqueeTv = require('../src/engines/marqueeTv');
+  assert.strictEqual(marqueeTv.capabilities.serveOrder, 'calibrated', 'serveOrder calibrated');
+  const cfg = require('../src/engines/marqueeTv/config').DEFAULTS;
+  assert.deepStrictEqual(marqueeTv.serveOptions({}), cfg.serve, 'serveOptions({}) = the §6 serve defaults');
+});
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');

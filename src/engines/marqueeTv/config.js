@@ -7,7 +7,7 @@
 // pattern as Marquee Cinema's resolveConfig (marquee/config.js) and Glass's
 // (glass/config.js). Unknown sections are ignored; a malformed blob never
 // throws — it just doesn't apply. No UI.
-const ALGORITHM_VERSION = 'marquee-tv-t1';
+const ALGORITHM_VERSION = 'marquee-tv-t2';
 
 const DEFAULTS = {
   seed_cap: 50, history_meta_cap: 150, lookup_cap: 250, store_cap: 300,
@@ -22,6 +22,12 @@ const DEFAULTS = {
   trending_gate: 0.35,
   cancelled_one_season_penalty: 0.05,
   default_comfort_eps: 20,
+  llm_timeout_ms: 60000,
+  brief:   { top_shows: 40 },
+  suggest: { enabled: true, count: 40, avoid_recent: 40, ttl_days: 7 },
+  llm_fit: { enabled: true, weight: 0.15, candidate_cap: 150, batch: 15, ttl_days: 14 },
+  serve:   { strategy: 'calibrated', lambda: 0.85, window_factor: 3, kl_alpha: 0.01,
+             wildcard_slots: 0, wildcard_max_share: 0.05, wildcard_position: 6 },
 };
 
 // Resolve the EFFECTIVE Marquee TV config for a build: Tier-1 defaults with a

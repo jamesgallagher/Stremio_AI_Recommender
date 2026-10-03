@@ -7218,6 +7218,116 @@ async function main() {
     }
   });
 
+  // ── TV-3 S1/S2: calibrated serving for series ──
+  // S1: after generate, getTarget has engine_id 'marquee-tv', SPLIT genre
+  // names (never combined), anime + value≤0 shows excluded, shares sum to 1;
+  // a 0-row build sets no target. S2: selectServeFor serves the calibrated
+  // ordering's prefix (not the round-robin), and limit-5 is a prefix of limit-10.
+  await it('TV-3 S1/S2: generate sets the serve target (split names, anime + value≤0 excluded, shares sum 1); 0-row build sets none; selectServeFor serves the calibrated prefix', async () => {
+    const marqueeTv = require('../src/engines/marqueeTv');
+    const serveCalibration = require('../src/serveCalibration');
+    const nowMs = Date.parse('2026-10-02T00:00:00Z');
+    const mkLadder = (pid) => [
+      { simkl_id: 100, kind: 'show', imdb_id: 'ttseed1', tmdb_id: 'seed1', title: 'SciFi Show', year: 2020, status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0, last_watched_at: nowMs, first_watched_at: nowMs, first_real_at: nowMs, last_real_at: nowMs, stamps: 10, real_stamps: 10, eps_per_week: null },
+      { simkl_id: 110, kind: 'show', imdb_id: 'ttseed2', tmdb_id: 'seed2', title: 'Drama Show', year: 2020, status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0, last_watched_at: nowMs, first_watched_at: nowMs, first_real_at: nowMs, last_real_at: nowMs, stamps: 10, real_stamps: 10, eps_per_week: null },
+      { simkl_id: 200, kind: 'anime', imdb_id: 'ttanime', tmdb_id: 'anime1', title: 'Anime Show', year: 2020, status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0, last_watched_at: nowMs, first_watched_at: nowMs, first_real_at: nowMs, last_real_at: nowMs, stamps: 10, real_stamps: 10, eps_per_week: null },
+      { simkl_id: 300, kind: 'show', imdb_id: 'ttreality', tmdb_id: 'reality1', title: 'Reality Show', year: 2020, status: 'watching', watched_eps: 1, total_eps: 10, not_aired_eps: 0, last_watched_at: nowMs - 90 * 86400e3, first_watched_at: nowMs - 90 * 86400e3, first_real_at: nowMs - 90 * 86400e3, last_real_at: nowMs - 90 * 86400e3, stamps: 1, real_stamps: 1, eps_per_week: null },
+    ];
+    const tvMeta = (apiKey, ids) => {
+      const m = new Map();
+      for (const id of ids) {
+        const base = { tmdb_id: id, imdb_id: 'tt' + id, type: 'series', title: 'Show ' + id, year: 2024, genres: ['Drama'], keywords: [], tvType: 'Scripted', status: 'Returning Series', vote_average: 8, vote_count: 1000, popularity: 5, certAU: null, certUS: null, first_air_date: '2024-01-01', last_air_date: '2026-01-01', number_of_episodes: 20, number_of_seasons: 1 };
+        if (id === 'seed1') base.genres = ['Sci-Fi & Fantasy'];
+        m.set(id, base);
+      }
+      return m;
+    };
+    // Batch fetcher (L2): one candidate (good1) per seed.
+    const simklRecs = async (profile, ids) => {
+      const m = new Map();
+      for (const id of ids) m.set(id, [{ tmdb_id: 'good1', imdb_id: 'ttgood1', title: 'Good Show', year: 2024 }]);
+      return m;
+    };
+    const mkCtx = (profile, filters) => ({
+      settings: {},
+      nowMs,
+      filters,
+      tmdbKey: 'itest-tmdb',
+      mdblistKey: '',
+      log: { log: () => {}, warn: () => {}, error: () => {} },
+      stats: {},
+      watchedIds: { imdb: new Set(), tmdb: new Set() },
+      dont: new Set(),
+      marqueeTvFetchers: { tvMeta, simklRecs, tmdbRecs: () => [], discover: () => [], trending: () => [], imdbRatings: () => new Map() },
+    });
+    const p = config.addProfile('INT-TV3-S1');
+    const pB = config.addProfile('INT-TV3-S1B');
+    try {
+      // (S1) A normal build stores rows → the target is set.
+      config.updateProfile(p.id, {
+        filters: { engine_series: 'marquee-tv', excluded_genres: ['Horror'], min_year: 2010, min_rating: 7, vote_count_floor: 50, age_limit: 0 },
+        keys: { tmdb_api_key: 'itest-tmdb' },
+        simkl_auth: { access_token: 'tok' },
+      });
+      const profile = config.getProfile(p.id);
+      watchedStore.upsertSeriesProgress(p.id, mkLadder(p.id));
+      const out = await marqueeTv.generate(profile, 'series', mkCtx(profile, profile.filters));
+      assert.ok(out.length > 0, 'the build stored rows');
+      const t = serveCalibration.getTarget(p.id, 'series');
+      assert.ok(t, 'target stored');
+      assert.strictEqual(t.engine_id, 'marquee-tv', 'engine_id marquee-tv');
+      // SPLIT names: Science Fiction + Fantasy (from Sci-Fi & Fantasy) + Drama — never a combined name.
+      assert.deepStrictEqual(Object.keys(t.target).sort(), ['Drama', 'Fantasy', 'Science Fiction'], 'split names');
+      assert.ok(!Object.keys(t.target).some((g) => g.includes('&')), 'no combined names');
+      const sum = Object.values(t.target).reduce((a, b) => a + b, 0);
+      assert.ok(Math.abs(sum - 1) < 1e-9, 'shares sum to 1');
+      // film_count = the 2 non-anime value>0 shows with meta (anime + value≤0 excluded).
+      assert.strictEqual(t.film_count, 2, 'anime + value≤0 shows excluded');
+
+      // (S1) A 0-row build sets no target.
+      config.updateProfile(pB.id, {
+        filters: { engine_series: 'marquee-tv', excluded_genres: ['Drama'], min_year: 2010, min_rating: 7, vote_count_floor: 50, age_limit: 0 },
+        keys: { tmdb_api_key: 'itest-tmdb' },
+        simkl_auth: { access_token: 'tok' },
+      });
+      const profileB = config.getProfile(pB.id);
+      watchedStore.upsertSeriesProgress(pB.id, mkLadder(pB.id));
+      const outB = await marqueeTv.generate(profileB, 'series', mkCtx(profileB, profileB.filters));
+      assert.strictEqual(outB.length, 0, '0 rows stored');
+      assert.strictEqual(serveCalibration.getTarget(pB.id, 'series'), null, 'no target set');
+
+      // (S2) selectServeFor serves the calibrated ordering's prefix, not the round-robin.
+      settings.updateSettings({ engines: { 'marquee-tv': true } });
+      const rows = [
+        { type: 'series', tmdb_id: 's1', imdb_id: 'tts1', title: 'S1', year: 2024, genres: 'Science Fiction,Fantasy', primary_genre: 'Science Fiction', vote_average: 8, imdb_rating: 8, affinity: 10, popularity: 5 },
+        { type: 'series', tmdb_id: 's2', imdb_id: 'tts2', title: 'S2', year: 2024, genres: 'Drama', primary_genre: 'Drama', vote_average: 7, imdb_rating: 7, affinity: 9, popularity: 5 },
+        { type: 'series', tmdb_id: 's3', imdb_id: 'tts3', title: 'S3', year: 2024, genres: 'Drama', primary_genre: 'Drama', vote_average: 8, imdb_rating: 8, affinity: 8, popularity: 5 },
+        { type: 'series', tmdb_id: 's4', imdb_id: 'tts4', title: 'S4', year: 2024, genres: 'Science Fiction,Fantasy', primary_genre: 'Science Fiction', vote_average: 7, imdb_rating: 7, affinity: 7, popularity: 5 },
+        { type: 'series', tmdb_id: 's5', imdb_id: 'tts5', title: 'S5', year: 2024, genres: 'Drama', primary_genre: 'Drama', vote_average: 8, imdb_rating: 8, affinity: 6, popularity: 5 },
+        { type: 'series', tmdb_id: 's6', imdb_id: 'tts6', title: 'S6', year: 2024, genres: 'Drama', primary_genre: 'Drama', vote_average: 7, imdb_rating: 7, affinity: 5, popularity: 5 },
+      ];
+      const served5 = rs.selectServeFor(profile, 'series', rows, { limit: 5 });
+      const served10 = rs.selectServeFor(profile, 'series', rows, { limit: 10 });
+      // The expected calibrated prefix: the pool sorted affinity DESC, through
+      // calibratedOrder with the stored target + the §6 serve defaults.
+      const passed = rows.slice().sort((a, b) => (b.affinity - a.affinity) || (String(a.tmdb_id) < String(b.tmdb_id) ? -1 : 1));
+      const pTarget = serveCalibration.applyExclusions(serveCalibration.getTarget(p.id, 'series').target, profile.filters.excluded_genres);
+      const expected = serveCalibration.calibratedOrder(passed, pTarget, { listSize: 20, lambda: 0.85, windowFactor: 3, klAlpha: 0.01, wildcardSlots: 0, wildcardMaxShare: 0.05, wildcardPosition: 6 });
+      assert.deepStrictEqual(served5, expected.slice(0, 5), 'limit-5 = the calibrated prefix');
+      assert.deepStrictEqual(served10.slice(0, 5), served5, 'limit-5 is a prefix of limit-10');
+      assert.deepStrictEqual(served10, expected.slice(0, 6), 'limit-10 = the full calibrated order');
+      // Not the round-robin (balanceByGenre).
+      const roundRobin = rs.selectServe(rows, profile.filters, { limit: 6 });
+      assert.notDeepStrictEqual(served10, roundRobin, 'not the round-robin');
+    } finally {
+      settings.updateSettings({ engines: { 'marquee-tv': false } });
+      config.removeProfile(p.id);
+      config.removeProfile(pB.id);
+      watchedStore.deleteForProfile(p.id);
+      watchedStore.deleteForProfile(pB.id);
+    }
+  });
+
   // ── TV-2 E1: the full orchestrator (hermetic; stubbed network fetchers) ──
   // A temp DB with series_progress rows (a normal seed, an anime row, a Reality
   // show seen only as sampled_left) + Glass meta + stubs for every network
