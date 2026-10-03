@@ -949,8 +949,16 @@ function noteMetaOpen(profileId, type, imdbId, nowMs = Date.now()) {
 function needsBuild(profileId, { profile = null, now = Date.now() } = {}) {
   if (countRecommended(profileId) === 0) return true;
   if (watchedStore.newestWatchedMs(profileId) > getBuiltAt(profileId)) return true;
-  if (profile && require('./engines').resolveFor(profile, 'movie').id === 'marquee') {
-    return tasteFeedback.trainingDue(profileId, now);
+  // Trainer T2 (N8) + TV-R §4: a Trainer edit (rating / ignore / finished)
+  // triggers a rebuild when the profile's movie engine is Marquee (the only
+  // engine that reads the taste-feedback store for films) OR its series engine
+  // is Marquee TV (which reads it for shows). Keep the Marquee Cinema result
+  // exactly as before; only add the Marquee TV case.
+  if (profile) {
+    const engines = require('./engines');
+    if (engines.resolveFor(profile, 'movie').id === 'marquee' || engines.resolveFor(profile, 'series').id === 'marquee-tv') {
+      if (tasteFeedback.trainingDue(profileId, now)) return true;
+    }
   }
   return false;
 }

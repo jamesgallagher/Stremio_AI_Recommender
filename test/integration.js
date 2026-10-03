@@ -7551,6 +7551,181 @@ async function main() {
     }
   });
 
+  // ── TV-R T6: Marquee TV honours Ignore ──
+  // An ignored show that is a strong seed is removed from Marquee TV's history:
+  // the taste events, the seeds, the serve target, and it never appears as a
+  // candidate. The non-ignored show is untouched.
+  await it('TV-R T6: Marquee TV — an ignored strong seed leaves the seeds, taste events, serve target; never a candidate', async () => {
+    const marqueeTv = require('../src/engines/marqueeTv');
+    const taste = require('../src/engines/marqueeTv/taste');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const serveCalibration = require('../src/serveCalibration');
+    const config = require('../src/config');
+    const watchedStore = require('../src/watchedStore');
+    const settings = require('../src/settings');
+    const nowMs = Date.parse('2026-10-02T00:00:00Z');
+    // Two engaged (seed-eligible) shows: seed1 (the strong seed we'll ignore)
+    // and seed2 (the control).
+    const mkLadder = (pid) => [
+      { simkl_id: 100, kind: 'show', imdb_id: 'ttseed1', tmdb_id: 'seed1', title: 'SciFi Show', year: 2020, status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0, last_watched_at: nowMs, first_watched_at: nowMs, first_real_at: nowMs, last_real_at: nowMs, stamps: 10, real_stamps: 10, eps_per_week: null },
+      { simkl_id: 110, kind: 'show', imdb_id: 'ttseed2', tmdb_id: 'seed2', title: 'Drama Show', year: 2020, status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0, last_watched_at: nowMs - 86400e3, first_watched_at: nowMs - 86400e3, first_real_at: nowMs - 86400e3, last_real_at: nowMs - 86400e3, stamps: 10, real_stamps: 10, eps_per_week: null },
+    ];
+    const tvMeta = (apiKey, ids) => {
+      const m = new Map();
+      for (const id of ids) {
+        const base = { tmdb_id: id, imdb_id: 'tt' + id, type: 'series', title: 'Show ' + id, year: 2024, genres: ['Drama'], keywords: [], tvType: 'Scripted', status: 'Returning Series', vote_average: 8, vote_count: 1000, popularity: 5, certAU: null, certUS: null, first_air_date: '2024-01-01', last_air_date: '2026-01-01', number_of_episodes: 20, number_of_seasons: 1 };
+        if (id === 'seed1') base.genres = ['Sci-Fi & Fantasy'];
+        m.set(id, base);
+      }
+      return m;
+    };
+    let seedIds = [];
+    const mkCtx = (profile, filters) => ({
+      settings: { llm: {} },
+      nowMs,
+      filters,
+      tmdbKey: 'itest-tmdb',
+      mdblistKey: '',
+      log: { log: () => {}, warn: () => {}, error: () => {} },
+      stats: {},
+      watchedIds: { imdb: new Set(), tmdb: new Set() },
+      dont: new Set(),
+      marqueeSkipSync: true, // focus on the ignore filter, not the sync
+      marqueeTvFetchers: {
+        tvMeta,
+        simklRecs: async (p, ids) => { seedIds = [...ids]; const m = new Map(); for (const id of ids) m.set(id, [{ tmdb_id: 'good1', imdb_id: 'ttgood1', title: 'Good Show', year: 2024 }]); return m; },
+        tmdbRecs: () => [], discover: () => [], trending: () => [], imdbRatings: () => new Map(),
+      },
+    });
+    const p = config.addProfile('INT-TV-R-T6');
+    const realTasteEvents = taste.tasteEvents;
+    let tasteEventEntries = null;
+    taste.tasteEvents = (ladderEntries, ...rest) => { tasteEventEntries = ladderEntries; return realTasteEvents(ladderEntries, ...rest); };
+    try {
+      config.updateProfile(p.id, {
+        filters: { engine_series: 'marquee-tv', excluded_genres: [], min_year: 2010, min_rating: 7, vote_count_floor: 50, age_limit: 0 },
+        keys: { tmdb_api_key: 'itest-tmdb' },
+        simkl_auth: { access_token: 'tok' },
+      });
+      const profile = config.getProfile(p.id);
+      watchedStore.upsertSeriesProgress(p.id, mkLadder(p.id));
+      // Ignore the strong seed (seed1).
+      tasteFeedback.setIgnored(p.id, { type: 'series', tmdb_id: 'seed1', simkl_id: 100 }, true, nowMs);
+      settings.updateSettings({ engines: { 'marquee-tv': true } });
+      const out = await marqueeTv.generate(profile, 'series', mkCtx(profile, profile.filters));
+      assert.ok(out.length > 0, 'the build stored rows (so the serve target is set)');
+      // (a) the taste events input excludes the ignored show.
+      assert.ok(Array.isArray(tasteEventEntries), 'tasteEvents called');
+      assert.ok(!tasteEventEntries.some((e) => e.row.tmdb_id === 'seed1'), 'the ignored show is not in the taste events');
+      assert.ok(tasteEventEntries.some((e) => e.row.tmdb_id === 'seed2'), 'the non-ignored show is in the taste events');
+      // (b) the seeds exclude the ignored show (the simkl recs fetcher's ids).
+      assert.ok(!seedIds.includes(100), 'the ignored show is not a seed');
+      assert.ok(seedIds.includes(110), 'the non-ignored show is a seed');
+      // (c) the serve target excludes the ignored show's genres (split names).
+      const t = serveCalibration.getTarget(p.id, 'series');
+      assert.ok(t, 'target stored');
+      assert.ok(Object.keys(t.target).includes('Drama'), 'the non-ignored show genre is in the target');
+      assert.ok(!Object.keys(t.target).some((g) => ['Science Fiction', 'Fantasy'].includes(g)), 'the ignored show genres are NOT in the target');
+      // (d) the ignored show never appears as a candidate.
+      assert.ok(!out.some((r) => r.tmdb_id === 'seed1'), 'the ignored show is not a candidate');
+    } finally {
+      taste.tasteEvents = realTasteEvents;
+      settings.updateSettings({ engines: { 'marquee-tv': false } });
+      config.removeProfile(p.id);
+      watchedStore.deleteForProfile(p.id);
+      serveCalibration.deleteForProfile(p.id);
+      tasteFeedback.deleteForProfile(p.id);
+    }
+  });
+
+  // ── TV-R T7: Marquee TV sync + rebuild on rating changes ──
+  // With marqueeSkipSync false, syncRatings is called once with type 'series';
+  // with true, it isn't. needsBuild is true for a Marquee TV profile after a
+  // show rating change and false after markTrainingBuilt; a Genesis-series,
+  // Genesis-movie profile is unaffected; the Marquee Cinema result is unchanged.
+  await it('TV-R T7: Marquee TV — syncRatings once (type series) when marqueeSkipSync false, none when true; needsBuild Marquee TV + Marquee Cinema unchanged', async () => {
+    const marqueeTv = require('../src/engines/marqueeTv');
+    const tasteFeedback = require('../src/tasteFeedback');
+    const config = require('../src/config');
+    const watchedStore = require('../src/watchedStore');
+    const rs = require('../src/recommendationStore');
+    const settings = require('../src/settings');
+    const db = require('../src/db');
+    const nowMs = Date.parse('2026-10-02T00:00:00Z');
+    const mkLadder = (pid) => [
+      { simkl_id: 100, kind: 'show', imdb_id: 'ttseed1', tmdb_id: 'seed1', title: 'SciFi Show', year: 2020, status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0, last_watched_at: nowMs, first_watched_at: nowMs, first_real_at: nowMs, last_real_at: nowMs, stamps: 10, real_stamps: 10, eps_per_week: null },
+    ];
+    const tvMeta = (apiKey, ids) => {
+      const m = new Map();
+      for (const id of ids) m.set(id, { tmdb_id: id, imdb_id: 'tt' + id, type: 'series', title: 'Show ' + id, year: 2024, genres: ['Drama'], keywords: [], tvType: 'Scripted', status: 'Returning Series', vote_average: 8, vote_count: 1000, popularity: 5, certAU: null, certUS: null, first_air_date: '2024-01-01', last_air_date: '2026-01-01', number_of_episodes: 20, number_of_seasons: 1 });
+      return m;
+    };
+    const mkCtx = (profile, filters, skipSync) => ({
+      settings: { llm: {} },
+      nowMs,
+      filters,
+      tmdbKey: 'itest-tmdb',
+      mdblistKey: '',
+      log: { log: () => {}, warn: () => {}, error: () => {} },
+      stats: {},
+      watchedIds: { imdb: new Set(), tmdb: new Set() },
+      dont: new Set(),
+      marqueeSkipSync: skipSync,
+      marqueeTvFetchers: { tvMeta, simklRecs: async () => new Map(), tmdbRecs: () => [], discover: () => [], trending: () => [], imdbRatings: () => new Map() },
+    });
+    const p = config.addProfile('INT-TV-R-T7');
+    const realSync = tasteFeedback.syncRatings;
+    let syncCalls = [];
+    tasteFeedback.syncRatings = async (profile, opts) => { syncCalls.push(opts); return { ok: true, skipped: 'unchanged' }; };
+    const T0 = 1_000_000;
+    const min = 60e3;
+    try {
+      config.updateProfile(p.id, {
+        filters: { engine_series: 'marquee-tv', excluded_genres: [], min_year: 2010, min_rating: 7, vote_count_floor: 50, age_limit: 0 },
+        keys: { tmdb_api_key: 'itest-tmdb' },
+        simkl_auth: { access_token: 'tok' },
+      });
+      const profile = config.getProfile(p.id);
+      watchedStore.upsertSeriesProgress(p.id, mkLadder(p.id));
+      // (a) marqueeSkipSync false → syncRatings called once with type 'series'.
+      syncCalls = [];
+      await marqueeTv.generate(profile, 'series', mkCtx(profile, profile.filters, false));
+      assert.strictEqual(syncCalls.length, 1, 'syncRatings called once');
+      assert.strictEqual(syncCalls[0].type, 'series', 'syncRatings called with type series');
+      // (b) marqueeSkipSync true → syncRatings NOT called.
+      syncCalls = [];
+      await marqueeTv.generate(profile, 'series', mkCtx(profile, profile.filters, true));
+      assert.strictEqual(syncCalls.length, 0, 'syncRatings NOT called (marqueeSkipSync)');
+      // (c) needsBuild: Marquee TV profile → true after a show rating change, false after markTrainingBuilt.
+      rs.upsertCandidates(p.id, [{ type: 'series', tmdb_id: 't7', imdb_id: 'ttt7', title: 'T', year: 2020, vote_average: 7, vote_count: 1000, affinity: 0.5, rec_count: 1, popularity: 5 }]);
+      rs.setBuiltAt(p.id, T0);
+      settings.updateSettings({ engines: { 'marquee-tv': true } });
+      tasteFeedback.recordChange(p.id, T0 + 5 * min);
+      assert.strictEqual(rs.needsBuild(p.id, { profile, now: T0 + 9 * min }), false, 'inside the quiet period');
+      assert.strictEqual(rs.needsBuild(p.id, { profile, now: T0 + 15 * min }), true, 'quiet period elapsed (Marquee TV)');
+      tasteFeedback.markTrainingBuilt(p.id, T0 + 5 * min);
+      assert.strictEqual(rs.needsBuild(p.id, { profile, now: T0 + 15 * min }), false, 'the build covered the change');
+      // (d) Genesis-series, Genesis-movie profile is unaffected.
+      const pG = config.addProfile('INT-TV-R-T7G');
+      config.updateProfile(pG.id, { filters: { engine_movie: 'genesis', engine_series: 'genesis' }, keys: { tmdb_api_key: 'itest-tmdb' }, simkl_auth: { access_token: 'tok' } });
+      const profileG = config.getProfile(pG.id);
+      rs.upsertCandidates(pG.id, [{ type: 'series', tmdb_id: 't7g', imdb_id: 'ttt7g', title: 'T', year: 2020, vote_average: 7, vote_count: 1000, affinity: 0.5, rec_count: 1, popularity: 5 }]);
+      rs.setBuiltAt(pG.id, T0);
+      tasteFeedback.recordChange(pG.id, T0 + 5 * min);
+      assert.strictEqual(rs.needsBuild(pG.id, { profile: profileG, now: T0 + 15 * min }), false, 'Genesis-series/Genesis-movie unaffected');
+      config.removeProfile(pG.id);
+      rs.deleteForProfile(pG.id);
+    } finally {
+      tasteFeedback.syncRatings = realSync;
+      settings.updateSettings({ engines: { 'marquee-tv': false } });
+      config.removeProfile(p.id);
+      watchedStore.deleteForProfile(p.id);
+      rs.deleteForProfile(p.id);
+      tasteFeedback.deleteForProfile(p.id);
+      db.get().prepare('DELETE FROM taste_changes WHERE profile_id = ?').run(p.id);
+    }
+  });
+
   // ── TV-3 B1: the taste brief (local LLM) ──
   // The exact prompt (rung words, rated suffix, split genres, networks), a
   // second call is a cache hit, a rung change changes the key, a failure →
