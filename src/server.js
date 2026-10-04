@@ -152,9 +152,10 @@ const scrobble = require('./services/scrobble');
 const watchedStore = require('./watchedStore');
 const recommendationStore = require('./recommendationStore');
 const jobs = require('./jobs');
+const aiSchedule = require('./aiSchedule');
 const mobileOtpStore = require('../mobile/server/otpStore');
 const TICK_MS = 60 * 60e3;
-function tick() {
+async function tick() {
   for (const profile of config.listProfiles()) {
     try {
       // A rebuild or a Trakt import in flight is already moving this profile's
@@ -162,18 +163,33 @@ function tick() {
       // don't kick off a build off a half-finished import (the mid-import
       // activities bump would otherwise pull a partial history and rebuild on it).
       if (jobs.isBusy(profile.id)) continue;
-      scrobble.ensureSynced(profile);
+      // Awaitable provider→Simkl sync (Stage 3): the tick waits for the sync
+      // to complete before proceeding to the local backfill and the AI
+      // schedule consider. A failure logs a warning and resolves (the tick
+      // proceeds to the local backfill even when the provider/Simkl sync
+      // fails).
+      await scrobble.ensureSyncedAsync(profile);
       rebuild.ensureFresh(profile);
-      // v6: pull Simkl watched history (activities-gated — a no-op when nothing
-      // changed) into the local store, top up genre/age enrichment, then rebuild
-      // the recommendation pool if the watched history moved (ensureBuilt is a
-      // no-op when nothing new was watched). All fire-and-forget; failures are
-      // logged, never fatal.
+      // v6: pull Simkl watched history (activities-gated — a no-op when
+      // nothing changed) into the local store, top up genre/age enrichment,
+      // then let the AI schedule decide whether a heavy build is due. The
+      // local backfill is request-time and network-free (M1.2); the heavy
+      // watch-driven build is deferred to the daily/weekly window
+      // (M1.3/M1.4).
       if (profile.simkl_auth?.access_token) {
-        watchedStore.syncFromSimkl(profile)
-          .then(() => watchedStore.enrichPending(profile.id))
-          .then(() => recommendationStore.ensureBuilt(profile))
-          .catch((err) => console.warn(`[simkl] ${profile.name}: watched sync/enrich/build failed — ${err.message}`));
+        try {
+          await watchedStore.syncFromSimkl(profile);
+          await watchedStore.enrichPending(profile.id);
+        } catch (err) {
+          console.warn(`[simkl] ${profile.name}: watched sync/enrich failed — ${err.message}`);
+        }
+        // AI schedule consider: runs the local due test and enqueues at most
+        // one heavy recs job per profile through the existing global queue.
+        // Never calls an external API. A no-op when the daily/weekly window
+        // is not due or the history is unchanged.
+        aiSchedule.consider(profile, Date.now()).catch((err) =>
+          console.warn(`[ai-schedule] ${profile.name}: consider failed — ${err.message}`)
+        );
       }
       // v6 decay: retire persistently-shown-but-ignored recommendations. Cheap
       // local SQL scan. Opt-in per profile (v6.37) — decayWindowMsFor returns
@@ -195,4 +211,4 @@ function tick() {
 setInterval(tick, TICK_MS);
 
 // Also warm on boot (after a short delay so the container settles)
-setTimeout(tick, 15e3);
+setTimeout(() => { tick().catch((err) => console.error(`[scheduler] boot tick failed: ${err.message}`)); }, 15e3);

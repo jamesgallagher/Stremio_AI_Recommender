@@ -4938,6 +4938,120 @@ ok('TV-3 S1: the descriptor — serveOrder calibrated + serveOptions returns the
   assert.deepStrictEqual(marqueeTv.serveOptions({}), cfg.serve, 'serveOptions({}) = the §6 serve defaults');
 });
 
+// ---- AI catalog cadence (feature/ai-catalog-cadence) — Stage 1 ----
+// Pure Sydney due calculation, durable state, and the local watch-history
+// fingerprint. No scheduler wiring yet (Stage 3 wires the tick).
+{
+  const aiSchedule = require('../src/aiSchedule');
+  const rs = require('../src/recommendationStore');
+  const watchedStore = require('../src/watchedStore');
+  const config = require('../src/config');
+
+  // Fixed Sydney instants (Sydney = UTC+11 in October, after the 2026-10-04 DST start):
+  //   Sunday 2026-10-04 03:00 Sydney = 2026-10-03T16:00Z
+  //   Monday 2026-10-05 02:59 Sydney = 2026-10-04T15:59Z
+  //   Monday 2026-10-05 03:00 Sydney = 2026-10-04T16:00Z
+  const sunday0300 = Date.parse('2026-10-03T16:00:00Z');
+  const sunday0200 = Date.parse('2026-10-03T15:00:00Z'); // Sunday 02:00 Sydney
+  const mon0259 = Date.parse('2026-10-04T15:59:00Z');
+  const mon0300 = Date.parse('2026-10-04T16:00:00Z');
+
+  ok('aiSchedule: 2026-10-04 is a Sydney Sunday; weekdayOf + sydneyDay agree', () => {
+    // 2026-10-04 is a Sunday (weekday 0).
+    assert.strictEqual(aiSchedule.weekdayOf(2026, 10, 4), 0, '2026-10-04 is Sunday');
+    const p = aiSchedule.sydneyParts(sunday0300);
+    assert.strictEqual(aiSchedule.sydneyDay(sunday0300), '2026-10-04', 'Sydney date of the instant');
+    assert.strictEqual(p.h, 3); assert.strictEqual(p.min, 0);
+  });
+
+  ok('aiSchedule: dueAt cold-start on an empty pool', () => {
+    const d = aiSchedule.dueAt({ nowMs: sunday0300, evaluatedDay: null, completedWeek: null, builtHash: null, currentHash: 'h', retryAfter: null, hasPool: false });
+    assert.deepStrictEqual(d, { due: false, reason: 'cold-start' });
+  });
+
+  ok('aiSchedule: dueAt weekly (forced Sunday) at/after 03:00 even with unchanged hash', () => {
+    const d = aiSchedule.dueAt({ nowMs: sunday0300, evaluatedDay: null, completedWeek: null, builtHash: 'h', currentHash: 'h', retryAfter: null, hasPool: true });
+    assert.strictEqual(d.due, true);
+    assert.strictEqual(d.kind, 'weekly');
+    assert.strictEqual(d.anchor, '2026-10-04');
+    // Before 03:00 on Sunday, the new week is not due yet (the previous Sunday is the anchor).
+    const dEarly = aiSchedule.dueAt({ nowMs: sunday0200, evaluatedDay: null, completedWeek: '2026-10-04', builtHash: 'h', currentHash: 'h', retryAfter: null, hasPool: true });
+    assert.strictEqual(dEarly.due, false, 'Sunday before 03:00 with the week already completed → not due');
+  });
+
+  ok('aiSchedule: dueAt daily window — before 03:00 not due; at/after 03:00 queues once; unchanged skips', () => {
+    // Before 03:00, a changed watch does not queue heavy work.
+    let d = aiSchedule.dueAt({ nowMs: mon0259, evaluatedDay: null, completedWeek: '2026-10-04', builtHash: 'old', currentHash: 'new', retryAfter: null, hasPool: true });
+    assert.strictEqual(d.due, false); assert.strictEqual(d.reason, 'before-window');
+    // At/after 03:00, a changed watch queues a daily build.
+    d = aiSchedule.dueAt({ nowMs: mon0300, evaluatedDay: null, completedWeek: '2026-10-04', builtHash: 'old', currentHash: 'new', retryAfter: null, hasPool: true });
+    assert.strictEqual(d.due, true); assert.strictEqual(d.kind, 'daily'); assert.strictEqual(d.anchor, '2026-10-05');
+    // Unchanged history skips + marks the day evaluated.
+    d = aiSchedule.dueAt({ nowMs: mon0300, evaluatedDay: null, completedWeek: '2026-10-04', builtHash: 'h', currentHash: 'h', retryAfter: null, hasPool: true });
+    assert.strictEqual(d.due, false); assert.strictEqual(d.reason, 'unchanged'); assert.strictEqual(d.markEvaluated, true); assert.strictEqual(d.anchor, '2026-10-05');
+    // Once the window is evaluated, a later watch waits until tomorrow.
+    d = aiSchedule.dueAt({ nowMs: Date.parse('2026-10-04T20:00:00Z'), evaluatedDay: '2026-10-05', completedWeek: '2026-10-04', builtHash: 'old', currentHash: 'new', retryAfter: null, hasPool: true });
+    assert.strictEqual(d.due, false); assert.strictEqual(d.reason, 'not-due');
+  });
+
+  ok('aiSchedule: dueAt backoff — a failed build backs off; the window is not consumed', () => {
+    const retryAfter = mon0300 + 30 * 60e3;
+    let d = aiSchedule.dueAt({ nowMs: mon0300, evaluatedDay: null, completedWeek: '2026-10-04', builtHash: 'old', currentHash: 'new', retryAfter, hasPool: true });
+    assert.strictEqual(d.due, false); assert.strictEqual(d.reason, 'backoff');
+    // After the backoff passes, the window is still due (not consumed).
+    d = aiSchedule.dueAt({ nowMs: mon0300 + 31 * 60e3, evaluatedDay: null, completedWeek: '2026-10-04', builtHash: 'old', currentHash: 'new', retryAfter, hasPool: true });
+    assert.strictEqual(d.due, true); assert.strictEqual(d.kind, 'daily');
+  });
+
+  // T2 — fingerprint semantics: a byte-identical re-sync is unchanged; a
+  // backdated import, an unwatch, a pending watch, and a new episode change it.
+  ok('aiSchedule: historyHash — identical re-sync unchanged; backdated/unwatch/pending/episode change it', () => {
+    const pid = 'ai-sched-hash';
+    config.addProfile(pid);
+    try {
+      // Seed a watched movie + a series with episode progress.
+      const seriesRow = (over) => ({
+        simkl_id: 2, kind: 'show', imdb_id: 'tt2', tmdb_id: '200', title: 'S1', year: 2021,
+        status: 'watching', watched_eps: 3, total_eps: 10, not_aired_eps: null,
+        last_watched_at: 3000, first_watched_at: 1000, first_real_at: 1000, last_real_at: 3000,
+        stamps: 3, real_stamps: 3, eps_per_week: null, ...over,
+      });
+      watchedStore.upsertMany(pid, [
+        { simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '100', title: 'M1', year: 2020, watched_at: '2026-09-01T10:00:00Z' },
+        { simkl_id: 2, type: 'series', imdb_id: 'tt2', tmdb_id: '200', title: 'S1', year: 2021, watched_at: '2026-09-02T10:00:00Z' },
+      ]);
+      watchedStore.upsertSeriesProgress(pid, [seriesRow({})]);
+      const h0 = aiSchedule.historyHash(pid);
+      // A byte-identical re-sync (same ids + timestamps) → same hash.
+      watchedStore.upsertMany(pid, [
+        { simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '100', title: 'M1', year: 2020, watched_at: '2026-09-01T10:00:00Z' },
+        { simkl_id: 2, type: 'series', imdb_id: 'tt2', tmdb_id: '200', title: 'S1', year: 2021, watched_at: '2026-09-02T10:00:00Z' },
+      ]);
+      watchedStore.upsertSeriesProgress(pid, [seriesRow({})]);
+      assert.strictEqual(aiSchedule.historyHash(pid), h0, 'identical re-sync → same hash');
+      // Enrichment-only change (title/genre) → same hash.
+      watchedStore.updateEnrichment(pid, 1, { genre: 'Drama', age: 'PG' });
+      assert.strictEqual(aiSchedule.historyHash(pid), h0, 'enrichment-only → same hash');
+      // A backdated newly imported watch (same id, older timestamp) → different hash.
+      watchedStore.upsertMany(pid, [{ simkl_id: 3, type: 'movie', imdb_id: 'tt3', tmdb_id: '300', title: 'M2', year: 2015, watched_at: '2026-08-01T10:00:00Z' }]);
+      assert.notStrictEqual(aiSchedule.historyHash(pid), h0, 'backdated import → different hash');
+      // A local unwatch (removing a baseline watched row) → different hash.
+      watchedStore.removeWatched(pid, 'movie', { imdbId: 'tt1' });
+      assert.notStrictEqual(aiSchedule.historyHash(pid), h0, 'unwatch → different hash');
+      // Restore the baseline row (tt1) so the pending-watch check is isolated.
+      watchedStore.upsertMany(pid, [{ simkl_id: 1, type: 'movie', imdb_id: 'tt1', tmdb_id: '100', title: 'M1', year: 2020, watched_at: '2026-09-01T10:00:00Z' }]);
+      // A pending watch → different hash.
+      watchedStore.addPendingWatched(pid, { type: 'movie', imdbId: 'tt4' });
+      assert.notStrictEqual(aiSchedule.historyHash(pid), h0, 'pending watch → different hash');
+      // A newly watched episode (watched_eps incremented) → different hash.
+      watchedStore.upsertSeriesProgress(pid, [seriesRow({ watched_eps: 4, last_real_at: 4000, real_stamps: 4, stamps: 4 })]);
+      assert.notStrictEqual(aiSchedule.historyHash(pid), h0, 'newly watched episode → different hash');
+    } finally {
+      config.removeProfile(pid); rs.deleteForProfile(pid); watchedStore.deleteForProfile(pid);
+    }
+  });
+}
+
 // ---- HTTP surface ----
 console.log('http:');
 require('../src/server');

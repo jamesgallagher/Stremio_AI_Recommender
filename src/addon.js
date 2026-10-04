@@ -8,6 +8,7 @@ const store = require('./store');
 const rebuild = require('./rebuild');
 const catalogs = require('./catalogs');
 const recommendationStore = require('./recommendationStore');
+const aiSchedule = require('./aiSchedule');
 const dontRecommend = require('./dontRecommend');
 // CP-01: the served-titles assembly + the AI catalog registry + RPDB swap live
 // in one shared module, so the addon route, the portal preview and the companion
@@ -348,10 +349,14 @@ router.get('/catalog/:type/:catalogId{/:extra}', async (req, res) => {
   // route is the Stremio envelope: SWR triggers, skip pagination, warming-up
   // cards, cache headers. Cache-only, no network.
   if (aiCatalog) {
-    // SWR: fire-and-forget background build when the watched history moved
-    // (no-op when fresh/locked). This request serves the current pool.
+    // SWR (Stage 3): the AI schedule decides whether a heavy build is due
+    // (daily watch-driven or forced Sunday). A no-op when the window is not
+    // due or the history is unchanged. The local backfill (watched-first
+    // selection before the limit) is request-time and network-free (M1.2);
+    // the heavy watch-driven build is deferred to the daily/weekly window
+    // (M1.3/M1.4). This request serves the current pool.
     if (profile.simkl_auth?.access_token) {
-      recommendationStore.ensureBuilt(profile).catch((err) => console.warn(`[rec] ${profile.name}: background build failed — ${err.message}`));
+      aiSchedule.consider(profile, Date.now()).catch((err) => console.warn(`[ai-schedule] ${profile.name}: consider failed — ${err.message}`));
     }
   } else {
     rebuild.ensureFresh(profile); // SWR: fire-and-forget; this request serves cache
