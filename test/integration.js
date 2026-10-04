@@ -9809,6 +9809,10 @@ async function main() {
       const prevEngines = { ...(settings.getSettings()?.engines || {}) };
       const origBuildPool = rs.buildPool;
       settings.updateSettings({ keys: { tmdb_api_key: 't9a-tmdb' } });
+      // Fixed Sydney instants: 2026-10-04 17:00 UTC = 03:00/04:00 Sydney (after window).
+      // 2026-10-04 15:00 UTC = 01:00/02:00 Sydney (before window).
+      const AFTER_WINDOW = Date.UTC(2026, 9, 4, 17, 0);
+      const PRE_WINDOW = Date.UTC(2026, 9, 4, 15, 0);
       try {
         // Seed watched history + a non-empty pool so the schedule state is initialized.
         watchedStore.upsertMany(pid, [
@@ -9818,7 +9822,7 @@ async function main() {
           { type: 'movie', tmdb_id: 't9a-m1', imdb_id: 'tt-t9a-m1', title: 'M1', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, affinity: 5, rec_count: 1, popularity: 1, poster: null, engine_id: 'genesis' },
         ], { ratingCheckedAt: null });
         // Initialize the schedule state (so dueAt sees hasPool=true).
-        aiSchedule.initFromExisting(pid, Date.now());
+        aiSchedule.initFromExisting(pid, AFTER_WINDOW);
         // Add a new watched item so the history hash changes (triggering the daily build).
         watchedStore.upsertMany(pid, [
           { simkl_id: 2, type: 'movie', imdb_id: 'tt-new-watch', tmdb_id: 'w2', title: 'New Watch', year: 2025, watched_at: '2026-10-04T10:00:00Z' },
@@ -9827,9 +9831,13 @@ async function main() {
         // Stub buildPool to throw (simulating a failed scheduled build).
         rs.buildPool = async () => { throw new Error('simulated build failure'); };
 
-        // Run consider — it should enqueue the job and the rejection should be
-        // consumed (logged) without crashing the process.
-        const result = await aiSchedule.consider(config.getProfile(pid), Date.now());
+        // Pre-window: consider must NOT queue (the daily window hasn't opened).
+        const preResult = await aiSchedule.consider(config.getProfile(pid), PRE_WINDOW);
+        assert.ok(!preResult.queued, 'consider does not queue before the 03:00 Sydney window');
+
+        // At/after window: consider should enqueue the job and the rejection
+        // should be consumed (logged) without crashing the process.
+        const result = await aiSchedule.consider(config.getProfile(pid), AFTER_WINDOW);
         assert.ok(result.queued, 'consider queued the scheduled build');
 
         // Wait for the job to settle (the queue runs the job synchronously).
@@ -10119,6 +10127,10 @@ async function main() {
       const prevEngines = { ...(settings.getSettings()?.engines || {}) };
       const origBuildPool = rs.buildPool;
       settings.updateSettings({ keys: { tmdb_api_key: 't10c-tmdb' } });
+      // Fixed Sydney instants: 2026-10-04 17:00 UTC = 03:00/04:00 Sydney (after window).
+      // 2026-10-04 15:00 UTC = 01:00/02:00 Sydney (before window).
+      const AFTER_WINDOW = Date.UTC(2026, 9, 4, 17, 0);
+      const PRE_WINDOW = Date.UTC(2026, 9, 4, 15, 0);
       try {
         // Seed watched history + a non-empty pool.
         watchedStore.upsertMany(pid, [
@@ -10127,7 +10139,7 @@ async function main() {
         rs.upsertCandidates(pid, [
           { type: 'movie', tmdb_id: 't10c-m1', imdb_id: 'tt-t10c-m1', title: 'M1', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, affinity: 5, rec_count: 1, popularity: 1, poster: null, engine_id: 'genesis' },
         ], { ratingCheckedAt: null });
-        aiSchedule.initFromExisting(pid, Date.now());
+        aiSchedule.initFromExisting(pid, AFTER_WINDOW);
         // Add a new watched item so the history hash changes (triggering the daily build).
         watchedStore.upsertMany(pid, [
           { simkl_id: 2, type: 'movie', imdb_id: 'tt-new-watch', tmdb_id: 'w2', title: 'New Watch', year: 2025, watched_at: '2026-10-04T10:00:00Z' },
@@ -10136,9 +10148,13 @@ async function main() {
         // Stub buildPool to return a skipped result.
         rs.buildPool = async () => ({ skipped: true, reason: 'acceptance-gate', movie: { stored: 0 }, series: { stored: 0 }, total: 0 });
 
-        // Run consider — it should enqueue the job and the rejection should be
-        // consumed (logged) without crashing the process.
-        const result = await aiSchedule.consider(config.getProfile(pid), Date.now());
+        // Pre-window: consider must NOT queue (the daily window hasn't opened).
+        const preResult = await aiSchedule.consider(config.getProfile(pid), PRE_WINDOW);
+        assert.ok(!preResult.queued, 'consider does not queue before the 03:00 Sydney window');
+
+        // At/after window: consider should enqueue the job and the rejection
+        // should be consumed (logged) without crashing the process.
+        const result = await aiSchedule.consider(config.getProfile(pid), AFTER_WINDOW);
         assert.ok(result.queued, 'consider queued the scheduled build');
 
         // Wait for the job to settle.
@@ -10154,6 +10170,104 @@ async function main() {
         assert.ok(jobState, 'job state exists');
         assert.strictEqual(jobState.state, 'error', 'queue state is error (not done)');
         assert.ok(jobState.error && jobState.error.includes('skipped'), 'error message includes skipped');
+      } finally {
+        rs.buildPool = origBuildPool;
+        settings.updateSettings({ keys: { tmdb_api_key: prevTmdb } });
+        settings.updateSettings({ engines: prevEngines });
+        aiSchedule._reset();
+        config.removeProfile(pid); rs.deleteForProfile(pid); watchedStore.deleteForProfile(pid);
+      }
+    });
+
+    // ---- Review round 3 regressions ----
+
+    await it('T11a: acceptance gate oldEligible reflects the actual served catalog (no vote floor on old side)', async () => {
+      const prof = config.addProfile('T11a');
+      const pid = prof.id;
+      const prevTmdb = settings.getSettings()?.keys?.tmdb_api_key || '';
+      const prevEngines = { ...(settings.getSettings()?.engines || {}) };
+      settings.updateSettings({ keys: { tmdb_api_key: 't11a-tmdb' } });
+      settings.updateSettings({ engines: { 't11a-engine': true } });
+      // Set a vote floor of 1000 so below-floor rows are filtered by atomicPromotion.
+      config.updateProfile(pid, { filters: { engine_movie: 't11a-engine', engine_series: 't11a-engine', min_rating: 0, vote_count_floor: 1000 } });
+      const dispose = engines._register({
+        id: 't11a-engine', name: 'T11A', description: 't', supportedTypes: ['movie', 'series'],
+        capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+        requirements: () => ({ ok: true, missing: [] }),
+        generate: async (profile, type) => {
+          if (type === 'movie') {
+            // 2 new movies, both above the vote floor.
+            return [
+              { type: 'movie', tmdb_id: 't11a-new1', rankScore: 5, imdb_id: 'tt-t11a-new1', title: 'New1', year: 2025, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, popularity: 1, poster: null },
+              { type: 'movie', tmdb_id: 't11a-new2', rankScore: 4, imdb_id: 'tt-t11a-new2', title: 'New2', year: 2025, primary_genre: 'Action', genres: 'Action', vote_average: 7, vote_count: 4000, popularity: 1, poster: null },
+            ];
+          }
+          return [];
+        },
+      });
+      try {
+        // Seed the old movie pool with 3 rows: one below the vote floor (vote_count=100).
+        // The serve path (selectedRecommendationRows) does NOT apply the vote floor,
+        // so all 3 are currently served. After promotion, the below-floor row is
+        // deleted, leaving only 2. The gate must block this replacement.
+        rs.upsertCandidates(pid, [
+          { type: 'movie', tmdb_id: 't11a-old1', imdb_id: 'tt-t11a-old1', title: 'Old1', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, affinity: 5, rec_count: 1, popularity: 1, poster: null, engine_id: 't11a-engine' },
+          { type: 'movie', tmdb_id: 't11a-old2', imdb_id: 'tt-t11a-old2', title: 'Old2', year: 2024, primary_genre: 'Action', genres: 'Action', vote_average: 7, vote_count: 4000, affinity: 4, rec_count: 1, popularity: 1, poster: null, engine_id: 't11a-engine' },
+          { type: 'movie', tmdb_id: 't11a-old3', imdb_id: 'tt-t11a-old3', title: 'Old3', year: 2024, primary_genre: 'Sci-Fi', genres: 'Sci-Fi', vote_average: 7, vote_count: 100, affinity: 3, rec_count: 1, popularity: 1, poster: null, engine_id: 't11a-engine' },
+        ], { ratingCheckedAt: null });
+
+        // Run the staged build. oldEligible = 3 (no vote floor on old side).
+        // newEligible = 2 (vote floor applied to new side). minRequired = min(20, 3) = 3.
+        // 2 < 3 → gate fails → build skipped.
+        const result = await rs.buildPool(config.getProfile(pid), quiet, () => {}, { kind: 'weekly', anchor: '2026-10-04', startHash: 'h0' });
+        assert.ok(result.skipped, 'build skipped (gate blocks a shrinking catalog)');
+        assert.ok(result.reason === 'acceptance-gate', 'reason is acceptance-gate');
+        // The old pool is intact (all 3 rows still present).
+        assert.strictEqual(rs.countRecommended(pid, 'movie'), 3, 'old pool intact (3 rows)');
+      } finally {
+        settings.updateSettings({ keys: { tmdb_api_key: prevTmdb } });
+        settings.updateSettings({ engines: prevEngines });
+        dispose();
+        config.removeProfile(pid); rs.deleteForProfile(pid); watchedStore.deleteForProfile(pid);
+      }
+    });
+
+    await it('T11b: a colliding external error message still persists the retry marker', async () => {
+      const prof = config.addProfile('T11b');
+      const pid = prof.id;
+      const prevTmdb = settings.getSettings()?.keys?.tmdb_api_key || '';
+      const prevEngines = { ...(settings.getSettings()?.engines || {}) };
+      const origBuildPool = rs.buildPool;
+      settings.updateSettings({ keys: { tmdb_api_key: 't11b-tmdb' } });
+      try {
+        // Seed watched history + a non-empty pool.
+        watchedStore.upsertMany(pid, [
+          { simkl_id: 1, type: 'movie', imdb_id: 'tt-watched', tmdb_id: 'w1', title: 'Watched', year: 2020, watched_at: '2026-09-01T10:00:00Z' },
+        ]);
+        rs.upsertCandidates(pid, [
+          { type: 'movie', tmdb_id: 't11b-m1', imdb_id: 'tt-t11b-m1', title: 'M1', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, affinity: 5, rec_count: 1, popularity: 1, poster: null, engine_id: 'genesis' },
+        ], { ratingCheckedAt: null });
+        aiSchedule.initFromExisting(pid, Date.UTC(2026, 9, 4, 17, 0));
+
+        // Stub buildPool to throw an error whose message contains "skipped —"
+        // (simulating an unrelated engine/provider error with a colliding word).
+        rs.buildPool = async () => { throw new Error('provider skipped — transient'); };
+
+        // Run the scheduled build directly. The error must be recorded as a
+        // failure (retry_after set), not misclassified as an internally-recorded skip.
+        let threw = null;
+        try {
+          await aiSchedule.runScheduledBuild(config.getProfile(pid), 'daily', '2026-10-04', 'h0', () => {});
+        } catch (err) {
+          threw = err;
+        }
+        assert.ok(threw, 'runScheduledBuild throws for a thrown build error');
+        assert.ok(threw.message.includes('provider skipped'), 'error message preserved');
+
+        // The durable retry marker IS set (the error was not misclassified).
+        const st = aiSchedule.getScheduleState(pid);
+        assert.ok(st.retry_after, 'retry_after is set after a thrown build error (not suppressed by substring match)');
+        assert.ok(!st.last_success_at, 'last_success_at NOT set');
       } finally {
         rs.buildPool = origBuildPool;
         settings.updateSettings({ keys: { tmdb_api_key: prevTmdb } });

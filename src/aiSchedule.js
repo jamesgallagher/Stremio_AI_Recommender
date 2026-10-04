@@ -371,34 +371,35 @@ async function consider(profile, nowMs) {
 // next eligible tick can retry. Only a successful promotion records success.
 async function runScheduledBuild(profile, kind, anchor, startHash, progress) {
   const rs = require('./recommendationStore');
+  let result;
   try {
-    const result = await rs.buildPool(profile, console, progress, { kind, anchor, startHash });
-    if (result.skipped) {
-      // Non-promotion: treat as a retryable failure. The window stays due.
-      // Throw so the queue records the job as an error (not 'done'), while
-      // the durable retry marker is set by recordFailure. The .catch() in
-      // consider consumes the rejection to prevent process exit.
-      const retryAfter = recordFailure(profile.id, kind, anchor, result.reason || 'skipped');
-      const err = new Error(`${kind} ${anchor} skipped — ${result.reason || 'unknown'}`);
-      console.warn(`[ai-schedule] ${profile.name}: ${err.message}; retry after ${new Date(retryAfter).toISOString()}`);
-      throw err;
-    }
-    const counts = {
-      movies: result.movie?.stored || 0,
-      shows: result.series?.stored || 0,
-      pool: result.total || 0,
-    };
-    recordSuccess(profile.id, kind, anchor, startHash, counts);
-    console.log(`[ai-schedule] ${profile.name}: ${kind} ${anchor} completed — movies ${counts.movies}, shows ${counts.shows}, pool ${counts.pool}`);
-    return result;
+    result = await rs.buildPool(profile, console, progress, { kind, anchor, startHash });
   } catch (err) {
-    // The catch handles thrown errors from buildPool (not the skipped case,
-    // which already called recordFailure above). Avoid double-recording.
-    if (err.message.includes('skipped —')) throw err; // already recorded
+    // A thrown build error (engine failure, network, etc.): persist exactly
+    // one retry marker and rethrow so the queue records state:'error'.
     const retryAfter = recordFailure(profile.id, kind, anchor, err.message);
     console.warn(`[ai-schedule] ${profile.name}: ${kind} ${anchor} failed — retry after ${new Date(retryAfter).toISOString()}: ${err.message}`);
     throw err;
   }
+  if (result.skipped) {
+    // A skipped result (missing TMDB key, failed acceptance gate, sparse
+    // output): persist exactly one retry marker and throw so the queue
+    // records state:'error'. The .catch() in consider consumes the rejection
+    // to prevent process exit.
+    const retryAfter = recordFailure(profile.id, kind, anchor, result.reason || 'skipped');
+    const err = new Error(`${kind} ${anchor} skipped — ${result.reason || 'unknown'}`);
+    console.warn(`[ai-schedule] ${profile.name}: ${err.message}; retry after ${new Date(retryAfter).toISOString()}`);
+    throw err;
+  }
+  // Success: persist the completion markers.
+  const counts = {
+    movies: result.movie?.stored || 0,
+    shows: result.series?.stored || 0,
+    pool: result.total || 0,
+  };
+  recordSuccess(profile.id, kind, anchor, startHash, counts);
+  console.log(`[ai-schedule] ${profile.name}: ${kind} ${anchor} completed — movies ${counts.movies}, shows ${counts.shows}, pool ${counts.pool}`);
+  return result;
 }
 
 // Test/maintenance helper: clear all schedule rows + the single-flight set.

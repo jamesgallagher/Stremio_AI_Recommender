@@ -549,20 +549,21 @@ function acceptanceGate(profile, stagedByType, filters) {
   const tmdb = require('./services/tmdb');
   for (const type of ['movie', 'series']) {
     const voteFloor = tmdb.voteFloor(filters, type);
-    // OLD eligible: the same effective serve-time conditions as the new set —
-    // vote floor, current watched state, current suppression, serve filter.
-    // This mirrors selectedRecommendationRows (watched + dont_recommend before
-    // the limit) so the gate compares like-for-like.
+    // OLD eligible: the actual currently served catalog. selectedRecommendationRows
+    // does NOT apply the vote-count floor to stored rows at serve time (the floor
+    // is enforced by atomicPromotion deleting below-floor rows during promotion).
+    // So the old side reflects what is actually served: watched + suppression +
+    // normal serve filters (rating, genre, recency, age band).
     const oldRows = getRecommended(profile.id, { type, limit: 100000 });
     const oldEligible = oldRows.filter((r) => {
-      if (r.vote_count != null && r.vote_count < voteFloor) return false;
       if (r.imdb_id && watchedImdb.has(r.imdb_id)) return false;
       if (dnr.has(`${type}:${r.tmdb_id}`)) return false;
       return filterServable([r], filters).length === 1;
     }).length;
-    // NEW eligible: distinct pool identities (tmdb_id) after the same
-    // exclusions. SQLite upsert collapses equal (profile_id, type, tmdb_id)
-    // candidates, so counting entries would overestimate the served count.
+    // NEW eligible: distinct pool identities (tmdb_id) that would survive
+    // promotion. atomicPromotion deletes below-vote-floor rows, so the vote
+    // floor IS applied to the new set. Watched + suppression + serve filters
+    // also apply (same as the old side).
     const newRows = stagedByType[type] || [];
     const newEligible = new Set(
       newRows.filter((c) => {
