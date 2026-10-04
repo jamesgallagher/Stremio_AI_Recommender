@@ -542,11 +542,29 @@ async function stagedAgeGate(profile, stagedByType, log = console, onProgress = 
 function acceptanceGate(profile, stagedByType, filters) {
   const listSize = listSizeFor(profile);
   const result = { ok: true, movie: null, series: null };
+  // Current watched + suppression state at gate time (a title watched or
+  // suppressed during generation must not count toward the eligible set).
+  const watchedImdb = watchedStore.watchedIdSets(profile.id).imdb;
+  const dnr = dontRecommendKeys(profile.id);
   for (const type of ['movie', 'series']) {
     const oldRows = getRecommended(profile.id, { type, limit: 100000 });
     const oldEligible = filterServable(oldRows, filters).length;
     const newRows = stagedByType[type] || [];
-    const newEligible = filterServable(newRows, filters).length;
+    // Evaluate the actual eligible replacement set after every promotion-time
+    // exclusion: vote-count floor, current watched state, current suppression.
+    const tmdb = require('./services/tmdb');
+    const voteFloor = tmdb.voteFloor(filters, type);
+    const eligible = newRows.filter((c) => {
+      // Vote-count floor (the same filter atomicPromotion applies).
+      if (c.vote_count != null && c.vote_count < voteFloor) return false;
+      // Current watched state (a title watched during generation is not eligible).
+      if (c.imdb_id && watchedImdb.has(c.imdb_id)) return false;
+      // Current suppression state (a title suppressed during generation is not eligible).
+      if (dnr.has(`${type}:${c.tmdb_id}`)) return false;
+      // Serve-time filter (rating floor, excluded genres, recency, age band).
+      return filterServable([c], filters).length === 1;
+    });
+    const newEligible = eligible.length;
     const minRequired = Math.min(listSize, oldEligible);
     const ok = newEligible >= minRequired;
     result[type] = { oldEligible, newEligible, minRequired, ok };
@@ -568,6 +586,17 @@ function atomicPromotion(profileId, stagedByType, { kind, filters, engineIds, ra
   conn.prepare('BEGIN').run();
   try {
     const now = Date.now();
+    // Recheck current suppression at promotion time: a rejection that arrived
+    // during generation (after the pipeline's ctx.dont snapshot) must not be
+    // reinserted. The dont_recommend table is not modified by this transaction,
+    // so reading it here is safe.
+    const dnr = dontRecommendKeys(profileId);
+    for (const type of ['movie', 'series']) {
+      const cands = stagedByType[type] || [];
+      if (cands.length) {
+        stagedByType[type] = cands.filter((c) => !dnr.has(`${type}:${c.tmdb_id}`));
+      }
+    }
     const stmt = conn.prepare(`
       INSERT INTO recommended (profile_id, type, tmdb_id, imdb_id, title, year, primary_genre, genres, vote_average, imdb_rating, imdb_rating_at, vote_count, affinity, rec_count, because_title, score_components, algorithm_version, engine_id, popularity, poster, created_at, certification)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1125,7 +1154,8 @@ function listSizeFor(profile) {
 function selectedRecommendationRows(profile, type, { limit } = {}) {
   const rows = getRecommended(profile.id, { type, limit: 100000 });
   const watchedImdb = watchedStore.watchedIdSets(profile.id).imdb;
-  const unwatched = rows.filter((row) => !watchedImdb.has(row.imdb_id));
+  const dnr = dontRecommendKeys(profile.id);
+  const unwatched = rows.filter((row) => !watchedImdb.has(row.imdb_id) && !dnr.has(`${type}:${row.tmdb_id}`));
   return selectServeFor(profile, type, unwatched, {
     limit: limit ?? listSizeFor(profile),
   });

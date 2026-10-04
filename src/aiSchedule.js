@@ -326,6 +326,18 @@ async function consider(profile, nowMs) {
         markEvaluated(profileId, decision.anchor);
         console.log(`[ai-schedule] ${profile.name}: daily ${decision.anchor} skipped — history unchanged`);
       }
+      // Cold-start: a new or empty AI pool builds immediately (prompt), outside
+      // the daily/weekly window. This restores the boot/request cold-start flow
+      // that was replaced by consider in server.js and addon.js.
+      if (decision.reason === 'cold-start') {
+        const jobs = require('./jobs');
+        if (jobs.isBusy(profileId)) return { skipped: 'busy' };
+        console.log(`[ai-schedule] ${profile.name}: cold-start queued`);
+        const rs = require('./recommendationStore');
+        jobs.enqueue(profileId, 'recs', (progress) => rs.buildPool(profile, console, progress))
+          .catch((err) => console.warn(`[ai-schedule] ${profile.name}: cold-start job rejected — ${err.message}`));
+        return { queued: 'cold-start' };
+      }
       return { skipped: decision.reason };
     }
     const kind = decision.kind;
@@ -335,8 +347,13 @@ async function consider(profile, nowMs) {
     const startHash = currentHash;
     console.log(`[ai-schedule] ${profile.name}: ${kind} ${anchor} queued — ${kind === 'weekly' ? 'forced' : 'history changed'}`);
     // Fire-and-forget through the global queue (the job serializes + reports
-    // progress); the tick does not wait for the heavy build.
-    jobs.enqueue(profileId, 'recs', (progress) => runScheduledBuild(profile, kind, anchor, startHash, progress));
+    // progress); the tick does not wait for the heavy build. The promise is
+    // consumed (logged) so an unhandled rejection never exits the process.
+    // The queue's error state and the durable 30-minute retry marker (set by
+    // recordFailure inside runScheduledBuild) are preserved — this catch only
+    // prevents the rejection from propagating as an unhandled promise.
+    jobs.enqueue(profileId, 'recs', (progress) => runScheduledBuild(profile, kind, anchor, startHash, progress))
+      .catch((err) => console.warn(`[ai-schedule] ${profile.name}: ${kind} ${anchor} job rejected — ${err.message}`));
     return { queued: kind, anchor };
   } finally {
     considering.delete(profileId);
@@ -347,10 +364,21 @@ async function consider(profile, nowMs) {
 // atomic promotion (Stage 2), then the completion markers. `kind` is 'daily' |
 // 'weekly'; `anchor` is the Sydney date of the window; `startHash` is the
 // history snapshot at build start.
+//
+// A skipped build (missing TMDB key, failed acceptance gate, sparse output)
+// is a retryable failure: it does NOT advance built_history_hash,
+// evaluated_day, or completed_week. The 30-minute backoff applies so the
+// next eligible tick can retry. Only a successful promotion records success.
 async function runScheduledBuild(profile, kind, anchor, startHash, progress) {
   const rs = require('./recommendationStore');
   try {
     const result = await rs.buildPool(profile, console, progress, { kind, anchor, startHash });
+    if (result.skipped) {
+      // Non-promotion: treat as a retryable failure. The window stays due.
+      const retryAfter = recordFailure(profile.id, kind, anchor, result.reason || 'skipped');
+      console.warn(`[ai-schedule] ${profile.name}: ${kind} ${anchor} skipped — ${result.reason || 'unknown'}; retry after ${new Date(retryAfter).toISOString()}`);
+      return result;
+    }
     const counts = {
       movies: result.movie?.stored || 0,
       shows: result.series?.stored || 0,
