@@ -56,14 +56,24 @@ function servedCatalog(profile, catalogId, { record = false } = {}) {
     const hasSimkl = !!profile.simkl_auth?.access_token;
     const raw = recommendationStore.serveRecommendations(profile, def.type, { record });
     if (!raw.length) {
+      // The watched-first selection can legitimately produce zero visible rows
+      // when the pool has rows but every one is watched or excluded — that is a
+      // BUILT pool serving nothing, not an unbuilt one. Distinguish it from a
+      // genuinely empty type pool by checking whether the type has at least one
+      // stored row (countRecommended counts BOTH types and would mistake a
+      // movie-empty pool for a built movie pool).
+      const poolHasRows = recommendationStore.getRecommended(profile.id, { type: def.type, limit: 1 }).length > 0;
+      if (poolHasRows) {
+        return { id: catalogId, name: def.name, type: def.type, source: 'ai', requirement_met: true, state: 'ok', metas: [] };
+      }
       return {
         id: catalogId, name: def.name, type: def.type, source: 'ai',
         requirement_met: hasSimkl, state: hasSimkl ? 'not_built' : 'needs_simkl', metas: [],
       };
     }
-    // Serve-time watched prune: the pool excludes watched at build, this catches
-    // titles watched since. Union of both types — IMDb ids are global and
-    // Simkl/TMDB can disagree on movie vs show.
+    // Serve-time watched prune (safety net): a watch can arrive between the
+    // watched-first selection and this response. Union of both types — IMDb ids
+    // are global and Simkl/TMDB can disagree on movie vs show.
     const watched = watchedStore.watchedIdSets(profile.id).imdb;
     const metas = applyRpdb(raw.filter((m) => !watched.has(m.id)), rpdbKey);
     return { id: catalogId, name: def.name, type: def.type, source: 'ai', requirement_met: true, state: 'ok', metas };
