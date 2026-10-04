@@ -375,9 +375,13 @@ async function runScheduledBuild(profile, kind, anchor, startHash, progress) {
     const result = await rs.buildPool(profile, console, progress, { kind, anchor, startHash });
     if (result.skipped) {
       // Non-promotion: treat as a retryable failure. The window stays due.
+      // Throw so the queue records the job as an error (not 'done'), while
+      // the durable retry marker is set by recordFailure. The .catch() in
+      // consider consumes the rejection to prevent process exit.
       const retryAfter = recordFailure(profile.id, kind, anchor, result.reason || 'skipped');
-      console.warn(`[ai-schedule] ${profile.name}: ${kind} ${anchor} skipped — ${result.reason || 'unknown'}; retry after ${new Date(retryAfter).toISOString()}`);
-      return result;
+      const err = new Error(`${kind} ${anchor} skipped — ${result.reason || 'unknown'}`);
+      console.warn(`[ai-schedule] ${profile.name}: ${err.message}; retry after ${new Date(retryAfter).toISOString()}`);
+      throw err;
     }
     const counts = {
       movies: result.movie?.stored || 0,
@@ -388,6 +392,9 @@ async function runScheduledBuild(profile, kind, anchor, startHash, progress) {
     console.log(`[ai-schedule] ${profile.name}: ${kind} ${anchor} completed — movies ${counts.movies}, shows ${counts.shows}, pool ${counts.pool}`);
     return result;
   } catch (err) {
+    // The catch handles thrown errors from buildPool (not the skipped case,
+    // which already called recordFailure above). Avoid double-recording.
+    if (err.message.includes('skipped —')) throw err; // already recorded
     const retryAfter = recordFailure(profile.id, kind, anchor, err.message);
     console.warn(`[ai-schedule] ${profile.name}: ${kind} ${anchor} failed — retry after ${new Date(retryAfter).toISOString()}: ${err.message}`);
     throw err;

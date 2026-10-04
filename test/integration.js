@@ -9873,7 +9873,15 @@ async function main() {
         rs.buildPool = async () => ({ skipped: true, reason: 'acceptance-gate', movie: { stored: 0 }, series: { stored: 0 }, total: 0 });
 
         // Run the scheduled build directly (bypassing consider's enqueue).
-        await aiSchedule.runScheduledBuild(config.getProfile(pid), 'daily', '2026-10-04', 'h0', () => {});
+        // A skipped build now throws so the queue records state:'error'.
+        let threw = null;
+        try {
+          await aiSchedule.runScheduledBuild(config.getProfile(pid), 'daily', '2026-10-04', 'h0', () => {});
+        } catch (err) {
+          threw = err;
+        }
+        assert.ok(threw, 'runScheduledBuild throws for a skipped build');
+        assert.ok(threw.message.includes('skipped'), 'error message identifies the skip');
 
         // The durable state: retry_after is set (failure), last_success_at NOT set.
         // (completed_week was set by initFromExisting, not by the build — the
@@ -9992,6 +10000,164 @@ async function main() {
         settings.updateSettings({ keys: { tmdb_api_key: prevTmdb } });
         settings.updateSettings({ engines: prevEngines });
         dispose();
+        aiSchedule._reset();
+        config.removeProfile(pid); rs.deleteForProfile(pid); watchedStore.deleteForProfile(pid);
+      }
+    });
+
+    // ---- Review round 2 regressions ----
+
+    await it('T10a: acceptance gate oldEligible applies watched + dont_recommend + vote-floor exclusions', async () => {
+      const prof = config.addProfile('T10a');
+      const pid = prof.id;
+      const prevTmdb = settings.getSettings()?.keys?.tmdb_api_key || '';
+      const prevEngines = { ...(settings.getSettings()?.engines || {}) };
+      settings.updateSettings({ keys: { tmdb_api_key: 't10a-tmdb' } });
+      settings.updateSettings({ engines: { 't10a-engine': true } });
+      const dispose = engines._register({
+        id: 't10a-engine', name: 'T10A', description: 't', supportedTypes: ['movie', 'series'],
+        capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+        requirements: () => ({ ok: true, missing: [] }),
+        generate: async (profile, type) => {
+          if (type === 'movie') {
+            // 2 valid new movies (the old pool has 3 stored, but 1 is watched,
+            // so oldEligible should be 2, not 3).
+            return [
+              { type: 'movie', tmdb_id: 't10a-new1', rankScore: 5, imdb_id: 'tt-t10a-new1', title: 'New1', year: 2025, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, popularity: 1, poster: null },
+              { type: 'movie', tmdb_id: 't10a-new2', rankScore: 4, imdb_id: 'tt-t10a-new2', title: 'New2', year: 2025, primary_genre: 'Action', genres: 'Action', vote_average: 7, vote_count: 4000, popularity: 1, poster: null },
+            ];
+          }
+          return [];
+        },
+      });
+      config.updateProfile(pid, { filters: { engine_movie: 't10a-engine', engine_series: 't10a-engine' } });
+      try {
+        // Seed watched history: one of the old pool's movies is watched.
+        watchedStore.upsertMany(pid, [
+          { simkl_id: 1, type: 'movie', imdb_id: 'tt-t10a-watched', tmdb_id: 't10a-watched', title: 'Watched', year: 2020, watched_at: '2026-09-01T10:00:00Z' },
+        ]);
+        // Seed the old movie pool with 3 rows: one watched, two valid.
+        rs.upsertCandidates(pid, [
+          { type: 'movie', tmdb_id: 't10a-watched', imdb_id: 'tt-t10a-watched', title: 'Watched', year: 2020, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, affinity: 5, rec_count: 1, popularity: 1, poster: null, engine_id: 't10a-engine' },
+          { type: 'movie', tmdb_id: 't10a-old1', imdb_id: 'tt-t10a-old1', title: 'Old1', year: 2024, primary_genre: 'Action', genres: 'Action', vote_average: 7, vote_count: 4000, affinity: 4, rec_count: 1, popularity: 1, poster: null, engine_id: 't10a-engine' },
+          { type: 'movie', tmdb_id: 't10a-old2', imdb_id: 'tt-t10a-old2', title: 'Old2', year: 2024, primary_genre: 'Sci-Fi', genres: 'Sci-Fi', vote_average: 7, vote_count: 3500, affinity: 3, rec_count: 1, popularity: 1, poster: null, engine_id: 't10a-engine' },
+        ], { ratingCheckedAt: null });
+
+        // Run the staged build. oldEligible should be 2 (watched excluded),
+        // newEligible should be 2. minRequired = min(20, 2) = 2. 2 >= 2 → ok.
+        const result = await rs.buildPool(config.getProfile(pid), quiet, () => {}, { kind: 'weekly', anchor: '2026-10-04', startHash: 'h0' });
+        assert.ok(!result.skipped, 'build not skipped (gate passes with like-for-like comparison)');
+        // The watched title is not in the pool after promotion.
+        assert.ok(!rs.getRecommended(pid, { type: 'movie', limit: 10 }).some((r) => r.tmdb_id === 't10a-watched'), 'watched title not in pool');
+        // The new titles are promoted.
+        assert.ok(rs.getRecommended(pid, { type: 'movie', limit: 10}).some((r) => r.tmdb_id === 't10a-new1'), 'new1 promoted');
+        assert.ok(rs.getRecommended(pid, { type: 'movie', limit: 10}).some((r) => r.tmdb_id === 't10a-new2'), 'new2 promoted');
+      } finally {
+        settings.updateSettings({ keys: { tmdb_api_key: prevTmdb } });
+        settings.updateSettings({ engines: prevEngines });
+        dispose();
+        config.removeProfile(pid); rs.deleteForProfile(pid); watchedStore.deleteForProfile(pid);
+      }
+    });
+
+    await it('T10b: acceptance gate counts distinct tmdb_id, not candidate entries', async () => {
+      const prof = config.addProfile('T10b');
+      const pid = prof.id;
+      const prevTmdb = settings.getSettings()?.keys?.tmdb_api_key || '';
+      const prevEngines = { ...(settings.getSettings()?.engines || {}) };
+      settings.updateSettings({ keys: { tmdb_api_key: 't10b-tmdb' } });
+      settings.updateSettings({ engines: { 't10b-engine': true } });
+      const dispose = engines._register({
+        id: 't10b-engine', name: 'T10B', description: 't', supportedTypes: ['movie', 'series'],
+        capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+        requirements: () => ({ ok: true, missing: [] }),
+        generate: async (profile, type) => {
+          if (type === 'movie') {
+            // 3 copies of the SAME tmdb_id (simulating duplicate candidates).
+            // The gate must count 1 distinct identity, not 3 entries.
+            return [
+              { type: 'movie', tmdb_id: 't10b-same', rankScore: 5, imdb_id: 'tt-t10b-same', title: 'Same', year: 2025, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, popularity: 1, poster: null },
+              { type: 'movie', tmdb_id: 't10b-same', rankScore: 4, imdb_id: 'tt-t10b-same', title: 'Same', year: 2025, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, popularity: 1, poster: null },
+              { type: 'movie', tmdb_id: 't10b-same', rankScore: 3, imdb_id: 'tt-t10b-same', title: 'Same', year: 2025, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, popularity: 1, poster: null },
+            ];
+          }
+          return [];
+        },
+      });
+      config.updateProfile(pid, { filters: { engine_movie: 't10b-engine', engine_series: 't10b-engine' } });
+      try {
+        // Seed watched history.
+        watchedStore.upsertMany(pid, [
+          { simkl_id: 1, type: 'movie', imdb_id: 'tt-watched', tmdb_id: 'w1', title: 'Watched', year: 2020, watched_at: '2026-09-01T10:00:00Z' },
+        ]);
+        // Seed the old movie pool with 3 distinct rows.
+        rs.upsertCandidates(pid, [
+          { type: 'movie', tmdb_id: 't10b-old1', imdb_id: 'tt-t10b-old1', title: 'Old1', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, affinity: 5, rec_count: 1, popularity: 1, poster: null, engine_id: 't10b-engine' },
+          { type: 'movie', tmdb_id: 't10b-old2', imdb_id: 'tt-t10b-old2', title: 'Old2', year: 2024, primary_genre: 'Action', genres: 'Action', vote_average: 7, vote_count: 4000, affinity: 4, rec_count: 1, popularity: 1, poster: null, engine_id: 't10b-engine' },
+          { type: 'movie', tmdb_id: 't10b-old3', imdb_id: 'tt-t10b-old3', title: 'Old3', year: 2024, primary_genre: 'Sci-Fi', genres: 'Sci-Fi', vote_average: 7, vote_count: 3500, affinity: 3, rec_count: 1, popularity: 1, poster: null, engine_id: 't10b-engine' },
+        ], { ratingCheckedAt: null });
+
+        // Run the staged build. oldEligible = 3, newEligible = 1 (distinct).
+        // minRequired = min(20, 3) = 3. 1 < 3 → gate fails → build skipped.
+        const result = await rs.buildPool(config.getProfile(pid), quiet, () => {}, { kind: 'weekly', anchor: '2026-10-04', startHash: 'h0' });
+        assert.ok(result.skipped, 'build skipped (duplicate candidates counted as 1, not 3)');
+        assert.ok(result.reason === 'acceptance-gate', 'reason is acceptance-gate');
+        // The old pool is intact.
+        assert.strictEqual(rs.countRecommended(pid, 'movie'), 3, 'old pool intact');
+      } finally {
+        settings.updateSettings({ keys: { tmdb_api_key: prevTmdb } });
+        settings.updateSettings({ engines: prevEngines });
+        dispose();
+        config.removeProfile(pid); rs.deleteForProfile(pid); watchedStore.deleteForProfile(pid);
+      }
+    });
+
+    await it('T10c: skipped build is recorded as a queue error, not done', async () => {
+      const prof = config.addProfile('T10c');
+      const pid = prof.id;
+      const prevTmdb = settings.getSettings()?.keys?.tmdb_api_key || '';
+      const prevEngines = { ...(settings.getSettings()?.engines || {}) };
+      const origBuildPool = rs.buildPool;
+      settings.updateSettings({ keys: { tmdb_api_key: 't10c-tmdb' } });
+      try {
+        // Seed watched history + a non-empty pool.
+        watchedStore.upsertMany(pid, [
+          { simkl_id: 1, type: 'movie', imdb_id: 'tt-watched', tmdb_id: 'w1', title: 'Watched', year: 2020, watched_at: '2026-09-01T10:00:00Z' },
+        ]);
+        rs.upsertCandidates(pid, [
+          { type: 'movie', tmdb_id: 't10c-m1', imdb_id: 'tt-t10c-m1', title: 'M1', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, affinity: 5, rec_count: 1, popularity: 1, poster: null, engine_id: 'genesis' },
+        ], { ratingCheckedAt: null });
+        aiSchedule.initFromExisting(pid, Date.now());
+        // Add a new watched item so the history hash changes (triggering the daily build).
+        watchedStore.upsertMany(pid, [
+          { simkl_id: 2, type: 'movie', imdb_id: 'tt-new-watch', tmdb_id: 'w2', title: 'New Watch', year: 2025, watched_at: '2026-10-04T10:00:00Z' },
+        ]);
+
+        // Stub buildPool to return a skipped result.
+        rs.buildPool = async () => ({ skipped: true, reason: 'acceptance-gate', movie: { stored: 0 }, series: { stored: 0 }, total: 0 });
+
+        // Run consider — it should enqueue the job and the rejection should be
+        // consumed (logged) without crashing the process.
+        const result = await aiSchedule.consider(config.getProfile(pid), Date.now());
+        assert.ok(result.queued, 'consider queued the scheduled build');
+
+        // Wait for the job to settle.
+        await new Promise((r) => setTimeout(r, 50));
+
+        // The durable 30-minute retry marker is set.
+        const st = aiSchedule.getScheduleState(pid);
+        assert.ok(st.retry_after, 'retry_after is set after a skipped build');
+
+        // The queue records the job as an error (not 'done').
+        const jobs = require('../src/jobs');
+        const jobState = jobs.snapshot(pid);
+        assert.ok(jobState, 'job state exists');
+        assert.strictEqual(jobState.state, 'error', 'queue state is error (not done)');
+        assert.ok(jobState.error && jobState.error.includes('skipped'), 'error message includes skipped');
+      } finally {
+        rs.buildPool = origBuildPool;
+        settings.updateSettings({ keys: { tmdb_api_key: prevTmdb } });
+        settings.updateSettings({ engines: prevEngines });
         aiSchedule._reset();
         config.removeProfile(pid); rs.deleteForProfile(pid); watchedStore.deleteForProfile(pid);
       }

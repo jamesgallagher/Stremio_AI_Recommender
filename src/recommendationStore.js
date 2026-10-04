@@ -546,25 +546,32 @@ function acceptanceGate(profile, stagedByType, filters) {
   // suppressed during generation must not count toward the eligible set).
   const watchedImdb = watchedStore.watchedIdSets(profile.id).imdb;
   const dnr = dontRecommendKeys(profile.id);
+  const tmdb = require('./services/tmdb');
   for (const type of ['movie', 'series']) {
-    const oldRows = getRecommended(profile.id, { type, limit: 100000 });
-    const oldEligible = filterServable(oldRows, filters).length;
-    const newRows = stagedByType[type] || [];
-    // Evaluate the actual eligible replacement set after every promotion-time
-    // exclusion: vote-count floor, current watched state, current suppression.
-    const tmdb = require('./services/tmdb');
     const voteFloor = tmdb.voteFloor(filters, type);
-    const eligible = newRows.filter((c) => {
-      // Vote-count floor (the same filter atomicPromotion applies).
-      if (c.vote_count != null && c.vote_count < voteFloor) return false;
-      // Current watched state (a title watched during generation is not eligible).
-      if (c.imdb_id && watchedImdb.has(c.imdb_id)) return false;
-      // Current suppression state (a title suppressed during generation is not eligible).
-      if (dnr.has(`${type}:${c.tmdb_id}`)) return false;
-      // Serve-time filter (rating floor, excluded genres, recency, age band).
-      return filterServable([c], filters).length === 1;
-    });
-    const newEligible = eligible.length;
+    // OLD eligible: the same effective serve-time conditions as the new set —
+    // vote floor, current watched state, current suppression, serve filter.
+    // This mirrors selectedRecommendationRows (watched + dont_recommend before
+    // the limit) so the gate compares like-for-like.
+    const oldRows = getRecommended(profile.id, { type, limit: 100000 });
+    const oldEligible = oldRows.filter((r) => {
+      if (r.vote_count != null && r.vote_count < voteFloor) return false;
+      if (r.imdb_id && watchedImdb.has(r.imdb_id)) return false;
+      if (dnr.has(`${type}:${r.tmdb_id}`)) return false;
+      return filterServable([r], filters).length === 1;
+    }).length;
+    // NEW eligible: distinct pool identities (tmdb_id) after the same
+    // exclusions. SQLite upsert collapses equal (profile_id, type, tmdb_id)
+    // candidates, so counting entries would overestimate the served count.
+    const newRows = stagedByType[type] || [];
+    const newEligible = new Set(
+      newRows.filter((c) => {
+        if (c.vote_count != null && c.vote_count < voteFloor) return false;
+        if (c.imdb_id && watchedImdb.has(c.imdb_id)) return false;
+        if (dnr.has(`${type}:${c.tmdb_id}`)) return false;
+        return filterServable([c], filters).length === 1;
+      }).map((c) => String(c.tmdb_id))
+    ).size;
     const minRequired = Math.min(listSize, oldEligible);
     const ok = newEligible >= minRequired;
     result[type] = { oldEligible, newEligible, minRequired, ok };
