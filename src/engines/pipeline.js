@@ -43,7 +43,15 @@ function normalize(c) {
 // Build one type's pool slice from one engine's output. Returns
 // { seeds, raw, strong, kept, stored, purged } — seeds/raw/strong/kept are the
 // engine's own stats (via ctx.stats), stored/purged are the pipeline's.
-async function runEngineBuild(profile, type, engine, ctx, onProgress = () => {}) {
+//
+// `{ stage: true }` (feature/ai-catalog-cadence, Stage 2): run the generation
+// half (generate → normalize → filter → resolve → enrich) and return the
+// `servable` candidates IN MEMORY without touching the pool (no upsert, no
+// prune). The caller (recommendationStore's staged path) age-gates the
+// candidates in memory and promotes them atomically, so a failed/partial build
+// never mutates the live pool. The shape is { servable, stats } where stats is
+// { seeds, raw, strong, kept }.
+async function runEngineBuild(profile, type, engine, ctx, onProgress = () => {}, { stage = false } = {}) {
   const store = require('../recommendationStore'); // lazy — see Boundaries
   const { tmdbKey, filters = {}, log = console } = ctx;
 
@@ -129,6 +137,23 @@ async function runEngineBuild(profile, type, engine, ctx, onProgress = () => {})
   // the score_components/algorithm_version the engine emitted). Engine-agnostic:
   // an engine that emits no components still gets an accurate engine_id.
   for (const c of servable) c.engine_id = engine.id;
+
+  // Staged path (feature/ai-catalog-cadence, Stage 2): return the servable
+  // candidates in memory WITHOUT touching the pool (no upsert, no prune). The
+  // caller age-gates the candidates in memory and promotes them atomically.
+  if (stage) {
+    const st = ctx.stats || {};
+    onProgress(95, `Staged ${servable.length} ${type} candidate(s)…`);
+    return {
+      servable,
+      stats: {
+        seeds: st.seeds ?? 0,
+        raw: st.raw ?? 0,
+        strong: st.strong ?? 0,
+        kept: st.kept ?? 0,
+      },
+    };
+  }
 
   // 5. Upsert (I4). Stamp imdb_rating_at only when a key was present, so the heal
   //    pass re-checks these rows later once a key is configured.

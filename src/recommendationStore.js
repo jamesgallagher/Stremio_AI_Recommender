@@ -450,6 +450,296 @@ async function ageGatePool(profile, log = console, onProgress = () => {}) {
   return { dropped, vetoed, remain: countRecommended(profile.id) };
 }
 
+// ---- Staged build (feature/ai-catalog-cadence, Stage 2) ----
+//
+// The heavy watch-driven build used by the scheduled daily/weekly paths.
+// Generates candidates in memory (both types), age-gates them in memory,
+// checks the acceptance gate per type, and promotes them atomically. A
+// failed/partial build never mutates the live pool (M6).
+//
+// Invariants:
+//   • No unverified candidate is visible during the run — the staged
+//     candidates live in memory until the atomic promotion commits.
+//   • The old pool and schedule success markers remain intact on any
+//     failure (generation, age gate, acceptance gate, promotion error).
+//   • Successful promotion preserves impression/engagement columns for
+//     surviving titles and all dont_recommend rows.
+//   • A weekly (Sunday) promotion replaces obsolete same-engine rows; a
+//     daily promotion is a cumulative upsert.
+
+// Staged age gate: age-gate the staged candidates IN MEMORY (no pool
+// mutation). Mirrors ageGatePool's two passes (NSFW + anime band via
+// rebuild.applyAnimeGate; the LLM ACB pass via ageVerify.verify) but
+// operates on the in-memory staged candidates instead of the live pool.
+// Returns { movie: [...], series: [...], dropped, vetoed } — the filtered
+// candidates with age_classification/certification set in memory.
+async function stagedAgeGate(profile, stagedByType, log = console, onProgress = () => {}) {
+  const rebuild = require('./rebuild');
+  const limit = profile.filters?.age_limit || 0;
+  onProgress(0, 'Age-gating the staged candidates…');
+
+  const out = { movie: [], series: [] };
+  let dropped = 0;
+  let vetoed = 0;
+
+  for (const type of ['movie', 'series']) {
+    const cands = stagedByType[type] || [];
+    if (!cands.length) continue;
+
+    // 1. NSFW + anime band (pure, in memory).
+    const metas = cands.map((c) => ({ id: c.imdb_id || c.tmdb_id, _tmdb_id: c.tmdb_id, name: c.title, _rtype: type }));
+    const kept = await rebuild.applyAnimeGate(metas, profile, log);
+    const keptKeys = new Set(kept.map((m) => key(m._rtype, m._tmdb_id)));
+    const keptCands = cands.filter((c) => keptKeys.has(key(type, c.tmdb_id)));
+    for (const m of kept) {
+      const c = cands.find((c) => c.tmdb_id === m._tmdb_id);
+      if (c && m._certification) c.age_classification = m._certification;
+    }
+    dropped += cands.length - keptCands.length;
+
+    // 2. LLM ACB pass (age-limited profiles only).
+    if (limit > 0 && keptCands.length) {
+      const ageVerify = require('./ageVerification');
+      const tier = ageVerify.tierFor({ age_limit: limit });
+      onProgress(50, 'Age-checking the staged candidates…');
+      const sources = require('./ageVerification/sources').buildSources(profile, log);
+      const titles = keptCands.map((c) => ({
+        key: `${type}:${c.tmdb_id}`,
+        imdb_id: c.imdb_id,
+        adult: c.adult || false,
+        title: c.title,
+        year: c.year,
+        genres: c.primary_genre ? [c.primary_genre] : [],
+        certification: c.certification || c.age_classification,
+      }));
+      const result = await ageVerify.verify(titles, type, tier, sources, log);
+      const finalCands = [];
+      for (const c of keptCands) {
+        const v = result.get(`${type}:${c.tmdb_id}`);
+        if (v && v.verdict === 'block') { vetoed++; continue; }
+        if (v && (v.verdict === 'allow' || v.verdict === 'block')) {
+          c.certification = `${v.source}:${v.rating || ''}`;
+        }
+        finalCands.push(c);
+      }
+      out[type] = finalCands;
+    } else {
+      out[type] = keptCands;
+    }
+  }
+
+  const total = out.movie.length + out.series.length;
+  log.log(`[rec] ${profile.name}: staged age gate — ${dropped} NSFW/band dropped, ${vetoed} LLM-vetoed, ${total} remain`);
+  return { movie: out.movie, series: out.series, dropped, vetoed };
+}
+
+// Acceptance gate: per type, the new eligible visible count must be >=
+// min(listSizeFor, oldEligibleVisibleCount). "Eligible visible" = the count of
+// rows that pass the serve-time filter (rating floor, excluded genres, age
+// band) — the same filter the serve path applies. A failure means the new pool
+// is too sparse; the caller aborts without promoting, so the old pool remains
+// intact. Returns { ok, movie: {oldEligible, newEligible, minRequired, ok}, series: ... }.
+function acceptanceGate(profile, stagedByType, filters) {
+  const listSize = listSizeFor(profile);
+  const result = { ok: true, movie: null, series: null };
+  for (const type of ['movie', 'series']) {
+    const oldRows = getRecommended(profile.id, { type, limit: 100000 });
+    const oldEligible = filterServable(oldRows, filters).length;
+    const newRows = stagedByType[type] || [];
+    const newEligible = filterServable(newRows, filters).length;
+    const minRequired = Math.min(listSize, oldEligible);
+    const ok = newEligible >= minRequired;
+    result[type] = { oldEligible, newEligible, minRequired, ok };
+    if (!ok) result.ok = false;
+  }
+  return result;
+}
+
+// Atomic promotion: promote the staged candidates into the pool in ONE
+// synchronous SQLite transaction. For a weekly (Sunday) build, obsolete
+// same-engine rows (rows of this type with this engine_id NOT in the new staged
+// set) are deleted BEFORE the upsert (the full replacement). For a daily build,
+// the upsert is cumulative (no obsolete deletion). The upsert's ON CONFLICT
+// clause preserves impression/engagement columns for surviving titles.
+// dont_recommend is a separate table, untouched. A thrown error rolls back the
+// entire transaction, so the old pool remains intact.
+function atomicPromotion(profileId, stagedByType, { kind, filters, engineIds, ratingCheckedAt }) {
+  const conn = db.get();
+  conn.prepare('BEGIN').run();
+  try {
+    const now = Date.now();
+    const stmt = conn.prepare(`
+      INSERT INTO recommended (profile_id, type, tmdb_id, imdb_id, title, year, primary_genre, genres, vote_average, imdb_rating, imdb_rating_at, vote_count, affinity, rec_count, because_title, score_components, algorithm_version, engine_id, popularity, poster, created_at, certification)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(profile_id, type, tmdb_id) DO UPDATE SET
+        affinity = excluded.affinity, rec_count = excluded.rec_count, popularity = excluded.popularity,
+        primary_genre = excluded.primary_genre, genres = excluded.genres, vote_average = excluded.vote_average,
+        imdb_rating = COALESCE(excluded.imdb_rating, recommended.imdb_rating),
+        imdb_rating_at = COALESCE(excluded.imdb_rating_at, recommended.imdb_rating_at), vote_count = excluded.vote_count,
+        because_title = excluded.because_title, title = excluded.title, year = excluded.year, poster = excluded.poster,
+        score_components = excluded.score_components, algorithm_version = excluded.algorithm_version, engine_id = excluded.engine_id,
+        certification = COALESCE(excluded.certification, recommended.certification)
+    `);
+
+    for (const type of ['movie', 'series']) {
+      const cands = stagedByType[type] || [];
+      const engineId = engineIds[type];
+      if (!cands.length) continue;
+
+      // Weekly (Sunday): full replacement — delete obsolete same-engine rows
+      // (rows of this type with this engine_id NOT in the new staged set)
+      // BEFORE the upsert. A daily build is cumulative (no obsolete deletion).
+      if (kind === 'weekly' && engineId) {
+        const newIds = new Set(cands.map((c) => String(c.tmdb_id)));
+        const rows = conn.prepare('SELECT tmdb_id FROM recommended WHERE profile_id = ? AND type = ? AND engine_id = ?').all(profileId, type, engineId);
+        const del = conn.prepare('DELETE FROM recommended WHERE profile_id = ? AND type = ? AND engine_id = ? AND tmdb_id = ?');
+        for (const r of rows) {
+          if (!newIds.has(String(r.tmdb_id))) del.run(profileId, type, engineId, r.tmdb_id);
+        }
+      }
+
+      // Upsert the staged candidates (preserving impression/engagement for
+      // surviving titles via the ON CONFLICT clause).
+      for (const c of cands) {
+        const comps = c.score_components == null ? null
+          : (typeof c.score_components === 'string' ? c.score_components : JSON.stringify(c.score_components));
+        stmt.run(profileId, c.type, c.tmdb_id, c.imdb_id || null, c.title, c.year, c.primary_genre || null, c.genres || null, c.vote_average ?? null, c.imdb_rating ?? null, ratingCheckedAt, c.vote_count ?? null, c.affinity, c.rec_count, c.because_title || null, comps, c.algorithm_version || null, c.engine_id || null, c.popularity, c.poster || null, now, c.certification || null);
+      }
+
+      // ENG-1: the slice now belongs to this engine — remove other engines' leftovers.
+      conn.prepare('DELETE FROM recommended WHERE profile_id = ? AND type = ? AND (engine_id IS NULL OR engine_id != ?)').run(profileId, type, engineId);
+      // Prune superseded versions (only when the build stored rows AND they agree on one version).
+      const versions = new Set(cands.map((c) => c.algorithm_version).filter(Boolean));
+      if (cands.length && versions.size === 1) {
+        conn.prepare('DELETE FROM recommended WHERE profile_id = ? AND type = ? AND engine_id = ? AND algorithm_version IS NOT NULL AND algorithm_version != ?').run(profileId, type, engineId, [...versions][0]);
+      }
+    }
+
+    // Vote-count floor (per profile, both types).
+    conn.prepare(`
+      DELETE FROM recommended
+      WHERE profile_id = ? AND vote_count IS NOT NULL
+        AND ((type = 'movie'  AND vote_count < ?)
+          OR (type = 'series' AND vote_count < ?))
+    `).run(profileId, tmdb.voteFloor(filters, 'movie'), tmdb.voteFloor(filters, 'series'));
+
+    conn.prepare('COMMIT').run();
+  } catch (err) {
+    conn.prepare('ROLLBACK').run();
+    throw err;
+  }
+}
+
+// Staged build: the heavy watch-driven build used by the scheduled daily/weekly
+// paths. Generates candidates in memory (both types), age-gates them in
+// memory, checks the acceptance gate per type, and promotes them atomically.
+// A failed/partial build never mutates the live pool. `kind` is 'daily' |
+// 'weekly'; `anchor` is the Sydney date of the window; `startHash` is the
+// history snapshot at build start.
+async function stagedBuildPool(profile, log = console, onProgress = () => {}, { kind, anchor, startHash } = {}) {
+  init();
+  const s = settings.getSettings();
+  const tmdbKey = s?.keys?.tmdb_api_key;
+  if (!tmdbKey) return { skipped: true, reason: 'no TMDB key in Server Config' };
+
+  // Trainer T2 (N8): snapshot the taste-feedback change cursor at the build's
+  // START — the stamp after a successful build is this value, so a Trainer
+  // edit landing DURING the build stays newer than the stamp and triggers the
+  // NEXT build.
+  const trainingSnap = tasteFeedback.getTraining(profile.id);
+
+  const engines = require('./engines');
+  const pipeline = require('./engines/pipeline');
+  const filters = profile.filters || {};
+  const ctx = {
+    tmdbKey,
+    mdblistKey: settings.keyFor(profile, 'mdblist_api_key'),
+    settings: s,
+    filters,
+    log,
+    stage: true, // feature/ai-catalog-cadence: the staged path defers serveCalibration.setTarget
+  };
+
+  // Staged generation (both types).
+  const stagedByType = { movie: [], series: [] };
+  const engineIds = {};
+  const missing = [];
+  const spans = { movie: [0, 50], series: [50, 80] };
+  const band = (lo, hi) => (pct, label) => onProgress(lo + (pct / 100) * (hi - lo), label);
+
+  for (const type of ['movie', 'series']) {
+    const engine = engines.resolveFor(profile, type);
+    engineIds[type] = engine.id;
+    const req = engine.requirements(profile);
+    if (!req.ok) {
+      const miss = req.missing || [];
+      missing.push(...miss);
+      log.warn(`[rec] ${profile.name}/${type}: ${engine.name} unavailable — missing ${miss.join(', ') || 'requirements'} (keeping existing ${type} rows)`);
+      continue;
+    }
+    log.log(`[rec] ${profile.name}/${type}: staging with ${engine.name}`);
+    const r = await pipeline.runEngineBuild(profile, type, engine, ctx, band(...spans[type]), { stage: true });
+    stagedByType[type] = r.servable;
+  }
+
+  // Age-gate the staged candidates in memory.
+  const ageResult = await stagedAgeGate(profile, stagedByType, log, (pct, label) => onProgress(80 + pct * 0.1, label));
+  stagedByType.movie = ageResult.movie;
+  stagedByType.series = ageResult.series;
+
+  // Acceptance gate per type.
+  const gate = acceptanceGate(profile, stagedByType, filters);
+  if (!gate.ok) {
+    const failed = [];
+    if (gate.movie && !gate.movie.ok) failed.push(`movie (new ${gate.movie.newEligible} < min ${gate.movie.minRequired})`);
+    if (gate.series && !gate.series.ok) failed.push(`series (new ${gate.series.newEligible} < min ${gate.series.minRequired})`);
+    log.warn(`[rec] ${profile.name}: acceptance gate failed — ${failed.join('; ')} (old pool intact)`);
+    return {
+      skipped: true, reason: 'acceptance-gate',
+      movie: { stored: gate.movie?.newEligible || 0 },
+      series: { stored: gate.series?.newEligible || 0 },
+      total: 0,
+    };
+  }
+
+  // Atomic promotion.
+  atomicPromotion(profile.id, stagedByType, {
+    kind,
+    filters,
+    engineIds,
+    ratingCheckedAt: ctx.mdblistKey ? Date.now() : null,
+  });
+
+  // Promote the deferred serveCalibration targets (feature/ai-catalog-cadence,
+  // Stage 2). The Marquee/Marquee TV engines stash the computed target in ctx
+  // during generation (ctx.stage) so a failed/partial build never writes a
+  // target for candidates that weren't promoted. Best-effort: a failure only
+  // logs (C6).
+  try {
+    if (ctx.marqueeTarget) {
+      serveCalibration.setTarget(profile.id, 'movie', 'marquee', ctx.marqueeTarget.target, ctx.marqueeTarget.filmCount, Date.now());
+    }
+    if (ctx.marqueeTvTarget) {
+      serveCalibration.setTarget(profile.id, 'series', 'marquee-tv', ctx.marqueeTvTarget.target, ctx.marqueeTvTarget.filmCount, Date.now());
+    }
+  } catch (err) {
+    log.warn(`[rec] ${profile.name}: serve target promotion failed: ${err.message}`);
+  }
+
+  // Stamp built_at + markTrainingBuilt (same as the urgent path).
+  setBuiltAt(profile.id);
+  tasteFeedback.markTrainingBuilt(profile.id, trainingSnap.changed_at);
+
+  const stored = (stagedByType.movie.length || 0) + (stagedByType.series.length || 0);
+  log.log(`[rec] ${profile.name}: staged ${kind} build — ${stagedByType.movie.length} movie(s) + ${stagedByType.series.length} series (total ${countRecommended(profile.id)})`);
+  return {
+    movie: { stored: stagedByType.movie.length },
+    series: { stored: stagedByType.series.length },
+    stored,
+    total: countRecommended(profile.id),
+  };
+}
+
 // Reset: wipe the pool AND the user's don't-recommend flags for a profile.
 function resetRecommendations(profileId) {
   init();
@@ -985,8 +1275,22 @@ function needsBuild(profileId, { profile = null, now = Date.now() } = {}) {
 // the unit of work the job queue runs; callers should route it through
 // jobs.enqueue so builds serialise + report a percentage. Exported so the portal
 // and the tick share one implementation.
-async function buildPool(profile, log = console, onProgress = () => {}) {
+//
+// `{ kind, anchor, startHash }` (feature/ai-catalog-cadence, Stage 2): when
+// present, runs the STAGED path (stagedBuildPool) — generate in memory, age-gate
+// in memory, acceptance gate, atomic promotion. A failed/partial build never
+// mutates the live pool (M6). When absent, runs the existing urgent path
+// (buildRecommendations + ageGatePool).
+async function buildPool(profile, log = console, onProgress = () => {}, opts = {}) {
   init();
+  if (opts.kind) {
+    // Staged path (scheduled daily/weekly builds).
+    return stagedBuildPool(profile, log, onProgress, {
+      kind: opts.kind,
+      anchor: opts.anchor,
+      startHash: opts.startHash,
+    });
+  }
   const r = await buildRecommendations(profile, log, (pct, label) => onProgress(pct * 0.85, label)); // 0–85%
   // Age-gate (I1) whenever this build STORED candidates. buildRecommendations no
   // longer reports `skipped` once rows were stored (so `!r.skipped` already covers
@@ -1050,6 +1354,11 @@ module.exports = {
   buildRecommendations,
   ageGatePool,
   buildPool,
+  // feature/ai-catalog-cadence (Stage 2): the staged build path.
+  stagedBuildPool,
+  stagedAgeGate,
+  acceptanceGate,
+  atomicPromotion,
   ensureBuilt,
   rebuildAfterChange,
   pruneOtherEngines,

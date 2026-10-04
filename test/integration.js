@@ -9472,6 +9472,328 @@ async function main() {
     }
   });
 
+  // ── T7: Staged build (feature/ai-catalog-cadence, Stage 2) ─────────────────
+  // Atomic full generation: staged candidate/age evaluation, safe atomic
+  // promotion, and Sunday obsolete-row replacement.
+  {
+    const aiSchedule = require('../src/aiSchedule');
+
+    // A preResolved engine that returns deterministic candidates. `tag`
+    // namespaces the ids so the test can distinguish the engine's output
+    // from the seeded old pool rows.
+    const mkStagedEngine = (id, tag, { suppressIds = [] } = {}) => ({
+      id, name: id, description: 't', supportedTypes: ['movie', 'series'],
+      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+      requirements: () => ({ ok: true, missing: [] }),
+      generate: async (profile, type, ctx) => {
+        if (ctx.stats) ctx.stats.seeds = 1;
+        // Two candidates per type: one overlapping with the old pool (to test
+        // impression/engagement preservation) and one new (to test the reserve).
+        // Plus a suppression candidate (to test dont_recommend survival).
+        const cands = [
+          { type, tmdb_id: `${tag}-${type}-overlap`, rankScore: 5, imdb_id: `tt-${tag}-${type}-overlap`, title: `${tag} overlap`, year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, popularity: 1, poster: null },
+          { type, tmdb_id: `${tag}-${type}-new`, rankScore: 4, imdb_id: `tt-${tag}-${type}-new`, title: `${tag} new`, year: 2025, primary_genre: 'Action', genres: 'Action', vote_average: 7, vote_count: 4000, popularity: 2, poster: null },
+          { type, tmdb_id: `${tag}-${type}-new2`, rankScore: 3, imdb_id: `tt-${tag}-${type}-new2`, title: `${tag} new2`, year: 2025, primary_genre: 'Sci-Fi', genres: 'Sci-Fi', vote_average: 7, vote_count: 3500, popularity: 2, poster: null },
+        ];
+        if (type === 'movie') {
+          cands.push({ type: 'movie', tmdb_id: `${tag}-movie-suppressed`, rankScore: 2, imdb_id: `tt-${tag}-movie-suppressed`, title: `${tag} suppressed`, year: 2023, primary_genre: 'Comedy', genres: 'Comedy', vote_average: 6, vote_count: 3000, popularity: 1, poster: null });
+        }
+        return cands;
+      },
+    });
+
+    await it('T7a: staged weekly build — atomic promotion, obsolete removal, impression preservation, dont_recommend survival', async () => {
+      const prof = config.addProfile('T7a');
+      const pid = prof.id;
+      const dispose = engines._register(mkStagedEngine('t7-engine', 't7'));
+      // Save + restore global settings (SC-03 pattern).
+      const prevTmdb = settings.getSettings()?.keys?.tmdb_api_key || '';
+      const prevEngines = { ...(settings.getSettings()?.engines || {}) };
+      settings.updateSettings({ keys: { tmdb_api_key: 't7-tmdb' } });
+      settings.updateSettings({ engines: { 't7-engine': true } });
+      config.updateProfile(pid, { filters: { engine_movie: 't7-engine', engine_series: 't7-engine' } });
+      try {
+        // Seed watched history (so the watched set is non-empty).
+        watchedStore.upsertMany(pid, [
+          { simkl_id: 1, type: 'movie', imdb_id: 'tt-watched', tmdb_id: 'w1', title: 'Watched', year: 2020, watched_at: '2026-09-01T10:00:00Z' },
+        ]);
+
+        // Seed the old movie pool with:
+        //   1. An obsolete high-affinity row (engine_id = 't7-engine', NOT in the new staged set).
+        //   2. An overlapping row with nonzero impression/engagement state (engine_id = 't7-engine', IN the new staged set).
+        //   3. A newly watched row (in the watched set).
+        rs.upsertCandidates(pid, [
+          { type: 'movie', tmdb_id: 't7-movie-obsolete', imdb_id: 'tt-t7-movie-obsolete', title: 'Obsolete', year: 2023, primary_genre: 'Drama', genres: 'Drama', vote_average: 9, vote_count: 6000, affinity: 10, rec_count: 1, popularity: 3, poster: null, engine_id: 't7-engine', algorithm_version: 'v1' },
+          { type: 'movie', tmdb_id: 't7-movie-overlap', imdb_id: 'tt-t7-movie-overlap', title: 'Overlap', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, affinity: 5, rec_count: 1, popularity: 1, poster: null, engine_id: 't7-engine', algorithm_version: 'v1' },
+          { type: 'movie', tmdb_id: 'w1', imdb_id: 'tt-watched', title: 'Watched', year: 2020, primary_genre: 'Comedy', genres: 'Comedy', vote_average: 7, vote_count: 3000, affinity: 3, rec_count: 1, popularity: 1, poster: null, engine_id: 't7-engine', algorithm_version: 'v1' },
+        ], { ratingCheckedAt: null });
+
+        // Set nonzero impression/engagement state on the overlapping row.
+        const conn = require('../src/db').get();
+        conn.prepare(`UPDATE recommended SET times_shown = 5, times_shown_in_streak = 3, last_shown_at = 1000, streak_started_at = 500, first_shown_at = 400, engaged_at = 800 WHERE profile_id = ? AND type = 'movie' AND tmdb_id = 't7-movie-overlap'`).run(pid);
+
+        // Seed a dont_recommend row (the engine will emit this candidate; the
+        // pipeline's watched/dont filter must drop it before promotion).
+        rs.addDontRecommend(pid, 'movie', 't7-movie-suppressed');
+
+        // Verify the old pool state before the staged build.
+        assert.strictEqual(rs.countRecommended(pid), 3, 'old movie pool has 3 rows');
+        assert.ok(rs.getRecommended(pid, { type: 'movie', limit: 10 }).some((r) => r.tmdb_id === 't7-movie-obsolete'), 'obsolete row present before build');
+        assert.ok(rs.getRecommended(pid, { type: 'movie', limit: 10 }).some((r) => r.tmdb_id === 't7-movie-overlap'), 'overlap row present before build');
+
+        // Run the staged weekly build.
+        const result = await rs.buildPool(config.getProfile(pid), quiet, () => {}, { kind: 'weekly', anchor: '2026-10-04', startHash: 'h0' });
+
+        // The obsolete row is removed (full replacement for weekly).
+        assert.ok(!rs.getRecommended(pid, { type: 'movie', limit: 10 }).some((r) => r.tmdb_id === 't7-movie-obsolete'), 'obsolete row removed after weekly build');
+        // The overlapping row is retained with its impression/engagement state.
+        const overlap = rs.getRecommended(pid, { type: 'movie', limit: 10 }).find((r) => r.tmdb_id === 't7-movie-overlap');
+        assert.ok(overlap, 'overlap row retained after weekly build');
+        assert.strictEqual(overlap.times_shown, 5, 'times_shown preserved');
+        assert.strictEqual(overlap.times_shown_in_streak, 3, 'times_shown_in_streak preserved');
+        assert.strictEqual(overlap.engaged_at, 800, 'engaged_at preserved');
+        // The new candidate is stored.
+        assert.ok(rs.getRecommended(pid, { type: 'movie', limit: 10 }).some((r) => r.tmdb_id === 't7-movie-new'), 'new candidate stored');
+        // The watched row is NOT resurrected (it's in the watched set).
+        assert.ok(!rs.getRecommended(pid, { type: 'movie', limit: 10 }).some((r) => r.tmdb_id === 'w1'), 'watched row not resurrected');
+        // The dont_recommend candidate is NOT promoted (the pipeline's dont filter drops it).
+        assert.ok(!rs.getRecommended(pid, { type: 'movie', limit: 10 }).some((r) => r.tmdb_id === 't7-movie-suppressed'), 'suppressed candidate not promoted');
+        // The dont_recommend row is preserved.
+        const dnr = require('../src/db').get().prepare('SELECT * FROM dont_recommend WHERE profile_id = ?').all(pid);
+        assert.ok(dnr.some((r) => r.tmdb_id === 't7-movie-suppressed'), 'dont_recommend row preserved');
+      } finally {
+        settings.updateSettings({ keys: { tmdb_api_key: prevTmdb } });
+        settings.updateSettings({ engines: prevEngines });
+        dispose();
+        config.removeProfile(pid); rs.deleteForProfile(pid); watchedStore.deleteForProfile(pid);
+      }
+    });
+
+    await it('T7b: staged build — sparse second type leaves neither type promoted', async () => {
+      const prof = config.addProfile('T7b');
+      const pid = prof.id;
+      // An engine that produces NO candidates for series (sparse output).
+      const sparseEngine = {
+        id: 't7-sparse', name: 'Sparse', description: 't', supportedTypes: ['movie', 'series'],
+        capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+        requirements: () => ({ ok: true, missing: [] }),
+        generate: async (profile, type, ctx) => {
+          if (ctx.stats) ctx.stats.seeds = 1;
+          if (type === 'series') return []; // sparse: no series candidates
+          return [
+            { type: 'movie', tmdb_id: 't7-movie-keep', rankScore: 5, imdb_id: 'tt-t7-movie-keep', title: 'Keep', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, popularity: 1, poster: null },
+          ];
+        },
+      };
+      const dispose = engines._register(sparseEngine);
+      const prevTmdb = settings.getSettings()?.keys?.tmdb_api_key || '';
+      const prevEngines = { ...(settings.getSettings()?.engines || {}) };
+      settings.updateSettings({ keys: { tmdb_api_key: 't7-tmdb' } });
+      settings.updateSettings({ engines: { 't7-sparse': true } });
+      config.updateProfile(pid, { filters: { engine_movie: 't7-sparse', engine_series: 't7-sparse' } });
+      try {
+        // Seed the old movie + series pool with rows.
+        rs.upsertCandidates(pid, [
+          { type: 'movie', tmdb_id: 'old-movie', imdb_id: 'tt-old-movie', title: 'Old Movie', year: 2023, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, affinity: 5, rec_count: 1, popularity: 1, poster: null, engine_id: 't7-sparse' },
+          { type: 'series', tmdb_id: 'old-series', imdb_id: 'tt-old-series', title: 'Old Series', year: 2023, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, affinity: 5, rec_count: 1, popularity: 1, poster: null, engine_id: 't7-sparse' },
+        ], { ratingCheckedAt: null });
+        assert.strictEqual(rs.countRecommended(pid), 2, 'old pool has 2 rows');
+
+        // Run the staged weekly build (sparse series → acceptance gate fails for series).
+        const result = await rs.buildPool(config.getProfile(pid), quiet, () => {}, { kind: 'weekly', anchor: '2026-10-04', startHash: 'h0' });
+
+        // The old pool is intact (no promotion for either type).
+        assert.strictEqual(rs.countRecommended(pid), 2, 'old pool intact after sparse series');
+        assert.ok(rs.getRecommended(pid, { type: 'movie', limit: 10}).some((r) => r.tmdb_id === 'old-movie'), 'old movie row still present');
+        assert.ok(rs.getRecommended(pid, { type: 'series', limit: 10}).some((r) => r.tmdb_id === 'old-series'), 'old series row still present');
+      } finally {
+        settings.updateSettings({ keys: { tmdb_api_key: prevTmdb } });
+        settings.updateSettings({ engines: prevEngines });
+        dispose();
+        config.removeProfile(pid); rs.deleteForProfile(pid); watchedStore.deleteForProfile(pid);
+      }
+    });
+
+    await it('T7c: staged build — failed age gate leaves old pool intact', async () => {
+      const prof = config.addProfile('T7c');
+      const pid = prof.id;
+      // An engine that produces candidates that will all be blocked by the age gate.
+      const ageFailEngine = {
+        id: 't7-agefail', name: 'AgeFail', description: 't', supportedTypes: ['movie', 'series'],
+        capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+        requirements: () => ({ ok: true, missing: [] }),
+        generate: async (profile, type, ctx) => {
+          if (ctx.stats) ctx.stats.seeds = 1;
+          return [
+            { type: 'movie', tmdb_id: 't7-movie-blocked', rankScore: 5, imdb_id: 'tt-t7-movie-blocked', title: 'Blocked', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, popularity: 1, poster: null, adult: true },
+          ];
+        },
+      };
+      const dispose = engines._register(ageFailEngine);
+      const prevTmdb = settings.getSettings()?.keys?.tmdb_api_key || '';
+      const prevEngines = { ...(settings.getSettings()?.engines || {}) };
+      settings.updateSettings({ keys: { tmdb_api_key: 't7-tmdb' } });
+      settings.updateSettings({ engines: { 't7-agefail': true } });
+      config.updateProfile(pid, { filters: { engine_movie: 't7-agefail', engine_series: 't7-agefail', age_limit: 14 } });
+      try {
+        // Seed the old movie pool with a row.
+        rs.upsertCandidates(pid, [
+          { type: 'movie', tmdb_id: 'old-movie', imdb_id: 'tt-old-movie', title: 'Old Movie', year: 2023, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, affinity: 5, rec_count: 1, popularity: 1, poster: null, engine_id: 't7-agefail' },
+        ], { ratingCheckedAt: null });
+        assert.strictEqual(rs.countRecommended(pid), 1, 'old pool has 1 row');
+
+        // Run the staged weekly build (age gate blocks all candidates → acceptance gate fails).
+        const result = await rs.buildPool(config.getProfile(pid), quiet, () => {}, { kind: 'weekly', anchor: '2026-10-04', startHash: 'h0' });
+
+        // The old pool is intact (no promotion).
+        assert.strictEqual(rs.countRecommended(pid), 1, 'old pool intact after failed age gate');
+        assert.ok(rs.getRecommended(pid, { type: 'movie', limit: 10}).some((r) => r.tmdb_id === 'old-movie'), 'old row still present');
+      } finally {
+        settings.updateSettings({ keys: { tmdb_api_key: prevTmdb } });
+        settings.updateSettings({ engines: prevEngines });
+        dispose();
+        config.removeProfile(pid); rs.deleteForProfile(pid); watchedStore.deleteForProfile(pid);
+      }
+    });
+
+    await it('T7d: staged build — injected commit error leaves old pool + markers intact', async () => {
+      const prof = config.addProfile('T7d');
+      const pid = prof.id;
+      const dispose = engines._register(mkStagedEngine('t7-commit', 't7c'));
+      const prevTmdb = settings.getSettings()?.keys?.tmdb_api_key || '';
+      const prevEngines = { ...(settings.getSettings()?.engines || {}) };
+      settings.updateSettings({ keys: { tmdb_api_key: 't7-tmdb' } });
+      settings.updateSettings({ engines: { 't7-commit': true } });
+      config.updateProfile(pid, { filters: { engine_movie: 't7-commit', engine_series: 't7-commit' } });
+      try {
+        // Seed watched history.
+        watchedStore.upsertMany(pid, [
+          { simkl_id: 1, type: 'movie', imdb_id: 'tt-watched', tmdb_id: 'w1', title: 'Watched', year: 2020, watched_at: '2026-09-01T10:00:00Z' },
+        ]);
+        // Seed the old movie pool with 3 rows (so the acceptance gate passes).
+        rs.upsertCandidates(pid, [
+          { type: 'movie', tmdb_id: 't7c-movie-old1', imdb_id: 'tt-t7c-movie-old1', title: 'Old1', year: 2023, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, affinity: 5, rec_count: 1, popularity: 1, poster: null, engine_id: 't7-commit' },
+          { type: 'movie', tmdb_id: 't7c-movie-old2', imdb_id: 'tt-t7c-movie-old2', title: 'Old2', year: 2023, primary_genre: 'Comedy', genres: 'Comedy', vote_average: 7, vote_count: 4000, affinity: 4, rec_count: 1, popularity: 1, poster: null, engine_id: 't7-commit' },
+          { type: 'movie', tmdb_id: 't7c-movie-old3', imdb_id: 'tt-t7c-movie-old3', title: 'Old3', year: 2023, primary_genre: 'Action', genres: 'Action', vote_average: 6, vote_count: 3000, affinity: 3, rec_count: 1, popularity: 1, poster: null, engine_id: 't7-commit' },
+        ], { ratingCheckedAt: null });
+        assert.strictEqual(rs.countRecommended(pid), 3, 'old movie pool has 3 rows');
+
+        // Inject a commit error: wrap conn.prepare to throw on COMMIT.
+        const dbMod = require('../src/db');
+        const conn = dbMod.get();
+        const origPrepare = conn.prepare;
+        conn.prepare = (sql, ...args) => {
+          if (sql === 'COMMIT') {
+            return { run: () => { throw new Error('injected commit error'); } };
+          }
+          return origPrepare.call(conn, sql, ...args);
+        };
+        try {
+          // The build should throw (the commit error propagates).
+          let threw = false;
+          try {
+            await rs.buildPool(config.getProfile(pid), quiet, () => {}, { kind: 'weekly', anchor: '2026-10-04', startHash: 'h0' });
+          } catch (err) {
+            threw = true;
+            assert.ok(err.message.includes('injected commit error'), 'error is the injected commit error');
+          }
+          assert.ok(threw, 'build threw due to injected commit error');
+
+          // The old pool is intact (no promotion).
+          assert.strictEqual(rs.countRecommended(pid), 3, 'old pool intact after commit error');
+          assert.ok(rs.getRecommended(pid, { type: 'movie', limit: 10 }).some((r) => r.tmdb_id === 't7c-movie-old1'), 'old row 1 still present');
+          assert.ok(rs.getRecommended(pid, { type: 'movie', limit: 10 }).some((r) => r.tmdb_id === 't7c-movie-old2'), 'old row 2 still present');
+          assert.ok(rs.getRecommended(pid, { type: 'movie', limit: 10 }).some((r) => r.tmdb_id === 't7c-movie-old3'), 'old row 3 still present');
+        } finally {
+          conn.prepare = origPrepare;
+        }
+      } finally {
+        settings.updateSettings({ keys: { tmdb_api_key: prevTmdb } });
+        settings.updateSettings({ engines: prevEngines });
+        dispose();
+        config.removeProfile(pid); rs.deleteForProfile(pid); watchedStore.deleteForProfile(pid);
+      }
+    });
+
+    await it('T7e: staged build — suppression + impression arriving during generation', async () => {
+      const prof = config.addProfile('T7e');
+      const pid = prof.id;
+      // An engine that, during generate, adds a dont_recommend row for one of
+      // its own candidates AND updates the impression of an overlapping row.
+      // This simulates a suppression/impression arriving while the async
+      // generation is in flight.
+      const inFlightEngine = {
+        id: 't7-inflight', name: 'InFlight', description: 't', supportedTypes: ['movie', 'series'],
+        capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+        requirements: () => ({ ok: true, missing: [] }),
+        generate: async (profile, type, ctx) => {
+          if (ctx.stats) ctx.stats.seeds = 1;
+          if (type === 'movie') {
+            // Simulate a suppression arriving during generation: add a
+            // dont_recommend row for one of the candidates this engine emits.
+            // (The pipeline's dont set was computed BEFORE generate, so this
+            // new row is not in ctx.dont — the candidate survives generation.)
+            rs.addDontRecommend(profile.id, 'movie', 't7e-movie-new');
+            // Simulate an impression arriving during generation: bump the
+            // times_shown on the overlapping row.
+            const conn = require('../src/db').get();
+            conn.prepare('UPDATE recommended SET times_shown = 9 WHERE profile_id = ? AND type = ? AND tmdb_id = ?').run(profile.id, 'movie', 't7e-movie-overlap');
+          }
+          return [
+            { type, tmdb_id: `t7e-${type}-overlap`, rankScore: 5, imdb_id: `tt-t7e-${type}-overlap`, title: `T7E ${type} overlap`, year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, popularity: 1, poster: null },
+            { type, tmdb_id: `t7e-${type}-new`, rankScore: 4, imdb_id: `tt-t7e-${type}-new`, title: `T7E ${type} new`, year: 2025, primary_genre: 'Action', genres: 'Action', vote_average: 7, vote_count: 4000, popularity: 2, poster: null },
+            { type, tmdb_id: `t7e-${type}-new2`, rankScore: 3, imdb_id: `tt-t7e-${type}-new2`, title: `T7E ${type} new2`, year: 2025, primary_genre: 'Sci-Fi', genres: 'Sci-Fi', vote_average: 7, vote_count: 3500, popularity: 2, poster: null },
+          ];
+        },
+      };
+      const dispose = engines._register(inFlightEngine);
+      const prevTmdb = settings.getSettings()?.keys?.tmdb_api_key || '';
+      const prevEngines = { ...(settings.getSettings()?.engines || {}) };
+      settings.updateSettings({ keys: { tmdb_api_key: 't7-tmdb' } });
+      settings.updateSettings({ engines: { 't7-inflight': true } });
+      config.updateProfile(pid, { filters: { engine_movie: 't7-inflight', engine_series: 't7-inflight' } });
+      try {
+        // Seed watched history.
+        watchedStore.upsertMany(pid, [
+          { simkl_id: 1, type: 'movie', imdb_id: 'tt-watched', tmdb_id: 'w1', title: 'Watched', year: 2020, watched_at: '2026-09-01T10:00:00Z' },
+        ]);
+        // Seed the old movie pool with 3 rows (so the acceptance gate passes).
+        rs.upsertCandidates(pid, [
+          { type: 'movie', tmdb_id: 't7e-movie-overlap', imdb_id: 'tt-t7e-movie-overlap', title: 'Overlap', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, affinity: 5, rec_count: 1, popularity: 1, poster: null, engine_id: 't7-inflight' },
+          { type: 'movie', tmdb_id: 't7e-movie-old2', imdb_id: 'tt-t7e-movie-old2', title: 'Old2', year: 2023, primary_genre: 'Comedy', genres: 'Comedy', vote_average: 7, vote_count: 4000, affinity: 4, rec_count: 1, popularity: 1, poster: null, engine_id: 't7-inflight' },
+          { type: 'movie', tmdb_id: 't7e-movie-old3', imdb_id: 'tt-t7e-movie-old3', title: 'Old3', year: 2023, primary_genre: 'Action', genres: 'Action', vote_average: 6, vote_count: 3000, affinity: 3, rec_count: 1, popularity: 1, poster: null, engine_id: 't7-inflight' },
+        ], { ratingCheckedAt: null });
+        assert.strictEqual(rs.countRecommended(pid), 3, 'old movie pool has 3 rows');
+
+        // Run the staged weekly build.
+        await rs.buildPool(config.getProfile(pid), quiet, () => {}, { kind: 'weekly', anchor: '2026-10-04', startHash: 'h0' });
+
+        // The dont_recommend row (added during generation) is preserved.
+        const dnr = require('../src/db').get().prepare('SELECT * FROM dont_recommend WHERE profile_id = ?').all(pid);
+        assert.ok(dnr.some((r) => r.tmdb_id === 't7e-movie-new'), 'dont_recommend row added during generation is preserved');
+
+        // The overlapping row's impression (bumped during generation) is preserved
+        // by the ON CONFLICT clause.
+        const overlap = rs.getRecommended(pid, { type: 'movie', limit: 10 }).find((r) => r.tmdb_id === 't7e-movie-overlap');
+        assert.ok(overlap, 'overlap row retained');
+        assert.strictEqual(overlap.times_shown, 9, 'times_shown preserved after in-flight impression');
+
+        // The suppressed candidate (t7e-movie-new) IS in the pool (it was
+        // generated before the suppression arrived), but it is filtered at
+        // serve time by the dont_recommend table.
+        assert.ok(rs.getRecommended(pid, { type: 'movie', limit: 10 }).some((r) => r.tmdb_id === 't7e-movie-new'), 'suppressed candidate in pool (generated before suppression)');
+
+        // The new2 candidate is promoted.
+        assert.ok(rs.getRecommended(pid, { type: 'movie', limit: 10 }).some((r) => r.tmdb_id === 't7e-movie-new2'), 'new2 candidate promoted');
+      } finally {
+        settings.updateSettings({ keys: { tmdb_api_key: prevTmdb } });
+        settings.updateSettings({ engines: prevEngines });
+        dispose();
+        config.removeProfile(pid); rs.deleteForProfile(pid); watchedStore.deleteForProfile(pid);
+      }
+    });
+  }
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();

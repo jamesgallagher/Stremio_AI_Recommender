@@ -431,6 +431,10 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
   // TV-3 §4: the calibrated serve target — only when rows are stored. Built
   // from the same SPLIT genre names the served rows carry (tvGenres). A
   // failure only logs — it never fails the build.
+  // feature/ai-catalog-cadence (Stage 2): the staged path defers the setTarget
+  // write until promotion (ctx.stage) so a failed/partial build never writes a
+  // target for candidates that weren't promoted. The target is computed and
+  // stashed in ctx.marqueeTvTarget for the promotion step.
   if (out.length > 0) {
     try {
       const shows = [];
@@ -442,7 +446,11 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
         if (genres.length) shows.push({ genres, weight: e.value });
       }
       const target = serveCalibration.computeTarget(shows);
-      serveCalibration.setTarget(profile.id, 'series', 'marquee-tv', target, shows.length, nowMs);
+      if (ctx.stage) {
+        ctx.marqueeTvTarget = { target, filmCount: shows.length }; // deferred — promoted by stagedBuildPool
+      } else {
+        serveCalibration.setTarget(profile.id, 'series', 'marquee-tv', target, shows.length, nowMs);
+      }
       const top = Object.entries(target).slice(0, 3).map(([g, v]) => `${g} ${Math.round(v * 100)}%`);
       log.log(`[marquee-tv] ${profile.name}: serve target from ${shows.length} shows — top: ${top.join(', ')}${Object.keys(target).length > 3 ? ' …' : ''}`);
     } catch (err) {

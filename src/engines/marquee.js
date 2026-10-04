@@ -146,10 +146,18 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
   // Calibrated serving (spec §16, C4): store the per-profile taste target at
   // build time (only when the build produced films) so serving stays
   // instant/local/network-free. A failure here NEVER fails the build (C6).
+  // feature/ai-catalog-cadence (Stage 2): the staged path defers the setTarget
+  // write until promotion (ctx.stage) so a failed/partial build never writes a
+  // target for candidates that weren't promoted. The target is computed and
+  // stashed in ctx.marqueeTarget for the promotion step.
   if (final.length > 0) {
     try {
       const gt = taste.genreTarget(profile.id, cfg, { nowMs });
-      serveCalibration.setTarget(profile.id, 'movie', 'marquee', gt.target, gt.filmCount, nowMs);
+      if (ctx.stage) {
+        ctx.marqueeTarget = gt; // deferred — promoted by stagedBuildPool
+      } else {
+        serveCalibration.setTarget(profile.id, 'movie', 'marquee', gt.target, gt.filmCount, nowMs);
+      }
       const top = Object.entries(gt.target).slice(0, 3).map(([g, v]) => `${g} ${(v * 100).toFixed(0)}%`);
       log.log(`[marquee] ${profile.name}: serve target from ${gt.filmCount} films — top: ${top.join(', ')}${Object.keys(gt.target).length > 3 ? ' …' : ''}`);
     } catch (err) {
