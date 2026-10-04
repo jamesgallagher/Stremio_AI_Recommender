@@ -75,23 +75,21 @@ function isStaleForProfile(profile, def, entry) {
   if (Date.now() - (entry.generated_at || 0) > STALE_MS) return true;
   // Legacy cache without the format marker — one-time migration.
   if (!entry.format) return true;
-  // Built for a smaller list size: the reserve (2×old list size) may be too
-  // small to fill the current setting. Check whether the pool can serve the
-  // current list size at all.
   const listSize = require('./recommendationStore').listSizeFor(profile);
   const builtFor = entry.list_size;
+  // List-size change: the pool was built for a smaller size and its eligible
+  // count can't fill the current setting.
   if (builtFor && builtFor < listSize) {
-    // The pool was built for a smaller size; if its total metas are fewer
-    // than the current list size, it can't fill the setting.
-    if (entry.metas?.length < listSize) return true;
+    const currentEligible = eligibleVisible(entry.metas, profile, def);
+    if (currentEligible < listSize) return true;
   }
-  // Depletion: eligible visible count dropped below what it was at build.
-  // A thin source that was thin at build (eligible_at_build < listSize) does
-  // NOT trigger on every request — the check is "dropped below what it had
-  // at build", not "below list size".
+  // Depletion: the eligible count has dropped below what it was at build
+  // (capped at list size). A thin source that was thin at build does NOT
+  // trigger on every request — the check is "the pool can no longer fill the
+  // list size", not "any single watch happened".
   if (entry.eligible_at_build != null) {
     const currentEligible = eligibleVisible(entry.metas, profile, def);
-    if (currentEligible < entry.eligible_at_build) return true;
+    if (Math.min(listSize, currentEligible) < Math.min(listSize, entry.eligible_at_build)) return true;
   }
   return false;
 }
@@ -448,6 +446,58 @@ async function buildWatchlistCatalog(profile, def, log = console) {
   return built;
 }
 
+// Fetch one page of MDBList items and convert them to metas (rating-gated).
+// Returns { metas, items } where items is the raw page (empty if no more data).
+async function fetchExtraPage(key, def, page, seen, log) {
+  const items = await mdblist.listItemsPage(key, def.user, def.slug, def.type, {
+    limit: EXTRA_PAGE_SIZE, offset: page * EXTRA_PAGE_SIZE, sort: def.sort,
+  });
+  if (!items.length) return { metas: [], items };
+
+  // Batch-enrich items whose list entry lacks a poster or (when gated) a
+  // rating — one POST for the whole page instead of per-item lookups.
+  const needInfo = items.filter((i) => {
+    const id = i.imdb_id || i.ids?.imdb;
+    return id && (!i.poster || (def.min_imdb > 0 && mdblist.parseImdbRating(i) === null));
+  }).map((i) => i.imdb_id || i.ids?.imdb);
+  let infoMap = new Map();
+  if (needInfo.length) {
+    try {
+      infoMap = await mdblist.mediaInfoBatch(key, def.type, needInfo);
+    } catch (err) {
+      log.warn(`[extra] ${def.id}: batch enrich failed (${err.message}) — serving list data as-is`);
+    }
+  }
+
+  const metas = [];
+  for (const item of items) {
+    const imdb = item.imdb_id || item.ids?.imdb;
+    if (!imdb || seen.has(imdb)) continue;
+    seen.add(imdb);
+    const info = infoMap.get(imdb);
+    const rating = mdblist.parseImdbRating(item) ?? mdblist.parseImdbRating(info);
+    // Unrated titles are kept — the gate only drops a rating that exists
+    // and is below the bar (same semantics as the AI min-rating filter).
+    if (def.min_imdb > 0 && rating !== null && rating < def.min_imdb) {
+      log.log(`[extra] ${def.id}: "${item.title}" IMDb ${rating} < ${def.min_imdb} — dropped`);
+      continue;
+    }
+    metas.push({
+      id: imdb,
+      type: def.type,
+      name: item.title || info?.title || imdb,
+      poster: item.poster || info?.poster || null,
+      description: item.description || info?.description || '',
+      releaseInfo: String(item.release_year || info?.year || '') || null,
+      imdbRating: rating !== null ? rating.toFixed(1) : null,
+      // CB-0: the age gate keys titles by TMDB id — the real id from the live
+      // payload (ids.tmdb, falling back to tmdb_id), not a collapsed `undefined`.
+      _tmdb_id: tmdbIdOf(item),
+    });
+  }
+  return { metas, items };
+}
+
 async function buildExtraCatalog(profile, def, log = console) {
   if (def.source === 'simkl_plantowatch') {
     return cleanMetas(await applyExtraAgeGate(profile, def, await buildWatchlistCatalog(profile, def, log), log));
@@ -462,64 +512,54 @@ async function buildExtraCatalog(profile, def, log = console) {
   const target = 2 * listSize;
   const collected = [];
   const seen = new Set();
-  for (let page = 0; page < MAX_EXTRA_PAGES && collected.length < target; page++) {
-    const items = await mdblist.listItemsPage(key, def.user, def.slug, def.type, {
-      limit: EXTRA_PAGE_SIZE, offset: page * EXTRA_PAGE_SIZE, sort: def.sort,
-    });
+  // Eligibility filter for counting toward the reserve target: a title is
+  // "eligible" if it would be served (not watched unless dedupe_watched:false,
+  // not suppressed unless source is simkl_plantowatch). Ineligible titles stay
+  // in the cache so undo works locally.
+  const watched = watchedStore.watchedIdSets(profile.id).imdb;
+  const suppressed = def.source !== 'simkl_plantowatch'
+    ? require('./recommendationStore').dontRecommendImdbSet(profile.id)
+    : new Set();
+  const isEligible = (m) => {
+    if (def.dedupe_watched !== false && watched.has(m.id)) return false;
+    if (def.source !== 'simkl_plantowatch' && suppressed.has(m.id)) return false;
+    return true;
+  };
+  let eligibleCount = 0;
+  let page = 0;
+
+  // Page until 2×listSize ELIGIBLE candidates are collected (or MAX_EXTRA_PAGES).
+  // ALL titles (including ineligible) stay in the cache.
+  while (page < MAX_EXTRA_PAGES && eligibleCount < target) {
+    const { metas: pageMetas, items } = await fetchExtraPage(key, def, page, seen, log);
     if (!items.length) break;
-
-    // Batch-enrich items whose list entry lacks a poster or (when gated) a
-    // rating — one POST for the whole page instead of per-item lookups.
-    const needInfo = items.filter((i) => {
-      const id = i.imdb_id || i.ids?.imdb;
-      return id && (!i.poster || (def.min_imdb > 0 && mdblist.parseImdbRating(i) === null));
-    }).map((i) => i.imdb_id || i.ids?.imdb);
-    let infoMap = new Map();
-    if (needInfo.length) {
-      try {
-        infoMap = await mdblist.mediaInfoBatch(key, def.type, needInfo);
-      } catch (err) {
-        log.warn(`[extra] ${def.id}: batch enrich failed (${err.message}) — serving list data as-is`);
-      }
-    }
-
-    let pageMetas = [];
-    for (const item of items) {
-      const imdb = item.imdb_id || item.ids?.imdb;
-      if (!imdb || seen.has(imdb)) continue;
-      seen.add(imdb);
-      const info = infoMap.get(imdb);
-      const rating = mdblist.parseImdbRating(item) ?? mdblist.parseImdbRating(info);
-      // Unrated titles are kept — the gate only drops a rating that exists
-      // and is below the bar (same semantics as the AI min-rating filter).
-      if (def.min_imdb > 0 && rating !== null && rating < def.min_imdb) {
-        log.log(`[extra] ${def.id}: "${item.title}" IMDb ${rating} < ${def.min_imdb} — dropped`);
-        continue;
-      }
-      pageMetas.push({
-        id: imdb,
-        type: def.type,
-        name: item.title || info?.title || imdb,
-        poster: item.poster || info?.poster || null,
-        description: item.description || info?.description || '',
-        releaseInfo: String(item.release_year || info?.year || '') || null,
-        imdbRating: rating !== null ? rating.toFixed(1) : null,
-        // CB-0: the age gate keys titles by TMDB id — the real id from the live
-        // payload (ids.tmdb, falling back to tmdb_id), not a collapsed `undefined`.
-        _tmdb_id: tmdbIdOf(item),
-      });
-    }
     for (const m of pageMetas) {
-      if (collected.length >= target) break;
       collected.push(m);
+      if (isEligible(m)) eligibleCount++;
     }
-    log.log(`[extra] ${profile.name}/${def.id}: page ${page + 1} -> ${collected.length}/${target} (reserve)`);
+    log.log(`[extra] ${profile.name}/${def.id}: page ${page + 1} -> ${eligibleCount}/${target} eligible (${collected.length} total)`);
+    page++;
   }
-  // Second age layer for kids profiles, then randomize so the daily list
-  // looks fresh instead of serving the same fixed sequence. cleanMetas strips
-  // the internal `_tmdb_id` (and any other `_` field) before the list is
-  // cached/served — the Watch Later path already does this.
-  return cleanMetas(shuffle(await applyExtraAgeGate(profile, def, collected, log)));
+
+  // Second age layer for kids profiles.
+  let result = await applyExtraAgeGate(profile, def, collected, log);
+
+  // If the age gate left fewer than listSize eligible and more pages exist,
+  // keep paging and run the age gate on the new titles (within MAX_EXTRA_PAGES).
+  let postAgeEligible = result.filter(isEligible).length;
+  while (postAgeEligible < listSize && page < MAX_EXTRA_PAGES) {
+    const { metas: pageMetas, items } = await fetchExtraPage(key, def, page, seen, log);
+    if (!items.length || !pageMetas.length) break;
+    const aged = await applyExtraAgeGate(profile, def, pageMetas, log);
+    result.push(...aged);
+    postAgeEligible = result.filter(isEligible).length;
+    page++;
+  }
+
+  // Randomize so the daily list looks fresh instead of serving the same fixed
+  // sequence. cleanMetas strips the internal `_tmdb_id` (and any other `_`
+  // field) before the list is cached/served.
+  return cleanMetas(shuffle(result));
 }
 
 // Rebuilds a profile's EXTRA catalogs (MDBList curated + the remaining
@@ -552,7 +592,7 @@ async function rebuildProfile(profile, log = console, opts = {}, onProgress = ()
             const newVisible = eligibleVisible(metas, profile, def);
             const oldEntry = store.loadCache(profile.id).extras?.[def.id];
             const oldVisible = oldEntry ? eligibleVisible(oldEntry.metas, profile, def) : 0;
-            const gate = newVisible >= Math.min(listSize, oldVisible || listSize);
+            const gate = newVisible >= Math.min(listSize, oldVisible);
             if (metas.length >= MIN_METAS && gate) {
               const meta = { format: 'reserve-v1', list_size: listSize, eligible_at_build: newVisible };
               store.swapExtra(profile.id, def.id, metas, meta);
@@ -561,7 +601,7 @@ async function rebuildProfile(profile, log = console, opts = {}, onProgress = ()
             } else {
               const reason = metas.length < MIN_METAS
                 ? `only ${metas.length} usable titles (< ${MIN_METAS})`
-                : `new visible ${newVisible} < gate ${Math.min(listSize, oldVisible || listSize)}`;
+                : `new visible ${newVisible} < gate ${Math.min(listSize, oldVisible)}`;
               results[def.id] = { ok: false, error: `${reason} — kept previous list` };
               log.warn(`[extra] ${profile.name}/${def.id}: ${results[def.id].error}`);
             }

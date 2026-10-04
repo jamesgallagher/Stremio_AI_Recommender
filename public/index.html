@@ -732,10 +732,15 @@ let _cpvCatalogId = null;
 // CB-1: refetch the preview sheet after a successful action. The refetch
 // shows the backfilled titles (the reserve) so the count stays at list size.
 // If the refetch fails, the caller falls back to optimistic removal.
+// Guard: ignore the response if the sheet has closed or now shows a different
+// catalog or profile (capture the id before the call and compare after).
 async function _cpvRefetch() {
   if (!_cpvCatalogId) return false;
+  const catalogId = _cpvCatalogId;
+  const pid = _cpvPid;
   try {
-    const data = await api('/profiles/' + _cpvPid + '/catalogs/' + encodeURIComponent(_cpvCatalogId) + '/preview');
+    const data = await api('/profiles/' + pid + '/catalogs/' + encodeURIComponent(catalogId) + '/preview');
+    if (_cpvCatalogId !== catalogId || _cpvPid !== pid) return false;
     _cpvRender(data);
     return true;
   } catch { return false; }

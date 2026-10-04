@@ -661,9 +661,9 @@
         // keeps watched titles (Christmas, Watch Later).
         const ok = await pvRefetch();
         if (!ok && dedupeWatched) pvDropCell(cell);
-      } else if (res.status === 400) showSnack('Couldn't mark watched — connect Simkl in the portal first', null);
-      else showSnack('Couldn't mark watched — try again', null);
-    } catch { showSnack('Couldn't mark watched — try again.', null); }
+      } else if (res.status === 400) showSnack('Couldn’t mark watched — connect Simkl in the portal first', null);
+      else showSnack('Couldn’t mark watched — try again', null);
+    } catch { showSnack('Couldn’t mark watched — try again.', null); }
   }
 
   async function pvNotInterested(m, type, cell) {
@@ -675,8 +675,8 @@
         const ok = await pvRefetch();
         if (!ok) pvDropCell(cell); // fallback: optimistic removal
       }
-      else showSnack('Couldn't update — try again', null);
-    } catch { showSnack('Couldn't update — try again.', null); }
+      else showSnack('Couldn’t update — try again', null);
+    } catch { showSnack('Couldn’t update — try again.', null); }
   }
 
   async function pvRemoveFromWatchlist(m, type, cell) {
@@ -688,9 +688,9 @@
         const ok = await pvRefetch();
         if (!ok) pvDropCell(cell); // fallback: optimistic removal
       }
-      else if (res.status === 400) showSnack('Couldn't remove — connect Simkl in the portal first', null);
-      else showSnack('Couldn't remove — try again', null);
-    } catch { showSnack('Couldn't remove — try again.', null); }
+      else if (res.status === 400) showSnack('Couldn’t remove — connect Simkl in the portal first', null);
+      else showSnack('Couldn’t remove — try again', null);
+    } catch { showSnack('Couldn’t remove — try again.', null); }
   }
 
   let pvCatalogId = null; // CB-1: the catalog whose preview is open (for refetch after actions)
@@ -711,12 +711,16 @@
   // not-interested / watchlist-remove). The refetch shows the backfilled
   // titles (the reserve) so the count stays at list size. If the refetch
   // fails, fall back to the optimistic removal (the cell stays dropped).
+  // Guard: ignore the response if the sheet has closed or now shows a
+  // different catalog (capture the id before the call and compare after).
   async function pvRefetch() {
     if (!pvCatalogId) return false;
+    const catalogId = pvCatalogId;
     try {
-      const res = await apiFetch('/catalogs/' + encodeURIComponent(pvCatalogId) + '/preview');
+      const res = await apiFetch('/catalogs/' + encodeURIComponent(catalogId) + '/preview');
       const data = await res.json().catch(() => ({}));
       if (!res.ok) return false;
+      if (pvCatalogId !== catalogId) return false;
       renderPreview(data);
       return true;
     } catch { return false; }

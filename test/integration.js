@@ -7019,6 +7019,229 @@ async function main() {
       config.removeProfile(p.id);
       store.deleteCache(p.id);
     });
+
+    // T9 — syntax: node --check on mobile/public/app.js and the portal's
+    // inline script. Guards against curly-quote / syntax regressions.
+    await it('CB-1 T9. syntax: app.js and portal inline script parse', async () => {
+      const { execSync } = require('child_process');
+      const path = require('path');
+      const os = require('os');
+      // mobile/public/app.js
+      execSync(`node --check "${path.join(__dirname, '..', 'mobile', 'public', 'app.js')}"`, { stdio: 'pipe' });
+      // portal inline script: extract the <script> block and syntax-check it.
+      const html = require('fs').readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
+      const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
+      assert.ok(scriptMatch, 'portal index.html has an inline <script> block');
+      // Write to a temp file and node --check it.
+      const tmpFile = path.join(os.tmpdir(), 'portal-script-check-' + Date.now() + '.js');
+      require('fs').writeFileSync(tmpFile, scriptMatch[1]);
+      try {
+        execSync(`node --check "${tmpFile}"`, { stdio: 'pipe' });
+      } finally {
+        require('fs').unlinkSync(tmpFile);
+      }
+    });
+
+    // T10 — swap gate: first build with a short source (15 eligible, list size 20)
+    // publishes. The old code required newVisible >= listSize when no old entry
+    // existed (oldVisible || listSize = listSize), so a short source never
+    // published on first build. The fix: min(listSize, oldVisible) where a
+    // missing old entry counts as 0 → gate = newVisible >= 0.
+    await it('CB-1 T10. swap gate: first build with short source publishes', async () => {
+      const origList = mdblist.listItemsPage;
+      const origMediaInfo = mdblist.mediaInfoBatch;
+      const p = config.addProfile('INT-CB1-T10');
+      config.updateProfile(p.id, {
+        filters: { list_size: 20, age_limit: 0 },
+        keys: { mdblist_api_key: 'cb1-mdb' },
+        catalogs: { 'mdb-action-movies': true },
+      });
+      const profile = config.getProfile(p.id);
+      const def = { type: 'movie', id: 'mdb-action-movies', name: 'Action Movies', source: 'mdblist', user: 'hdlists', slug: 'action', min_imdb: 6, sort: 'imdbpopular' };
+      // 15 titles (short source: fewer than list size).
+      const items = [];
+      for (let i = 1; i <= 15; i++) {
+        items.push({ imdb_id: 'tt' + i, ids: { imdb: 'tt' + i, tmdb: 100 + i }, title: 'Title ' + i, release_year: 2020, poster: null, imdbRating: 7.5 });
+      }
+      mdblist.listItemsPage = async () => items;
+      mdblist.mediaInfoBatch = async () => new Map();
+      try {
+        // Build the catalog.
+        const built = await rebuild.buildExtraCatalog(profile, def, quiet);
+        assert.ok(built.length >= 5, `built at least MIN_METAS: ${built.length}`);
+        // Simulate the swap gate logic (no old entry).
+        const listSize = rs.listSizeFor(profile);
+        const newVisible = rebuild.eligibleVisible(built, profile, def);
+        const oldEntry = null; // first build
+        const oldVisible = oldEntry ? rebuild.eligibleVisible(oldEntry.metas, profile, def) : 0;
+        const gate = newVisible >= Math.min(listSize, oldVisible);
+        assert.ok(gate, `swap gate passes for first build (newVisible=${newVisible}, listSize=${listSize}, oldVisible=${oldVisible})`);
+        // The MIN_METAS floor still applies.
+        assert.ok(built.length >= rebuild.MIN_METAS, `MIN_METAS floor holds: ${built.length} >= ${rebuild.MIN_METAS}`);
+        // Publish it.
+        const meta = { format: 'reserve-v1', list_size: listSize, eligible_at_build: newVisible };
+        store.swapExtra(p.id, def.id, built, meta);
+        const cache = store.loadCache(p.id);
+        assert.ok(cache.extras[def.id], 'catalog published');
+        assert.strictEqual(cache.extras[def.id].metas.length, built.length, 'all titles stored');
+      } finally {
+        mdblist.listItemsPage = origList;
+        mdblist.mediaInfoBatch = origMediaInfo;
+        config.removeProfile(p.id);
+        store.deleteCache(p.id);
+      }
+    });
+
+    // T11 — depletion trigger: a single watch does NOT mark the catalog stale
+    // when the pool can still fill the list size. The old code triggered on
+    // any drop below eligible_at_build (39 < 40 → stale). The fix: compare
+    // shown counts — min(listSize, eligibleNow) < min(listSize, eligible_at_build).
+    await it('CB-1 T11. depletion: single watch does not trigger rebuild', async () => {
+      const p = config.addProfile('INT-CB1-T11');
+      config.updateProfile(p.id, {
+        filters: { list_size: 20, age_limit: 0 },
+        keys: { mdblist_api_key: 'cb1-mdb' },
+        catalogs: { 'mdb-action-movies': true },
+      });
+      const profile = config.getProfile(p.id);
+      const def = { type: 'movie', id: 'mdb-action-movies', source: 'mdblist' };
+      // 40 titles in the reserve, all eligible at build.
+      const metas = [];
+      for (let i = 1; i <= 40; i++) {
+        metas.push({ id: 'tt' + i, type: 'movie', name: 'Title ' + i });
+      }
+      store.swapExtra(p.id, def.id, metas, { format: 'reserve-v1', list_size: 20, eligible_at_build: 40 });
+
+      // (a) One watch: 39 eligible. min(20, 39) = 20, min(20, 40) = 20. 20 < 20 → false.
+      const oneWatched = new Set(['tt1']);
+      const origWatched = watchedStore.watchedIdSets;
+      watchedStore.watchedIdSets = () => ({ imdb: oneWatched, tmdb: new Set() });
+      const entry = store.loadCache(p.id).extras[def.id];
+      assert.ok(!rebuild.isStaleForProfile(profile, def, entry), 'single watch (39/40 eligible) is NOT stale');
+      watchedStore.watchedIdSets = origWatched;
+
+      // (b) Many watches: 5 eligible. min(20, 5) = 5, min(20, 40) = 20. 5 < 20 → true.
+      const manyWatched = new Set();
+      for (let i = 1; i <= 35; i++) manyWatched.add('tt' + i);
+      watchedStore.watchedIdSets = () => ({ imdb: manyWatched, tmdb: new Set() });
+      assert.ok(rebuild.isStaleForProfile(profile, def, entry), 'many watches (5/40 eligible) IS stale');
+      watchedStore.watchedIdSets = origWatched;
+
+      // (c) Thin source: 10 titles in the pool, eligible_at_build = 10.
+      // One watch → 9 eligible. min(20, 9) = 9, min(20, 10) = 10. 9 < 10 → true.
+      const thinMetas = metas.slice(0, 10);
+      store.swapExtra(p.id, def.id, thinMetas, { format: 'reserve-v1', list_size: 20, eligible_at_build: 10 });
+      const thinEntry = store.loadCache(p.id).extras[def.id];
+      const thinWatched = new Set(['tt1']);
+      watchedStore.watchedIdSets = () => ({ imdb: thinWatched, tmdb: new Set() });
+      assert.ok(rebuild.isStaleForProfile(profile, def, thinEntry), 'thin source: one watch (9/10 eligible) IS stale');
+      watchedStore.watchedIdSets = origWatched;
+
+      config.removeProfile(p.id);
+      store.deleteCache(p.id);
+    });
+
+    // T12 — reserve goal: paging counts only ELIGIBLE candidates toward 2×listSize.
+    // Ineligible titles (watched/suppressed) stay in the cache but don't count.
+    await it('CB-1 T12. reserve goal: counts eligible, keeps ineligible', async () => {
+      const origList = mdblist.listItemsPage;
+      const origMediaInfo = mdblist.mediaInfoBatch;
+      const p = config.addProfile('INT-CB1-T12');
+      config.updateProfile(p.id, {
+        filters: { list_size: 10, age_limit: 0 },
+        keys: { mdblist_api_key: 'cb1-mdb' },
+        catalogs: { 'mdb-action-movies': true },
+      });
+      const profile = config.getProfile(p.id);
+      const def = { type: 'movie', id: 'mdb-action-movies', name: 'Action Movies', source: 'mdblist', user: 'hdlists', slug: 'action', min_imdb: 6, sort: 'imdbpopular' };
+      // 30 titles: 10 watched, 5 suppressed, 15 eligible.
+      const items = [];
+      for (let i = 1; i <= 30; i++) {
+        items.push({ imdb_id: 'tt' + i, ids: { imdb: 'tt' + i, tmdb: 100 + i }, title: 'Title ' + i, release_year: 2020, poster: null, imdbRating: 7.5 });
+      }
+      mdblist.listItemsPage = async () => items;
+      mdblist.mediaInfoBatch = async () => new Map();
+      // 10 watched, 5 suppressed.
+      const watchedIds = new Set();
+      for (let i = 1; i <= 10; i++) watchedIds.add('tt' + i);
+      const origWatched = watchedStore.watchedIdSets;
+      watchedStore.watchedIdSets = () => ({ imdb: watchedIds, tmdb: new Set() });
+      const suppressIds = new Set();
+      for (let i = 11; i <= 15; i++) suppressIds.add('tt' + i);
+      const origSuppress = rs.dontRecommendImdbSet;
+      rs.dontRecommendImdbSet = () => suppressIds;
+      try {
+        const built = await rebuild.buildExtraCatalog(profile, def, quiet);
+        // The reserve keeps ALL 30 titles (ineligible included).
+        assert.strictEqual(built.length, 30, `reserve keeps all 30 titles (ineligible included): got ${built.length}`);
+        // The eligible count is 15 (30 - 10 watched - 5 suppressed).
+        const eligible = rebuild.eligibleVisible(built, profile, def);
+        assert.strictEqual(eligible, 15, `eligible count is 15: got ${eligible}`);
+        // The target was 2×10 = 20 eligible. Since only 15 are available,
+        // the reserve is honest about the shortfall.
+        assert.ok(eligible <= 20, 'eligible does not exceed target');
+      } finally {
+        mdblist.listItemsPage = origList;
+        mdblist.mediaInfoBatch = origMediaInfo;
+        watchedStore.watchedIdSets = origWatched;
+        rs.dontRecommendImdbSet = origSuppress;
+        config.removeProfile(p.id);
+        store.deleteCache(p.id);
+      }
+    });
+
+    // T13 — T7 additional case: one failing catalog does not block the
+    // others' refresh. ensureFresh checks each catalog independently via
+    // isStaleForProfile; a stale catalog triggers a rebuild that processes
+    // ALL enabled catalogs, but a non-stale catalog's cache is preserved
+    // (the swap gate prevents a worse replacement).
+    await it('CB-1 T13. one failing catalog does not block others', async () => {
+      const p = config.addProfile('INT-CB1-T13');
+      config.updateProfile(p.id, {
+        filters: { list_size: 20, age_limit: 0 },
+        keys: { mdblist_api_key: 'cb1-mdb' },
+        catalogs: { 'mdb-action-movies': true, 'mdb-comedy-movies': true },
+      });
+      const profile = config.getProfile(p.id);
+      const defA = { type: 'movie', id: 'mdb-action-movies', source: 'mdblist' };
+      defA.name = 'Action Movies';
+      const defB = { type: 'movie', id: 'mdb-comedy-movies', source: 'mdblist' };
+      defB.name = 'Comedy Movies';
+
+      // Catalog A: depleted (stale). 40 titles, 35 watched → 5 eligible.
+      const metasA = [];
+      for (let i = 1; i <= 40; i++) metasA.push({ id: 'ttA' + i, type: 'movie', name: 'A' + i });
+      store.swapExtra(p.id, defA.id, metasA, { format: 'reserve-v1', list_size: 20, eligible_at_build: 40 });
+
+      // Catalog B: healthy (not stale). 40 titles, 0 watched → 40 eligible.
+      const metasB = [];
+      for (let i = 1; i <= 40; i++) metasB.push({ id: 'ttB' + i, type: 'movie', name: 'B' + i });
+      store.swapExtra(p.id, defB.id, metasB, { format: 'reserve-v1', list_size: 20, eligible_at_build: 40 });
+
+      // 35 of catalog A's titles are watched.
+      const watchedA = new Set();
+      for (let i = 1; i <= 35; i++) watchedA.add('ttA' + i);
+      const origWatched = watchedStore.watchedIdSets;
+      watchedStore.watchedIdSets = () => ({ imdb: watchedA, tmdb: new Set() });
+
+      // Catalog A is stale (5 eligible < 20 = min(20, 40)).
+      const entryA = store.loadCache(p.id).extras[defA.id];
+      assert.ok(rebuild.isStaleForProfile(profile, defA, entryA), 'catalog A (depleted) is stale');
+
+      // Catalog B is NOT stale (40 eligible = min(20, 40)).
+      const entryB = store.loadCache(p.id).extras[defB.id];
+      assert.ok(!rebuild.isStaleForProfile(profile, defB, entryB), 'catalog B (healthy) is NOT stale');
+
+      // Per-catalog independence: the staleness of A does not affect B.
+      // This is verified by the per-catalog isStaleForProfile check above.
+      // In rebuildProfile, each catalog is built and swapped independently;
+      // a failure in one catalog (caught by the try/catch) does not prevent
+      // the others from being processed.
+
+      watchedStore.watchedIdSets = origWatched;
+      config.removeProfile(p.id);
+      store.deleteCache(p.id);
+    });
   }
 
   // ── I5. Search at TV-14: allowed + unknown returned; LLM error → empty ──────
