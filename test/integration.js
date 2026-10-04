@@ -6481,8 +6481,13 @@ async function main() {
 
     // T4 — fail closed: with a positive effective limit, a title with no tmdb id is
     // withheld and counted; with limit 0 (adult, unbanded) it is kept as today.
+    // The gate's LLM tripwire (hasLlm) must pass before the stubbed verify is
+    // reached, so this test sets its own LLM (saved/restored) — it does not
+    // depend on a key left by an earlier test.
     await it('I8-T4. Fail closed: no-tmdb-id title withheld when gated, kept when ungated', async () => {
       const origVerify = ageVerify.verify;
+      const origLlm = { ...settings.getSettings().llm };
+      settings.updateSettings({ llm: { groq_api_key: 'itest-groq' } });
       const metas = [
         { id: 'tt100', type: 'series', name: 'Identifiable', releaseInfo: '2020', _tmdb_id: 111, _genre_names: ['Drama'], _certification: null, description: '' },
         { id: 'tt200', type: 'series', name: 'Unidentifiable', releaseInfo: '2021', _genre_names: ['Comedy'], _certification: null, description: '' },
@@ -6504,6 +6509,7 @@ async function main() {
         const outUngated = await rebuild.applyExtraAgeGate(adultProfile, def, metas, quiet);
         assert.deepStrictEqual(outUngated.map((m) => m.id), ['tt100', 'tt200'], 'unidentifiable title kept when ungated');
       } finally {
+        settings.updateSettings({ llm: origLlm });
         ageVerify.verify = origVerify;
       }
     });
@@ -6536,6 +6542,61 @@ async function main() {
         mdblist.listItemsPage = origList;
         mdblist.mediaInfoBatch = origMediaInfo;
         ageVerify.verify = origVerify;
+      }
+    });
+
+    // T6 — no LLM configured: a gated catalog throws (fail-closed), and for
+    // Watch Later the caller (rebuildProfile) keeps the previous list rather
+    // than publishing an unvetted one. The LLM is cleared (saved/restored) so
+    // the tripwire fires even though earlier tests may have set a key.
+    await it('I8-T6. No LLM configured + gated catalog → gate throws; Watch Later keeps previous list', async () => {
+      const origLlm = { ...settings.getSettings().llm };
+      const origPTW = simkl.getPlanToWatch;
+      const origMeta = tmdb.metaByTmdbId;
+      const p = config.addProfile('INT-I8T6');
+      config.updateProfile(p.id, {
+        filters: { age_limit: 12 },
+        simkl_auth: { access_token: 't' },
+        keys: { tmdb_api_key: 'itest-tmdb' },
+      });
+      const profile = config.getProfile(p.id);
+      const wlDef = { type: 'series', id: 'trakt-watchlist-movies', name: 'Watch Later', source: 'simkl_plantowatch', age_band: null };
+      // Seed the store with a previous list (the state a failed rebuild must keep).
+      store.swapExtra(p.id, wlDef.id, [
+        { id: 'tt_prev', type: 'series', name: 'Previous Show', releaseInfo: '2020' },
+      ]);
+      try {
+        // Clear the LLM (no custom endpoint, no Groq key).
+        settings.updateSettings({ llm: { custom_uri: '', custom_name: '', custom_api_key: '', groq_api_key: '', groq_api_key_backup: '' } });
+        // Simkl returns one plan-to-watch title; TMDB resolves it.
+        simkl.getPlanToWatch = async () => ([{ imdb_id: 'tt1', tmdb_id: '111', title: 'Show One', year: 2020 }]);
+        tmdb.metaByTmdbId = async (_k, _t, id) => ({
+          id: 'tt1', type: 'series', name: 'Show One', poster: null, description: '', releaseInfo: '2020', _tmdb_id: 111,
+        });
+        // (a) The gate throws directly (a gated catalog with a non-empty list).
+        const metas = [{ id: 'tt1', type: 'series', name: 'Show One', releaseInfo: '2020', _tmdb_id: 111, _genre_names: ['Drama'], _certification: null, description: '' }];
+        let threw = null;
+        try {
+          await rebuild.applyExtraAgeGate(profile, wlDef, metas, quiet);
+        } catch (err) {
+          threw = err;
+        }
+        assert.ok(threw, 'gate throws when no LLM is configured');
+        assert.ok(/No LLM/.test(threw.message), `gate error mentions No LLM: ${threw.message}`);
+
+        // (b) rebuildProfile catches the error and keeps the previous list.
+        const results = await rebuild.rebuildProfile(profile, quiet, { extras: true });
+        assert.strictEqual(results[wlDef.id].ok, false, 'rebuildProfile records failure for Watch Later');
+        assert.ok(/No LLM/.test(results[wlDef.id].error), `rebuildProfile error mentions No LLM: ${results[wlDef.id].error}`);
+        // The previous list is kept (not swapped).
+        const cache = store.loadCache(p.id);
+        assert.deepStrictEqual(cache.extras[wlDef.id].metas.map((m) => m.id), ['tt_prev'], 'previous list kept (not swapped)');
+      } finally {
+        settings.updateSettings({ llm: origLlm });
+        simkl.getPlanToWatch = origPTW;
+        tmdb.metaByTmdbId = origMeta;
+        config.removeProfile(p.id);
+        store.deleteCache(p.id);
       }
     });
   }
