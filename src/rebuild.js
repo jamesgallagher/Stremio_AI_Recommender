@@ -117,6 +117,17 @@ function cleanMetas(metas) {
   ));
 }
 
+// Normalise a TMDB id (number or string) to a string, or null if absent. The
+// age gate keys titles by TMDB id, so the identity must be a stable string
+// across the MDBList path (string ids) and the Watch Later path (numeric
+// _tmdb_id from tmdb.toMeta) — otherwise a blocked id never matches the
+// `blocked` set and the gate removes nothing.
+function tmdbIdOf(item) {
+  const raw = item.ids?.tmdb ?? item.tmdb_id;
+  if (raw === undefined || raw === null || raw === '') return null;
+  return String(raw);
+}
+
 // Anime gate (v5.2). Runs BEFORE the LLM on every surface and narrows what it
 // has to judge; it never replaces it. Two rules, deliberately opposite:
 //
@@ -254,15 +265,29 @@ async function applyExtraAgeGate(profile, def, metas, log = console) {
   let list = await applyAnimeGate(metas, gateProfile, log);
   if (limit <= 0 || !list.length) return list;
   metas = list;
+  // CB-0 fail-closed: a title the chain can't identify (no TMDB id) can't be
+  // checked individually, so it is withheld from this gated catalog. Log the
+  // count (no titles or ids) — applies to Watch Later too.
+  const identified = metas.filter((m) => m._tmdb_id != null && String(m._tmdb_id) !== '');
+  if (identified.length < metas.length) {
+    log.log(`[extra] ${profile.name}/${def.id}: ${metas.length - identified.length} title(s) without a TMDB id withheld (age gate, band ${limit})`);
+  }
   // AGE-2: every positive age limit is a chain tier — the multi-source decision
   // chain is the ONLY age gate (mandate B3: no legacy LLM age path remains).
   // The chain's LLM step (step 5) is fail-closed: without an LLM it throws, so
   // the caller keeps the previous list rather than publishing an unvetted one.
+  // That tripwire must fire even when every title is unidentifiable (CB-0), so
+  // check the provider before the chain is built.
+  if (!require('./settings').hasLlm()) {
+    throw new Error('No LLM provider configured (set a custom endpoint or a Groq key in Server Config)');
+  }
   const ageVerify = require('./ageVerification');
   const tier = ageVerify.tierFor({ age_limit: limit });
   const sources = require('./ageVerification/sources').buildSources(profile, log);
-  const titles = metas.map((m) => ({
-    key: `${def.type}:${m._tmdb_id}`,
+  // CB-0: key by the normalised (string) TMDB id so numeric (Watch Later) and
+  // string (MDBList) ids match the `blocked` set.
+  const titles = identified.map((m) => ({
+    key: `${def.type}:${String(m._tmdb_id)}`,
     imdb_id: m.id,
     adult: m._adult || false,
     title: m.name,
@@ -273,11 +298,11 @@ async function applyExtraAgeGate(profile, def, metas, log = console) {
   const result = await ageVerify.verify(titles, def.type, tier, sources, log);
   const blocked = new Set();
   for (const [k, v] of result) {
-    if (v.verdict === 'block') blocked.add(k.split(':')[1]);
+    if (v.verdict === 'block') blocked.add(String(k.split(':')[1]));
   }
-  const out = metas.filter((m) => !blocked.has(m._tmdb_id));
+  const out = identified.filter((m) => !blocked.has(String(m._tmdb_id)));
   if (blocked.size) {
-    log.log(`[extra] ${profile.name}/${def.id}: chain removed ${blocked.size} of ${metas.length} (band ${limit})`);
+    log.log(`[extra] ${profile.name}/${def.id}: chain removed ${blocked.size} of ${identified.length} (band ${limit})`);
   }
   return out;
 }
@@ -420,6 +445,9 @@ async function buildExtraCatalog(profile, def, log = console) {
         description: item.description || info?.description || '',
         releaseInfo: String(item.release_year || info?.year || '') || null,
         imdbRating: rating !== null ? rating.toFixed(1) : null,
+        // CB-0: the age gate keys titles by TMDB id — the real id from the live
+        // payload (ids.tmdb, falling back to tmdb_id), not a collapsed `undefined`.
+        _tmdb_id: tmdbIdOf(item),
       });
     }
     for (const m of pageMetas) {
@@ -429,8 +457,10 @@ async function buildExtraCatalog(profile, def, log = console) {
     log.log(`[extra] ${profile.name}/${def.id}: page ${page + 1} -> ${collected.length}/${target}`);
   }
   // Second age layer for kids profiles, then randomize so the daily list
-  // looks fresh instead of serving the same fixed sequence.
-  return shuffle(await applyExtraAgeGate(profile, def, collected, log));
+  // looks fresh instead of serving the same fixed sequence. cleanMetas strips
+  // the internal `_tmdb_id` (and any other `_` field) before the list is
+  // cached/served — the Watch Later path already does this.
+  return cleanMetas(shuffle(await applyExtraAgeGate(profile, def, collected, log)));
 }
 
 // Rebuilds a profile's EXTRA catalogs (MDBList curated + the remaining

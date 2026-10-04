@@ -6372,6 +6372,235 @@ async function main() {
     }
   });
 
+  // ── I8. CB-0: extra-catalog age gate — per-title identity + block removal +
+  //      fail-closed. The gate must check each title as its own title (a real TMDB
+  //      id, not a collapsed `undefined` key), remove a title the chain blocks,
+  //      and withhold a title the chain cannot identify. No network: `verify` and
+  //      the MDBList fetchers are stubbed.
+  {
+    const ageVerify = require('../src/ageVerification');
+    const mdblist = require('../src/services/mdblist');
+
+    // T1 — MDBList identity: two items with distinct ids.tmdb reach verify as two
+    // distinct keys (neither contains `undefined`).
+    await it('I8-T1. MDBList identity: distinct ids.tmdb reach verify as distinct keys (no undefined)', async () => {
+      const origList = mdblist.listItemsPage;
+      const origMediaInfo = mdblist.mediaInfoBatch;
+      const origVerify = ageVerify.verify;
+      // Realistic MDBList payload: ids at item.ids.tmdb (number), no top-level tmdb_id.
+      mdblist.listItemsPage = async () => ([
+        { imdb_id: 'tt100', ids: { imdb: 'tt100', tmdb: 111 }, title: 'Title One', release_year: 2020 },
+        { imdb_id: 'tt200', ids: { imdb: 'tt200', tmdb: 222 }, title: 'Title Two', release_year: 2021 },
+      ]);
+      mdblist.mediaInfoBatch = async () => new Map();
+      let verifyKeys = [];
+      ageVerify.verify = (titles) => {
+        verifyKeys = titles.map((t) => t.key);
+        const result = new Map();
+        for (const t of titles) result.set(t.key, { verdict: 'allow', source: 'csm', rating: '13' });
+        return Promise.resolve(result);
+      };
+      const profile = { id: 'cb0-t1', name: 'CB0-T1', keys: { mdblist_api_key: 'cb0-mdb' }, filters: { age_limit: 12 } };
+      const def = { type: 'movie', id: 'cb0-kids', name: 'Kids', source: 'mdblist', user: 'u', slug: 's', sort: null, min_imdb: 0, age_band: 12 };
+      try {
+        await rebuild.buildExtraCatalog(profile, def, quiet);
+        assert.strictEqual(verifyKeys.length, 2, `both titles reached verify: ${verifyKeys.join(', ')}`);
+        assert.ok(verifyKeys.every((k) => !k.includes('undefined')), `no undefined in keys: ${verifyKeys.join(', ')}`);
+        assert.strictEqual(new Set(verifyKeys).size, 2, 'two distinct keys');
+      } finally {
+        mdblist.listItemsPage = origList;
+        mdblist.mediaInfoBatch = origMediaInfo;
+        ageVerify.verify = origVerify;
+      }
+    });
+
+    // T2 — block removes (MDBList): the chain returns block for one of two titles
+    // on a banded catalog; the blocked title is absent from the built list, the
+    // other remains.
+    await it('I8-T2. MDBList block removes: blocked title absent, other remains', async () => {
+      const origList = mdblist.listItemsPage;
+      const origMediaInfo = mdblist.mediaInfoBatch;
+      const origVerify = ageVerify.verify;
+      mdblist.listItemsPage = async () => ([
+        { imdb_id: 'tt100', ids: { imdb: 'tt100', tmdb: 111 }, title: 'Title One', release_year: 2020 },
+        { imdb_id: 'tt200', ids: { imdb: 'tt200', tmdb: 222 }, title: 'Title Two', release_year: 2021 },
+      ]);
+      mdblist.mediaInfoBatch = async () => new Map();
+      ageVerify.verify = (titles) => {
+        const result = new Map();
+        for (const t of titles) {
+          const verdict = String(t.key.split(':')[1]) === '222' ? 'block' : 'allow';
+          result.set(t.key, { verdict, source: 'csm', rating: verdict === 'block' ? '18' : '13' });
+        }
+        return Promise.resolve(result);
+      };
+      const profile = { id: 'cb0-t2', name: 'CB0-T2', keys: { mdblist_api_key: 'cb0-mdb' }, filters: { age_limit: 12 } };
+      const def = { type: 'movie', id: 'cb0-kids', name: 'Kids', source: 'mdblist', user: 'u', slug: 's', sort: null, min_imdb: 0, age_band: 12 };
+      try {
+        const built = await rebuild.buildExtraCatalog(profile, def, quiet);
+        const ids = built.map((m) => m.id);
+        assert.ok(ids.includes('tt100'), 'allowed title remains');
+        assert.ok(!ids.includes('tt200'), 'blocked title is absent');
+        assert.strictEqual(built.length, 1, 'exactly one title remains');
+      } finally {
+        mdblist.listItemsPage = origList;
+        mdblist.mediaInfoBatch = origMediaInfo;
+        ageVerify.verify = origVerify;
+      }
+    });
+
+    // T3 — block removes (Watch Later): numeric _tmdb_id (as tmdb.toMeta produces),
+    // on a profile with age_limit 12; the blocked title is absent, the other remains.
+    await it('I8-T3. Watch Later block removes: numeric _tmdb_id, blocked title absent', async () => {
+      const origVerify = ageVerify.verify;
+      // Watch Later metas as tmdb.toMeta produces: numeric _tmdb_id.
+      const metas = [
+        { id: 'tt100', type: 'series', name: 'Show One', releaseInfo: '2020', _tmdb_id: 111, _genre_names: ['Drama'], _certification: null, description: '' },
+        { id: 'tt200', type: 'series', name: 'Show Two', releaseInfo: '2021', _tmdb_id: 222, _genre_names: ['Comedy'], _certification: null, description: '' },
+      ];
+      ageVerify.verify = (titles) => {
+        const result = new Map();
+        for (const t of titles) {
+          const verdict = String(t.key.split(':')[1]) === '222' ? 'block' : 'allow';
+          result.set(t.key, { verdict, source: 'csm', rating: verdict === 'block' ? '18' : '13' });
+        }
+        return Promise.resolve(result);
+      };
+      const profile = { id: 'cb0-t3', name: 'CB0-T3', keys: {}, filters: { age_limit: 12 } };
+      const def = { type: 'series', id: 'cb0-watch-later', name: 'Watch Later', source: 'simkl_plantowatch', age_band: null };
+      try {
+        const out = await rebuild.applyExtraAgeGate(profile, def, metas, quiet);
+        const ids = out.map((m) => m.id);
+        assert.ok(ids.includes('tt100'), 'allowed title remains');
+        assert.ok(!ids.includes('tt200'), 'blocked title is absent');
+        assert.strictEqual(out.length, 1, 'exactly one title remains');
+      } finally {
+        ageVerify.verify = origVerify;
+      }
+    });
+
+    // T4 — fail closed: with a positive effective limit, a title with no tmdb id is
+    // withheld and counted; with limit 0 (adult, unbanded) it is kept as today.
+    // The gate's LLM tripwire (hasLlm) must pass before the stubbed verify is
+    // reached, so this test sets its own LLM (saved/restored) — it does not
+    // depend on a key left by an earlier test.
+    await it('I8-T4. Fail closed: no-tmdb-id title withheld when gated, kept when ungated', async () => {
+      const origVerify = ageVerify.verify;
+      const origLlm = { ...settings.getSettings().llm };
+      settings.updateSettings({ llm: { groq_api_key: 'itest-groq' } });
+      const metas = [
+        { id: 'tt100', type: 'series', name: 'Identifiable', releaseInfo: '2020', _tmdb_id: 111, _genre_names: ['Drama'], _certification: null, description: '' },
+        { id: 'tt200', type: 'series', name: 'Unidentifiable', releaseInfo: '2021', _genre_names: ['Comedy'], _certification: null, description: '' },
+      ];
+      ageVerify.verify = (titles) => {
+        const result = new Map();
+        for (const t of titles) result.set(t.key, { verdict: 'allow', source: 'csm', rating: '13' });
+        return Promise.resolve(result);
+      };
+      const def = { type: 'series', id: 'cb0-watch-later', name: 'Watch Later', source: 'simkl_plantowatch', age_band: null };
+      try {
+        // (a) Gated (age_limit 12): the unidentifiable title is withheld.
+        const gatedProfile = { id: 'cb0-t4a', name: 'CB0-T4a', keys: {}, filters: { age_limit: 12 } };
+        const outGated = await rebuild.applyExtraAgeGate(gatedProfile, def, metas, quiet);
+        assert.deepStrictEqual(outGated.map((m) => m.id), ['tt100'], 'unidentifiable title withheld when gated');
+
+        // (b) Ungated (adult, unbanded): the unidentifiable title is kept.
+        const adultProfile = { id: 'cb0-t4b', name: 'CB0-T4b', keys: {}, filters: { age_limit: 0 } };
+        const outUngated = await rebuild.applyExtraAgeGate(adultProfile, def, metas, quiet);
+        assert.deepStrictEqual(outUngated.map((m) => m.id), ['tt100', 'tt200'], 'unidentifiable title kept when ungated');
+      } finally {
+        settings.updateSettings({ llm: origLlm });
+        ageVerify.verify = origVerify;
+      }
+    });
+
+    // T5 — no leakage: built MDBList metas contain no underscore fields.
+    await it('I8-T5. No leakage: built MDBList metas contain no underscore fields', async () => {
+      const origList = mdblist.listItemsPage;
+      const origMediaInfo = mdblist.mediaInfoBatch;
+      const origVerify = ageVerify.verify;
+      mdblist.listItemsPage = async () => ([
+        { imdb_id: 'tt100', ids: { imdb: 'tt100', tmdb: 111 }, title: 'Title One', release_year: 2020 },
+      ]);
+      mdblist.mediaInfoBatch = async () => new Map();
+      ageVerify.verify = (titles) => {
+        const result = new Map();
+        for (const t of titles) result.set(t.key, { verdict: 'allow', source: 'csm', rating: '13' });
+        return Promise.resolve(result);
+      };
+      const profile = { id: 'cb0-t5', name: 'CB0-T5', keys: { mdblist_api_key: 'cb0-mdb' }, filters: { age_limit: 12 } };
+      const def = { type: 'movie', id: 'cb0-kids', name: 'Kids', source: 'mdblist', user: 'u', slug: 's', sort: null, min_imdb: 0, age_band: 12 };
+      try {
+        const built = await rebuild.buildExtraCatalog(profile, def, quiet);
+        assert.ok(built.length >= 1, 'built at least one title');
+        for (const m of built) {
+          for (const k of Object.keys(m)) {
+            assert.ok(!k.startsWith('_'), `no underscore field ${k} on ${m.id}`);
+          }
+        }
+      } finally {
+        mdblist.listItemsPage = origList;
+        mdblist.mediaInfoBatch = origMediaInfo;
+        ageVerify.verify = origVerify;
+      }
+    });
+
+    // T6 — no LLM configured: a gated catalog throws (fail-closed), and for
+    // Watch Later the caller (rebuildProfile) keeps the previous list rather
+    // than publishing an unvetted one. The LLM is cleared (saved/restored) so
+    // the tripwire fires even though earlier tests may have set a key.
+    await it('I8-T6. No LLM configured + gated catalog → gate throws; Watch Later keeps previous list', async () => {
+      const origLlm = { ...settings.getSettings().llm };
+      const origPTW = simkl.getPlanToWatch;
+      const origMeta = tmdb.metaByTmdbId;
+      const p = config.addProfile('INT-I8T6');
+      config.updateProfile(p.id, {
+        filters: { age_limit: 12 },
+        simkl_auth: { access_token: 't' },
+        keys: { tmdb_api_key: 'itest-tmdb' },
+      });
+      const profile = config.getProfile(p.id);
+      const wlDef = { type: 'series', id: 'trakt-watchlist-movies', name: 'Watch Later', source: 'simkl_plantowatch', age_band: null };
+      // Seed the store with a previous list (the state a failed rebuild must keep).
+      store.swapExtra(p.id, wlDef.id, [
+        { id: 'tt_prev', type: 'series', name: 'Previous Show', releaseInfo: '2020' },
+      ]);
+      try {
+        // Clear the LLM (no custom endpoint, no Groq key).
+        settings.updateSettings({ llm: { custom_uri: '', custom_name: '', custom_api_key: '', groq_api_key: '', groq_api_key_backup: '' } });
+        // Simkl returns one plan-to-watch title; TMDB resolves it.
+        simkl.getPlanToWatch = async () => ([{ imdb_id: 'tt1', tmdb_id: '111', title: 'Show One', year: 2020 }]);
+        tmdb.metaByTmdbId = async (_k, _t, id) => ({
+          id: 'tt1', type: 'series', name: 'Show One', poster: null, description: '', releaseInfo: '2020', _tmdb_id: 111,
+        });
+        // (a) The gate throws directly (a gated catalog with a non-empty list).
+        const metas = [{ id: 'tt1', type: 'series', name: 'Show One', releaseInfo: '2020', _tmdb_id: 111, _genre_names: ['Drama'], _certification: null, description: '' }];
+        let threw = null;
+        try {
+          await rebuild.applyExtraAgeGate(profile, wlDef, metas, quiet);
+        } catch (err) {
+          threw = err;
+        }
+        assert.ok(threw, 'gate throws when no LLM is configured');
+        assert.ok(/No LLM/.test(threw.message), `gate error mentions No LLM: ${threw.message}`);
+
+        // (b) rebuildProfile catches the error and keeps the previous list.
+        const results = await rebuild.rebuildProfile(profile, quiet, { extras: true });
+        assert.strictEqual(results[wlDef.id].ok, false, 'rebuildProfile records failure for Watch Later');
+        assert.ok(/No LLM/.test(results[wlDef.id].error), `rebuildProfile error mentions No LLM: ${results[wlDef.id].error}`);
+        // The previous list is kept (not swapped).
+        const cache = store.loadCache(p.id);
+        assert.deepStrictEqual(cache.extras[wlDef.id].metas.map((m) => m.id), ['tt_prev'], 'previous list kept (not swapped)');
+      } finally {
+        settings.updateSettings({ llm: origLlm });
+        simkl.getPlanToWatch = origPTW;
+        tmdb.metaByTmdbId = origMeta;
+        config.removeProfile(p.id);
+        store.deleteCache(p.id);
+      }
+    });
+  }
+
   // ── I5. Search at TV-14: allowed + unknown returned; LLM error → empty ──────
   await it('I5. Search at TV-14: chain decides; LLM error → empty results (fail-closed)', async () => {
     const ageVerify = require('../src/ageVerification');
