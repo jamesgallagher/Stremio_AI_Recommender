@@ -822,6 +822,25 @@ function listSizeFor(profile) {
   return Math.min(LIST_SIZE_MAX, Math.max(LIST_SIZE_MIN, n));
 }
 
+// Shared row selection (watched-first): the ONE place every serve surface
+// (the AI catalog, the portal Advanced view) selects the user-visible titles.
+// It filters the profile's watched IMDb ids out of the stored candidate rows
+// BEFORE selectServeFor applies filters, genre/calibrated ordering, and the
+// limit — so a watched title is replaced by a valid pool row instead of
+// shrinking the catalog after the limit is applied. The watched set unions
+// authoritative + pending watches across movie/show types
+// (watchedStore.watchedIdSets). Returns the selected RAW pool rows (no meta
+// projection, no impression recording), so callers keep their own projection.
+// `getRecommended` initialises the store; no external call or write happens here.
+function selectedRecommendationRows(profile, type, { limit } = {}) {
+  const rows = getRecommended(profile.id, { type, limit: 100000 });
+  const watchedImdb = watchedStore.watchedIdSets(profile.id).imdb;
+  const unwatched = rows.filter((row) => !watchedImdb.has(row.imdb_id));
+  return selectServeFor(profile, type, unwatched, {
+    limit: limit ?? listSizeFor(profile),
+  });
+}
+
 // Build Stremio catalog metas for a profile's AI recommendations of one type.
 // Cache-only + cheap (local writes only, no external calls) — safe for the addon
 // request path. Records one impression per served title (fuels decay). The served
@@ -831,8 +850,7 @@ function listSizeFor(profile) {
 // advances the decay lifecycle.
 function serveRecommendations(profile, type, { limit, record = true } = {}) {
   init();
-  const rows = getRecommended(profile.id, { type, limit: 100000 });
-  const picked = selectServeFor(profile, type, rows, { limit: limit ?? listSizeFor(profile) });
+  const picked = selectedRecommendationRows(profile, type, { limit });
   if (record) recordImpressions(profile.id, picked);
   return picked.map((r) => ({
     id: r.imdb_id,
@@ -1055,6 +1073,7 @@ module.exports = {
   selectServe,
   filterServable,
   selectServeFor,
+  selectedRecommendationRows,
   _resetServeWarnings,
   balanceByGenre,
   certMinAge,

@@ -4523,8 +4523,8 @@ async function main() {
       const direct = rs.selectServeFor(profile, 'movie', stored, { limit: listSize });
       // Catalog (serveRecommendations — the Stremio serve surface).
       const catalog = rs.serveRecommendations(profile, 'movie', { record: false });
-      // Portal View (the portal.js code path: selectServeFor over getRecommended).
-      const portal = rs.selectServeFor(profile, 'movie', rs.getRecommended(p.id, { type: 'movie', limit: 100000 }), { limit: listSize });
+      // Portal View (the portal.js code path: the watched-first shared selection).
+      const portal = rs.selectedRecommendationRows(profile, 'movie', { limit: listSize });
       assert.deepStrictEqual(catalog.map((m) => m.id), direct.map((r) => r.imdb_id), 'serveRecommendations matches selectServeFor');
       assert.deepStrictEqual(portal.map((r) => r.imdb_id), direct.map((r) => r.imdb_id), 'portal View matches selectServeFor');
     } finally {
@@ -9206,6 +9206,226 @@ async function main() {
       }
     } finally {
       config.removeProfile(p.id); rs.deleteForProfile(p.id);
+    }
+  });
+
+  // ── Watched-title backfill (fix/catalog-watched-backfill) ──────────────────
+  // The AI catalog must select up to list_size UNWATCHED, otherwise-eligible
+  // titles: the profile's watched IMDb ids are filtered out of the stored pool
+  // BEFORE the serve limit is applied, so a watched title is replaced by a valid
+  // pool row instead of shrinking the catalog after the limit. These tests
+  // encode the card's user-facing behaviour, not the internal seam.
+  const mkBackfillRow = (tmdbId, genre, affinity, type = 'movie') => ({
+    type, tmdb_id: tmdbId, imdb_id: 'tt' + tmdbId, title: 'T' + tmdbId,
+    year: 2020, primary_genre: genre, genres: genre, affinity, vote_average: 7,
+    rec_count: 1, popularity: 1, poster: null,
+  });
+  // 28 otherwise-servable movie rows: 4 genres × 7, distinct affinities within
+  // each genre (round-robin picks the strongest of each genre in turn).
+  const backfillMovieRows = () => {
+    const rows = [];
+    for (const [prefix, genre] of [['A', 'Action'], ['B', 'Drama'], ['C', 'Comedy'], ['D', 'Science Fiction']]) {
+      for (let i = 1; i <= 7; i++) rows.push(mkBackfillRow(prefix + i, genre, 100 - i));
+    }
+    return rows;
+  };
+
+  // T1a — the production-shaped shortfall (fallback genre-balanced path): a
+  // 20-title movie catalog serves 20 unwatched titles immediately (was 14 after
+  // the post-limit watched prune). Six watched ids are chosen so the OLD catalog
+  // selects them in its first 20.
+  await it('T1a: 20-title movie catalog serves 20 unwatched (fallback genre-balanced path)', async () => {
+    const p = config.addProfile('INT-WBF-T1a');
+    try {
+      config.updateProfile(p.id, { filters: { engine_movie: 'genesis', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      const rows = backfillMovieRows();
+      rs.upsertCandidates(p.id, rows);
+      const watchedIds = ['ttA1', 'ttA2', 'ttB1', 'ttB2', 'ttC1', 'ttD1'];
+      for (const imdbId of watchedIds) watchedStore.addPendingWatched(p.id, { type: 'movie', imdbId });
+      const served = catalogServe.servedCatalog(config.getProfile(p.id), 'ai-recs-movies', { record: false });
+      assert.strictEqual(served.state, 'ok');
+      assert.strictEqual(served.metas.length, 20, 'serves 20 unwatched titles (was 14)');
+      assert.ok(served.metas.every((m) => !watchedIds.includes(m.id)), 'no watched id served');
+      const poolIds = new Set(rows.map((r) => r.imdb_id));
+      assert.ok(served.metas.every((m) => poolIds.has(m.id)), 'all served ids are valid pool rows');
+    } finally {
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id);
+    }
+  });
+
+  // T1b — the same shortfall on the calibrated serve path (Marquee + target):
+  // six watched Action ids are in the old catalog's first 20; the fix serves 20.
+  await it('T1b: 20-title movie catalog serves 20 unwatched (calibrated serve path)', async () => {
+    const p = config.addProfile('INT-WBF-T1b');
+    try {
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      settings.updateSettings({ engines: { marquee: true } });
+      const rows = [];
+      for (let i = 1; i <= 7; i++) rows.push(mkBackfillRow('A' + i, 'Action', 100 - i));
+      for (let i = 1; i <= 7; i++) rows.push(mkBackfillRow('B' + i, 'Drama', 90 - i));
+      for (let i = 1; i <= 7; i++) rows.push(mkBackfillRow('C' + i, 'Comedy', 80 - i));
+      for (let i = 1; i <= 7; i++) rows.push(mkBackfillRow('D' + i, 'Science Fiction', 70 - i));
+      rs.upsertCandidates(p.id, rows);
+      const target = { Action: 0.7, Drama: 0.1, Comedy: 0.1, 'Science Fiction': 0.1 };
+      serveCalibration.setTarget(p.id, 'movie', 'marquee', target, 28, Date.now());
+      const watchedIds = ['ttA1', 'ttA2', 'ttA3', 'ttA4', 'ttA5', 'ttA6'];
+      for (const imdbId of watchedIds) watchedStore.addPendingWatched(p.id, { type: 'movie', imdbId });
+      const served = catalogServe.servedCatalog(config.getProfile(p.id), 'ai-recs-movies', { record: false });
+      assert.strictEqual(served.state, 'ok');
+      assert.strictEqual(served.metas.length, 20, 'serves 20 unwatched titles (was 14)');
+      assert.ok(served.metas.every((m) => !watchedIds.includes(m.id)), 'no watched id served');
+      const poolIds = new Set(rows.map((r) => r.imdb_id));
+      assert.ok(served.metas.every((m) => poolIds.has(m.id)), 'all served ids are valid pool rows');
+    } finally {
+      settings.updateSettings({ engines: { marquee: false } });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); serveCalibration.deleteForProfile(p.id);
+      watchedStore.deleteForProfile(p.id);
+    }
+  });
+
+  // T2 — ordering correctness: the served ids equal selectServeFor over the
+  // watched-filtered pool (projected to IMDb ids), for both the fallback and
+  // calibrated paths. Watched removal can change calibrated ordering throughout
+  // the list, so this is a property assertion, not a hand-picked order.
+  await it('T2: served ids equal selectServeFor over the watched-filtered pool (fallback + calibrated)', async () => {
+    const p = config.addProfile('INT-WBF-T2');
+    try {
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      settings.updateSettings({ engines: { marquee: true } });
+      const rows = backfillMovieRows();
+      rs.upsertCandidates(p.id, rows);
+      const watchedIds = ['ttA1', 'ttA2', 'ttB1', 'ttB2', 'ttC1', 'ttD1'];
+      for (const imdbId of watchedIds) watchedStore.addPendingWatched(p.id, { type: 'movie', imdbId });
+      const profile = config.getProfile(p.id);
+      const watchedImdb = watchedStore.watchedIdSets(p.id).imdb;
+      const allRows = rs.getRecommended(p.id, { type: 'movie', limit: 100000 });
+      const unwatched = allRows.filter((r) => !watchedImdb.has(r.imdb_id));
+      // (a) fallback (no target → genre-balanced round-robin).
+      const expectedFallback = rs.selectServeFor(profile, 'movie', unwatched, { limit: 20 }).map((r) => r.imdb_id);
+      const servedFallback = rs.serveRecommendations(profile, 'movie', { record: false }).map((m) => m.id);
+      assert.deepStrictEqual(servedFallback, expectedFallback, 'fallback served ids match selectServeFor over the watched-filtered pool');
+      // (b) calibrated (Marquee + target).
+      const target = { Action: 0.4, Drama: 0.3, Comedy: 0.2, 'Science Fiction': 0.1 };
+      serveCalibration.setTarget(p.id, 'movie', 'marquee', target, 28, Date.now());
+      const profile2 = config.getProfile(p.id);
+      const expectedCalibrated = rs.selectServeFor(profile2, 'movie', unwatched, { limit: 20 }).map((r) => r.imdb_id);
+      const servedCalibrated = rs.serveRecommendations(profile2, 'movie', { record: false }).map((m) => m.id);
+      assert.deepStrictEqual(servedCalibrated, expectedCalibrated, 'calibrated served ids match selectServeFor over the watched-filtered pool');
+    } finally {
+      settings.updateSettings({ engines: { marquee: false } });
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); serveCalibration.deleteForProfile(p.id);
+      watchedStore.deleteForProfile(p.id);
+    }
+  });
+
+  // T3 — watch transitions: an authoritative watched title AND a pending_watched
+  // title both disappear (and are replaced) without a build. Covers a show
+  // catalog too, and the profile-wide IMDb exclusion when the watched type and
+  // the recommendation type disagree.
+  await it('T3: authoritative + pending watches both disappear without a build (movies + shows, cross-type)', async () => {
+    const p = config.addProfile('INT-WBF-T3');
+    try {
+      config.updateProfile(p.id, { filters: { engine_movie: 'genesis', engine_series: 'genesis', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      // 28 movie rows + 28 show rows.
+      const movieRows = backfillMovieRows();
+      const showRows = movieRows.map((r) => ({ ...r, type: 'series', tmdb_id: 's' + r.tmdb_id, imdb_id: 'tt' + 's' + r.tmdb_id }));
+      rs.upsertCandidates(p.id, [...movieRows, ...showRows]);
+      // An authoritative movie watch + a pending movie watch.
+      const authImdb = 'ttA1';
+      const pendImdb = 'ttB1';
+      watchedStore.upsertMany(p.id, [{ type: 'movie', title: 'Auth', year: 2020, tmdb_id: 'A1', imdb_id: authImdb, simkl_id: 1001, watched_at: '2026-09-09T00:00:00Z' }]);
+      watchedStore.addPendingWatched(p.id, { type: 'movie', imdbId: pendImdb });
+      // A cross-type watch: a SHOW watched (type 'series') must exclude the
+      // same IMDb id from the MOVIE catalog (profile-wide IMDb identity).
+      const crossImdb = 'ttC1';
+      watchedStore.addPendingWatched(p.id, { type: 'series', imdbId: crossImdb });
+      // A show watch of the show row itself (imdb ttsD1, type series).
+      const showWatchImdb = 'tt' + 's' + 'D1';
+      watchedStore.addPendingWatched(p.id, { type: 'series', imdbId: showWatchImdb });
+      const movies = catalogServe.servedCatalog(config.getProfile(p.id), 'ai-recs-movies', { record: false });
+      assert.strictEqual(movies.metas.length, 20, 'movie catalog still serves 20');
+      assert.ok(!movies.metas.some((m) => m.id === authImdb), 'authoritative watch gone');
+      assert.ok(!movies.metas.some((m) => m.id === pendImdb), 'pending watch gone');
+      assert.ok(!movies.metas.some((m) => m.id === crossImdb), 'cross-type (series) watch excludes the movie catalog');
+      // A show catalog too: the cross-type watch (imdb ttC1, type series) does NOT
+      // exclude the show row (imdb ttsC1, a different id) — the profile-wide IMDb
+      // identity is exact, not a prefix. But the show watch of the show row itself
+      // (imdb ttsD1) IS excluded from the show catalog.
+      const shows = catalogServe.servedCatalog(config.getProfile(p.id), 'ai-recs-series', { record: false });
+      assert.ok(shows.metas.some((m) => m.id === 'tt' + 's' + 'C1'), 'series catalog still serves its own show (different imdb id)');
+      assert.ok(!shows.metas.some((m) => m.id === showWatchImdb), 'series catalog excludes its own watched show');
+    } finally {
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id);
+    }
+  });
+
+  // T4 — impressions and read-only surfaces: in a real record:true catalog call,
+  // the six watched rows' impression columns do NOT advance; the selected visible
+  // rows advance once. Read-only surfaces (preview, rebuild.status, Advanced
+  // view) do not advance them.
+  await it('T4: record:true advances only the selected visible rows; read-only surfaces do not', async () => {
+    const p = config.addProfile('INT-WBF-T4');
+    try {
+      config.updateProfile(p.id, { filters: { engine_movie: 'genesis', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      const rows = backfillMovieRows();
+      rs.upsertCandidates(p.id, rows);
+      const watchedIds = ['ttA1', 'ttA2', 'ttB1', 'ttB2', 'ttC1', 'ttD1'];
+      for (const imdbId of watchedIds) watchedStore.addPendingWatched(p.id, { type: 'movie', imdbId });
+      const profile = config.getProfile(p.id);
+      const before = rs.getRecommended(p.id, { type: 'movie', limit: 100000 });
+      const beforeByTmdb = new Map(before.map((r) => [r.tmdb_id, r]));
+      // A real serve (record:true) — an impression.
+      const served = rs.serveRecommendations(profile, 'movie', { record: true });
+      assert.strictEqual(served.length, 20);
+      const after = rs.getRecommended(p.id, { type: 'movie', limit: 100000 });
+      const afterByTmdb = new Map(after.map((r) => [r.tmdb_id, r]));
+      // The six watched rows' impression columns do NOT advance.
+      for (const imdbId of watchedIds) {
+        const tmdbId = imdbId.slice(2); // ttX -> X
+        const b = beforeByTmdb.get(tmdbId);
+        const a = afterByTmdb.get(tmdbId);
+        assert.strictEqual(a.times_shown, b.times_shown, `watched ${imdbId} times_shown unchanged`);
+        assert.strictEqual(a.times_shown_in_streak, b.times_shown_in_streak, `watched ${imdbId} streak unchanged`);
+      }
+      // Each selected visible row advances exactly once.
+      const servedTmdb = new Set(served.map((m) => m.id).map((id) => id.slice(2)));
+      for (const r of after) {
+        if (servedTmdb.has(r.tmdb_id)) {
+          const b = beforeByTmdb.get(r.tmdb_id);
+          assert.strictEqual(r.times_shown - b.times_shown, 1, `served ${r.tmdb_id} advanced exactly once`);
+        }
+      }
+      // Read-only surfaces do not advance impressions.
+      const before2 = rs.getRecommended(p.id, { type: 'movie', limit: 100000 });
+      const before2ByTmdb = new Map(before2.map((r) => [r.tmdb_id, r]));
+      catalogServe.servedCatalog(profile, 'ai-recs-movies', { record: false }); // preview
+      rebuild.status(profile); // rebuild.status
+      const after2 = rs.getRecommended(p.id, { type: 'movie', limit: 100000 });
+      for (const r of after2) {
+        const b = before2ByTmdb.get(r.tmdb_id);
+        assert.strictEqual(r.times_shown, b.times_shown, 'read-only surfaces do not advance times_shown');
+      }
+    } finally {
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id);
+    }
+  });
+
+  // T5a — honest shortfall: when only 13 unwatched eligible rows remain, serve
+  // 13 (no duplication / invented candidates).
+  await it('T5a: honest shortfall — 13 unwatched eligible rows serve 13 (no duplication/invention)', async () => {
+    const p = config.addProfile('INT-WBF-T5a');
+    try {
+      config.updateProfile(p.id, { filters: { engine_movie: 'genesis', engine_series: 'genesis', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      // 20 movie rows, 7 watched → 13 unwatched eligible.
+      const rows = [];
+      for (let i = 1; i <= 20; i++) rows.push(mkBackfillRow('M' + i, 'Action', 100 - i));
+      rs.upsertCandidates(p.id, rows);
+      for (let i = 1; i <= 7; i++) watchedStore.addPendingWatched(p.id, { type: 'movie', imdbId: 'ttM' + i });
+      const served = catalogServe.servedCatalog(config.getProfile(p.id), 'ai-recs-movies', { record: false });
+      assert.strictEqual(served.metas.length, 13, 'serves the 13 unwatched eligible rows (no duplication/invention)');
+      assert.ok(new Set(served.metas.map((m) => m.id)).size === 13, 'no duplicated ids');
+    } finally {
+      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id);
     }
   });
 
