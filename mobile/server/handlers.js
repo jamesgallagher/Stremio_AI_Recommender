@@ -250,7 +250,11 @@ function companionCatalogs(profile) {
       enabled: catalogs.isEnabled(profile, def),
       source: def.source,
       min_imdb: def.min_imdb || 0,
-      target: def.target || 20,
+      // CB-1: no per-catalog `target`. Non-Watch-Later rows are sized by the
+      // profile's list-size setting (the effective value the server uses); Watch
+      // Later is source-sized (its true plan-to-watch count).
+      sized_by: def.source === 'simkl_plantowatch' ? 'source' : 'list_size',
+      list_size: def.source === 'simkl_plantowatch' ? null : recommendationStore.listSizeFor(profile),
       dedupe_watched: def.dedupe_watched !== false,
       requirement_met: catalogs.requirementMet(profile, def),
     }));
@@ -312,8 +316,13 @@ const engDTO = (e) => ({ id: e.id, name: e.name, description: e.description });
 // pref + genre options + per-type engine choices) and Catalogs tab
 // (age-appropriate extra catalogs). Never includes the age gate. Exported for tests.
 function companionSettings(profile) {
+  const filters = toCompanionFilters(profile.filters || {}); // includes engine_movie/series via COMPANION_FILTERS
+  // CB-1: the settings GET reports the EFFECTIVE list size (the value the
+  // server uses to size every non-Watch-Later catalog), not the raw setting —
+  // the client shows the number it actually gets, with no client-side fallback.
+  filters.list_size = recommendationStore.listSizeFor(profile);
   return {
-    filters: toCompanionFilters(profile.filters || {}), // includes engine_movie/series via COMPANION_FILTERS
+    filters,
     catalog_only: catalogOnlyOf(profile),
     genres: Object.keys(tmdb.GENRE_ALIASES).sort(),
     catalogs: companionCatalogs(profile),

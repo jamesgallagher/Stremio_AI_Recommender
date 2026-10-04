@@ -39,10 +39,7 @@ const mal = require('./services/mal');
 const STALE_MS = (parseInt(process.env.STALE_HOURS, 10) || 24) * 3600e3;
 const BACKOFF_MS = (parseInt(process.env.BACKOFF_MINUTES, 10) || 30) * 60e3;
 const MIN_METAS = 5;
-const DEFAULT_LIST_SIZE = 20;
-// Bench (hidden reserve) is always the same size as the displayed list.
-const EXTRA_LIST_TARGET = 20; // default extra-catalog size (per-catalog `target` overrides)
-const MAX_EXTRA_PAGES = 8;    // headroom for the larger (50-title) kids lists
+const MAX_EXTRA_PAGES = 8;    // headroom for the larger reserve builds
 const EXTRA_PAGE_SIZE = 50;
 
 const locks = new Set(); // profile ids currently rebuilding
@@ -400,7 +397,11 @@ async function buildExtraCatalog(profile, def, log = console) {
   }
   const key = settings.keyFor(profile, 'mdblist_api_key');
   if (!key) throw new Error('MDBList API key is required for extra catalogs');
-  const target = def.target || EXTRA_LIST_TARGET;
+  // CB-1: the visible count comes from the profile's list-size setting (one
+  // number for every non-Watch-Later catalog). Watch Later keeps its source-sized
+  // list (handled above, before this point).
+  const listSize = require('./recommendationStore').listSizeFor(profile);
+  const target = listSize;
   const collected = [];
   const seen = new Set();
   for (let page = 0; page < MAX_EXTRA_PAGES && collected.length < target; page++) {
@@ -538,5 +539,4 @@ module.exports = {
   isStale,
   STALE_MS,
   MIN_METAS,
-  DEFAULT_LIST_SIZE,
 };

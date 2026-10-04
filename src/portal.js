@@ -164,11 +164,16 @@ router.get('/engines', (req, res) => {
 });
 
 // Available extra-catalog definitions (static) for the portal's Catalogs section.
+// CB-1: no per-catalog `target` — every non-Watch-Later catalog is sized by the
+// profile's list-size setting, and Watch Later is source-sized. `sized_by` tells
+// the client how the row is sized (it has no profile here, so it can't report a
+// number).
 router.get('/catalogs', (req, res) => {
   res.json({
     catalogs: catalogs.EXTRA_CATALOGS.map(
-      ({ id, type, name, min_imdb, source, default_on, target, min_profile_age, age_band, dedupe_watched }) => ({
-        id, type, name, min_imdb, source, default_on: !!default_on, target: target || 20,
+      ({ id, type, name, min_imdb, source, default_on, min_profile_age, age_band, dedupe_watched }) => ({
+        id, type, name, min_imdb, source, default_on: !!default_on,
+        sized_by: source === 'simkl_plantowatch' ? 'source' : 'list_size',
         min_profile_age: min_profile_age || 0, age_band: age_band || 0, dedupe_watched: dedupe_watched !== false,
       }),
     ),

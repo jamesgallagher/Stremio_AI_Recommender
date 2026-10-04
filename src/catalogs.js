@@ -47,15 +47,17 @@ const EXTRA_CATALOGS = [
   // Christmas — seasonal re-watchables (Elf, Home Alone, Die Hard): NEVER
   // de-duped against watched, showing the ones you've seen is the point.
   { id: 'mdb-christmas-movies', type: 'movie', name: 'Christmas Movies', source: 'mdblist', user: 'hdlists', slug: 'christmas-movies', min_imdb: 6, sort: 'imdbpopular', dedupe_watched: false },
-  // Kids lists — bigger targets (50), rating-gated at 6.0. age_band 12 is applied
-  // ALWAYS (even on adult profiles), so the row is trustworthy on its own;
-  // effective gate = min(age_band, profile.age_limit) when the profile is limited.
-  { id: 'mdb-kids-movies', type: 'movie', name: 'Trending Kids Movies', source: 'mdblist', user: 'tvgeniekodi', slug: 'trending-kids-movies', min_imdb: 6, sort: 'tmdbpopular', target: 50, age_band: 12 },
-  { id: 'mdb-kids-series', type: 'series', name: 'Trending Kids TV', source: 'mdblist', user: 'tvgeniekodi', slug: 'trending-kids-tv-shows', min_imdb: 6, sort: 'tmdbpopular', target: 50, age_band: 12 },
+  // Kids lists — rating-gated at 6.0. Sized by the profile's list-size setting
+  // (CB-1: no per-catalog target). age_band 12 is applied ALWAYS (even on adult
+  // profiles), so the row is trustworthy on its own; effective gate =
+  // min(age_band, profile.age_limit) when the profile is limited.
+  { id: 'mdb-kids-movies', type: 'movie', name: 'Trending Kids Movies', source: 'mdblist', user: 'tvgeniekodi', slug: 'trending-kids-movies', min_imdb: 6, sort: 'tmdbpopular', age_band: 12 },
+  { id: 'mdb-kids-series', type: 'series', name: 'Trending Kids TV', source: 'mdblist', user: 'tvgeniekodi', slug: 'trending-kids-tv-shows', min_imdb: 6, sort: 'tmdbpopular', age_band: 12 },
   // Anime TV-14 — snoak/trending-anime-shows on MDBList (v6 decision, not the
   // doc's AniList). min_profile_age 14 HIDES it below the band; age_band 14
-  // GATES it always (→ the TV-14 tier). ID kept for manifest stability.
-  { id: 'trakt-anime-teen-series', type: 'series', name: 'Anime TV-14', source: 'mdblist', user: 'snoak', slug: 'trending-anime-shows', min_imdb: 6, sort: 'tmdbpopular', target: 50, min_profile_age: 14, age_band: 14 },
+  // GATES it always (→ the TV-14 tier). ID kept for manifest stability. Sized
+  // by the profile's list-size setting (CB-1: no per-catalog target).
+  { id: 'trakt-anime-teen-series', type: 'series', name: 'Anime TV-14', source: 'mdblist', user: 'snoak', slug: 'trending-anime-shows', min_imdb: 6, sort: 'tmdbpopular', min_profile_age: 14, age_band: 14 },
 ];
 
 const byId = new Map(EXTRA_CATALOGS.map((d) => [d.id, d]));
