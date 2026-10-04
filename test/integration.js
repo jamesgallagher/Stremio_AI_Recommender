@@ -10188,8 +10188,9 @@ async function main() {
       const prevEngines = { ...(settings.getSettings()?.engines || {}) };
       settings.updateSettings({ keys: { tmdb_api_key: 't11a-tmdb' } });
       settings.updateSettings({ engines: { 't11a-engine': true } });
-      // Set a vote floor of 1000 so below-floor rows are filtered by atomicPromotion.
-      config.updateProfile(pid, { filters: { engine_movie: 't11a-engine', engine_series: 't11a-engine', min_rating: 0, vote_count_floor: 1000 } });
+      // Register the engine BEFORE selecting it on the profile: config.updateProfile
+      // validates engine IDs against the registry at write time and silently falls
+      // back to genesis for an unregistered ID.
       const dispose = engines._register({
         id: 't11a-engine', name: 'T11A', description: 't', supportedTypes: ['movie', 'series'],
         capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
@@ -10205,6 +10206,12 @@ async function main() {
           return [];
         },
       });
+      // Set a vote floor of 1000 so below-floor rows are filtered by atomicPromotion.
+      config.updateProfile(pid, { filters: { engine_movie: 't11a-engine', engine_series: 't11a-engine', min_rating: 0, vote_count_floor: 1000 } });
+      // Guard against silent fallback: the profile must actually have t11a-engine.
+      const verifyProfile = config.getProfile(pid);
+      assert.strictEqual(verifyProfile.filters.engine_movie, 't11a-engine', 'engine_movie is t11a-engine (not silently fallen back to genesis)');
+      assert.strictEqual(verifyProfile.filters.engine_series, 't11a-engine', 'engine_series is t11a-engine');
       try {
         // Seed the old movie pool with 3 rows: one below the vote floor (vote_count=100).
         // The serve path (selectedRecommendationRows) does NOT apply the vote floor,
@@ -10215,6 +10222,13 @@ async function main() {
           { type: 'movie', tmdb_id: 't11a-old2', imdb_id: 'tt-t11a-old2', title: 'Old2', year: 2024, primary_genre: 'Action', genres: 'Action', vote_average: 7, vote_count: 4000, affinity: 4, rec_count: 1, popularity: 1, poster: null, engine_id: 't11a-engine' },
           { type: 'movie', tmdb_id: 't11a-old3', imdb_id: 'tt-t11a-old3', title: 'Old3', year: 2024, primary_genre: 'Sci-Fi', genres: 'Sci-Fi', vote_average: 7, vote_count: 100, affinity: 3, rec_count: 1, popularity: 1, poster: null, engine_id: 't11a-engine' },
         ], { ratingCheckedAt: null });
+
+        // Before the build: assert the old pool has 3 distinct served eligible titles,
+        // including the below-floor row (which is served because the serve path does
+        // not apply the vote floor).
+        const oldPool = rs.getRecommended(pid, { type: 'movie', limit: 10 });
+        assert.strictEqual(oldPool.length, 3, 'old pool has 3 distinct titles');
+        assert.ok(oldPool.some((r) => r.tmdb_id === 't11a-old3' && r.vote_count === 100), 'below-floor row is present and served');
 
         // Run the staged build. oldEligible = 3 (no vote floor on old side).
         // newEligible = 2 (vote floor applied to new side). minRequired = min(20, 3) = 3.
