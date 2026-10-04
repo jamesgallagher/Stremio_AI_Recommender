@@ -111,10 +111,15 @@ function pruneWatched(profileId, type, imdbIds) {
 
 // Extra (MDBList-backed) catalog cache, keyed by catalog id. Same atomic-swap
 // discipline as the AI catalogs: only called on successful builds.
-function swapExtra(profileId, catalogId, metas) {
+// CB-1: `meta` is an optional object with build metadata (format marker, list
+// size built for, eligible count at build). Watch Later callers and old caches
+// (no `meta` field) continue to work unchanged.
+function swapExtra(profileId, catalogId, metas, meta) {
   const cache = loadCache(profileId);
   cache.extras = cache.extras || {};
-  cache.extras[catalogId] = { metas, generated_at: Date.now() };
+  const entry = { metas, generated_at: Date.now() };
+  if (meta) Object.assign(entry, meta);
+  cache.extras[catalogId] = entry;
   writeJsonAtomic(cacheFile(profileId), cache);
 }
 

@@ -57,6 +57,63 @@ function isStale(catalog) {
   return !catalog || Date.now() - (catalog.generated_at || 0) > STALE_MS;
 }
 
+// CB-1: per-catalog staleness with the reserve-aware triggers. Returns true
+// when a rebuild is needed:
+//   - the old time-based staleness (generated_at > STALE_MS), OR
+//   - a legacy cache without the 'reserve-v1' format marker (one-time migration), OR
+//   - the cache was built for a smaller list size and its reserve is too small
+//     to fill the current setting, OR
+//   - the eligible visible count has dropped below what it was at build
+//     (depletion from watches/suppressions).
+// A source already thin at its last successful build does NOT trigger a
+// refetch on every request: the depletion check compares against
+// eligible_at_build, so a thin source that was thin at build stays put until
+// the time-based staleness fires.
+function isStaleForProfile(profile, def, entry) {
+  if (!entry) return true;
+  // Time-based staleness (the original trigger).
+  if (Date.now() - (entry.generated_at || 0) > STALE_MS) return true;
+  // Legacy cache without the format marker — one-time migration.
+  if (!entry.format) return true;
+  // Built for a smaller list size: the reserve (2×old list size) may be too
+  // small to fill the current setting. Check whether the pool can serve the
+  // current list size at all.
+  const listSize = require('./recommendationStore').listSizeFor(profile);
+  const builtFor = entry.list_size;
+  if (builtFor && builtFor < listSize) {
+    // The pool was built for a smaller size; if its total metas are fewer
+    // than the current list size, it can't fill the setting.
+    if (entry.metas?.length < listSize) return true;
+  }
+  // Depletion: eligible visible count dropped below what it was at build.
+  // A thin source that was thin at build (eligible_at_build < listSize) does
+  // NOT trigger on every request — the check is "dropped below what it had
+  // at build", not "below list size".
+  if (entry.eligible_at_build != null) {
+    const currentEligible = eligibleVisible(entry.metas, profile, def);
+    if (currentEligible < entry.eligible_at_build) return true;
+  }
+  return false;
+}
+
+// CB-1: the eligible visible count for a catalog's pool — how many titles
+// would actually be served after filtering watched (unless dedupe_watched:false)
+// and suppressed (unless source is simkl_plantowatch). Used by the swap gate
+// and the refresh triggers.
+function eligibleVisible(metas, profile, def) {
+  if (!metas?.length) return 0;
+  let visible = metas;
+  if (def.dedupe_watched !== false) {
+    const watched = watchedStore.watchedIdSets(profile.id).imdb;
+    visible = visible.filter((m) => !watched.has(m.id));
+  }
+  if (def.source !== 'simkl_plantowatch') {
+    const suppressed = require('./recommendationStore').dontRecommendImdbSet(profile.id);
+    visible = visible.filter((m) => !suppressed.has(m.id));
+  }
+  return visible.length;
+}
+
 function status(profile) {
   const rs = require('./recommendationStore');   // lazy — heavy module, avoids a load cycle
   const engines = require('./engines');          // lazy — avoids a load cycle
@@ -399,9 +456,10 @@ async function buildExtraCatalog(profile, def, log = console) {
   if (!key) throw new Error('MDBList API key is required for extra catalogs');
   // CB-1: the visible count comes from the profile's list-size setting (one
   // number for every non-Watch-Later catalog). Watch Later keeps its source-sized
-  // list (handled above, before this point).
+  // list (handled above, before this point). The reserve is 2× the list size so
+  // that watched/suppressed titles can be replaced locally without a refetch.
   const listSize = require('./recommendationStore').listSizeFor(profile);
-  const target = listSize;
+  const target = 2 * listSize;
   const collected = [];
   const seen = new Set();
   for (let page = 0; page < MAX_EXTRA_PAGES && collected.length < target; page++) {
@@ -455,7 +513,7 @@ async function buildExtraCatalog(profile, def, log = console) {
       if (collected.length >= target) break;
       collected.push(m);
     }
-    log.log(`[extra] ${profile.name}/${def.id}: page ${page + 1} -> ${collected.length}/${target}`);
+    log.log(`[extra] ${profile.name}/${def.id}: page ${page + 1} -> ${collected.length}/${target} (reserve)`);
   }
   // Second age layer for kids profiles, then randomize so the daily list
   // looks fresh instead of serving the same fixed sequence. cleanMetas strips
@@ -482,14 +540,31 @@ async function rebuildProfile(profile, log = console, opts = {}, onProgress = ()
           const metas = await buildExtraCatalog(profile, def, log);
           // Watch Later is a mirror, not a generated list: any size — even
           // empty — is the true state of the user's watchlist, so it always
-          // swaps. Curated lists keep the >= MIN_METAS quality gate.
-          if (def.source === 'simkl_plantowatch' || metas.length >= MIN_METAS) {
+          // swaps. Curated lists keep the >= MIN_METAS quality gate plus the
+          // CB-1 swap gate: never replace an old catalog with one showing
+          // fewer eligible titles.
+          if (def.source === 'simkl_plantowatch') {
             store.swapExtra(profile.id, def.id, metas);
             results[def.id] = { ok: true, count: metas.length };
             log.log(`[extra] ${profile.name}/${def.id}: swapped in ${metas.length} titles`);
           } else {
-            results[def.id] = { ok: false, error: `only ${metas.length} usable titles (< ${MIN_METAS}) — kept previous list` };
-            log.warn(`[extra] ${profile.name}/${def.id}: ${results[def.id].error}`);
+            const listSize = require('./recommendationStore').listSizeFor(profile);
+            const newVisible = eligibleVisible(metas, profile, def);
+            const oldEntry = store.loadCache(profile.id).extras?.[def.id];
+            const oldVisible = oldEntry ? eligibleVisible(oldEntry.metas, profile, def) : 0;
+            const gate = newVisible >= Math.min(listSize, oldVisible || listSize);
+            if (metas.length >= MIN_METAS && gate) {
+              const meta = { format: 'reserve-v1', list_size: listSize, eligible_at_build: newVisible };
+              store.swapExtra(profile.id, def.id, metas, meta);
+              results[def.id] = { ok: true, count: metas.length, visible: newVisible };
+              log.log(`[extra] ${profile.name}/${def.id}: swapped in ${metas.length} titles (${newVisible} eligible)`);
+            } else {
+              const reason = metas.length < MIN_METAS
+                ? `only ${metas.length} usable titles (< ${MIN_METAS})`
+                : `new visible ${newVisible} < gate ${Math.min(listSize, oldVisible || listSize)}`;
+              results[def.id] = { ok: false, error: `${reason} — kept previous list` };
+              log.warn(`[extra] ${profile.name}/${def.id}: ${results[def.id].error}`);
+            }
           }
         } catch (err) {
           results[def.id] = { ok: false, error: err.message };
@@ -512,7 +587,7 @@ async function rebuildProfile(profile, log = console, opts = {}, onProgress = ()
 function ensureFresh(profile, log = console) {
   const cache = store.loadCache(profile.id);
   const extrasStale = catalogs.enabledExtras(profile).some(
-    (d) => catalogs.requirementMet(profile, d) && isStale(cache.extras?.[d.id]),
+    (d) => catalogs.requirementMet(profile, d) && isStaleForProfile(profile, d, cache.extras?.[d.id]),
   );
   if (!extrasStale) return false;
   if (locks.has(profile.id)) return false;
@@ -537,6 +612,8 @@ module.exports = {
   applyAnimeGate,
   isBlacklistedTitle,
   isStale,
+  isStaleForProfile,
+  eligibleVisible,
   STALE_MS,
   MIN_METAS,
 };
