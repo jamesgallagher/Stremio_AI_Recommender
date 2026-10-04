@@ -520,11 +520,10 @@ router.get('/profiles/:id/recommend', (req, res) => {
   // (the ME-10 backtest: ~70% of a Genesis pool), so the old raw view listed
   // films the user would never be shown. Read-only: no impressions recorded.
   const listSize = recommendationStore.listSizeFor(profile);
-  const served = (type) => recommendationStore.selectServeFor(
-    profile, type,
-    recommendationStore.getRecommended(profile.id, { type, limit: 100000 }),
-    { limit: listSize },
-  );
+  // The same watched-first shared selection the AI catalogs use, so the Advanced
+  // view shows exactly the user-visible titles (watched/pending excluded before
+  // the limit) — not the raw pool's top list_size with watched titles leaking in.
+  const served = (type) => recommendationStore.selectedRecommendationRows(profile, type, { limit: listSize });
   res.json({
     total: recommendationStore.countRecommended(profile.id),
     listSize,

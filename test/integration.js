@@ -9429,6 +9429,49 @@ async function main() {
     }
   });
 
+  // T5b — empty states: when a type pool exists but all rows are watched,
+  // state:'ok' + metas:[]. When the type pool is genuinely empty, preserve
+  // not_built (Simkl connected) / needs_simkl (not), even if the OTHER type has
+  // rows.
+  await it('T5b: empty states — all-watched ok + metas [], genuinely-empty not_built/needs_simkl', async () => {
+    try {
+      // (a) All-watched pool: state 'ok', metas [].
+      const p2 = config.addProfile('INT-WBF-T5b');
+      config.updateProfile(p2.id, { filters: { engine_movie: 'genesis', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      const allRows = backfillMovieRows();
+      rs.upsertCandidates(p2.id, allRows);
+      for (const r of allRows) watchedStore.addPendingWatched(p2.id, { type: 'movie', imdbId: r.imdb_id });
+      const allWatched = catalogServe.servedCatalog(config.getProfile(p2.id), 'ai-recs-movies', { record: false });
+      assert.strictEqual(allWatched.state, 'ok', 'all-watched pool is a built pool serving nothing (state ok)');
+      assert.deepStrictEqual(allWatched.metas, [], 'all-watched pool serves no metas');
+      assert.strictEqual(allWatched.requirement_met, true);
+      // (b) Genuinely-empty type pool (Simkl connected) → not_built, even when
+      // the OTHER type (series) has rows.
+      const p3 = config.addProfile('INT-WBF-T5c');
+      config.updateProfile(p3.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'genesis', engine_series: 'genesis', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      rs.upsertCandidates(p3.id, backfillMovieRows().map((r) => ({ ...r, type: 'series', tmdb_id: 's' + r.tmdb_id, imdb_id: 'tt' + 's' + r.tmdb_id })));
+      const emptyMovie = catalogServe.servedCatalog(config.getProfile(p3.id), 'ai-recs-movies', { record: false });
+      assert.strictEqual(emptyMovie.state, 'not_built', 'genuinely-empty movie pool (Simkl connected) is not_built');
+      assert.strictEqual(emptyMovie.requirement_met, true);
+      // (c) Genuinely-empty type pool (Simkl NOT connected) → needs_simkl.
+      const p4 = config.addProfile('INT-WBF-T5d');
+      config.updateProfile(p4.id, { filters: { engine_movie: 'genesis', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      const emptyMovieNoSimkl = catalogServe.servedCatalog(config.getProfile(p4.id), 'ai-recs-movies', { record: false });
+      assert.strictEqual(emptyMovieNoSimkl.state, 'needs_simkl', 'genuinely-empty movie pool (no Simkl) is needs_simkl');
+      assert.strictEqual(emptyMovieNoSimkl.requirement_met, false);
+      // Cleanup the extra throwaway profiles.
+      config.removeProfile(p2.id); rs.deleteForProfile(p2.id); watchedStore.deleteForProfile(p2.id);
+      config.removeProfile(p3.id); rs.deleteForProfile(p3.id);
+      config.removeProfile(p4.id); rs.deleteForProfile(p4.id);
+    } finally {
+      // Belt-and-braces cleanup if an assertion fails mid-test.
+      for (const id of ['INT-WBF-T5b', 'INT-WBF-T5c', 'INT-WBF-T5d']) {
+        const prof = config.getProfile(id);
+        if (prof) { config.removeProfile(prof.id); rs.deleteForProfile(prof.id); watchedStore.deleteForProfile(prof.id); }
+      }
+    }
+  });
+
   // Restore a clean-ish shared state for any process that runs after this one.
   store.saveAgeVerdicts({});
   offlineAnimeMap();
