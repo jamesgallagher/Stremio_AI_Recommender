@@ -9792,6 +9792,104 @@ async function main() {
         config.removeProfile(pid); rs.deleteForProfile(pid); watchedStore.deleteForProfile(pid);
       }
     });
+
+    await it('T5: urgent paths — ensureBuilt still works for manual/config/Trainer/cold-start', async () => {
+      const prof = config.addProfile('T5');
+      const pid = prof.id;
+      const dispose = engines._register(mkStagedEngine('t5-engine', 't5'));
+      const prevTmdb = settings.getSettings()?.keys?.tmdb_api_key || '';
+      const prevEngines = { ...(settings.getSettings()?.engines || {}) };
+      settings.updateSettings({ keys: { tmdb_api_key: 't5-tmdb' } });
+      settings.updateSettings({ engines: { 't5-engine': true } });
+      config.updateProfile(pid, { filters: { engine_movie: 't5-engine', engine_series: 't5-engine' } });
+      try {
+        // Seed watched history (so the build has seeds).
+        watchedStore.upsertMany(pid, [
+          { simkl_id: 1, type: 'movie', imdb_id: 'tt-watched', tmdb_id: 'w1', title: 'Watched', year: 2020, watched_at: '2026-09-01T10:00:00Z' },
+        ]);
+        // ensureBuilt with no kind (urgent path) runs the existing buildRecommendations
+        // + ageGatePool path (not the staged path).
+        const result = await rs.ensureBuilt(config.getProfile(pid), quiet);
+        assert.ok(result, 'ensureBuilt returned a result');
+        // The pool should now have rows (the urgent path stores candidates directly).
+        assert.ok(rs.countRecommended(pid) > 0, 'urgent path stored candidates');
+        // A second ensureBuilt with no history change is a no-op (needsBuild → false).
+        const result2 = await rs.ensureBuilt(config.getProfile(pid), quiet);
+        assert.ok(result2.skipped === 'fresh', 'second ensureBuilt is a no-op when fresh');
+      } finally {
+        settings.updateSettings({ keys: { tmdb_api_key: prevTmdb } });
+        settings.updateSettings({ engines: prevEngines });
+        dispose();
+        config.removeProfile(pid); rs.deleteForProfile(pid); watchedStore.deleteForProfile(pid);
+      }
+    });
+
+    await it('T6: sync sequencing — ensureSyncedAsync skips when not configured/not due', async () => {
+      const scrobble = require('../src/services/scrobble');
+      // A profile with no scrobble config → skipped: not-configured.
+      const prof = config.addProfile('T6');
+      const pid = prof.id;
+      try {
+        const result = await scrobble.ensureSyncedAsync(config.getProfile(pid));
+        assert.ok(result.skipped === 'not-configured', 'not-configured when no scrobble config');
+
+        // A profile with scrobble enabled but no Simkl token → skipped: not-configured.
+        config.updateProfile(pid, { scrobble: { enabled: true, provider: 'nuvio', email: 'test@example.com', password_enc: 'enc' } });
+        const result2 = await scrobble.ensureSyncedAsync(config.getProfile(pid));
+        assert.ok(result2.skipped === 'not-configured', 'not-configured when no Simkl token');
+      } finally {
+        config.removeProfile(pid); rs.deleteForProfile(pid); watchedStore.deleteForProfile(pid);
+      }
+    });
+
+    await it('T6b: sync sequencing — ensureSyncedAsync awaits syncProfile and returns the result', async () => {
+      const scrobble = require('../src/services/scrobble');
+      const crypto = require('../src/services/crypto');
+      const prof = config.addProfile('T6b');
+      const pid = prof.id;
+      const prevTmdb = settings.getSettings()?.keys?.tmdb_api_key || '';
+      const prevEngines = { ...(settings.getSettings()?.engines || {}) };
+      settings.updateSettings({ keys: { tmdb_api_key: 't6b-tmdb' } });
+      try {
+        // Set up a profile with scrobble enabled + Simkl token.
+        config.updateProfile(pid, {
+          scrobble: { enabled: true, provider: 'nuvio', email: 'test@example.com', password_enc: 'enc' },
+        });
+        // Set the Simkl token + client id directly on the in-memory profile
+        // (the auth object is sealed at rest, so a plaintext token via
+        // updateProfile would be lost on the next load).
+        const profObj = config.getProfile(pid);
+        profObj.simkl_auth = { access_token: 'test-token' };
+        profObj.keys = { simkl_client_id: 'test-client' };
+        // Stub crypto.decrypt to bypass the credential decryption.
+        const origDecrypt = crypto.decrypt;
+        crypto.decrypt = (enc) => 'test-password';
+        // Stub the provider's pullWatched to return a deterministic item.
+        const nuvio = require('../src/services/nuvio');
+        const origPull = nuvio.pullWatched;
+        nuvio.pullWatched = async ({ email, password }) => {
+          return [{ type: 'movie', imdbId: 'tt-t6b-movie', title: 'T6B Movie', watchedAtMs: Date.now() - 3600e3 }];
+        };
+        // Stub Simkl's addToHistory to record the call.
+        const simkl = require('../src/services/simkl');
+        const origAdd = simkl.addToHistory;
+        let simklCalls = 0;
+        simkl.addToHistory = async (profile, body) => { simklCalls++; return { ok: true }; };
+        try {
+          const result = await scrobble.ensureSyncedAsync(profObj);
+          assert.ok(result.pulled === 1, 'syncProfile pulled 1 item');
+          assert.ok(simklCalls >= 1, 'Simkl addHistory was called');
+        } finally {
+          crypto.decrypt = origDecrypt;
+          nuvio.pullWatched = origPull;
+          simkl.addToHistory = origAdd;
+        }
+      } finally {
+        settings.updateSettings({ keys: { tmdb_api_key: prevTmdb } });
+        settings.updateSettings({ engines: prevEngines });
+        config.removeProfile(pid); rs.deleteForProfile(pid); watchedStore.deleteForProfile(pid);
+      }
+    });
   }
 
   // Restore a clean-ish shared state for any process that runs after this one.

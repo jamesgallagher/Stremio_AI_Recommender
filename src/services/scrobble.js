@@ -299,6 +299,31 @@ function ensureSynced(profile, log = console) {
   return true;
 }
 
+// Awaitable provider→Simkl sync (feature/ai-catalog-cadence, Stage 3). Returns
+// a Promise that resolves when the sync completes (or is skipped). The
+// scheduler tick awaits this before proceeding to the local backfill and the
+// AI schedule consider. Guarded by the same per-profile lock and cadence as
+// ensureSynced; a failure logs a warning and resolves (never throws into the
+// caller, so the tick can proceed to the local backfill even when the
+// provider/Simkl sync fails).
+async function ensureSyncedAsync(profile, log = console) {
+  const cfg = profile.scrobble;
+  if (!cfg?.enabled || !cfg.password_enc || !profile.simkl_auth?.access_token) return { skipped: 'not-configured' };
+  if (locks.has(profile.id)) return { skipped: 'in-flight' };
+  if (Date.now() - (lastSyncedAt.get(profile.id) || 0) < SYNC_INTERVAL_MS) return { skipped: 'not-due' };
+  locks.add(profile.id);
+  lastSyncedAt.set(profile.id, Date.now());
+  try {
+    const result = await syncProfile(profile, log);
+    return result;
+  } catch (err) {
+    log.warn(`[scrobble] ${profile.name}: sync failed: ${err.message} — provider left unchanged`);
+    return { failed: err.message };
+  } finally {
+    locks.delete(profile.id);
+  }
+}
+
 // ---- Portal helpers ----
 // Validate credentials and (for Nuvio) return the selectable profile list.
 // Accepts an explicit password (unsaved, from the Test button) or falls back to
@@ -330,4 +355,4 @@ async function pullProviderProgress(cfg) {
   return provider.pullWatchProgress({ email, password, profileIndex: cfg.nuvio_profile_index });
 }
 
-module.exports = { computeDelta, notFoundImdb, filterBackoff, syncProfile, ensureSynced, testCredentials, pullProviderWatched, pullProviderProgress };
+module.exports = { computeDelta, notFoundImdb, filterBackoff, syncProfile, ensureSynced, ensureSyncedAsync, testCredentials, pullProviderWatched, pullProviderProgress };
