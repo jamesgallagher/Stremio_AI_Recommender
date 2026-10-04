@@ -861,6 +861,156 @@ async function unitTests() {
     }
   });
 
+  // ---- Companion-recs-watched-backfill: the phone's catalog view must mirror
+  // the Stremio AI catalog exactly — watched titles removed BEFORE the limit,
+  // and the full candidate set (no 500-row cap). These compare the handler
+  // against the real Stremio surface (catalogServe.servedCatalog), not against
+  // a call to selectedRecommendationRows that would repeat the implementation.
+
+  // T1 — calibrated mismatch (the regression): a Marquee profile with a stored
+  // taste target, list_size 20, 28 servable movie rows across 4 genres. Six
+  // watched titles concentrated in the target's dominant genre (Action) so the
+  // OLD handler's first display_count differs from Stremio.
+  await ok('WBF-T1: companion catalog first display_count == Stremio catalog (calibrated)', () => {
+    const serveCalibration = require('../../src/serveCalibration');
+    const settings = require('../../src/settings');
+    const watchedStore = require('../../src/watchedStore');
+    const pid = 'wbf-t1-' + Date.now();
+    const prevMarquee = settings.getSettings()?.engines?.marquee ?? false;
+    try {
+      settings.updateSettings({ engines: { marquee: true } });
+      const rows = [];
+      for (const [prefix, genre] of [['A', 'Action'], ['B', 'Drama'], ['C', 'Comedy'], ['D', 'Science Fiction']]) {
+        for (let i = 1; i <= 7; i++) rows.push(mkCand({ tmdb_id: prefix + i, imdb_id: 'tt' + prefix + i, title: 'T' + prefix + i, affinity: 100 - i, primary_genre: genre, genres: genre }));
+      }
+      recommendationStore.upsertCandidates(pid, rows);
+      serveCalibration.setTarget(pid, 'movie', 'marquee', { Action: 0.7, Drama: 0.1, Comedy: 0.1, 'Science Fiction': 0.1 }, 28, Date.now());
+      const watchedIds = ['ttA1', 'ttA2', 'ttA3', 'ttA4', 'ttA5', 'ttA6'];
+      for (const imdbId of watchedIds) watchedStore.addPendingWatched(pid, { type: 'movie', imdbId });
+      const profile = { id: pid, filters: { engine_movie: 'marquee', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 }, companion: { catalog_only: true } };
+      const res = fakeRes();
+      handlers.recommendationsHandler({ query: { type: 'movie' }, profile }, res);
+      assert.strictEqual(res.body.view, 'catalog');
+      const stremio = catalogServe.servedCatalog(profile, 'ai-recs-movies', { record: false }).metas.map((m) => m.id);
+      assert.deepStrictEqual(res.body.items.slice(0, res.body.display_count).map((r) => r.id), stremio, 'companion catalog mirrors Stremio');
+      assert.ok(res.body.items.slice(0, res.body.display_count).every((r) => !watchedIds.includes(r.id)), 'no watched id served');
+    } finally {
+      settings.updateSettings({ engines: { marquee: prevMarquee } });
+      recommendationStore.deleteForProfile(pid);
+      serveCalibration.deleteForProfile(pid);
+      watchedStore.deleteForProfile(pid);
+    }
+  });
+
+  // T2 — fallback path: the same deep-equal assertion for a genre-balanced
+  // (no target) profile with watched titles in its old top 20.
+  await ok('WBF-T2: companion catalog first display_count == Stremio catalog (fallback genre-balanced)', () => {
+    const watchedStore = require('../../src/watchedStore');
+    const pid = 'wbf-t2-' + Date.now();
+    try {
+      const rows = [];
+      for (const [prefix, genre] of [['A', 'Action'], ['B', 'Drama'], ['C', 'Comedy'], ['D', 'Science Fiction']]) {
+        for (let i = 1; i <= 7; i++) rows.push(mkCand({ tmdb_id: prefix + i, imdb_id: 'tt' + prefix + i, title: 'T' + prefix + i, affinity: 100 - i, primary_genre: genre, genres: genre }));
+      }
+      recommendationStore.upsertCandidates(pid, rows);
+      const watchedIds = ['ttA1', 'ttA2', 'ttB1', 'ttB2', 'ttC1', 'ttD1'];
+      for (const imdbId of watchedIds) watchedStore.addPendingWatched(pid, { type: 'movie', imdbId });
+      const profile = { id: pid, filters: { engine_movie: 'genesis', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 }, companion: { catalog_only: true } };
+      const res = fakeRes();
+      handlers.recommendationsHandler({ query: { type: 'movie' }, profile }, res);
+      assert.strictEqual(res.body.view, 'catalog');
+      const stremio = catalogServe.servedCatalog(profile, 'ai-recs-movies', { record: false }).metas.map((m) => m.id);
+      assert.deepStrictEqual(res.body.items.slice(0, res.body.display_count).map((r) => r.id), stremio, 'companion catalog mirrors Stremio');
+      assert.ok(res.body.items.slice(0, res.body.display_count).every((r) => !watchedIds.includes(r.id)), 'no watched id served');
+    } finally {
+      recommendationStore.deleteForProfile(pid);
+      watchedStore.deleteForProfile(pid);
+    }
+  });
+
+  // T3 — bench and view=all: the catalog-view bench (items past display_count)
+  // has no watched ids and no duplicates; view=all has no watched ids,
+  // display_count === items.length, and its first list_size ids equal the
+  // catalog view's first display_count ids.
+  await ok('WBF-T3: bench + view=all have no watched ids / no duplicates; all first list_size == catalog first display_count', () => {
+    const watchedStore = require('../../src/watchedStore');
+    const pid = 'wbf-t3-' + Date.now();
+    try {
+      const rows = [];
+      for (const [prefix, genre] of [['A', 'Action'], ['B', 'Drama'], ['C', 'Comedy'], ['D', 'Science Fiction']]) {
+        for (let i = 1; i <= 7; i++) rows.push(mkCand({ tmdb_id: prefix + i, imdb_id: 'tt' + prefix + i, title: 'T' + prefix + i, affinity: 100 - i, primary_genre: genre, genres: genre }));
+      }
+      recommendationStore.upsertCandidates(pid, rows);
+      const watchedIds = ['ttA1', 'ttA2', 'ttB1', 'ttB2', 'ttC1', 'ttD1'];
+      for (const imdbId of watchedIds) watchedStore.addPendingWatched(pid, { type: 'movie', imdbId });
+      const profile = { id: pid, filters: { engine_movie: 'genesis', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 }, companion: { catalog_only: true } };
+      const catRes = fakeRes();
+      handlers.recommendationsHandler({ query: { type: 'movie', view: 'catalog' }, profile }, catRes);
+      const bench = catRes.body.items.slice(catRes.body.display_count);
+      assert.ok(bench.every((r) => !watchedIds.includes(r.id)), 'bench has no watched ids');
+      assert.strictEqual(new Set(bench.map((r) => r.id)).size, bench.length, 'bench has no duplicates');
+      const allRes = fakeRes();
+      handlers.recommendationsHandler({ query: { type: 'movie', view: 'all' }, profile }, allRes);
+      assert.strictEqual(allRes.body.view, 'all');
+      assert.ok(allRes.body.items.every((r) => !watchedIds.includes(r.id)), 'view=all has no watched ids');
+      assert.strictEqual(allRes.body.display_count, allRes.body.items.length, 'view=all display_count == items.length');
+      assert.deepStrictEqual(allRes.body.items.slice(0, profile.filters.list_size).map((r) => r.id), catRes.body.items.slice(0, catRes.body.display_count).map((r) => r.id), 'all first list_size == catalog first display_count');
+    } finally {
+      recommendationStore.deleteForProfile(pid);
+      watchedStore.deleteForProfile(pid);
+    }
+  });
+
+  // T4 — pool over 500: seed more than 500 servable rows for one type, where
+  // the rows Stremio serves include at least one ranked below affinity position
+  // 500 (a genre that exists only below position 500, so genre balancing pulls
+  // it in). The phone's catalog view must equal Stremio's ids (no 500 cap).
+  await ok('WBF-T4: pool over 500 — companion catalog mirrors Stremio (genre below position 500 pulled in)', () => {
+    const pid = 'wbf-t4-' + Date.now();
+    try {
+      const rows = [];
+      for (let i = 1; i <= 500; i++) rows.push(mkCand({ tmdb_id: 'A' + i, imdb_id: 'ttA' + i, title: 'T' + 'A' + i, affinity: 500 - i, primary_genre: 'Action', genres: 'Action' }));
+      for (let i = 1; i <= 10; i++) rows.push(mkCand({ tmdb_id: 'D' + i, imdb_id: 'ttD' + i, title: 'T' + 'D' + i, affinity: 0.9 - i * 0.01, primary_genre: 'Drama', genres: 'Drama' }));
+      recommendationStore.upsertCandidates(pid, rows);
+      const profile = { id: pid, filters: { engine_movie: 'genesis', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 }, companion: { catalog_only: true } };
+      const res = fakeRes();
+      handlers.recommendationsHandler({ query: { type: 'movie', view: 'catalog' }, profile }, res);
+      const stremio = catalogServe.servedCatalog(profile, 'ai-recs-movies', { record: false }).metas.map((m) => m.id);
+      assert.deepStrictEqual(res.body.items.slice(0, res.body.display_count).map((r) => r.id), stremio, 'companion catalog mirrors Stremio (no 500 cap)');
+    } finally {
+      recommendationStore.deleteForProfile(pid);
+    }
+  });
+
+  // T5 — read-only and shows: calling the handler does not change any row's
+  // times_shown; a series watch excludes a matching movie IMDb id (cross-type).
+  await ok('WBF-T5: handler is read-only (times_shown unchanged) + series cross-type watch', () => {
+    const watchedStore = require('../../src/watchedStore');
+    const pid = 'wbf-t5-' + Date.now();
+    try {
+      const movieRows = [];
+      for (let i = 1; i <= 28; i++) movieRows.push(mkCand({ tmdb_id: 'M' + i, imdb_id: 'ttM' + i, title: 'T' + 'M' + i, affinity: 100 - i, primary_genre: 'Action', genres: 'Action' }));
+      const seriesRows = movieRows.map((r) => ({ ...r, type: 'series', tmdb_id: 's' + r.tmdb_id, imdb_id: 'tt' + 's' + r.tmdb_id }));
+      recommendationStore.upsertCandidates(pid, [...movieRows, ...seriesRows]);
+      const crossImdb = 'ttM1';
+      watchedStore.addPendingWatched(pid, { type: 'series', imdbId: crossImdb });
+      const profile = { id: pid, filters: { engine_movie: 'genesis', engine_series: 'genesis', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 }, companion: { catalog_only: true } };
+      const before = recommendationStore.getRecommended(pid, { type: 'movie', limit: 100000 });
+      const beforeByTmdb = new Map(before.map((r) => [r.tmdb_id, r]));
+      const movieRes = fakeRes();
+      handlers.recommendationsHandler({ query: { type: 'movie' }, profile }, movieRes);
+      const after = recommendationStore.getRecommended(pid, { type: 'movie', limit: 100000 });
+      for (const r of after) {
+        const b = beforeByTmdb.get(r.tmdb_id);
+        assert.strictEqual(r.times_shown, b.times_shown, 'times_shown unchanged (read-only)');
+      }
+      assert.ok(!movieRes.body.items.some((r) => r.id === crossImdb), 'series watch excludes the matching movie IMDb id');
+    } finally {
+      recommendationStore.deleteForProfile(pid);
+      watchedStore.deleteForProfile(pid);
+    }
+  });
+
   await ok('recs: default view follows companion.catalog_only; explicit ?view overrides it', () => {
     const pid = 'rec5-pref-' + Date.now();
     recommendationStore.upsertCandidates(pid, [mkCand({ tmdb_id: '301', imdb_id: 'tt301', title: 'P' })]);
