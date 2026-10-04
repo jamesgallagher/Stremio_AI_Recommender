@@ -653,6 +653,7 @@ async function openCatalogPreview(ev, pid, catalogId, title) {
   ev.preventDefault(); ev.stopPropagation();
   _cpvLastFocus = ev.currentTarget;
   _cpvPid = pid; // the cell actions (mark-watched / not-interested / WL-remove) post to this profile
+  _cpvCatalogId = catalogId; // CB-1: the refetch after actions uses this id
   const backdrop = document.createElement('div');
   backdrop.className = 'cpv-backdrop'; backdrop.id = 'cpvBackdrop';
   backdrop.addEventListener('mousedown', (e) => { if (e.target === backdrop) _cpvClose(); });
@@ -700,17 +701,18 @@ function _cpvRender(data) {
 // watched) top-left, ✕ top-right. On a Watch Later list (source:'simkl_plantowatch')
 // the ✕ removes from the list (MW-04) and the eye keeps the cell; elsewhere the ✕ is
 // "not interested" (suppress) and the eye drops the cell. Only the SAFE values
-// (type, tt-id, isWatchLater) ride the inline onclick; the title goes through a
-// data-name attribute (HTML-attribute-escaped) and is read back from the button, so
-// a title with an apostrophe/quote can never break out of the handler call.
+// (type, tt-id, isWatchLater, dedupeWatched) ride the inline onclick; the title goes
+// through a data-name attribute (HTML-attribute-escaped) and is read back from the
+// button, so a title with an apostrophe/quote can never break out of the handler call.
 function _cpvActions(data, m) {
   const isWL = data.source === 'simkl_plantowatch';
+  const dedupeWatched = data.dedupe_watched !== false;
   const xLabel = isWL ? 'Remove from Watch Later' : 'Not interested';
   const xFn    = isWL ? 'cpvRemoveFromWatchlist'  : 'cpvNotInterested';
   const eyeLbl = isWL ? 'Mark as watched (kept in Watch Later)' : 'Mark as watched';
   const t = esc(data.type), id = esc(m.id), nm = esc(m.name || '');
   return '<button type="button" class="cpv-act cpv-watch" data-name="' + nm + '" title="' + esc(eyeLbl) + '" aria-label="' + esc(eyeLbl) + ': ' + nm + '" '
-    + 'onclick="cpvMarkWatched(event, this, \'' + t + '\', \'' + id + '\', ' + isWL + ')">' + EYE + '</button>'
+    + 'onclick="cpvMarkWatched(event, this, \'' + t + '\', \'' + id + '\', ' + isWL + ', ' + dedupeWatched + ')">' + EYE + '</button>'
     + '<button type="button" class="cpv-act cpv-nope" data-name="' + nm + '" title="' + esc(xLabel) + '" aria-label="' + esc(xLabel) + ': ' + nm + '" '
     + 'onclick="' + xFn + '(event, this, \'' + t + '\', \'' + id + '\')">✕</button>';
 }
@@ -724,17 +726,37 @@ function _cpvDropCell(btn) {
   if (count) count.textContent = n + ' ' + (n === 1 ? 'title' : 'titles');
 }
 
+// CB-1: the catalog whose preview is open (for refetch after actions).
+let _cpvCatalogId = null;
+
+// CB-1: refetch the preview sheet after a successful action. The refetch
+// shows the backfilled titles (the reserve) so the count stays at list size.
+// If the refetch fails, the caller falls back to optimistic removal.
+async function _cpvRefetch() {
+  if (!_cpvCatalogId) return false;
+  try {
+    const data = await api('/profiles/' + _cpvPid + '/catalogs/' + encodeURIComponent(_cpvCatalogId) + '/preview');
+    _cpvRender(data);
+    return true;
+  } catch { return false; }
+}
+
 // MW-02 portal cell actions. Each reuses the SAME endpoint its companion twin does
 // so behaviour can't drift: watched → POST /profiles/:id/watched (shared markWatched),
 // not-interested → the existing /recommend/suppress, Watch Later ✕ → MW-04's
 // /watchlist/remove. api() throws on a non-2xx; we toast the reason and KEEP the cell.
-async function cpvMarkWatched(ev, btn, type, id, isWatchLater) {
+// CB-1: after a successful action, refetch the sheet so the backfilled titles
+// appear. The dedupeWatched flag from the preview DTO decides whether the
+// cell is dropped on fallback (never drop a cell in a catalog that keeps
+// watched titles: Watch Later, Christmas).
+async function cpvMarkWatched(ev, btn, type, id, isWatchLater, dedupeWatched) {
   ev.preventDefault(); ev.stopPropagation();
   const title = btn.dataset.name || '';
   try {
     await api('/profiles/' + _cpvPid + '/watched', { method: 'POST', body: { type, imdb_id: id, title } });
     toast(isWatchLater ? 'Marked “' + (title || 'title') + '” watched — kept in Watch Later' : 'Marked “' + (title || 'title') + '” watched');
-    if (!isWatchLater) _cpvDropCell(btn); // Watch Later keeps watched — leave the cell (WL-KW)
+    const ok = await _cpvRefetch();
+    if (!ok && dedupeWatched) _cpvDropCell(btn);
   } catch (err) { toast(/simkl/i.test(err.message) ? 'Connect Simkl for this profile first' : ('Couldn’t mark watched — ' + err.message)); }
 }
 async function cpvNotInterested(ev, btn, type, id) {
@@ -743,7 +765,8 @@ async function cpvNotInterested(ev, btn, type, id) {
   try {
     await api('/profiles/' + _cpvPid + '/recommend/suppress', { method: 'POST', body: { type, imdb_id: id, title } });
     toast('Not interested in “' + (title || 'title') + '”');
-    _cpvDropCell(btn);
+    const ok = await _cpvRefetch();
+    if (!ok) _cpvDropCell(btn);
   } catch (err) { toast('Couldn’t update — ' + err.message); }
 }
 async function cpvRemoveFromWatchlist(ev, btn, type, id) {
@@ -752,7 +775,8 @@ async function cpvRemoveFromWatchlist(ev, btn, type, id) {
   try {
     await api('/profiles/' + _cpvPid + '/watchlist/remove', { method: 'POST', body: { type, imdb_id: id, title } });
     toast('Removed “' + (title || 'title') + '” from Watch Later');
-    _cpvDropCell(btn);
+    const ok = await _cpvRefetch();
+    if (!ok) _cpvDropCell(btn);
   } catch (err) { toast(/simkl/i.test(err.message) ? 'Connect Simkl for this profile first' : ('Couldn’t remove — ' + err.message)); }
 }
 
