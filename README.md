@@ -124,6 +124,98 @@ Each profile carries its own full key set — nothing is shared.
 First list generates within a minute or two (a "warming up" card shows until
 then). After that, lists refresh in the background roughly daily.
 
+## Simkl (watch tracking)
+
+Simkl is the watch-history source. Each profile carries its own Simkl app
+credentials — nothing is shared across profiles. Two auth versions are
+supported per profile:
+
+- **AUTH V1** — PIN device flow (legacy). The user enters a code at
+  `simkl.com/pin` while signed in; the addon polls for the token. V1 tokens
+  are long-lived and never auto-refreshed.
+- **AUTH V2** — OAuth authorization code + PKCE (S256). The browser is
+  redirected to Simkl's consent page; Simkl redirects back to the callback
+  URI with an authorization code. The addon exchanges the code for tokens
+  server-side. V2 tokens are refreshed shortly before expiry or once after a
+  401, using the refresh-token grant.
+
+### Server app registration
+
+Create a Simkl API app at [simkl.com/settings/developer](https://simkl.com/settings/developer)
+for each family member (or one per profile). Two separate registrations are
+needed if you want both V1 and V2. For V2 choose **Server apps & services**
+(Client ID + secret). AIR's backend handles the callback and token exchange;
+the secret stays on the server. V1 is for existing legacy registrations:
+
+| Field | AUTH V1 | AUTH V2 |
+|---|---|---|
+| Client ID | `simkl_client_id` | `simkl_v2_client_id` |
+| Client Secret | `simkl_client_secret` (optional for PIN) | `simkl_v2_client_secret` (required) |
+| Callback URI | — (PIN flow, no redirect) | `{EXTERNAL_URL}/simkl/oauth2/callback` |
+| Scope | — (PIN flow) | `media:read media:write` |
+
+The V2 callback URI is derived **only** from a validated HTTPS `EXTERNAL_URL`
+env var — no request-Host fallback. Without a valid HTTPS `EXTERNAL_URL`, V2
+Connect is unavailable (the portal shows a hint). The registered URI on the
+Simkl app and the URI sent to the token endpoint must match this exact string.
+
+### Per-profile selector
+
+The portal's Simkl tab has an **Auth version** dropdown (AUTH V1 / AUTH V2).
+This selects which flow **Connect** starts. It does **not** change the active
+token's version — a V1 token stays active while the user has selected V2 for
+the next connection (M3). The active token's version is shown separately in
+the status line.
+
+### Migration
+
+Existing profiles with a V1 credential or V1 token migrate idempotently to
+AUTH V1 preference. New profiles and completely unconfigured profiles default
+to AUTH V2. A V2 auth object (version 2) implies a V2 preference. The
+migration is best-effort: it binds the active V1 token to the current V1
+Client ID so a later credential change is detectable (credential mismatch is
+reported, never a user API call with a mismatched pair).
+
+### Check connection
+
+The **Check connection** button (`POST /simkl/check`) verifies the active
+grant with `/sync/activities` and `/users/settings`, refreshing V2 if needed.
+Each provider request, including response parsing, has a 10-second deadline.
+Without a token, V1 checks app readiness using a PIN probe; V2 requires OAuth.
+The button returns a structured state:
+
+| State | Meaning |
+|---|---|
+| `connected` | Token valid, verified live |
+| `v1_ready_unconnected` | V1 app accepted the PIN probe; account not connected |
+| `not_authorized` | V2 credentials saved; account not yet verified via OAuth |
+| `wrong_auth_version` | V1 endpoint rejected the ID as a V2 app |
+| `client_id_rejected` | V1 Client ID rejected (HTTP 412) |
+| `credential_mismatch` | Token bound to a different Client ID than the current credential |
+| `rate_limited` | Simkl rate limit (HTTP 429) |
+| `provider_unavailable` | Simkl unreachable or returned an unexpected status |
+| `missing_configuration` | Required credential field is empty |
+
+Only `connected` is a success badge. A stored token alone is "token stored",
+never "connected" — the passive status poll (`GET /simkl/status`) reads the
+last verification for the current grant without making a provider call.
+
+During reauthorization, the existing grant stays active until the new account
+is verified. A different account or unavailable identity check preserves the
+existing grant and reports failure. A first connection with no prior grant
+may retain an unverified token as "token stored". Disconnect, credential edits,
+or a newer connection attempt prevent an older attempt from replacing tokens.
+Pending connections are held in memory; after a server restart, start Connect
+again. The Configure page follows the specific connection attempt, not the
+previous account's connected status.
+
+### V2 Client Secret handling (M4)
+
+The V2 Client Secret is **never returned to the browser**. The portal's V2
+Secret input is blank and replace-only: an untouched or empty save preserves
+the stored secret. The secret is sealed at rest (AES-256-GCM) and sent
+server-side only to Simkl's token/refresh/revoke endpoints.
+
 ## Extra catalogs (curated lists)
 
 Per profile, in the portal's **Catalogs** section: the two AI catalogs are

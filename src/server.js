@@ -26,14 +26,17 @@ app.set('trust proxy', true); // correct req.protocol/host behind Cloudflare Tun
 
 // Request logging: all /api calls and every error response, with timestamps.
 // docker logs ai-recommender  (or the Unraid log button) shows these.
+// The OAuth callback query is redacted (M4): code/state are sensitive.
 app.use((req, res, next) => {
   const start = Date.now();
   res.on('finish', () => {
     if (res.statusCode >= 400 || req.originalUrl.startsWith('/api') || req.originalUrl.startsWith('/mobile/api')) {
+      let url = req.originalUrl;
+      if (url.startsWith('/simkl/oauth2/callback')) url = '/simkl/oauth2/callback [query redacted]';
       // Duration is server-side handling time (receive → response flushed to the
       // socket); it excludes tunnel transit, so a fast time here + a slow client
       // means the delay is in the network/proxy, not the app.
-      console.log(`[http] ${new Date().toISOString()} ${req.method} ${req.originalUrl} -> ${res.statusCode} (${Date.now() - start}ms)`);
+      console.log(`[http] ${new Date().toISOString()} ${req.method} ${url} -> ${res.statusCode} (${Date.now() - start}ms)`);
     }
   });
   next();
@@ -133,6 +136,190 @@ app.use('/configure', adminAuth, express.static(path.join(__dirname, '..', 'publ
 app.get('/', (req, res) => res.redirect('/configure/'));
 
 app.get('/health', (req, res) => res.json({ ok: true }));
+
+// Simkl V2 OAuth callback — outside admin auth (the browser is redirected
+// back by Simkl with no credentials). The query carries code + state; the
+// code_verifier and client_secret stay server-side (M4). The HTTP log
+// redacts the query so no tokens/verifier ever appear in logs.
+const simklAuthV2 = require('./services/simklAuthV2');
+app.get('/simkl/oauth2/callback', async (req, res) => {
+  const { code, state, error, iss } = req.query;
+  let callbackProfileId = null;
+  // Profile ID is safe UI routing metadata, never an OAuth credential.
+  const redirect = target => res.redirect(callbackProfileId
+    ? target + (target.includes('?') ? '&' : '?') + 'profile=' + encodeURIComponent(callbackProfileId)
+    : target);
+  // Cancellation: Simkl redirects back with error=access_denied when the user
+  // denies or closes the consent page. This is NOT a failure — the existing
+  // grant (if any) is preserved and the user is redirected to the portal.
+  // Bind the cancellation to a real pending state and consume it. If the
+  // state is missing/unknown/expired, reject safely (do not treat as a
+  // successful cancellation).
+  if (error) {
+    const config = require('./config');
+    const simklConnectionFlow = require('./services/simklConnectionFlow');
+    let consumed = false;
+    for (const p of config.listProfiles()) {
+      const flowRec = simklAuthV2.getFlow(p.id);
+      if (flowRec?.state === state) {
+        // Mark the specific attempt failed on OAuth cancellation.
+        if (flowRec.flow_id) {
+          const cancelAttempt = simklConnectionFlow.getAttempt(flowRec.flow_id);
+          if (cancelAttempt && (cancelAttempt.state === 'pending' || cancelAttempt.state === 'verifying')) {
+            simklConnectionFlow.completeAttempt(flowRec.flow_id, 'failed', null, 'Connection cancelled — start again');
+          }
+        }
+        callbackProfileId = p.id;
+        simklAuthV2.consumeFlow(p.id);
+        consumed = true;
+        break;
+      }
+    }
+    if (consumed) {
+      redirect('/configure/#simkl?error=' + encodeURIComponent('Connection cancelled — start again'));
+    } else {
+      // No matching pending flow: reject safely, show the outcome.
+      redirect(`/configure/#simkl?error=${encodeURIComponent('V2 cancellation rejected — no matching pending flow')}`);
+    }
+    return;
+  }
+  if (!code || !state) return res.status(400).json({ error: 'Missing code or state' });
+  // Match state first so handleCallback can fail the specific attempt on a
+  // missing/wrong issuer. It validates the exact issuer before token exchange.
+  // The callback is tied to the profile that started the flow. We look up
+  // the profile by matching the state against stored flows.
+  const config = require('./config');
+  let matched = null;
+  for (const p of config.listProfiles()) {
+    if (simklAuthV2.getFlow(p.id)?.state === state) { matched = p; break; }
+  }
+  if (!matched) {
+    // No matching pending flow: the flow expired or was already consumed
+    // (replay). Redirect to the portal with a message; the existing grant
+    // is preserved.
+    redirect(`/configure/#simkl?error=${encodeURIComponent('V2 flow expired or already used — start the connection again')}`);
+    return;
+  }
+  // Capture the attempt's flow_id BEFORE the token exchange (which consumes
+  // the flow). This ensures we reference the specific attempt that started
+  // this flow, not a newer one that may have superseded it during the await.
+  const simklConnectionFlow = require('./services/simklConnectionFlow');
+  callbackProfileId = matched.id;
+  const flowRecord = simklAuthV2.getFlow(matched.id);
+  const flowId = flowRecord?.flow_id || null;
+  try {
+    const tokens = await simklAuthV2.handleCallback(matched, { code, state, iss });
+    // §2: Guarded promotion. The token is in a local variable; not persisted yet.
+    const attempt = flowId ? simklConnectionFlow.getAttempt(flowId) : null;
+    if (!attempt || (attempt.state !== 'pending' && attempt.state !== 'verifying')) {
+      // No active attempt for this profile (invalidated, superseded, or never started).
+      if (attempt) simklConnectionFlow.completeAttempt(attempt.flowId, 'failed', null, 'Connection changed — start again');
+      redirect(`/configure/#simkl?error=${encodeURIComponent('Connection changed — start again')}`);
+      return;
+    }
+    // Mark the attempt as verifying (token obtained, identity verification underway).
+    simklConnectionFlow.markVerifying(attempt.flowId);
+    // §3: Bounded identity verification (10 s deadline, includes JSON parse).
+    const identity = await simklConnectionFlow.verifyIdentity(matched.keys.simkl_v2_client_id, tokens.access_token);
+    // §2: Final guard — re-read the profile immediately before writing.
+    // Require: profile exists; attempt is current and unexpired; active grant
+    // matches the starting snapshot; relevant credentials match.
+    const currentProfile = config.getProfile(matched.id);
+    const guardOk = simklConnectionFlow.isCurrent(flowId, currentProfile, ['verifying']);
+    if (!guardOk) {
+      simklConnectionFlow.completeAttempt(attempt.flowId, 'failed', null, 'Connection changed — start again');
+      redirect(`/configure/#simkl?error=${encodeURIComponent('Connection changed — start again')}`);
+      return;
+    }
+    // §3 outcome — no await between guard, grant update, check-cache update, and attempt completion.
+    const oldAuth = currentProfile.simkl_auth;
+    const oldAccountId = oldAuth?.account_id ? String(oldAuth.account_id) : null;
+    const newAccountId = identity.id || null;
+    const { simklChecks, grantFingerprint } = require('./portal');
+    if (identity.ok) {
+      if (oldAccountId && newAccountId && oldAccountId !== newAccountId) {
+        // Valid identity + known old ID differs → preserve old grant/check cache.
+        simklConnectionFlow.completeAttempt(attempt.flowId, 'failed', null, 'Simkl account mismatch — the new authorization is for a different Simkl account. Disconnect first to switch accounts.');
+        redirect(`/configure/#simkl?error=${encodeURIComponent('Simkl account mismatch — the new authorization is for a different Simkl account. The existing connection is preserved. Disconnect first to switch accounts.')}`);
+        return;
+      }
+      // Valid identity + no known old ID or IDs match → promote.
+      config.updateProfile(matched.id, {
+        simkl_auth: {
+          access_token: tokens.access_token,
+          refresh_token: tokens.refresh_token,
+          expires_at: tokens.expires_at,
+          scope: tokens.scope,
+          username: identity.name || tokens.username || undefined,
+          account_id: newAccountId || undefined,
+          connected_at: Date.now(),
+          version: 2,
+          client_id: matched.keys.simkl_v2_client_id,
+        },
+      });
+      const newProfile = config.getProfile(matched.id);
+      simklChecks.set(grantFingerprint(newProfile), {
+        state: 'connected',
+        message: 'Connected and verified',
+        username: identity.name || tokens.username || null,
+        account_id: newAccountId || null,
+        checked_at: Date.now(),
+      });
+      simklConnectionFlow.completeAttempt(attempt.flowId, 'completed', 'connected', 'Connected and verified');
+      redirect('/configure/#simkl');
+    } else {
+      if (oldAuth?.access_token) {
+        // Verification fails + any grant existed → preserve old grant/check cache.
+        simklConnectionFlow.completeAttempt(attempt.flowId, 'failed', null, 'Could not verify Simkl account — existing connection preserved; try again');
+        redirect(`/configure/#simkl?error=${encodeURIComponent('Could not verify Simkl account — existing connection preserved; try again')}`);
+        return;
+      }
+      // Verification fails + no grant existed → store new token as unverified.
+      config.updateProfile(matched.id, {
+        simkl_auth: {
+          access_token: tokens.access_token,
+          refresh_token: tokens.refresh_token,
+          expires_at: tokens.expires_at,
+          scope: tokens.scope,
+          username: tokens.username || undefined,
+          connected_at: Date.now(),
+          version: 2,
+          client_id: matched.keys.simkl_v2_client_id,
+        },
+      });
+      const newProfile = config.getProfile(matched.id);
+      simklChecks.set(grantFingerprint(newProfile), {
+        state: 'token_stored',
+        message: 'Token stored — run Check connection to verify live',
+        username: tokens.username || null,
+        account_id: null,
+        checked_at: Date.now(),
+      });
+      simklConnectionFlow.completeAttempt(attempt.flowId, 'completed', 'token_stored', 'Token stored — run Check connection to verify live');
+      redirect('/configure/#simkl');
+    }
+  } catch (err) {
+    // A failed exchange (bad code, expired, wrong issuer, insufficient scope,
+    // credential change) must NOT overwrite the existing grant. Redirect to
+    // the portal with a safe, actionable message. Never echo the provider
+    // body to the browser (M4).
+    const msg = err.state === 'credential_changed'
+      ? 'Connection changed — Simkl credentials were edited; start again'
+      : err.state === 'insufficient_scope'
+        ? 'Simkl granted a read-only token — re-authorize with the full scope'
+        : err.state === 'invalid_issuer'
+          ? 'Unexpected callback issuer — start the connection again'
+          : 'V2 OAuth failed — start the connection again';
+    // §2: Mark the specific attempt as failed — no promotion on callback failure.
+    if (flowId) {
+      const failedAttempt = simklConnectionFlow.getAttempt(flowId);
+      if (failedAttempt && (failedAttempt.state === 'pending' || failedAttempt.state === 'verifying')) {
+        simklConnectionFlow.completeAttempt(failedAttempt.flowId, 'failed', null, msg);
+      }
+    }
+    redirect(`/configure/#simkl?error=${encodeURIComponent(msg)}`);
+  }
+});
 
 const PORT = parseInt(process.env.PORT || '7000', 10);
 app.listen(PORT, '0.0.0.0', () => {

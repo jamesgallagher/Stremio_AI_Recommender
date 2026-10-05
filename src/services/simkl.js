@@ -10,6 +10,7 @@
 //   - Reads are 10/s, writes 1/s (the rate governor, a later slice, will pace
 //     the sync traffic; auth calls here are one-offs).
 const governor = require('./governor');
+const http = require('./simklHttp');
 const API = 'https://api.simkl.com';
 const USER_AGENT = 'AI-Recommender/1.0 (+https://github.com/jamesgallagher/Stremio_AI_Recommender)';
 const APP_NAME = 'AI-Recommender';
@@ -35,13 +36,12 @@ function headers(accessToken) {
 // Start: returns { user_code, verification_url, expires_in, interval }. The user
 // enters user_code at verification_url (simkl.com/pin); we then poll.
 async function startPinFlow(clientId) {
-  const res = await fetch(withParams(clientId, '/oauth/pin'), { headers: headers() });
+  const { response: res, data: dc } = await http.json(withParams(clientId, '/oauth/pin'), { headers: headers() });
   if (!res.ok) {
-    const body = (await res.text().catch(() => '')).slice(0, 200);
-    throw new Error(`Simkl PIN request failed (${res.status})${body ? `: ${body}` : ''} — check the Client ID`);
+    throw new Error(`Simkl PIN request failed (${res.status}) — check the Client ID`);
   }
-  const dc = await res.json();
-  if (!dc.user_code) throw new Error('Simkl did not return a user code — check the Client ID');
+
+  if (!dc?.user_code) throw new Error('Simkl did not return a user code — check the Client ID');
   return dc;
 }
 
@@ -49,14 +49,12 @@ async function startPinFlow(clientId) {
 // { result: 'KO' } while pending. Mirrors the Trakt poll shape our portal
 // expects ({ pending } | { token } | { error }).
 async function pollPin(clientId, userCode) {
-  const res = await fetch(withParams(clientId, `/oauth/pin/${encodeURIComponent(userCode)}`), { headers: headers() });
+  const { response: res, data } = await http.json(withParams(clientId, `/oauth/pin/${encodeURIComponent(userCode)}`), { headers: headers() });
   if (res.status === 404) return { error: 'PIN expired — start again' };
   if (!res.ok) {
-    const body = (await res.text().catch(() => '')).slice(0, 200);
-    return { error: `Simkl PIN poll failed (${res.status})${body ? `: ${body}` : ''}` };
+    return { error: `Simkl PIN poll failed (${res.status})` };
   }
-  const data = await res.json();
-  if (data.result === 'OK' && data.access_token) {
+  if (data?.result === 'OK' && data.access_token) {
     // Simkl access tokens are long-lived (no refresh cycle like Trakt).
     return { token: { access_token: data.access_token, connected_at: Date.now() } };
   }
@@ -72,8 +70,8 @@ async function checkConnection(clientId, accessToken) {
   try {
     const res = await fetch(withParams(clientId, '/sync/activities'), { headers: headers(accessToken) });
     if (res.ok) {
-      const username = await accountName(clientId, accessToken).catch(() => null);
-      return { valid: true, username };
+      const info = await accountName(clientId, accessToken).catch(() => null);
+      return { valid: true, username: info?.name || null };
     }
     if (res.status === 401 || res.status === 403) return { valid: false, reason: 'token rejected — reconnect' };
     return { valid: false, reason: `Simkl returned ${res.status}` };
@@ -82,12 +80,343 @@ async function checkConnection(clientId, accessToken) {
   }
 }
 
-// Best-effort account name for the status line. Non-fatal if it fails.
+// Best-effort account info for the status line. Non-fatal if it fails.
+// Returns { name, id } where id is the stable Simkl account ID (user_id)
+// if the provider returns one; name is the display name/username.
 async function accountName(clientId, accessToken) {
-  const res = await fetch(withParams(clientId, '/users/settings'), { headers: headers(accessToken) });
-  if (!res.ok) return null;
-  const data = await res.json();
-  return data?.user?.name || data?.user?.username || null;
+  const { response, data } = await http.json(withParams(clientId, '/users/settings'), { headers: headers(accessToken) });
+  if (!response.ok) return null;
+  const id = data?.user?.id ?? data?.user?.user_id ?? null;
+  return { name: data?.user?.name || data?.user?.username || null, id };
+}
+
+function boundedFetch(url, opts = {}) {
+  return http.request(url, opts);
+}
+
+// ---- Shared auth resolution (SIMKL-AUTH-1 Step 3) ----
+// resolveAuth returns { clientId, token } for the profile's active token.
+// V1: simkl_client_id + simkl_auth.access_token.
+// V2: simkl_v2_client_id + simkl_auth.access_token.
+// The active token is always the one stored in simkl_auth, regardless of the
+// preferred version (simkl_auth_version). Selecting V2 for the NEXT connection
+// does NOT change the active token's version (M3).
+// Rejects a stored grant/client-ID mismatch before any request (Blocker 6):
+// if the active token's bound client_id differs from the current credential,
+// the token is unusable (it was minted by a different app registration).
+function resolveAuth(profile) {
+  const auth = profile.simkl_auth;
+  if (!auth?.access_token) return null;
+  const version = auth.version || 1; // absent version = V1
+  const clientId = version === 2 ? profile.keys.simkl_v2_client_id : profile.keys.simkl_client_id;
+  if (!clientId) return null;
+  // Reject a stored grant/client-ID mismatch: the token is bound to the
+  // client_id that minted it. A changed credential means the token is
+  // unusable (credential_mismatch), never a user API call with a mismatched pair.
+  if (auth.client_id && auth.client_id !== clientId) return null;
+  return { clientId, token: auth.access_token, version };
+}
+
+// simklFetch: the shared adapter for all Simkl API calls. Resolves the active
+// token via resolveAuth, applies the rate governor, and handles auth errors.
+// All Simkl call sites use this instead of directly referencing
+// profile.keys.simkl_client_id / profile.simkl_auth.
+//
+// Refresh policy:
+//   - Only an ACTIVE V2 grant is refreshed (version === 2 on the token).
+//   - Proactive: if the token is expired or about to expire (within 60 s),
+//     refresh before sending the request.
+//   - Reactive: on 401, refresh and replay once — but only if the refresh
+//     actually persisted a new token for the same grant (a disconnect or
+//     account switch during the refresh makes the refresh obsolete).
+//   - A 403 is NOT a refresh trigger (it may be insufficient scope, which a
+//     refresh cannot fix).
+//   - A V1 grant is never refreshed (V1 tokens are long-lived; a 401 means
+//     the token is dead → reconnect).
+const EXPIRY_MARGIN_MS = 60 * 1000; // refresh 60 s before expiry
+
+async function simklFetch(profile, path, { method = 'GET', extra = {}, body = null, lane = 'simkl_get' } = {}) {
+  const managed = !!require('../config').getProfile(profile.id);
+  let auth = resolveAuth(profile);
+  if (!auth) throw new Error('Simkl is not connected for this profile');
+  let { clientId, token, version } = auth;
+  let didRefresh = false;
+  // Proactive expiry check: if the token is expired or about to expire,
+  // refresh before sending the request (V2 only). After a successful refresh,
+  // re-resolve the persisted active grant so the first API call uses the NEW
+  // token (Simkl invalidates the old access token on refresh).
+  if (version === 2) {
+    const fresh = require('../config').getProfile(profile.id);
+    const expiresAt = fresh?.simkl_auth?.expires_at;
+    if (expiresAt && Date.now() >= expiresAt - EXPIRY_MARGIN_MS) {
+      // Proactive refresh precondition: the stored grant must still be the
+      // same as the caller's snapshot. If the grant was replaced (different
+      // account, disconnect, reauthorization) before the refresh, abort —
+      // do NOT refresh or send under a different grant.
+      if (fresh?.simkl_auth?.access_token !== token || fresh.simkl_auth.version !== version) {
+        throw new Error('Simkl grant changed before proactive refresh — abort');
+      }
+      const refreshed = await refreshV2(profile).catch(() => null);
+      didRefresh = true;
+      if (refreshed) {
+        // Re-read the grant to confirm the refresh persisted for the SAME
+        // grant (same client binding, same version).
+        const after = require('../config').getProfile(profile.id);
+        if (after?.simkl_auth?.access_token === refreshed.access_token && after.simkl_auth.version === 2 && after.simkl_auth.client_id === clientId) {
+          // Re-resolve: use the NEW token and client ID for the API call.
+          auth = resolveAuth(after);
+          if (!auth) throw new Error('Simkl token expired and refresh did not persist — reconnect the account');
+          clientId = auth.clientId;
+          token = auth.token;
+        } else {
+          // The refresh did not persist for the same grant (grant changed/disconnected).
+          throw new Error('Simkl token expired and refresh did not persist — reconnect the account');
+        }
+      } else {
+        throw new Error('Simkl token expired — reconnect the account');
+      }
+    }
+  }
+  // The governed send re-reads the active grant immediately before the fetch:
+  // a grant-keyed refresh alone does not protect the LATER governor callback.
+  // If a Disconnect or account replacement occurs while this call was queued,
+  // the send is aborted (the captured token no longer belongs to the active
+  // grant) rather than fired with a stale token.
+  const res = await governor.schedule(lane, async () => {
+    // Re-read the grant from the store (falls back to the passed profile if
+    // it is not in the store — e.g. a local test profile). A disconnect or
+    // account replacement while this call was queued must abort the send.
+    const after = require('../config').getProfile(profile.id) || (managed ? null : profile);
+    const current = after && resolveAuth(after);
+    if (!current || current.token !== token || current.version !== version || current.clientId !== clientId) {
+      throw new Error('Simkl grant changed while queued — abort');
+    }
+    return fetch(withParams(current.clientId, path, extra), {
+      method,
+      headers: headers(current.token),
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+  });
+  if (res.status === 401) {
+    // Only refresh an active V2 grant on 401. A V1 grant is never refreshed.
+    if (version === 2 && !didRefresh) {
+      // Bind the refresh and retry to the grant that sent the failed request.
+      // If the stored grant was replaced (different account, disconnect,
+      // reauthorization) before 401 handling, abort without refreshing or
+      // replaying under the replacement grant.
+      const stored = require('../config').getProfile(profile.id);
+      const storedAuth = stored?.simkl_auth;
+      if (!storedAuth || storedAuth.access_token !== token || storedAuth.version !== version || storedAuth.client_id !== clientId) {
+        throw new Error('Simkl grant changed before 401 handling — abort');
+      }
+      const refreshed = await refreshV2(profile).catch(() => null);
+      if (refreshed) {
+        // Verify the refresh persisted for the SAME grant (same client
+        // binding, same version). A disconnect or account switch during
+        // the refresh makes the refresh obsolete.
+        const after = require('../config').getProfile(profile.id);
+        if (after?.simkl_auth?.access_token === refreshed.access_token && after.simkl_auth.version === 2 && after.simkl_auth.client_id === clientId) {
+          const res2 = await governor.schedule(lane, async () => {
+            const after2 = require('../config').getProfile(profile.id);
+            if (!after2) throw new Error('Simkl grant changed while queued — abort');
+            const current = resolveAuth(after2);
+            if (!current || current.token !== refreshed.access_token || current.version !== 2 || current.clientId !== clientId) {
+              throw new Error('Simkl grant changed while queued — abort');
+            }
+            return fetch(withParams(current.clientId, path, extra), {
+              method,
+              headers: headers(current.token),
+              ...(body ? { body: JSON.stringify(body) } : {}),
+            });
+          });
+          if (res2.ok) return res2;
+        }
+      }
+    }
+    throw new Error('Simkl token rejected — reconnect the account');
+  }
+  if (res.status === 403) {
+    // 403 is NOT a refresh trigger: it may be insufficient scope (a refresh
+    // cannot fix that) or a permission error. Report it directly.
+    throw new Error('Simkl access denied (403) — check the token scope or reconnect');
+  }
+  if (!res.ok) throw new Error(`Simkl ${method} ${path} failed (${res.status})`);
+  return res;
+}
+
+// V2 token refresh (single-flight, non-rotating refresh token, one replay).
+// Re-read the latest grant before refreshing, key the single-flight to that
+// specific grant (not just the profile), update only if the grant still
+// matches after the refresh (a disconnect or new V2 authorization during the
+// refresh must not be reversed), and persist the new absolute expiry.
+//
+// Returns { access_token, refresh_token, expires_at } on success, or null if
+// the refresh is obsolete (grant disconnected/changed during the refresh).
+// An obsolete refresh returns no usable token to its caller.
+const refreshInFlight = new Map(); // grantKey → Promise
+async function refreshV2(profile) {
+  // Re-read the latest grant from the store (the `profile` argument may be
+  // a stale snapshot from before the refresh started).
+  const config = require('../config');
+  const fresh = config.getProfile(profile.id);
+  if (!fresh?.simkl_auth?.access_token || fresh.simkl_auth.version !== 2) return null;
+  if (!fresh.simkl_auth.refresh_token || !resolveAuth(fresh)) return null;
+  // Key the single-flight to the specific grant (access_token + refresh_token):
+  // a concurrent refresh for the SAME grant joins the in-flight one; a
+  // different grant (new authorization) starts a fresh refresh.
+  const grantKey = `${profile.id}:${fresh.simkl_auth.access_token}:${fresh.simkl_auth.refresh_token}`;
+  const existing = refreshInFlight.get(grantKey);
+  if (existing) return existing;
+  const simklAuthV2 = require('./simklAuthV2');
+  const promise = simklAuthV2.refreshToken(fresh).then((tokens) => {
+    // Re-read the grant after the refresh: a disconnect or new V2
+    // authorization during the refresh must not be reversed.
+    const after = config.getProfile(profile.id);
+    if (!after?.simkl_auth?.access_token || after.simkl_auth.version !== 2) return null;
+    // Update only if the grant still matches (same access_token as before the
+    // refresh — a new authorization would have a different token).
+    if (after.simkl_auth.access_token !== fresh.simkl_auth.access_token
+      || after.simkl_auth.refresh_token !== fresh.simkl_auth.refresh_token
+      || after.simkl_auth.client_id !== fresh.simkl_auth.client_id
+      || after.keys.simkl_v2_client_id !== fresh.keys.simkl_v2_client_id
+      || after.keys.simkl_v2_client_secret !== fresh.keys.simkl_v2_client_secret) return null;
+    config.updateProfile(profile.id, {
+      simkl_auth: {
+        ...after.simkl_auth,
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token || after.simkl_auth.refresh_token,
+        expires_at: tokens.expires_at,
+      },
+    });
+    return tokens;
+  }).finally(() => {
+    refreshInFlight.delete(grantKey);
+  });
+  refreshInFlight.set(grantKey, promise);
+  return promise;
+}
+
+// ---- Manual Check connection (mandate M6) ----
+// The manual "Check connection" button calls this (POST /simkl/check). It does
+// NOT create a connection flow, authorize a user, or show a PIN, and it does
+// NOT edit profile settings. It returns a structured state + a short safe
+// message (never a generic {connected:false}). Only `connected` is a success
+// badge; a stored token alone is "token stored", never "connected".
+//
+// The state enum (mandate M6): connected, v1_ready_unconnected, not_authorized,
+// wrong_auth_version, client_id_rejected, credential_mismatch, rate_limited,
+// provider_unavailable, missing_configuration.
+//
+// Simkl's documented stable `error` identifiers (conventions/errors) are parsed
+// by identifier + HTTP status — never by pattern-matching provider prose, and
+// the provider body is never echoed to the browser (M4).
+function checkFingerprint(p) {
+  const version = p.simkl_auth ? (p.simkl_auth.version || 1) : (p.simkl_auth_version || 2);
+  const clientId = p.simkl_auth?.client_id || '';
+  const credential = version === 2 ? 'simkl_v2_client_' : 'simkl_client_';
+  const digest = require('crypto').createHash('sha256').update(JSON.stringify([
+    p.simkl_auth?.access_token || '', p.keys?.[credential + 'id'] || '', p.keys?.[credential + 'secret'] || '',
+  ])).digest('hex').slice(0, 16);
+  return [p.id, version, clientId, digest].join(':');
+}
+
+async function manualCheck(profile) {
+  const result = await manualCheckImpl(profile);
+  return { ...result, check_fingerprint: result.check_fingerprint || checkFingerprint(profile) };
+}
+
+async function manualCheckImpl(profile) {
+  const version = profile.simkl_auth_version || 2;
+  const auth = profile.simkl_auth;
+  if (auth?.access_token) {
+    const config = require('../config');
+    const managed = !!config.getProfile(profile.id);
+    let checked = profile;
+    const unchanged = () => {
+      const current = config.getProfile(profile.id) || (managed ? null : checked);
+      return current && checkFingerprint(current) === checkFingerprint(checked);
+    };
+    const mismatch = { state: 'credential_mismatch', message: 'Simkl connection changed or token rejected — reconnect or check again' };
+    const refresh = async () => {
+      if (!unchanged()) return false;
+      const tokens = await refreshV2(checked).catch(() => null);
+      const after = config.getProfile(profile.id);
+      if (!tokens || !after || after.simkl_auth?.access_token !== tokens.access_token || !resolveAuth(after)) return false;
+      checked = after;
+      return true;
+    };
+    if (!resolveAuth(checked) || !unchanged()) return mismatch;
+    try {
+      let didRefresh = false;
+      if (auth.version === 2 && auth.expires_at && Date.now() >= auth.expires_at - EXPIRY_MARGIN_MS) {
+        if (!await refresh()) return mismatch;
+        didRefresh = true;
+      }
+      let active = resolveAuth(checked);
+      let res = await boundedFetch(withParams(active.clientId, '/sync/activities'), { headers: headers(active.token) });
+      if (!unchanged()) return mismatch;
+      if (res.status === 401 && active.version === 2 && !didRefresh) {
+        if (!await refresh()) return mismatch;
+        didRefresh = true;
+        active = resolveAuth(checked);
+        res = await boundedFetch(withParams(active.clientId, '/sync/activities'), { headers: headers(active.token) });
+        if (!unchanged()) return mismatch;
+      }
+      if (res.ok) {
+        const info = await accountName(active.clientId, active.token).catch(() => null);
+        if (!unchanged()) return mismatch;
+        if (info?.id != null && checked.simkl_auth.account_id != null && String(info.id) !== String(checked.simkl_auth.account_id)) return mismatch;
+        return { state: 'connected', message: didRefresh ? 'Connected and verified (token refreshed)' : 'Connected and verified',
+          username: info?.name || checked.simkl_auth.username || null, account_id: info?.id ?? null,
+          check_fingerprint: checkFingerprint(checked) };
+      }
+      if (res.status === 401 || res.status === 403) return mismatch;
+      if (res.status === 429) return { state: 'rate_limited', message: 'Simkl rate limit — try again shortly' };
+      return { state: 'provider_unavailable', message: 'Simkl returned ' + res.status };
+    } catch (err) {
+      return { state: 'provider_unavailable', message: err.message.includes('timeout') ? 'Simkl unreachable (timeout)' : 'Simkl unreachable — try again later' };
+    }
+  }
+
+  // No token. Branch on the preferred version (what Connect would start).
+  if (version === 1) {
+    const clientId = profile.keys.simkl_client_id;
+    if (!clientId) {
+      return { state: 'missing_configuration', message: 'Client ID required' };
+    }
+    // One GET /oauth/pin compatibility probe; discard the returned PIN. This
+    // tells us whether the V1 app can start the PIN flow (no grant exists yet).
+    try {
+      const { response: res, data } = await http.json(withParams(clientId, '/oauth/pin'), { headers: headers() });
+      if (res.ok) {
+        return { state: 'v1_ready_unconnected', message: 'V1 app accepted; Simkl account not connected. Click Connect.' };
+      }
+      const body = data || {};
+      // 400 unauthorized_client: Simkl's documented V2-ID-on-V1-endpoint error.
+      if (res.status === 400 && body.error === 'unauthorized_client') {
+        return { state: 'wrong_auth_version', message: 'This is a V2 app; select AUTH V2 and connect with the new flow.' };
+      }
+      // 412 client_id_failed: an incorrect/suspended ID or an active throttling
+      // block. It does NOT prove the ID is V2 — do not assert that (M6).
+      if (res.status === 412 && body.error === 'client_id_failed') {
+        return { state: 'client_id_rejected', message: 'V1 Client ID rejected (HTTP 412). Check the ID/app registration or a Simkl block.' };
+      }
+      return { state: 'provider_unavailable', message: `Simkl returned ${res.status}` };
+    } catch (err) {
+      return { state: 'provider_unavailable', message: err.message.includes('timeout') ? 'Simkl unreachable (timeout)' : 'Simkl unreachable — try again later' };
+    }
+  }
+
+  // V2 selected, no token. Simkl has no app-only grant — the secret cannot be
+  // validated without a user grant (M6). Name the missing field, or report that
+  // OAuth consent is needed (never a "successful secret test").
+  const v2Id = profile.keys.simkl_v2_client_id;
+  const v2Secret = profile.keys.simkl_v2_client_secret;
+  if (!v2Id || !v2Secret) {
+    const missing = !v2Id ? 'V2 Client ID' : 'V2 Client Secret';
+    return { state: 'missing_configuration', message: `${missing} required` };
+  }
+  return { state: 'not_authorized', message: 'Credentials saved; account not yet verified. Click Connect to complete V2 OAuth.' };
 }
 
 // ---- watched-history read (v6) ----
@@ -97,12 +426,7 @@ async function accountName(clientId, accessToken) {
 // included — enriched at ingest, see the watched store).
 
 async function authedGet(profile, path, extra = {}) {
-  const clientId = profile.keys.simkl_client_id;
-  const token = profile.simkl_auth?.access_token;
-  if (!clientId || !token) throw new Error('Simkl is not connected for this profile');
-  const res = await governor.schedule('simkl_get', () => fetch(withParams(clientId, path, extra), { headers: headers(token) }));
-  if (res.status === 401 || res.status === 403) throw new Error('Simkl token rejected — reconnect the account');
-  if (!res.ok) throw new Error(`Simkl GET ${path} failed (${res.status})`);
+  const res = await simklFetch(profile, path, { method: 'GET', extra });
   return res.json();
 }
 
@@ -185,32 +509,18 @@ function buildRatingsBody(items, { withRating = true } = {}) {
 // write cap (the simkl_post lane), exactly like addToHistory. Throws on a
 // rejected token or a non-ok response; the caller maps that to a 502.
 async function setRatings(profile, items) {
-  const clientId = profile.keys.simkl_client_id;
-  const token = profile.simkl_auth?.access_token;
-  if (!clientId || !token) throw new Error('Simkl is not connected for this profile');
   const body = buildRatingsBody(items);
   if (!body.movies.length && !body.shows.length) throw new Error('nothing to rate');
-  const res = await governor.schedule('simkl_post', () => fetch(withParams(clientId, '/sync/ratings'), {
-    method: 'POST', headers: headers(token), body: JSON.stringify(body),
-  }));
-  if (res.status === 401 || res.status === 403) throw new Error('Simkl token rejected — reconnect the account');
-  if (!res.ok) throw new Error(`Simkl POST /sync/ratings failed (${res.status})`);
+  const res = await simklFetch(profile, '/sync/ratings', { method: 'POST', body, lane: 'simkl_post' });
   return res.json().catch(() => ({}));
 }
 
 // POST /sync/ratings/remove — clear ratings (withRating:false → no rating field).
 // Same lane and error contract as setRatings.
 async function removeRatings(profile, items) {
-  const clientId = profile.keys.simkl_client_id;
-  const token = profile.simkl_auth?.access_token;
-  if (!clientId || !token) throw new Error('Simkl is not connected for this profile');
   const body = buildRatingsBody(items, { withRating: false });
   if (!body.movies.length && !body.shows.length) throw new Error('nothing to rate');
-  const res = await governor.schedule('simkl_post', () => fetch(withParams(clientId, '/sync/ratings/remove'), {
-    method: 'POST', headers: headers(token), body: JSON.stringify(body),
-  }));
-  if (res.status === 401 || res.status === 403) throw new Error('Simkl token rejected — reconnect the account');
-  if (!res.ok) throw new Error(`Simkl POST /sync/ratings/remove failed (${res.status})`);
+  const res = await simklFetch(profile, '/sync/ratings/remove', { method: 'POST', body, lane: 'simkl_post' });
   return res.json().catch(() => ({}));
 }
 
@@ -218,16 +528,9 @@ async function removeRatings(profile, items) {
 // "Mark unwatched"). Same lane and error contract as removeRatings (the
 // governed simkl_post lane). withRating:false → ids only, no rating field.
 async function removeFromHistory(profile, items) {
-  const clientId = profile.keys.simkl_client_id;
-  const token = profile.simkl_auth?.access_token;
-  if (!clientId || !token) throw new Error('Simkl is not connected for this profile');
   const body = buildRatingsBody(items, { withRating: false });
   if (!body.movies.length && !body.shows.length) throw new Error('nothing to remove');
-  const res = await governor.schedule('simkl_post', () => fetch(withParams(clientId, '/sync/history/remove'), {
-    method: 'POST', headers: headers(token), body: JSON.stringify(body),
-  }));
-  if (res.status === 401 || res.status === 403) throw new Error('Simkl token rejected — reconnect the account');
-  if (!res.ok) throw new Error(`Simkl POST /sync/history/remove failed (${res.status})`);
+  const res = await simklFetch(profile, '/sync/history/remove', { method: 'POST', body, lane: 'simkl_post' });
   return res.json().catch(() => ({}));
 }
 
@@ -403,14 +706,7 @@ async function getRecentWatched(profile, kind, { limit = 50 } = {}) {
 //     shows:  [{ ids:{imdb}, seasons:[{ number, episodes:[{ number, watched_at? }] }] }] }
 // Simkl de-dupes re-marks, so an over-broad push is harmless.
 async function addToHistory(profile, body) {
-  const clientId = profile.keys.simkl_client_id;
-  const token = profile.simkl_auth?.access_token;
-  if (!clientId || !token) throw new Error('Simkl is not connected for this profile');
-  const res = await governor.schedule('simkl_post', () => fetch(withParams(clientId, '/sync/history'), {
-    method: 'POST', headers: headers(token), body: JSON.stringify(body),
-  }));
-  if (res.status === 401 || res.status === 403) throw new Error('Simkl token rejected — reconnect the account');
-  if (!res.ok) throw new Error(`Simkl POST /sync/history failed (${res.status})`);
+  const res = await simklFetch(profile, '/sync/history', { method: 'POST', body, lane: 'simkl_post' });
   return res.json().catch(() => ({}));
 }
 
@@ -452,16 +748,9 @@ function buildAddToListBody(items, to = 'plantowatch') {
 // hard 1-POST/s Simkl write cap, exactly like addToHistory. Simkl de-dupes
 // re-adds, so a double-tap is harmless. Requires the profile's Simkl connection.
 async function addToPlanToWatch(profile, items) {
-  const clientId = profile.keys.simkl_client_id;
-  const token = profile.simkl_auth?.access_token;
-  if (!clientId || !token) throw new Error('Simkl is not connected for this profile');
   const body = buildAddToListBody(items, 'plantowatch');
   if (!body.movies.length && !body.shows.length) return { skipped: true, added: {} };
-  const res = await governor.schedule('simkl_post', () => fetch(withParams(clientId, '/sync/add-to-list'), {
-    method: 'POST', headers: headers(token), body: JSON.stringify(body),
-  }));
-  if (res.status === 401 || res.status === 403) throw new Error('Simkl token rejected — reconnect the account');
-  if (!res.ok) throw new Error(`Simkl POST /sync/add-to-list failed (${res.status})`);
+  const res = await simklFetch(profile, '/sync/add-to-list', { method: 'POST', body, lane: 'simkl_post' });
   return res.json().catch(() => ({}));
 }
 
@@ -503,16 +792,9 @@ function buildRemoveFromListBody(items) {
 // De-dupe-safe: removing something already gone is a harmless no-op. Requires the
 // profile's Simkl connection; a rejected token maps to the reconnect message.
 async function removeFromPlanToWatch(profile, items) {
-  const clientId = profile.keys.simkl_client_id;
-  const token = profile.simkl_auth?.access_token;
-  if (!clientId || !token) throw new Error('Simkl is not connected for this profile');
   const body = buildRemoveFromListBody(items);
   if (!body.movies.length && !body.shows.length) return { skipped: true };
-  const res = await governor.schedule('simkl_post', () => fetch(withParams(clientId, '/sync/history/remove'), {
-    method: 'POST', headers: headers(token), body: JSON.stringify(body),
-  }));
-  if (res.status === 401 || res.status === 403) throw new Error('Simkl token rejected — reconnect the account');
-  if (!res.ok) throw new Error(`Simkl POST /sync/history/remove failed (${res.status})`);
+  const res = await simklFetch(profile, '/sync/history/remove', { method: 'POST', body, lane: 'simkl_post' });
   return res.json().catch(() => ({}));
 }
 
@@ -520,7 +802,12 @@ module.exports = {
   startPinFlow,
   pollPin,
   checkConnection,
+  manualCheck,
+  checkFingerprint,
   accountName,
+  resolveAuth,
+  simklFetch,
+  refreshV2,
   authedGet,
   getActivities,
   getRatings,
@@ -545,6 +832,8 @@ module.exports = {
   parseSeriesProgressItems,
   BULK_GAP_MS,
   withParams,
+  boundedFetch,
+  headers,
   USER_AGENT,
   APP_NAME,
 };
