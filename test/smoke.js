@@ -1853,6 +1853,240 @@ okAsync('simkl-auth T4: V2 callback validates state, exchanges code for tokens, 
   }
 });
 
+// ---- SIMKL-AUTH-1 T5: V2 token refresh — single-flight, non-rotating ----
+okAsync('simkl-auth T5: V2 refresh is single-flight (one token call for concurrent callers) and the refresh_token is non-rotating', async () => {
+  const simkl = require('../src/services/simkl');
+  const p = config.addProfile('T5-V2');
+  config.updateProfile(p.id, {
+    keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+    simkl_auth: { access_token: 'v2-access', refresh_token: 'v2-refresh', version: 2, client_id: 'v2-cid', connected_at: 1 },
+    simkl_auth_version: 2,
+  });
+  const pf = config.getProfile(p.id);
+  const origFetch = global.fetch;
+  let tokenCalls = [];
+  global.fetch = async (url, opts) => {
+    tokenCalls.push({ url: String(url), opts });
+    return { ok: true, status: 200, json: async () => ({ access_token: 'v2-refreshed', refresh_token: 'v2-refresh', expires_in: 3600 }) };
+  };
+  try {
+    // Two concurrent refresh calls → exactly one token endpoint call (single-flight).
+    const [r1, r2] = await Promise.all([
+      simkl.refreshV2(pf),
+      simkl.refreshV2(pf),
+    ]);
+    assert.strictEqual(r1.access_token, 'v2-refreshed');
+    assert.strictEqual(r2.access_token, 'v2-refreshed');
+    assert.strictEqual(tokenCalls.length, 1, 'exactly one refresh token call (single-flight)');
+    // The token endpoint was called with grant_type=refresh_token.
+    assert.ok(tokenCalls[0].url.includes('api.simkl.com/oauth2/token'));
+    const body = tokenCalls[0].opts.body;
+    assert.ok(body.includes('grant_type=refresh_token'));
+    assert.ok(body.includes('refresh_token=v2-refresh'));
+    assert.ok(body.includes('client_id=v2-cid'));
+    assert.ok(body.includes('client_secret=v2-sec'));
+    // Non-rotating: the stored refresh_token is unchanged.
+    const fresh = config.getProfile(p.id);
+    assert.strictEqual(fresh.simkl_auth.refresh_token, 'v2-refresh', 'refresh_token is non-rotating');
+    assert.strictEqual(fresh.simkl_auth.access_token, 'v2-refreshed', 'access_token updated');
+  } finally {
+    global.fetch = origFetch;
+    config.removeProfile(p.id);
+  }
+});
+
+// ---- SIMKL-AUTH-1 T6: V2 disconnect via the portal endpoint — revoke + clear ----
+okAsync('simkl-auth T6: the portal disconnect endpoint revokes a V2 token via /oauth2/revoke then clears it; a V1 disconnect does not call revoke', async () => {
+  const portal = require('../src/portal');
+  const express = require('express');
+  const http = require('http');
+
+  // (a) V2 profile: disconnect calls /oauth2/revoke then clears the token.
+  {
+    const p = config.addProfile('T6-V2');
+    config.updateProfile(p.id, {
+      keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+      simkl_auth: { access_token: 'v2-access', refresh_token: 'v2-refresh', version: 2, client_id: 'v2-cid', connected_at: 1 },
+      simkl_auth_version: 2,
+    });
+    const origFetch = global.fetch;
+    let revokeCalls = [];
+    // Stub only Simkl API calls; pass through local HTTP to the standalone server.
+    global.fetch = async (url, opts) => {
+      const urlStr = String(url);
+      if (urlStr.includes('api.simkl.com')) {
+        revokeCalls.push({ url: urlStr, opts });
+        return { ok: true, status: 200, json: async () => ({}) };
+      }
+      return origFetch(url, opts);
+    };
+    try {
+      const app = express();
+      app.use(portal.router);
+      const server = http.createServer(app);
+      await new Promise((resolve) => server.listen(0, resolve));
+      const port = server.address().port;
+      const res = await origFetch(`http://127.0.0.1:${port}/profiles/${p.id}/simkl/disconnect`, { method: 'POST' });
+      assert.strictEqual(res.status, 200);
+      const body = await res.json();
+      assert.strictEqual(body.ok, true);
+      // /oauth2/revoke was called with the token, client_id, and client_secret.
+      assert.strictEqual(revokeCalls.length, 1, 'one /oauth2/revoke call');
+      assert.ok(revokeCalls[0].url.includes('api.simkl.com/oauth2/revoke'));
+      const rb = revokeCalls[0].opts.body;
+      assert.ok(rb.includes('token=v2-access'));
+      assert.ok(rb.includes('client_id=v2-cid'));
+      assert.ok(rb.includes('client_secret=v2-sec'));
+      // Token cleared.
+      assert.strictEqual(config.getProfile(p.id).simkl_auth, null, 'token cleared after disconnect');
+      server.close();
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
+  }
+  // (b) V1 profile: disconnect does NOT call /oauth2/revoke (V1 has no revoke endpoint).
+  {
+    const p = config.addProfile('T6-V1');
+    config.updateProfile(p.id, {
+      keys: { simkl_client_id: 'v1-cid', simkl_client_secret: 'v1-sec' },
+      simkl_auth: { access_token: 'v1-access', connected_at: 1 },
+      simkl_auth_version: 1,
+    });
+    const origFetch = global.fetch;
+    let simklCalls = [];
+    global.fetch = async (url, opts) => {
+      const urlStr = String(url);
+      if (urlStr.includes('api.simkl.com')) {
+        simklCalls.push(urlStr);
+        return { ok: true, status: 200, json: async () => ({}) };
+      }
+      return origFetch(url, opts);
+    };
+    try {
+      const app = express();
+      app.use(portal.router);
+      const server = http.createServer(app);
+      await new Promise((resolve) => server.listen(0, resolve));
+      const port = server.address().port;
+      const res = await origFetch(`http://127.0.0.1:${port}/profiles/${p.id}/simkl/disconnect`, { method: 'POST' });
+      assert.strictEqual(res.status, 200);
+      assert.strictEqual(simklCalls.length, 0, 'no Simkl call for V1 disconnect');
+      assert.strictEqual(config.getProfile(p.id).simkl_auth, null, 'token cleared');
+      server.close();
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
+  }
+});
+
+// ---- SIMKL-AUTH-1 T9: shared adapter (simklFetch) resolves V1 vs V2 tokens ----
+okAsync('simkl-auth T9: simklFetch resolves the correct client_id for V1 and V2 active tokens; throws when no token; handles 401 with V2 refresh + replay', async () => {
+  const simkl = require('../src/services/simkl');
+
+  // (a) V2 active token → uses the V2 client_id.
+  {
+    const p = config.addProfile('T9-V2');
+    config.updateProfile(p.id, {
+      keys: { simkl_client_id: 'v1-cid', simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+      simkl_auth: { access_token: 'v2-access', refresh_token: 'v2-refresh', version: 2, client_id: 'v2-cid', connected_at: 1 },
+      simkl_auth_version: 2,
+    });
+    const pf = config.getProfile(p.id);
+    const origFetch = global.fetch;
+    let calls = [];
+    global.fetch = async (url, opts) => {
+      calls.push(String(url));
+      return { ok: true, status: 200, json: async () => ({}) };
+    };
+    try {
+      await simkl.simklFetch(pf, '/sync/activities');
+      assert.strictEqual(calls.length, 1);
+      assert.ok(calls[0].includes('client_id=v2-cid'), 'V2 client_id used');
+      assert.ok(!calls[0].includes('client_id=v1-cid'), 'V1 client_id NOT used');
+      assert.ok(calls[0].includes('/sync/activities'));
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
+  }
+
+  // (b) V1 active token → uses the V1 client_id.
+  {
+    const p = config.addProfile('T9-V1');
+    config.updateProfile(p.id, {
+      keys: { simkl_client_id: 'v1-cid', simkl_v2_client_id: 'v2-cid' },
+      simkl_auth: { access_token: 'v1-access', connected_at: 1 },
+      simkl_auth_version: 2, // preferred V2, but the active token is V1
+    });
+    const pf = config.getProfile(p.id);
+    const origFetch = global.fetch;
+    let calls = [];
+    global.fetch = async (url) => { calls.push(String(url)); return { ok: true, status: 200, json: async () => ({}) }; };
+    try {
+      await simkl.simklFetch(pf, '/sync/activities');
+      assert.strictEqual(calls.length, 1);
+      assert.ok(calls[0].includes('client_id=v1-cid'), 'V1 client_id used');
+      assert.ok(!calls[0].includes('client_id=v2-cid'), 'V2 client_id NOT used');
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
+  }
+
+  // (c) No token → throws "Simkl is not connected".
+  {
+    const p = config.addProfile('T9-NoToken');
+    config.updateProfile(p.id, {
+      keys: { simkl_client_id: 'v1-cid' },
+      simkl_auth: null,
+      simkl_auth_version: 1,
+    });
+    await assert.rejects(() => simkl.simklFetch(config.getProfile(p.id), '/sync/activities'), /not connected/);
+    config.removeProfile(p.id);
+  }
+
+  // (d) 401 on a V2 token → one refresh + one replay.
+  {
+    const p = config.addProfile('T9-Refresh');
+    config.updateProfile(p.id, {
+      keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+      simkl_auth: { access_token: 'v2-old', refresh_token: 'v2-refresh', version: 2, client_id: 'v2-cid', connected_at: 1 },
+      simkl_auth_version: 2,
+    });
+    const pf = config.getProfile(p.id);
+    const origFetch = global.fetch;
+    let calls = [];
+    global.fetch = async (url, opts) => {
+      const urlStr = String(url);
+      calls.push(urlStr);
+      if (urlStr.includes('/oauth2/token')) {
+        return { ok: true, status: 200, json: async () => ({ access_token: 'v2-new', refresh_token: 'v2-refresh', expires_in: 3600 }) };
+      }
+      // First API call → 401; replay → 200.
+      if (calls.filter((u) => u.includes('/sync/activities')).length === 1) {
+        return { ok: false, status: 401, json: async () => ({}) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    };
+    try {
+      const res = await simkl.simklFetch(pf, '/sync/activities');
+      assert.ok(res.ok, 'replay succeeded');
+      // One API call (401) + one refresh + one replay = 3 fetch calls total.
+      const apiCalls = calls.filter((u) => u.includes('/sync/activities'));
+      assert.strictEqual(apiCalls.length, 2, 'one original + one replay');
+      const refreshCalls = calls.filter((u) => u.includes('/oauth2/token'));
+      assert.strictEqual(refreshCalls.length, 1, 'one refresh');
+      // The stored token is updated.
+      assert.strictEqual(config.getProfile(p.id).simkl_auth.access_token, 'v2-new');
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
+  }
+});
+
 // ---- SIMKL-AUTH-1 T7: V2 disconnect — /oauth2/revoke ----
 okAsync('simkl-auth T7: V2 disconnect revokes the token via /oauth2/revoke', async () => {
   const simklAuthV2 = require('../src/services/simklAuthV2');

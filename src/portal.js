@@ -842,9 +842,17 @@ router.post('/profiles/:id/watched', async (req, res) => {
   }
 });
 
-router.post('/profiles/:id/simkl/disconnect', (req, res) => {
-  const { profile } = config.updateProfile(req.params.id, { simkl_auth: null });
+router.post('/profiles/:id/simkl/disconnect', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  // V2: best-effort revoke before clearing (M4 — the token is sent server-side only).
+  if (profile.simkl_auth?.version === 2) {
+    const simklAuthV2 = require('./services/simklAuthV2');
+    try { await simklAuthV2.revokeToken(profile); } catch (err) {
+      console.warn(`[simkl] ${profile.name}: V2 revoke failed — ${err.message}`);
+    }
+  }
+  config.updateProfile(req.params.id, { simkl_auth: null });
   simklFlows.delete(req.params.id);
   res.json({ ok: true });
 });

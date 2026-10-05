@@ -107,6 +107,80 @@ async function boundedFetch(url, opts = {}) {
   }
 }
 
+// ---- Shared auth resolution (SIMKL-AUTH-1 Step 3) ----
+// resolveAuth returns { clientId, token } for the profile's active token.
+// V1: simkl_client_id + simkl_auth.access_token.
+// V2: simkl_v2_client_id + simkl_auth.access_token.
+// The active token is always the one stored in simkl_auth, regardless of the
+// preferred version (simkl_auth_version). Selecting V2 for the NEXT connection
+// does NOT change the active token's version (M3).
+function resolveAuth(profile) {
+  const auth = profile.simkl_auth;
+  if (!auth?.access_token) return null;
+  const version = auth.version || 1; // absent version = V1
+  const clientId = version === 2 ? profile.keys.simkl_v2_client_id : profile.keys.simkl_client_id;
+  if (!clientId) return null;
+  return { clientId, token: auth.access_token };
+}
+
+// simklFetch: the shared adapter for all Simkl API calls. Resolves the active
+// token via resolveAuth, applies the rate governor, and handles auth errors.
+// All Simkl call sites use this instead of directly referencing
+// profile.keys.simkl_client_id / profile.simkl_auth.
+async function simklFetch(profile, path, { method = 'GET', extra = {}, body = null, lane = 'simkl_get' } = {}) {
+  const auth = resolveAuth(profile);
+  if (!auth) throw new Error('Simkl is not connected for this profile');
+  const { clientId, token } = auth;
+  const res = await governor.schedule(lane, () =>
+    fetch(withParams(clientId, path, extra), {
+      method,
+      headers: headers(token),
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    })
+  );
+  if (res.status === 401 || res.status === 403) {
+    // V2: attempt one refresh + replay (single-flight, non-rotating).
+    if (auth.token && (profile.simkl_auth?.version === 2 || profile.simkl_auth_version === 2)) {
+      const refreshed = await refreshV2(profile).catch(() => null);
+      if (refreshed) {
+        const res2 = await governor.schedule(lane, () =>
+          fetch(withParams(clientId, path, extra), {
+            method,
+            headers: headers(refreshed.access_token),
+            ...(body ? { body: JSON.stringify(body) } : {}),
+          })
+        );
+        if (res2.ok) return res2;
+      }
+    }
+    throw new Error('Simkl token rejected — reconnect the account');
+  }
+  if (!res.ok) throw new Error(`Simkl ${method} ${path} failed (${res.status})`);
+  return res;
+}
+
+// V2 token refresh (single-flight, non-rotating refresh token, one replay).
+// A concurrent refresh is in-flight: the second caller waits for the first.
+const refreshInFlight = new Map(); // profileId → Promise
+async function refreshV2(profile) {
+  const existing = refreshInFlight.get(profile.id);
+  if (existing) return existing;
+  const simklAuthV2 = require('./simklAuthV2');
+  const promise = simklAuthV2.refreshToken(profile).then((tokens) => {
+    // Store the refreshed access token; the refresh_token is non-rotating
+    // (Simkl returns the same refresh_token on each refresh).
+    const config = require('../config');
+    config.updateProfile(profile.id, {
+      simkl_auth: { ...profile.simkl_auth, access_token: tokens.access_token, refresh_token: tokens.refresh_token || profile.simkl_auth?.refresh_token },
+    });
+    return tokens;
+  }).finally(() => {
+    refreshInFlight.delete(profile.id);
+  });
+  refreshInFlight.set(profile.id, promise);
+  return promise;
+}
+
 // ---- Manual Check connection (mandate M6) ----
 // The manual "Check connection" button calls this (POST /simkl/check). It does
 // NOT create a connection flow, authorize a user, or show a PIN, and it does
@@ -205,12 +279,7 @@ async function manualCheck(profile) {
 // included — enriched at ingest, see the watched store).
 
 async function authedGet(profile, path, extra = {}) {
-  const clientId = profile.keys.simkl_client_id;
-  const token = profile.simkl_auth?.access_token;
-  if (!clientId || !token) throw new Error('Simkl is not connected for this profile');
-  const res = await governor.schedule('simkl_get', () => fetch(withParams(clientId, path, extra), { headers: headers(token) }));
-  if (res.status === 401 || res.status === 403) throw new Error('Simkl token rejected — reconnect the account');
-  if (!res.ok) throw new Error(`Simkl GET ${path} failed (${res.status})`);
+  const res = await simklFetch(profile, path, { method: 'GET', extra });
   return res.json();
 }
 
@@ -293,32 +362,18 @@ function buildRatingsBody(items, { withRating = true } = {}) {
 // write cap (the simkl_post lane), exactly like addToHistory. Throws on a
 // rejected token or a non-ok response; the caller maps that to a 502.
 async function setRatings(profile, items) {
-  const clientId = profile.keys.simkl_client_id;
-  const token = profile.simkl_auth?.access_token;
-  if (!clientId || !token) throw new Error('Simkl is not connected for this profile');
   const body = buildRatingsBody(items);
   if (!body.movies.length && !body.shows.length) throw new Error('nothing to rate');
-  const res = await governor.schedule('simkl_post', () => fetch(withParams(clientId, '/sync/ratings'), {
-    method: 'POST', headers: headers(token), body: JSON.stringify(body),
-  }));
-  if (res.status === 401 || res.status === 403) throw new Error('Simkl token rejected — reconnect the account');
-  if (!res.ok) throw new Error(`Simkl POST /sync/ratings failed (${res.status})`);
+  const res = await simklFetch(profile, '/sync/ratings', { method: 'POST', body, lane: 'simkl_post' });
   return res.json().catch(() => ({}));
 }
 
 // POST /sync/ratings/remove — clear ratings (withRating:false → no rating field).
 // Same lane and error contract as setRatings.
 async function removeRatings(profile, items) {
-  const clientId = profile.keys.simkl_client_id;
-  const token = profile.simkl_auth?.access_token;
-  if (!clientId || !token) throw new Error('Simkl is not connected for this profile');
   const body = buildRatingsBody(items, { withRating: false });
   if (!body.movies.length && !body.shows.length) throw new Error('nothing to rate');
-  const res = await governor.schedule('simkl_post', () => fetch(withParams(clientId, '/sync/ratings/remove'), {
-    method: 'POST', headers: headers(token), body: JSON.stringify(body),
-  }));
-  if (res.status === 401 || res.status === 403) throw new Error('Simkl token rejected — reconnect the account');
-  if (!res.ok) throw new Error(`Simkl POST /sync/ratings/remove failed (${res.status})`);
+  const res = await simklFetch(profile, '/sync/ratings/remove', { method: 'POST', body, lane: 'simkl_post' });
   return res.json().catch(() => ({}));
 }
 
@@ -326,16 +381,9 @@ async function removeRatings(profile, items) {
 // "Mark unwatched"). Same lane and error contract as removeRatings (the
 // governed simkl_post lane). withRating:false → ids only, no rating field.
 async function removeFromHistory(profile, items) {
-  const clientId = profile.keys.simkl_client_id;
-  const token = profile.simkl_auth?.access_token;
-  if (!clientId || !token) throw new Error('Simkl is not connected for this profile');
   const body = buildRatingsBody(items, { withRating: false });
   if (!body.movies.length && !body.shows.length) throw new Error('nothing to remove');
-  const res = await governor.schedule('simkl_post', () => fetch(withParams(clientId, '/sync/history/remove'), {
-    method: 'POST', headers: headers(token), body: JSON.stringify(body),
-  }));
-  if (res.status === 401 || res.status === 403) throw new Error('Simkl token rejected — reconnect the account');
-  if (!res.ok) throw new Error(`Simkl POST /sync/history/remove failed (${res.status})`);
+  const res = await simklFetch(profile, '/sync/history/remove', { method: 'POST', body, lane: 'simkl_post' });
   return res.json().catch(() => ({}));
 }
 
@@ -511,14 +559,7 @@ async function getRecentWatched(profile, kind, { limit = 50 } = {}) {
 //     shows:  [{ ids:{imdb}, seasons:[{ number, episodes:[{ number, watched_at? }] }] }] }
 // Simkl de-dupes re-marks, so an over-broad push is harmless.
 async function addToHistory(profile, body) {
-  const clientId = profile.keys.simkl_client_id;
-  const token = profile.simkl_auth?.access_token;
-  if (!clientId || !token) throw new Error('Simkl is not connected for this profile');
-  const res = await governor.schedule('simkl_post', () => fetch(withParams(clientId, '/sync/history'), {
-    method: 'POST', headers: headers(token), body: JSON.stringify(body),
-  }));
-  if (res.status === 401 || res.status === 403) throw new Error('Simkl token rejected — reconnect the account');
-  if (!res.ok) throw new Error(`Simkl POST /sync/history failed (${res.status})`);
+  const res = await simklFetch(profile, '/sync/history', { method: 'POST', body, lane: 'simkl_post' });
   return res.json().catch(() => ({}));
 }
 
@@ -560,16 +601,9 @@ function buildAddToListBody(items, to = 'plantowatch') {
 // hard 1-POST/s Simkl write cap, exactly like addToHistory. Simkl de-dupes
 // re-adds, so a double-tap is harmless. Requires the profile's Simkl connection.
 async function addToPlanToWatch(profile, items) {
-  const clientId = profile.keys.simkl_client_id;
-  const token = profile.simkl_auth?.access_token;
-  if (!clientId || !token) throw new Error('Simkl is not connected for this profile');
   const body = buildAddToListBody(items, 'plantowatch');
   if (!body.movies.length && !body.shows.length) return { skipped: true, added: {} };
-  const res = await governor.schedule('simkl_post', () => fetch(withParams(clientId, '/sync/add-to-list'), {
-    method: 'POST', headers: headers(token), body: JSON.stringify(body),
-  }));
-  if (res.status === 401 || res.status === 403) throw new Error('Simkl token rejected — reconnect the account');
-  if (!res.ok) throw new Error(`Simkl POST /sync/add-to-list failed (${res.status})`);
+  const res = await simklFetch(profile, '/sync/add-to-list', { method: 'POST', body, lane: 'simkl_post' });
   return res.json().catch(() => ({}));
 }
 
@@ -611,16 +645,9 @@ function buildRemoveFromListBody(items) {
 // De-dupe-safe: removing something already gone is a harmless no-op. Requires the
 // profile's Simkl connection; a rejected token maps to the reconnect message.
 async function removeFromPlanToWatch(profile, items) {
-  const clientId = profile.keys.simkl_client_id;
-  const token = profile.simkl_auth?.access_token;
-  if (!clientId || !token) throw new Error('Simkl is not connected for this profile');
   const body = buildRemoveFromListBody(items);
   if (!body.movies.length && !body.shows.length) return { skipped: true };
-  const res = await governor.schedule('simkl_post', () => fetch(withParams(clientId, '/sync/history/remove'), {
-    method: 'POST', headers: headers(token), body: JSON.stringify(body),
-  }));
-  if (res.status === 401 || res.status === 403) throw new Error('Simkl token rejected — reconnect the account');
-  if (!res.ok) throw new Error(`Simkl POST /sync/history/remove failed (${res.status})`);
+  const res = await simklFetch(profile, '/sync/history/remove', { method: 'POST', body, lane: 'simkl_post' });
   return res.json().catch(() => ({}));
 }
 
@@ -630,6 +657,9 @@ module.exports = {
   checkConnection,
   manualCheck,
   accountName,
+  resolveAuth,
+  simklFetch,
+  refreshV2,
   authedGet,
   getActivities,
   getRatings,
