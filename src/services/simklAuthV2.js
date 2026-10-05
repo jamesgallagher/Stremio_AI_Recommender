@@ -103,6 +103,30 @@ function startFlow(profile, redirectUri) {
   return { authorizeUrl, state };
 }
 
+// Consume a pending flow for a profile (used by the cancellation path in
+// server.js). The flow is removed so a replayed callback with the same state
+// fails safely.
+function consumeFlow(profileId) {
+  flows.delete(profileId);
+}
+
+// Validate the granted scope: must contain exactly the required scope members.
+// A read-only grant (e.g. scope="media:read") is insufficient for this app.
+function validateScope(grantedScope) {
+  if (typeof grantedScope !== 'string' || !grantedScope) {
+    const err = new Error('Simkl did not return a scope');
+    err.state = 'malformed_token';
+    throw err;
+  }
+  const tokens = grantedScope.split(/\s+/);
+  if (!tokens.includes('media:read') || !tokens.includes('media:write')) {
+    const err = new Error('Insufficient scope — Simkl granted a read-only or restricted token');
+    err.state = 'insufficient_scope';
+    throw err;
+  }
+  return grantedScope;
+}
+
 // Handle the callback: validate state, exchange code for tokens, validate the
 // returned grant. Consumes the flow BEFORE the token exchange (a replayed or
 // failed callback cannot re-use the state). A failed/cancelled/replayed
@@ -111,10 +135,10 @@ function startFlow(profile, redirectUri) {
 //
 // Returns { access_token, refresh_token, expires_at, scope, username } or
 // throws a structured error { message, state } where state is one of:
-//   'cancelled', 'expired', 'state_mismatch', 'exchange_failed',
+//   'expired', 'state_mismatch', 'exchange_failed',
 //   'invalid_issuer', 'insufficient_scope', 'malformed_token',
 //   'credential_changed'
-async function handleCallback(profile, { code, state }) {
+async function handleCallback(profile, { code, state, iss }) {
   const flow = flows.get(profile.id);
   if (!flow) {
     const err = new Error('No pending V2 flow for this profile');
@@ -133,6 +157,13 @@ async function handleCallback(profile, { code, state }) {
   if (flow.state !== state) {
     const err = new Error('State mismatch (possible CSRF) — start again');
     err.state = 'state_mismatch';
+    throw err;
+  }
+  // Validate the callback issuer (Simkl supplies `iss` on the callback query).
+  // A non-Simkl issuer means the callback did not come from Simkl.
+  if (iss && iss !== EXPECTED_ISS) {
+    const err = new Error('Unexpected callback issuer');
+    err.state = 'invalid_issuer';
     throw err;
   }
   // Detect a credential change during the flow: the initiating Client ID
@@ -167,31 +198,36 @@ async function handleCallback(profile, { code, state }) {
     throw err;
   }
   const data = await res.json();
-  // Validate the returned grant.
-  if (!data.access_token) {
+  // Validate the returned grant. Require nonempty access_token AND
+  // refresh_token, positive finite expires_in, and exact granted scope members.
+  if (!data.access_token || typeof data.access_token !== 'string') {
     const err = new Error('Simkl did not return an access token');
     err.state = 'malformed_token';
     throw err;
   }
-  // Validate the issuer.
+  if (!data.refresh_token || typeof data.refresh_token !== 'string') {
+    const err = new Error('Simkl did not return a refresh token');
+    err.state = 'malformed_token';
+    throw err;
+  }
+  if (typeof data.expires_in !== 'number' || !Number.isFinite(data.expires_in) || data.expires_in <= 0) {
+    const err = new Error('Simkl did not return a valid expires_in');
+    err.state = 'malformed_token';
+    throw err;
+  }
+  // Validate the issuer (if present in the token response).
   if (data.iss && data.iss !== EXPECTED_ISS) {
     const err = new Error('Unexpected token issuer');
     err.state = 'invalid_issuer';
     throw err;
   }
-  // Validate the granted scope: must include media:read and media:write.
-  // A read-only grant (e.g. scope="media:read") is insufficient for this app.
-  const grantedScope = data.scope || '';
-  if (!grantedScope.includes('media:read') || !grantedScope.includes('media:write')) {
-    const err = new Error('Insufficient scope — Simkl granted a read-only or restricted token');
-    err.state = 'insufficient_scope';
-    throw err;
-  }
+  // Validate the granted scope.
+  const grantedScope = validateScope(data.scope);
   // Compute absolute expiry (expires_in is relative seconds).
-  const expiresAt = data.expires_in ? Date.now() + data.expires_in * 1000 : null;
+  const expiresAt = Date.now() + data.expires_in * 1000;
   return {
     access_token: data.access_token,
-    refresh_token: data.refresh_token || null,
+    refresh_token: data.refresh_token,
     expires_at: expiresAt,
     scope: grantedScope,
     username: data.username || null,
@@ -199,6 +235,8 @@ async function handleCallback(profile, { code, state }) {
 }
 
 // Refresh a V2 token using the refresh_token grant.
+// Returns { access_token, refresh_token, expires_at } where expires_at is
+// an absolute timestamp (ms since epoch).
 async function refreshToken(profile) {
   const auth = profile.simkl_auth;
   if (!auth?.refresh_token) throw new Error('No refresh token stored');
@@ -215,11 +253,16 @@ async function refreshToken(profile) {
   });
   if (!res.ok) throw new Error(`Simkl token refresh failed (${res.status})`);
   const data = await res.json();
-  if (!data.access_token) throw new Error('Simkl did not return a refreshed access token');
+  if (!data.access_token || typeof data.access_token !== 'string') {
+    throw new Error('Simkl did not return a refreshed access token');
+  }
+  const expiresAt = (typeof data.expires_in === 'number' && Number.isFinite(data.expires_in) && data.expires_in > 0)
+    ? Date.now() + data.expires_in * 1000
+    : null;
   return {
     access_token: data.access_token,
     refresh_token: data.refresh_token || auth.refresh_token, // non-rotating
-    expires_in: data.expires_in || null,
+    expires_at: expiresAt,
   };
 }
 
@@ -257,6 +300,7 @@ function getFlow(profileId) {
 module.exports = {
   startFlow,
   handleCallback,
+  consumeFlow,
   refreshToken,
   revokeToken,
   getFlow,

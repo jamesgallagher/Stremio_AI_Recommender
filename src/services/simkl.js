@@ -135,16 +135,44 @@ function resolveAuth(profile) {
 // All Simkl call sites use this instead of directly referencing
 // profile.keys.simkl_client_id / profile.simkl_auth.
 //
-// Refresh policy (Blocker 6):
+// Refresh policy:
 //   - Only an ACTIVE V2 grant is refreshed (version === 2 on the token).
-//   - Only on 401 (expired/invalid token). A 403 is NOT a refresh trigger
-//     (it may be insufficient scope, which a refresh cannot fix).
-//   - A V1 grant whose *preferred next* version is 2 is NOT refreshed
-//     (the user has not yet connected V2; the V1 token is still valid).
+//   - Proactive: if the token is expired or about to expire (within 60 s),
+//     refresh before sending the request.
+//   - Reactive: on 401, refresh and replay once — but only if the refresh
+//     actually persisted a new token for the same grant (a disconnect or
+//     account switch during the refresh makes the refresh obsolete).
+//   - A 403 is NOT a refresh trigger (it may be insufficient scope, which a
+//     refresh cannot fix).
+//   - A V1 grant is never refreshed (V1 tokens are long-lived; a 401 means
+//     the token is dead → reconnect).
+const EXPIRY_MARGIN_MS = 60 * 1000; // refresh 60 s before expiry
+
 async function simklFetch(profile, path, { method = 'GET', extra = {}, body = null, lane = 'simkl_get' } = {}) {
   const auth = resolveAuth(profile);
   if (!auth) throw new Error('Simkl is not connected for this profile');
   const { clientId, token, version } = auth;
+  // Proactive expiry check: if the token is expired or about to expire,
+  // refresh before sending the request (V2 only).
+  if (version === 2) {
+    const fresh = require('../config').getProfile(profile.id);
+    const expiresAt = fresh?.simkl_auth?.expires_at;
+    if (expiresAt && Date.now() >= expiresAt - EXPIRY_MARGIN_MS) {
+      const refreshed = await refreshV2(profile).catch(() => null);
+      if (refreshed) {
+        // Re-read the grant to confirm the refresh persisted.
+        const after = require('../config').getProfile(profile.id);
+        if (after?.simkl_auth?.access_token === refreshed.access_token && after.simkl_auth.version === 2) {
+          // Use the new token.
+        } else {
+          // The refresh did not persist (grant changed/disconnected).
+          throw new Error('Simkl token expired and refresh did not persist — reconnect the account');
+        }
+      } else {
+        throw new Error('Simkl token expired — reconnect the account');
+      }
+    }
+  }
   const res = await governor.schedule(lane, () =>
     fetch(withParams(clientId, path, extra), {
       method,
@@ -153,20 +181,24 @@ async function simklFetch(profile, path, { method = 'GET', extra = {}, body = nu
     })
   );
   if (res.status === 401) {
-    // Only refresh an active V2 grant on 401. A V1 grant is never refreshed
-    // (V1 tokens are long-lived; a 401 means the token is dead → reconnect).
-    // A 403 is handled below (no refresh).
+    // Only refresh an active V2 grant on 401. A V1 grant is never refreshed.
     if (version === 2) {
       const refreshed = await refreshV2(profile).catch(() => null);
       if (refreshed) {
-        const res2 = await governor.schedule(lane, () =>
-          fetch(withParams(clientId, path, extra), {
-            method,
-            headers: headers(refreshed.access_token),
-            ...(body ? { body: JSON.stringify(body) } : {}),
-          })
-        );
-        if (res2.ok) return res2;
+        // Verify the refresh persisted for the same grant. A disconnect or
+        // account switch during the refresh makes the refresh obsolete —
+        // do NOT replay with a token that no longer belongs to the active grant.
+        const after = require('../config').getProfile(profile.id);
+        if (after?.simkl_auth?.access_token === refreshed.access_token && after.simkl_auth.version === 2) {
+          const res2 = await governor.schedule(lane, () =>
+            fetch(withParams(clientId, path, extra), {
+              method,
+              headers: headers(refreshed.access_token),
+              ...(body ? { body: JSON.stringify(body) } : {}),
+            })
+          );
+          if (res2.ok) return res2;
+        }
       }
     }
     throw new Error('Simkl token rejected — reconnect the account');
@@ -181,11 +213,15 @@ async function simklFetch(profile, path, { method = 'GET', extra = {}, body = nu
 }
 
 // V2 token refresh (single-flight, non-rotating refresh token, one replay).
-// Blocker 6: re-read the latest grant before refreshing, key the single-flight
-// to that specific grant (not just the profile), update only if the grant
-// still matches after the refresh (a disconnect or new V2 authorization during
-// the refresh must not be reversed), and persist the new absolute expiry.
-const refreshInFlight = new Map(); // profileId → Promise
+// Re-read the latest grant before refreshing, key the single-flight to that
+// specific grant (not just the profile), update only if the grant still
+// matches after the refresh (a disconnect or new V2 authorization during the
+// refresh must not be reversed), and persist the new absolute expiry.
+//
+// Returns { access_token, refresh_token, expires_at } on success, or null if
+// the refresh is obsolete (grant disconnected/changed during the refresh).
+// An obsolete refresh returns no usable token to its caller.
+const refreshInFlight = new Map(); // grantKey → Promise
 async function refreshV2(profile) {
   // Re-read the latest grant from the store (the `profile` argument may be
   // a stale snapshot from before the refresh started).
@@ -204,16 +240,16 @@ async function refreshV2(profile) {
     // Re-read the grant after the refresh: a disconnect or new V2
     // authorization during the refresh must not be reversed.
     const after = config.getProfile(profile.id);
-    if (!after?.simkl_auth?.access_token || after.simkl_auth.version !== 2) return tokens;
+    if (!after?.simkl_auth?.access_token || after.simkl_auth.version !== 2) return null;
     // Update only if the grant still matches (same access_token as before the
     // refresh — a new authorization would have a different token).
-    if (after.simkl_auth.access_token !== fresh.simkl_auth.access_token) return tokens;
+    if (after.simkl_auth.access_token !== fresh.simkl_auth.access_token) return null;
     config.updateProfile(profile.id, {
       simkl_auth: {
         ...after.simkl_auth,
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token || after.simkl_auth.refresh_token,
-        expires_at: tokens.expires_at || null,
+        expires_at: tokens.expires_at,
       },
     });
     return tokens;

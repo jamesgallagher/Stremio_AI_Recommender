@@ -1951,6 +1951,67 @@ okAsync('simkl-auth T4: V2 callback validates state, issuer, and granted scope; 
       config.removeProfile(p.id);
     }
   }
+
+  // (g) Missing refresh token → rejected (malformed_token).
+  {
+    const p = config.addProfile('T4-NoRefresh');
+    config.updateProfile(p.id, {
+      keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+      simkl_auth_version: 2,
+    });
+    const pf = config.getProfile(p.id);
+    const { state } = simklAuthV2.startFlow(pf, 'https://example.com/simkl/oauth2/callback');
+    const origFetch = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ access_token: 'v2-access', expires_in: 3600, scope: 'media:read media:write', iss: 'https://simkl.com' }) });
+    try {
+      await assert.rejects(() => simklAuthV2.handleCallback(pf, { code: 'auth-code-1', state }),
+        (err) => err.state === 'malformed_token');
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
+  }
+
+  // (h) Invalid expires_in (zero) → rejected (malformed_token).
+  {
+    const p = config.addProfile('T4-BadExpiry');
+    config.updateProfile(p.id, {
+      keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+      simkl_auth_version: 2,
+    });
+    const pf = config.getProfile(p.id);
+    const { state } = simklAuthV2.startFlow(pf, 'https://example.com/simkl/oauth2/callback');
+    const origFetch = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ access_token: 'v2-access', refresh_token: 'v2-refresh', expires_in: 0, scope: 'media:read media:write', iss: 'https://simkl.com' }) });
+    try {
+      await assert.rejects(() => simklAuthV2.handleCallback(pf, { code: 'auth-code-1', state }),
+        (err) => err.state === 'malformed_token');
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
+  }
+
+  // (i) Callback issuer (iss from the query) → rejected if not simkl.com.
+  {
+    const p = config.addProfile('T4-CbIssuer');
+    config.updateProfile(p.id, {
+      keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+      simkl_auth_version: 2,
+    });
+    const pf = config.getProfile(p.id);
+    const { state } = simklAuthV2.startFlow(pf, 'https://example.com/simkl/oauth2/callback');
+    const origFetch = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ access_token: 'v2-access', refresh_token: 'v2-refresh', expires_in: 3600, scope: 'media:read media:write' }) });
+    try {
+      // The callback query carries iss=https://evil.test — rejected before token exchange.
+      await assert.rejects(() => simklAuthV2.handleCallback(pf, { code: 'auth-code-1', state, iss: 'https://evil.test' }),
+        (err) => err.state === 'invalid_issuer');
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
+  }
 });
 
 // ---- SIMKL-AUTH-1 T5: V2 token refresh — single-flight, non-rotating, grant-keyed ----
@@ -2063,6 +2124,29 @@ okAsync('simkl-auth T5: V2 refresh is single-flight, non-rotating, re-reads the 
       await refreshPromise;
       // The refresh must NOT restore the disconnected grant.
       assert.strictEqual(config.getProfile(p.id).simkl_auth, null, 'disconnect during refresh is not reversed');
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
+  }
+
+  // (d) The refresh persists the absolute expiry (expires_at), not expires_in.
+  {
+    const p = config.addProfile('T5-Expiry');
+    config.updateProfile(p.id, {
+      keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+      simkl_auth: { access_token: 'v2-access', refresh_token: 'v2-refresh', version: 2, client_id: 'v2-cid', connected_at: 1 },
+      simkl_auth_version: 2,
+    });
+    const pf = config.getProfile(p.id);
+    const origFetch = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ access_token: 'v2-refreshed', refresh_token: 'v2-refresh', expires_in: 3600 }) });
+    try {
+      const r = await simkl.refreshV2(pf);
+      assert.ok(r.expires_at > Date.now(), 'expires_at is an absolute timestamp');
+      assert.ok(r.expires_at < Date.now() + 3600 * 1000 + 5000, 'expires_at is within the expected window');
+      const fresh = config.getProfile(p.id);
+      assert.ok(fresh.simkl_auth.expires_at > Date.now(), 'persisted expires_at is an absolute timestamp');
     } finally {
       global.fetch = origFetch;
       config.removeProfile(p.id);
@@ -2309,7 +2393,7 @@ okAsync('simkl-auth T8: the portal never returns the V2 Client Secret to the bro
   assert.strictEqual(pub.simkl_auth_version, 2, 'auth version in publicProfile');
   assert.strictEqual(pub.keys.simkl_v2_client_id, 'v2-cid', 'V2 client ID in publicProfile');
   assert.ok(!('simkl_v2_client_secret' in pub.keys), 'V2 client secret is ABSENT from publicProfile (M4)');
-  assert.ok(pub.keys_preview.simkl_v2_client_secret, 'masked V2 secret preview present');
+  assert.ok(pub.keys_preview.simkl_v2_client_secret === '••••', 'V2 secret preview is a generic masked placeholder (no partial secret)');
   assert.ok(!pub.keys_preview.simkl_v2_client_secret.includes('v2-sec'), 'masked preview does not leak the real secret');
   assert.ok(pub.simkl_v2_callback_ready !== undefined, 'V2 callback readiness flag present');
   // (b) The real /api/profiles HTTP surface: the same M4 guarantee over the wire
@@ -2328,8 +2412,8 @@ okAsync('simkl-auth T8: the portal never returns the V2 Client Secret to the bro
     assert.ok(mine, 'profile present in /api/profiles');
     assert.strictEqual(mine.keys.simkl_v2_client_id, 'v2-cid', 'V2 client ID over the wire');
     assert.ok(!('simkl_v2_client_secret' in mine.keys), 'V2 secret ABSENT over the wire (M4)');
-    assert.ok(!JSON.stringify(mine).includes('v2-sec'), 'the real V2 secret appears nowhere in the response');
-    assert.ok(mine.keys_preview.simkl_v2_client_secret, 'masked preview over the wire');
+    assert.ok(!JSON.stringify(mine).includes('v2-sec'), 'the real V2 secret appears nowhere in the response (no full or partial)');
+    assert.ok(mine.keys_preview.simkl_v2_client_secret === '••••', 'masked preview over the wire is a generic placeholder');
     server.close();
   } finally {
     global.fetch = origFetch;

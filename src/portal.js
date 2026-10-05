@@ -136,12 +136,20 @@ function publicProfile(p, req) {
       groq_api_key: redactKey(p.keys.groq_api_key),
       rpdb_api_key: redactKey(p.keys.rpdb_api_key),
       mdblist_api_key: redactKey(p.keys.mdblist_api_key),
-      simkl_v2_client_secret: redactKey(p.keys.simkl_v2_client_secret),
+      // V2 Client Secret is never disclosed to the browser (M4). Only a
+      // generic masked placeholder is shown; the boolean `keys_set` above
+      // tells the portal whether it's set.
+      simkl_v2_client_secret: p.keys.simkl_v2_client_secret ? '••••' : '',
     },
     // Simkl: whether a token is STORED. Live validity is checked separately via
     // /simkl/status (the portal calls it on the Simkl tab open).
     simkl_connected: !!p.simkl_auth?.access_token,
     simkl_username: p.simkl_auth?.username || null,
+    // The latest manual check state (from the simklChecks Map). The passive
+    // status poll and the header badge use this to show the real connection
+    // state, not just token presence.
+    simkl_check_state: (simklChecks.get(p.id) || {}).state || null,
+    simkl_check_message: (simklChecks.get(p.id) || {}).message || null,
     // AUTH V1/V2 (M1/M3): the preferred connection version (what Connect
     // starts) and the active token's version (what is currently connected).
     // Shown separately when they differ — a V1 token can stay active while the
@@ -837,6 +845,7 @@ router.post('/profiles/:id/simkl/disconnect', async (req, res) => {
   }
   config.updateProfile(req.params.id, { simkl_auth: null });
   simklFlows.delete(req.params.id);
+  simklChecks.delete(req.params.id);
   res.json({ ok: true });
 });
 

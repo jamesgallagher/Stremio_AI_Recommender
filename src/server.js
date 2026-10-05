@@ -143,15 +143,30 @@ app.get('/health', (req, res) => res.json({ ok: true }));
 // redacts the query so no tokens/verifier ever appear in logs.
 const simklAuthV2 = require('./services/simklAuthV2');
 app.get('/simkl/oauth2/callback', async (req, res) => {
-  const { code, state, error } = req.query;
+  const { code, state, error, iss } = req.query;
   // Cancellation: Simkl redirects back with error=access_denied when the user
   // denies or closes the consent page. This is NOT a failure — the existing
   // grant (if any) is preserved and the user is redirected to the portal.
+  // Bind the cancellation to a real pending state and consume it.
   if (error) {
+    const config = require('./config');
+    for (const p of config.listProfiles()) {
+      if (simklAuthV2.getFlow(p.id)?.state === state) {
+        simklAuthV2.consumeFlow(p.id);
+        break;
+      }
+    }
     res.redirect('/configure/#simkl');
     return;
   }
   if (!code || !state) return res.status(400).json({ error: 'Missing code or state' });
+  // Validate the callback issuer (Simkl supplies `iss` on the callback query).
+  // This is the first trust boundary: a callback from a non-Simkl issuer is
+  // rejected before any token exchange.
+  if (iss && iss !== 'https://simkl.com') {
+    res.redirect(`/configure/#simkl?error=${encodeURIComponent('Unexpected callback issuer — start the connection again')}`);
+    return;
+  }
   // The callback is tied to the profile that started the flow. We look up
   // the profile by matching the state against stored flows.
   const config = require('./config');
@@ -163,11 +178,11 @@ app.get('/simkl/oauth2/callback', async (req, res) => {
     // No matching pending flow: the flow expired or was already consumed
     // (replay). Redirect to the portal with a message; the existing grant
     // is preserved.
-    res.redirect('/configure/#simkl');
+    res.redirect(`/configure/#simkl?error=${encodeURIComponent('V2 flow expired or already used — start the connection again')}`);
     return;
   }
   try {
-    const tokens = await simklAuthV2.handleCallback(matched, { code, state });
+    const tokens = await simklAuthV2.handleCallback(matched, { code, state, iss });
     // Persist the full grant: absolute expiry, scope, account identity.
     config.updateProfile(matched.id, {
       simkl_auth: {
@@ -192,7 +207,9 @@ app.get('/simkl/oauth2/callback', async (req, res) => {
       ? 'Simkl Client ID changed during the flow — start again'
       : err.state === 'insufficient_scope'
         ? 'Simkl granted a read-only token — re-authorize with the full scope'
-        : 'V2 OAuth failed — start the connection again';
+        : err.state === 'invalid_issuer'
+          ? 'Unexpected token issuer — start the connection again'
+          : 'V2 OAuth failed — start the connection again';
     res.redirect(`/configure/#simkl?error=${encodeURIComponent(msg)}`);
   }
 });

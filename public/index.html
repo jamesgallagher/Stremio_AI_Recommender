@@ -300,11 +300,23 @@ function catalogLine(label, entry) {
 
 // Volatile status badge + line — recomputed by the non-destructive poll so the
 // page never re-renders just to refresh a badge.
+// The badge reflects the latest manual check state (simkl_check_state), not
+// just token presence. A stored token alone is "token stored", never "connected".
 function statusBadge(p) {
-  const simklKeysOk = p.keys_set.simkl_client_id;
-  const b = p.simkl_connected
-    ? '<span class="badge ok">Simkl connected</span>'
-    : (simklKeysOk ? '<span class="badge warn">Simkl not authorized</span>' : '<span class="badge err">Simkl Client ID required</span>');
+  const checkState = p.simkl_check_state;
+  let b;
+  if (checkState === 'connected') {
+    b = '<span class="badge ok">Simkl connected</span>';
+  } else if (checkState === 'token_stored') {
+    b = '<span class="badge warn">Simkl token stored</span>';
+  } else if (p.simkl_connected) {
+    // Token stored but no manual check yet — show "token stored", never "connected".
+    b = '<span class="badge warn">Simkl token stored</span>';
+  } else if (p.keys_set.simkl_client_id || p.keys_set.simkl_v2_client_id) {
+    b = '<span class="badge warn">Simkl not authorized</span>';
+  } else {
+    b = '<span class="badge err">Simkl Client ID required</span>';
+  }
   const j = p.status.job;
   let rb = '';
   if (p.status.rebuilding) {
@@ -1225,7 +1237,7 @@ function renderSimklFlow(id, r) {
   const flowEl = card.querySelector('.simkl-flow');
   if (!flowEl) return;
   // Update the header badge to match the latest live check.
-  const badge = card.querySelector('.simkl-badge');
+  const badge = card.querySelector('.hdr-badge');
   if (badge) {
     if (r.connected) badge.innerHTML = '<span class="badge ok">Simkl connected</span>';
     else if (r.state === 'token_stored') badge.innerHTML = '<span class="badge warn">Simkl token stored</span>';
@@ -1240,7 +1252,7 @@ function renderSimklFlow(id, r) {
       <div class="muted" style="font-size:11px;margin-top:6px">Moving from Trakt? <b>Import from Trakt</b> takes your Trakt export .zip (request it at Trakt → Settings → <i>Your data</i>), pushes any watches Simkl doesn't already have — earliest play only, no rewatches — then pulls the updated history back in.</div>`;
   } else if (r.state === 'wrong_auth_version') {
     flowEl.innerHTML = `<div style="color:var(--err)">⚠ ${esc(r.message)}</div>
-      <div style="margin-top:8px"><button onclick="connectSimkl('${id}')">Start V2 connection</button></div>`;
+      <div style="margin-top:8px"><button onclick="connectSimklV2('${id}')">Start V2 connection</button></div>`;
   } else if (r.state === 'client_id_rejected' || r.state === 'credential_mismatch' || r.state === 'provider_unavailable') {
     flowEl.innerHTML = `<div style="color:var(--err)">✗ ${esc(r.message)}</div>
       <div style="margin-top:8px"><button onclick="connectSimkl('${id}')">Connect Simkl</button></div>`;
@@ -1248,7 +1260,6 @@ function renderSimklFlow(id, r) {
     flowEl.innerHTML = `<div><button onclick="connectSimkl('${id}')">Connect Simkl</button>${r.message ? ` <span class="muted">— ${esc(r.message)}</span>` : ''}</div>
       <div class="flow-status" style="margin-top:10px"></div>`;
   }
-}
 }
 
 async function connectSimkl(id) {
@@ -1295,6 +1306,16 @@ async function connectSimkl(id) {
   } catch (err) {
     statusEl.innerHTML = `<span style="color:var(--err)">${esc(err.message)}</span>`;
   }
+}
+
+// Start a V2 connection: set the auth version to V2 first, then connect.
+// This ensures the backend launches the V2 OAuth flow even if the user's
+// selector was on V1.
+async function connectSimklV2(id) {
+  const card = document.querySelector(`[data-id="${id}"]`);
+  const sel = card.querySelector('[data-auth-version]');
+  if (sel) sel.value = '2';
+  await connectSimkl(id);
 }
 
 async function disconnectSimkl(id) {
@@ -1901,7 +1922,30 @@ async function pollStatus() {
   }
 }
 
+// Read the #simkl?error=... fragment from the V2 OAuth callback redirect.
+// The callback redirects to /configure/#simkl?error=<message> on failure.
+// This reader shows the error in the Simkl tab so the user sees an actionable
+// result rather than a silent redirect.
+function readSimklCallbackError() {
+  const hash = window.location.hash; // e.g. #simkl?error=...
+  if (!hash || !hash.startsWith('#simkl')) return;
+  const q = new URLSearchParams(hash.slice('#simkl'.length));
+  const error = q.get('error');
+  if (!error) return;
+  // Clear the hash so it doesn't re-trigger on the next poll.
+  history.replaceState(null, '', window.location.pathname);
+  // Show the error in the selected profile's Simkl tab.
+  const card = document.querySelector(`[data-id="${SELECTED}"]`);
+  if (!card) return;
+  const flowEl = card.querySelector('.simkl-flow');
+  if (flowEl) {
+    flowEl.innerHTML = `<div style="color:var(--err)">✗ ${esc(error)}</div>
+      <div style="margin-top:8px"><button onclick="connectSimkl('${SELECTED}')">Connect Simkl</button></div>`;
+  }
+}
+
 load();
+readSimklCallbackError();
 setInterval(pollStatus, 30000);
 </script>
 </body>
