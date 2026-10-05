@@ -148,8 +148,8 @@ function publicProfile(p, req) {
     // The latest manual check state (from the simklChecks Map). The passive
     // status poll and the header badge use this to show the real connection
     // state, not just token presence.
-    simkl_check_state: (simklChecks.get(p.id) || {}).state || null,
-    simkl_check_message: (simklChecks.get(p.id) || {}).message || null,
+    simkl_check_state: (simklChecks.get(grantFingerprint(p)) || {}).state || null,
+    simkl_check_message: (simklChecks.get(grantFingerprint(p)) || {}).message || null,
     // AUTH V1/V2 (M1/M3): the preferred connection version (what Connect
     // starts) and the active token's version (what is currently connected).
     // Shown separately when they differ — a V1 token can stay active while the
@@ -406,11 +406,23 @@ router.post('/profiles/:id/test/:service', async (req, res) => {
 
 // ---- Simkl PIN device flow (v6) + AUTH V1/V2 (mandate M1/M6) ----
 const simklFlows = new Map(); // profileId -> { user_code, verification_url, state, error, expires_at }
-// Last manual Check-connection result per profile (mandate M6). The passive
+// Last manual Check-connection result per grant (mandate M6). The passive
 // status poll reads this (lightweight — no Simkl call); only the manual check
 // makes the provider's one-request check. A stored token alone is "token
 // stored", never "connected" — the badge reflects the latest live check.
-const simklChecks = new Map(); // profileId -> { state, message, username, checked_at }
+// Keyed by grant fingerprint (profileId:version:client_id) so a check result
+// is only valid for the exact active grant that produced it. When the grant
+// changes (new authorization, credential change, version switch, Disconnect)
+// the fingerprint changes and the old check is naturally invalidated.
+const simklChecks = new Map(); // grantFingerprint -> { state, message, username, account_id, checked_at }
+
+// Non-secret grant fingerprint: identifies the exact active grant/client ID
+// binding. A check result is only valid for this exact binding.
+function grantFingerprint(p) {
+  const version = p.simkl_auth?.version || 1;
+  const clientId = p.simkl_auth?.client_id || '';
+  return `${p.id}:${version}:${clientId}`;
+}
 
 // Manual Check connection (mandate M6): the button's own admin-authenticated
 // endpoint. It does not create a connection flow, authorize a user, or show a
@@ -420,8 +432,8 @@ router.post('/profiles/:id/simkl/check', async (req, res) => {
   const profile = config.getProfile(req.params.id);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
   const result = await simkl.manualCheck(profile);
-  const check = { state: result.state, message: result.message, username: result.username || null, checked_at: Date.now() };
-  simklChecks.set(profile.id, check);
+  const check = { state: result.state, message: result.message, username: result.username || null, account_id: result.account_id || null, checked_at: Date.now() };
+  simklChecks.set(grantFingerprint(profile), check);
   res.json({ ...check, connected: result.state === 'connected' });
 });
 
@@ -433,13 +445,21 @@ router.get('/profiles/:id/simkl/status', async (req, res) => {
   const profile = config.getProfile(req.params.id);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
   const flow = simklFlows.get(profile.id);
-  const lastCheck = simklChecks.get(profile.id) || null;
+  const lastCheck = simklChecks.get(grantFingerprint(profile)) || null;
   // When no manual check has run, derive a lightweight stored-token state
   // ("token stored", never "connected") so the badge is honest before the
   // first live check.
   let state, message, username;
   if (lastCheck) {
     state = lastCheck.state; message = lastCheck.message; username = lastCheck.username;
+    // Guard a known account mismatch: if the check result's account_id
+    // (the Simkl account the check verified) differs from the stored
+    // account_id (the Simkl account the grant was created against), the
+    // grant is for a different Simkl account than the one verified.
+    if (lastCheck.account_id && profile.simkl_auth?.account_id && lastCheck.account_id !== profile.simkl_auth.account_id) {
+      state = 'account_mismatch';
+      message = 'Simkl account mismatch — reconnect';
+    }
   } else if (profile.simkl_auth?.access_token) {
     state = 'token_stored'; message = 'Token stored — run Check connection to verify live'; username = profile.simkl_auth.username || null;
   } else {
@@ -514,10 +534,19 @@ router.post('/profiles/:id/simkl/connect', async (req, res) => {
           config.updateProfile(profile.id, { simkl_auth: result.token });
           flow.state = 'connected';
           try {
-            const username = await simkl.accountName(clientId, result.token.access_token);
-            if (username) config.updateProfile(profile.id, { simkl_auth: { ...result.token, username } });
-            console.log(`[simkl] ${profile.name}: connected via PIN${username ? ` as "${username}"` : ''}`);
-          } catch { /* username is best-effort */ }
+            // Complete one bounded verification on the new grant: capture the
+            // stable Simkl account ID (and username) via /users/settings. The
+            // account_id is stored so a later grant can be checked for a known
+            // account mismatch (a different Simkl account than the one the
+            // profile was previously verified against).
+            const info = await simkl.accountName(clientId, result.token.access_token);
+            if (info) {
+              config.updateProfile(profile.id, {
+                simkl_auth: { ...result.token, username: info.name || undefined, account_id: info.id || undefined },
+              });
+            }
+            console.log(`[simkl] ${profile.name}: connected via PIN${info?.name ? ` as "${info.name}"` : ''}`);
+          } catch { /* account info is best-effort */ }
         } else {
           flow.state = 'error'; flow.error = result.error || 'Authorization failed';
           console.error(`[simkl] ${profile.name}: PIN flow failed — ${flow.error}`);
@@ -845,7 +874,10 @@ router.post('/profiles/:id/simkl/disconnect', async (req, res) => {
   }
   config.updateProfile(req.params.id, { simkl_auth: null });
   simklFlows.delete(req.params.id);
-  simklChecks.delete(req.params.id);
+  // Clear all check results for this profile (any grant fingerprint).
+  for (const key of simklChecks.keys()) {
+    if (key.startsWith(req.params.id + ':')) simklChecks.delete(key);
+  }
   res.json({ ok: true });
 });
 

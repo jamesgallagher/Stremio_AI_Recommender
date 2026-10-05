@@ -1244,18 +1244,29 @@ function renderSimklFlow(id, r) {
     else badge.innerHTML = '<span class="badge err">Simkl not connected</span>';
   }
   if (r.connected) {
+    // When V2 is selected for the next connection but a V1 grant is still
+    // active, offer a V2 migration/re-authorize control so the user can
+    // switch to V2 without losing the working V1 actions.
+    const p = PROFILES.find(x => x.id === id);
+    const v2Preferred = p?.simkl_auth_version === 2;
+    const v1Active = p?.simkl_active_version === 1;
+    const v2Migration = (v2Preferred && v1Active) ? `<div style="margin-top:8px"><button onclick="connectSimklV2('${id}')">Reauthorize with V2 (OAuth)</button></div>` : '';
     flowEl.innerHTML = `<div class="muted">✓ Connected${r.username ? ` as <b style="color:var(--ok)">${esc(r.username)}</b>` : ''} — verified live. <b>${r.watched_count || 0}</b> watched title(s) in the local store.</div>
       <div style="margin-top:8px" class="row"><button class="ghost" onclick="syncSimkl('${id}', this)">Sync watched now</button>
       <button class="ghost" onclick="importTrakt('${id}')" title="One-time: upload your Trakt data-export ZIP to push its watched history into this Simkl account, then resync">Import from Trakt</button>
       <button class="ghost" onclick="disconnectSimkl('${id}')">Disconnect</button>
       <span class="tres" data-tres="simkl-sync"></span></div>
+      ${v2Migration}
+      <div class="flow-status" style="margin-top:10px"></div>
       <div class="muted" style="font-size:11px;margin-top:6px">Moving from Trakt? <b>Import from Trakt</b> takes your Trakt export .zip (request it at Trakt → Settings → <i>Your data</i>), pushes any watches Simkl doesn't already have — earliest play only, no rewatches — then pulls the updated history back in.</div>`;
   } else if (r.state === 'wrong_auth_version') {
     flowEl.innerHTML = `<div style="color:var(--err)">⚠ ${esc(r.message)}</div>
-      <div style="margin-top:8px"><button onclick="connectSimklV2('${id}')">Start V2 connection</button></div>`;
+      <div style="margin-top:8px"><button onclick="connectSimklV2('${id}')">Start V2 connection</button></div>
+      <div class="flow-status" style="margin-top:10px"></div>`;
   } else if (r.state === 'client_id_rejected' || r.state === 'credential_mismatch' || r.state === 'provider_unavailable') {
     flowEl.innerHTML = `<div style="color:var(--err)">✗ ${esc(r.message)}</div>
-      <div style="margin-top:8px"><button onclick="connectSimkl('${id}')">Connect Simkl</button></div>`;
+      <div style="margin-top:8px"><button onclick="connectSimkl('${id}')">Connect Simkl</button></div>
+      <div class="flow-status" style="margin-top:10px"></div>`;
   } else {
     flowEl.innerHTML = `<div><button onclick="connectSimkl('${id}')">Connect Simkl</button>${r.message ? ` <span class="muted">— ${esc(r.message)}</span>` : ''}</div>
       <div class="flow-status" style="margin-top:10px"></div>`;
@@ -1938,14 +1949,21 @@ function readSimklCallbackError() {
   const card = document.querySelector(`[data-id="${SELECTED}"]`);
   if (!card) return;
   const flowEl = card.querySelector('.simkl-flow');
-  if (flowEl) {
-    flowEl.innerHTML = `<div style="color:var(--err)">✗ ${esc(error)}</div>
-      <div style="margin-top:8px"><button onclick="connectSimkl('${SELECTED}')">Connect Simkl</button></div>`;
-  }
+  if (!flowEl) return;
+  // If the profile has a V1 grant active, show the V1 actions alongside the error.
+  const p = PROFILES.find(x => x.id === SELECTED);
+  const v1Active = p && p.simkl_active_version === 1;
+  const v1Actions = v1Active ? `<div style="margin-top:8px" class="row">
+    <button class="ghost" onclick="syncSimkl('${SELECTED}', this)">Sync watched now</button>
+    <button class="ghost" onclick="disconnectSimkl('${SELECTED}')">Disconnect</button>
+  </div>` : '';
+  flowEl.innerHTML = `<div style="color:var(--err)">✗ ${esc(error)}</div>
+    <div style="margin-top:8px"><button onclick="connectSimklV2('${SELECTED}')">Start V2 connection</button></div>
+    ${v1Actions}
+    <div class="flow-status" style="margin-top:10px"></div>`;
 }
 
-load();
-readSimklCallbackError();
+load().then(() => readSimklCallbackError());
 setInterval(pollStatus, 30000);
 </script>
 </body>

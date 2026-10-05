@@ -72,8 +72,8 @@ async function checkConnection(clientId, accessToken) {
   try {
     const res = await fetch(withParams(clientId, '/sync/activities'), { headers: headers(accessToken) });
     if (res.ok) {
-      const username = await accountName(clientId, accessToken).catch(() => null);
-      return { valid: true, username };
+      const info = await accountName(clientId, accessToken).catch(() => null);
+      return { valid: true, username: info?.name || null };
     }
     if (res.status === 401 || res.status === 403) return { valid: false, reason: 'token rejected — reconnect' };
     return { valid: false, reason: `Simkl returned ${res.status}` };
@@ -82,12 +82,16 @@ async function checkConnection(clientId, accessToken) {
   }
 }
 
-// Best-effort account name for the status line. Non-fatal if it fails.
+// Best-effort account info for the status line. Non-fatal if it fails.
+// Returns { name, id } where id is the stable Simkl account ID (user_id)
+// if the provider returns one; name is the display name/username.
 async function accountName(clientId, accessToken) {
   const res = await fetch(withParams(clientId, '/users/settings'), { headers: headers(accessToken) });
   if (!res.ok) return null;
   const data = await res.json();
-  return data?.user?.name || data?.user?.username || null;
+  const name = data?.user?.name || data?.user?.username || null;
+  const id = data?.user?.id || data?.user?.user_id || null;
+  return { name, id };
 }
 
 // Bounded fetch (mandate M6): the manual check must not hang the portal. A
@@ -149,11 +153,13 @@ function resolveAuth(profile) {
 const EXPIRY_MARGIN_MS = 60 * 1000; // refresh 60 s before expiry
 
 async function simklFetch(profile, path, { method = 'GET', extra = {}, body = null, lane = 'simkl_get' } = {}) {
-  const auth = resolveAuth(profile);
+  let auth = resolveAuth(profile);
   if (!auth) throw new Error('Simkl is not connected for this profile');
-  const { clientId, token, version } = auth;
+  let { clientId, token, version } = auth;
   // Proactive expiry check: if the token is expired or about to expire,
-  // refresh before sending the request (V2 only).
+  // refresh before sending the request (V2 only). After a successful refresh,
+  // re-resolve the persisted active grant so the first API call uses the NEW
+  // token (Simkl invalidates the old access token on refresh).
   if (version === 2) {
     const fresh = require('../config').getProfile(profile.id);
     const expiresAt = fresh?.simkl_auth?.expires_at;
@@ -163,7 +169,11 @@ async function simklFetch(profile, path, { method = 'GET', extra = {}, body = nu
         // Re-read the grant to confirm the refresh persisted.
         const after = require('../config').getProfile(profile.id);
         if (after?.simkl_auth?.access_token === refreshed.access_token && after.simkl_auth.version === 2) {
-          // Use the new token.
+          // Re-resolve: use the NEW token and client ID for the API call.
+          auth = resolveAuth(after);
+          if (!auth) throw new Error('Simkl token expired and refresh did not persist — reconnect the account');
+          clientId = auth.clientId;
+          token = auth.token;
         } else {
           // The refresh did not persist (grant changed/disconnected).
           throw new Error('Simkl token expired and refresh did not persist — reconnect the account');
@@ -173,13 +183,23 @@ async function simklFetch(profile, path, { method = 'GET', extra = {}, body = nu
       }
     }
   }
-  const res = await governor.schedule(lane, () =>
-    fetch(withParams(clientId, path, extra), {
+  // The governed send re-reads the active grant immediately before the fetch:
+  // a grant-keyed refresh alone does not protect the LATER governor callback.
+  // If a Disconnect or account replacement occurs while this call was queued,
+  // the send is aborted (the captured token no longer belongs to the active
+  // grant) rather than fired with a stale token.
+  const res = await governor.schedule(lane, async () => {
+    const after = require('../config').getProfile(profile.id);
+    const current = resolveAuth(after);
+    if (!current || current.token !== token || current.version !== version) {
+      throw new Error('Simkl grant changed while queued — abort');
+    }
+    return fetch(withParams(current.clientId, path, extra), {
       method,
-      headers: headers(token),
+      headers: headers(current.token),
       ...(body ? { body: JSON.stringify(body) } : {}),
-    })
-  );
+    });
+  });
   if (res.status === 401) {
     // Only refresh an active V2 grant on 401. A V1 grant is never refreshed.
     if (version === 2) {
@@ -190,13 +210,18 @@ async function simklFetch(profile, path, { method = 'GET', extra = {}, body = nu
         // do NOT replay with a token that no longer belongs to the active grant.
         const after = require('../config').getProfile(profile.id);
         if (after?.simkl_auth?.access_token === refreshed.access_token && after.simkl_auth.version === 2) {
-          const res2 = await governor.schedule(lane, () =>
-            fetch(withParams(clientId, path, extra), {
+          const res2 = await governor.schedule(lane, async () => {
+            const after2 = require('../config').getProfile(profile.id);
+            const current = resolveAuth(after2);
+            if (!current || current.token !== refreshed.access_token || current.version !== 2) {
+              throw new Error('Simkl grant changed while queued — abort');
+            }
+            return fetch(withParams(current.clientId, path, extra), {
               method,
-              headers: headers(refreshed.access_token),
+              headers: headers(current.token),
               ...(body ? { body: JSON.stringify(body) } : {}),
-            })
-          );
+            });
+          });
           if (res2.ok) return res2;
         }
       }
@@ -295,8 +320,8 @@ async function manualCheck(profile) {
     try {
       const res = await boundedFetch(withParams(clientId, '/sync/activities'), { headers: headers(token) });
       if (res.ok) {
-        const username = await accountName(clientId, token).catch(() => null);
-        return { state: 'connected', message: 'Connected and verified', username: username || auth.username || null };
+        const info = await accountName(clientId, token).catch(() => null);
+        return { state: 'connected', message: 'Connected and verified', username: info?.name || auth.username || null, account_id: info?.id || null };
       }
       // V2: a 401 may be an expired token — attempt one refresh before
       // declaring the grant rejected (Blocker 6).
@@ -305,8 +330,8 @@ async function manualCheck(profile) {
         if (refreshed) {
           const res2 = await boundedFetch(withParams(clientId, '/sync/activities'), { headers: headers(refreshed.access_token) });
           if (res2.ok) {
-            const username = await accountName(clientId, refreshed.access_token).catch(() => null);
-            return { state: 'connected', message: 'Connected and verified (token refreshed)', username: username || auth.username || null };
+            const info = await accountName(clientId, refreshed.access_token).catch(() => null);
+            return { state: 'connected', message: 'Connected and verified (token refreshed)', username: info?.name || auth.username || null, account_id: info?.id || null };
           }
         }
       }

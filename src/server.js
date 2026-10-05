@@ -147,23 +147,33 @@ app.get('/simkl/oauth2/callback', async (req, res) => {
   // Cancellation: Simkl redirects back with error=access_denied when the user
   // denies or closes the consent page. This is NOT a failure — the existing
   // grant (if any) is preserved and the user is redirected to the portal.
-  // Bind the cancellation to a real pending state and consume it.
+  // Bind the cancellation to a real pending state and consume it. If the
+  // state is missing/unknown/expired, reject safely (do not treat as a
+  // successful cancellation).
   if (error) {
     const config = require('./config');
+    let consumed = false;
     for (const p of config.listProfiles()) {
       if (simklAuthV2.getFlow(p.id)?.state === state) {
         simklAuthV2.consumeFlow(p.id);
+        consumed = true;
         break;
       }
     }
-    res.redirect('/configure/#simkl');
+    if (consumed) {
+      res.redirect('/configure/#simkl');
+    } else {
+      // No matching pending flow: reject safely, show the outcome.
+      res.redirect(`/configure/#simkl?error=${encodeURIComponent('V2 cancellation rejected — no matching pending flow')}`);
+    }
     return;
   }
   if (!code || !state) return res.status(400).json({ error: 'Missing code or state' });
   // Validate the callback issuer (Simkl supplies `iss` on the callback query).
   // This is the first trust boundary: a callback from a non-Simkl issuer is
-  // rejected before any token exchange.
-  if (iss && iss !== 'https://simkl.com') {
+  // rejected before any token exchange. A missing issuer is also rejected —
+  // the documented exact issuer is required.
+  if (iss !== 'https://simkl.com') {
     res.redirect(`/configure/#simkl?error=${encodeURIComponent('Unexpected callback issuer — start the connection again')}`);
     return;
   }
@@ -196,6 +206,28 @@ app.get('/simkl/oauth2/callback', async (req, res) => {
         client_id: matched.keys.simkl_v2_client_id,
       },
     });
+    // Complete one bounded verification on the new grant: capture the stable
+    // Simkl account ID (and username) via /users/settings. The account_id is
+    // stored so a later grant can be checked for a known account mismatch.
+    try {
+      const simkl = require('./services/simkl');
+      const info = await simkl.accountName(matched.keys.simkl_v2_client_id, tokens.access_token);
+      if (info) {
+        config.updateProfile(matched.id, {
+          simkl_auth: {
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            expires_at: tokens.expires_at,
+            scope: tokens.scope,
+            username: info.name || tokens.username || undefined,
+            account_id: info.id || undefined,
+            connected_at: Date.now(),
+            version: 2,
+            client_id: matched.keys.simkl_v2_client_id,
+          },
+        });
+      }
+    } catch { /* account info is best-effort */ }
     // Redirect to the portal's Simkl tab so the user sees the result.
     res.redirect('/configure/#simkl');
   } catch (err) {

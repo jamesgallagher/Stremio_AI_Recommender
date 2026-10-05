@@ -160,8 +160,9 @@ async function handleCallback(profile, { code, state, iss }) {
     throw err;
   }
   // Validate the callback issuer (Simkl supplies `iss` on the callback query).
-  // A non-Simkl issuer means the callback did not come from Simkl.
-  if (iss && iss !== EXPECTED_ISS) {
+  // A missing or non-Simkl issuer means the callback did not come from Simkl —
+  // the documented exact issuer is required (a missing issuer is rejected too).
+  if (iss !== EXPECTED_ISS) {
     const err = new Error('Unexpected callback issuer');
     err.state = 'invalid_issuer';
     throw err;
