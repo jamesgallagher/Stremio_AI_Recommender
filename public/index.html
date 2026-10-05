@@ -1289,13 +1289,17 @@ async function connectSimkl(id) {
         <div class="muted">Callback URI: <code>${esc(cbUri)}</code></div>
         <div class="muted">You'll be redirected back here automatically after authorizing.</div>`;
       // Bounded poll: the V2 callback stores the token server-side; poll for
-      // up to 10 minutes (the flow TTL) then stop.
+      // up to 10 minutes (the flow TTL) then stop. The poll completes on
+      // `connected` (bounded verification succeeded) or `token_stored`
+      // (token persisted but verification incomplete — never label an
+      // unverified grant `connected`).
       const deadline = Date.now() + 10 * 60e3;
       const poll = setInterval(async () => {
         if (Date.now() > deadline) { clearInterval(poll); checkSimklStatus(id); return; }
         try {
           const { connected, state } = await api(`/profiles/${id}/simkl/status`);
           if (connected) { clearInterval(poll); toast('Simkl connected 🎉'); checkSimklStatus(id); }
+          else if (state === 'token_stored') { clearInterval(poll); checkSimklStatus(id); }
         } catch { /* transient */ }
       }, 3000);
     } else {

@@ -416,12 +416,17 @@ const simklFlows = new Map(); // profileId -> { user_code, verification_url, sta
 // the fingerprint changes and the old check is naturally invalidated.
 const simklChecks = new Map(); // grantFingerprint -> { state, message, username, account_id, checked_at }
 
-// Non-secret grant fingerprint: identifies the exact active grant/client ID
-// binding. A check result is only valid for this exact binding.
+// Non-secret grant fingerprint: identifies the exact active grant. A check
+// result is only valid for this exact grant binding. Includes a token-derived
+// digest (SHA-256 of the access token, first 16 hex chars) so that a new
+// access/refresh token through the same V2 client invalidates the old check.
+// The digest is non-disclosed (a truncated hash, not the token itself).
 function grantFingerprint(p) {
   const version = p.simkl_auth?.version || 1;
   const clientId = p.simkl_auth?.client_id || '';
-  return `${p.id}:${version}:${clientId}`;
+  const token = p.simkl_auth?.access_token || '';
+  const digest = require('crypto').createHash('sha256').update(token).digest('hex').slice(0, 16);
+  return `${p.id}:${version}:${clientId}:${digest}`;
 }
 
 // Manual Check connection (mandate M6): the button's own admin-authenticated
@@ -533,13 +538,14 @@ router.post('/profiles/:id/simkl/connect', async (req, res) => {
         if (result.token) {
           config.updateProfile(profile.id, { simkl_auth: result.token });
           flow.state = 'connected';
+          let info = null;
           try {
             // Complete one bounded verification on the new grant: capture the
             // stable Simkl account ID (and username) via /users/settings. The
             // account_id is stored so a later grant can be checked for a known
             // account mismatch (a different Simkl account than the one the
             // profile was previously verified against).
-            const info = await simkl.accountName(clientId, result.token.access_token);
+            info = await simkl.accountName(clientId, result.token.access_token);
             if (info) {
               config.updateProfile(profile.id, {
                 simkl_auth: { ...result.token, username: info.name || undefined, account_id: info.id || undefined },
@@ -547,6 +553,17 @@ router.post('/profiles/:id/simkl/connect', async (req, res) => {
             }
             console.log(`[simkl] ${profile.name}: connected via PIN${info?.name ? ` as "${info.name}"` : ''}`);
           } catch { /* account info is best-effort */ }
+          // Store a check result for the new grant's fingerprint so the
+          // Configure poll can complete. Bounded verification succeeded →
+          // `connected`; failed → `token_stored`.
+          const newProfile = config.getProfile(profile.id);
+          simklChecks.set(grantFingerprint(newProfile), {
+            state: info ? 'connected' : 'token_stored',
+            message: info ? 'Connected and verified' : 'Token stored — run Check connection to verify live',
+            username: info?.name || result.token.username || null,
+            account_id: info?.id || null,
+            checked_at: Date.now(),
+          });
         } else {
           flow.state = 'error'; flow.error = result.error || 'Authorization failed';
           console.error(`[simkl] ${profile.name}: PIN flow failed — ${flow.error}`);
@@ -1139,4 +1156,4 @@ router.post('/settings/test-llm', async (req, res) => {
   }
 });
 
-module.exports = { router, publicProfile };
+module.exports = { router, publicProfile, simklChecks, grantFingerprint };

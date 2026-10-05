@@ -193,6 +193,25 @@ app.get('/simkl/oauth2/callback', async (req, res) => {
   }
   try {
     const tokens = await simklAuthV2.handleCallback(matched, { code, state, iss });
+    // Bounded verification: capture the stable Simkl account ID via
+    // /users/settings BEFORE persisting the new grant. If the old grant has
+    // a known account_id and the new grant's account_id differs, reject the
+    // promotion (preserve the old grant) — a silent account switch would
+    // corrupt watched-history data and later writes.
+    const simkl = require('./services/simkl');
+    const oldAuth = matched.simkl_auth;
+    const oldAccountId = oldAuth?.account_id || null;
+    let info = null;
+    try {
+      info = await simkl.accountName(matched.keys.simkl_v2_client_id, tokens.access_token);
+    } catch { /* account info is best-effort */ }
+    const newAccountId = info?.id || null;
+    // Guard: if both old and new stable Simkl IDs are available and differ,
+    // reject the promotion and preserve the old grant.
+    if (oldAccountId && newAccountId && oldAccountId !== newAccountId) {
+      res.redirect(`/configure/#simkl?error=${encodeURIComponent('Simkl account mismatch — the new authorization is for a different Simkl account. The existing connection is preserved. Disconnect first to switch accounts.')}`);
+      return;
+    }
     // Persist the full grant: absolute expiry, scope, account identity.
     config.updateProfile(matched.id, {
       simkl_auth: {
@@ -200,34 +219,27 @@ app.get('/simkl/oauth2/callback', async (req, res) => {
         refresh_token: tokens.refresh_token,
         expires_at: tokens.expires_at,
         scope: tokens.scope,
-        username: tokens.username || undefined,
+        username: info?.name || tokens.username || undefined,
+        account_id: newAccountId || undefined,
         connected_at: Date.now(),
         version: 2,
         client_id: matched.keys.simkl_v2_client_id,
       },
     });
-    // Complete one bounded verification on the new grant: capture the stable
-    // Simkl account ID (and username) via /users/settings. The account_id is
-    // stored so a later grant can be checked for a known account mismatch.
-    try {
-      const simkl = require('./services/simkl');
-      const info = await simkl.accountName(matched.keys.simkl_v2_client_id, tokens.access_token);
-      if (info) {
-        config.updateProfile(matched.id, {
-          simkl_auth: {
-            access_token: tokens.access_token,
-            refresh_token: tokens.refresh_token,
-            expires_at: tokens.expires_at,
-            scope: tokens.scope,
-            username: info.name || tokens.username || undefined,
-            account_id: info.id || undefined,
-            connected_at: Date.now(),
-            version: 2,
-            client_id: matched.keys.simkl_v2_client_id,
-          },
-        });
-      }
-    } catch { /* account info is best-effort */ }
+    // Store a check result for the new grant's fingerprint so the Configure
+    // poll can complete. The bounded verification (/users/settings) succeeded
+    // → `connected`; failed → `token_stored` (never label an unverified
+    // grant `connected`).
+    const { simklChecks, grantFingerprint } = require('./portal');
+    const newProfile = config.getProfile(matched.id);
+    const checkState = info ? 'connected' : 'token_stored';
+    simklChecks.set(grantFingerprint(newProfile), {
+      state: checkState,
+      message: info ? 'Connected and verified' : 'Token stored — run Check connection to verify live',
+      username: info?.name || tokens.username || null,
+      account_id: newAccountId || null,
+      checked_at: Date.now(),
+    });
     // Redirect to the portal's Simkl tab so the user sees the result.
     res.redirect('/configure/#simkl');
   } catch (err) {

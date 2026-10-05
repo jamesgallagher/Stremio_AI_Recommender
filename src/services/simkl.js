@@ -164,18 +164,26 @@ async function simklFetch(profile, path, { method = 'GET', extra = {}, body = nu
     const fresh = require('../config').getProfile(profile.id);
     const expiresAt = fresh?.simkl_auth?.expires_at;
     if (expiresAt && Date.now() >= expiresAt - EXPIRY_MARGIN_MS) {
+      // Proactive refresh precondition: the stored grant must still be the
+      // same as the caller's snapshot. If the grant was replaced (different
+      // account, disconnect, reauthorization) before the refresh, abort —
+      // do NOT refresh or send under a different grant.
+      if (fresh?.simkl_auth?.access_token !== token || fresh.simkl_auth.version !== version) {
+        throw new Error('Simkl grant changed before proactive refresh — abort');
+      }
       const refreshed = await refreshV2(profile).catch(() => null);
       if (refreshed) {
-        // Re-read the grant to confirm the refresh persisted.
+        // Re-read the grant to confirm the refresh persisted for the SAME
+        // grant (same client binding, same version).
         const after = require('../config').getProfile(profile.id);
-        if (after?.simkl_auth?.access_token === refreshed.access_token && after.simkl_auth.version === 2) {
+        if (after?.simkl_auth?.access_token === refreshed.access_token && after.simkl_auth.version === 2 && after.simkl_auth.client_id === clientId) {
           // Re-resolve: use the NEW token and client ID for the API call.
           auth = resolveAuth(after);
           if (!auth) throw new Error('Simkl token expired and refresh did not persist — reconnect the account');
           clientId = auth.clientId;
           token = auth.token;
         } else {
-          // The refresh did not persist (grant changed/disconnected).
+          // The refresh did not persist for the same grant (grant changed/disconnected).
           throw new Error('Simkl token expired and refresh did not persist — reconnect the account');
         }
       } else {
@@ -206,18 +214,27 @@ async function simklFetch(profile, path, { method = 'GET', extra = {}, body = nu
   if (res.status === 401) {
     // Only refresh an active V2 grant on 401. A V1 grant is never refreshed.
     if (version === 2) {
+      // Bind the refresh and retry to the grant that sent the failed request.
+      // If the stored grant was replaced (different account, disconnect,
+      // reauthorization) before 401 handling, abort without refreshing or
+      // replaying under the replacement grant.
+      const stored = require('../config').getProfile(profile.id);
+      const storedAuth = stored?.simkl_auth;
+      if (!storedAuth || storedAuth.access_token !== token || storedAuth.version !== version || storedAuth.client_id !== clientId) {
+        throw new Error('Simkl grant changed before 401 handling — abort');
+      }
       const refreshed = await refreshV2(profile).catch(() => null);
       if (refreshed) {
-        // Verify the refresh persisted for the same grant. A disconnect or
-        // account switch during the refresh makes the refresh obsolete —
-        // do NOT replay with a token that no longer belongs to the active grant.
+        // Verify the refresh persisted for the SAME grant (same client
+        // binding, same version). A disconnect or account switch during
+        // the refresh makes the refresh obsolete.
         const after = require('../config').getProfile(profile.id);
-        if (after?.simkl_auth?.access_token === refreshed.access_token && after.simkl_auth.version === 2) {
+        if (after?.simkl_auth?.access_token === refreshed.access_token && after.simkl_auth.version === 2 && after.simkl_auth.client_id === clientId) {
           const res2 = await governor.schedule(lane, async () => {
             const after2 = require('../config').getProfile(profile.id);
             if (!after2) throw new Error('Simkl grant changed while queued — abort');
             const current = resolveAuth(after2);
-            if (!current || current.token !== refreshed.access_token || current.version !== 2) {
+            if (!current || current.token !== refreshed.access_token || current.version !== 2 || current.clientId !== clientId) {
               throw new Error('Simkl grant changed while queued — abort');
             }
             return fetch(withParams(current.clientId, path, extra), {
