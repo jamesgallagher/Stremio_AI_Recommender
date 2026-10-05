@@ -1203,9 +1203,11 @@ async function syncScrobble(id, btn, full) {
 
 // Passive status poll — lightweight, no Simkl call. Renders the last manual
 // check's state (or the stored-token state). Used on the Simkl tab open.
+const SIMKL_UI = new Map();
+
 async function checkSimklStatus(id) {
   const card = document.querySelector(`[data-id="${id}"]`);
-  const flowEl = card.querySelector('.simkl-flow');
+  const flowEl = card?.querySelector('.simkl-flow');
   if (!flowEl) return;
   try {
     const r = await api(`/profiles/${id}/simkl/status`);
@@ -1219,7 +1221,7 @@ async function checkSimklStatus(id) {
 // rate_limited, provider_unavailable, missing_configuration.
 async function checkSimklLive(id) {
   const card = document.querySelector(`[data-id="${id}"]`);
-  const flowEl = card.querySelector('.simkl-flow');
+  const flowEl = card?.querySelector('.simkl-flow');
   if (!flowEl) return;
   flowEl.innerHTML = '<span class="muted">⟳ Checking Simkl live…</span>';
   try {
@@ -1234,7 +1236,7 @@ async function checkSimklLive(id) {
 // with the latest check state.
 function renderSimklFlow(id, r) {
   const card = document.querySelector(`[data-id="${id}"]`);
-  const flowEl = card.querySelector('.simkl-flow');
+  const flowEl = card?.querySelector('.simkl-flow');
   if (!flowEl) return;
   // Update the header badge to match the latest live check.
   const badge = card.querySelector('.hdr-badge');
@@ -1271,92 +1273,60 @@ function renderSimklFlow(id, r) {
     flowEl.innerHTML = `<div><button onclick="connectSimkl('${id}')">Connect Simkl</button>${r.message ? ` <span class="muted">— ${esc(r.message)}</span>` : ''}</div>
       <div class="flow-status" style="margin-top:10px"></div>`;
   }
+  const ui = SIMKL_UI.get(id);
+  if (ui?.instructions) flowEl.querySelector('.flow-status').innerHTML = ui.instructions;
+  if (ui?.message) flowEl.insertAdjacentHTML('beforeend', '<div class="simkl-attempt-error" style="color:var(--err)">' + esc(ui.message) + '</div>');
 }
 
 async function connectSimkl(id) {
-  const card = document.querySelector(`[data-id="${id}"]`);
-  const statusEl = card.querySelector('.simkl-flow .flow-status');
+  const previous = SIMKL_UI.get(id);
+  if (previous?.timer) clearInterval(previous.timer);
+  const ui = { instructions: '', message: '', busy: false };
+  SIMKL_UI.set(id, ui);
   try {
-    // Save the selected auth version BEFORE Connect (so the backend launches
-    // the correct flow even if the user just changed the selector).
     await saveSimkl(id);
-    const r = await api(`/profiles/${id}/simkl/connect`, { method: 'POST' });
+    const r = await api('/profiles/' + id + '/simkl/connect', { method: 'POST' });
+    if (SIMKL_UI.get(id) !== ui) return;
     if (r.authorize_url) {
-      // V2 OAuth: the user clicks the authorize URL in their browser.
-      // Show the exact server-derived callback URI for transparency.
       const cbUri = PROFILES.find(p => p.id === id)?.simkl_v2_callback_uri || '';
-      statusEl.innerHTML = `Click <a href="${r.authorize_url}" target="_blank" style="color:var(--accent)">Authorize with Simkl</a> to complete the connection.
-        <div class="muted">Callback URI: <code>${esc(cbUri)}</code></div>
-        <div class="muted">You'll be redirected back here automatically after authorizing.</div>`;
-      // Bounded poll: poll the specific connection attempt by flow_id.
-      // Stop only when THAT attempt reaches a terminal state (completed/failed).
-      const deadline = Date.now() + 10 * 60e3;
-      const poll = setInterval(async () => {
-        if (Date.now() > deadline) { clearInterval(poll); checkSimklStatus(id); return; }
-        try {
-          const { connection_attempt } = await api(`/profiles/${id}/simkl/status?flow_id=${r.flow_id}`);
-          if (connection_attempt && (connection_attempt.state === 'completed' || connection_attempt.state === 'failed')) {
-            clearInterval(poll);
-            if (connection_attempt.state === 'completed') {
-              toast(connection_attempt.result === 'connected' ? 'Simkl connected 🎉' : 'Simkl token stored');
-              // Reload profile data so active version/credentials/actions
-              // describe the promoted grant.
-              const { profiles } = await api('/profiles');
-              PROFILES = profiles;
-              renderSelected();
-              checkSimklStatus(id);
-            } else {
-              // Render the terminal failure message as part of the final
-              // flow UI, after the active-grant render. Keep it visible
-              // with existing connection controls.
-              await checkSimklStatus(id);
-              const card = document.querySelector(`[data-id="${id}"]`);
-              const flowEl = card?.querySelector('.simkl-flow');
-              if (flowEl) {
-                flowEl.insertAdjacentHTML('beforeend', `<div style="margin-top:8px"><span style="color:var(--err)">${esc(connection_attempt.message)}</span></div>`);
-              }
-            }
-          }
-        } catch { /* transient */ }
-      }, 3000);
+      ui.instructions = 'Click <a href="' + esc(r.authorize_url) + '" target="_blank" rel="noopener" style="color:var(--accent)">Authorize with Simkl</a> to complete the connection.'
+        + '<div class="muted">Callback URI: <code>' + esc(cbUri) + '</code></div>';
     } else {
-      // V1 PIN flow.
-      const { user_code, verification_url } = r;
-      statusEl.innerHTML = `Go to <a href="${verification_url}" target="_blank" style="color:var(--accent)">${verification_url}</a> and enter:
-        <div class="pin">${user_code}</div><div class="muted">Waiting for authorization…</div>`;
-      // Bounded poll: poll the specific connection attempt by flow_id.
-      const deadline = Date.now() + 15 * 60e3;
-      const poll = setInterval(async () => {
-        if (Date.now() > deadline) { clearInterval(poll); checkSimklStatus(id); return; }
-        try {
-          const { connection_attempt } = await api(`/profiles/${id}/simkl/status?flow_id=${r.flow_id}`);
-          if (connection_attempt && (connection_attempt.state === 'completed' || connection_attempt.state === 'failed')) {
-            clearInterval(poll);
-            if (connection_attempt.state === 'completed') {
-              toast(connection_attempt.result === 'connected' ? 'Simkl connected 🎉' : 'Simkl token stored');
-              // Reload profile data so active version/credentials/actions
-              // describe the promoted grant.
-              const { profiles } = await api('/profiles');
-              PROFILES = profiles;
-              renderSelected();
-              checkSimklStatus(id);
-            } else {
-              // Render the terminal failure message as part of the final
-              // flow UI, after the active-grant render. Keep it visible
-              // with existing connection controls.
-              await checkSimklStatus(id);
-              const card = document.querySelector(`[data-id="${id}"]`);
-              const flowEl = card?.querySelector('.simkl-flow');
-              if (flowEl) {
-                flowEl.insertAdjacentHTML('beforeend', `<div style="margin-top:8px"><span style="color:var(--err)">${esc(connection_attempt.message)}</span></div>`);
-              }
-            }
-          }
-        } catch { /* transient */ }
-      }, 3000);
+      ui.instructions = 'Go to <a href="' + esc(r.verification_url) + '" target="_blank" rel="noopener">Simkl PIN</a> and enter: <div class="pin">'
+        + esc(r.user_code) + '</div><div class="muted">Waiting for authorization…</div>';
     }
+    await checkSimklStatus(id);
+    if (SIMKL_UI.get(id) !== ui) return;
+    const deadline = Date.now() + (r.authorize_url ? 10 : 15) * 60e3;
+    ui.timer = setInterval(async () => {
+      if (ui.busy || SIMKL_UI.get(id) !== ui) return;
+      ui.busy = true;
+      try {
+        const result = Date.now() > deadline
+          ? { connection_attempt: { state: 'failed', message: 'Connection expired — start again' } }
+          : await api('/profiles/' + id + '/simkl/status?flow_id=' + encodeURIComponent(r.flow_id));
+        if (SIMKL_UI.get(id) !== ui) return;
+        const attempt = result.connection_attempt;
+        if (!attempt || !['completed', 'failed'].includes(attempt.state)) return;
+        if (attempt.state === 'completed') {
+          const profiles = (await api('/profiles')).profiles;
+          if (SIMKL_UI.get(id) !== ui) return;
+          PROFILES = profiles;
+          ui.instructions = '';
+          if (SELECTED === id) renderSelected();
+          toast(attempt.result === 'connected' ? 'Simkl connected 🎉' : 'Simkl token stored — run Check connection');
+        } else ui.message = attempt.message;
+        clearInterval(ui.timer);
+        ui.instructions = '';
+        await checkSimklStatus(id);
+      } catch { /* retry transient local HTTP failure until the deadline */ }
+      finally { ui.busy = false; }
+    }, 3000);
   } catch (err) {
-    statusEl.innerHTML = `<span style="color:var(--err)">${esc(err.message)}</span>`;
+    if (SIMKL_UI.get(id) !== ui) return;
+    ui.instructions = '';
+    ui.message = err.message;
+    await checkSimklStatus(id);
   }
 }
 
@@ -1371,6 +1341,9 @@ async function connectSimklV2(id) {
 }
 
 async function disconnectSimkl(id) {
+  const ui = SIMKL_UI.get(id);
+  if (ui?.timer) clearInterval(ui.timer);
+  SIMKL_UI.delete(id);
   await api(`/profiles/${id}/simkl/disconnect`, { method: 'POST' });
   checkSimklStatus(id);
 }
@@ -1978,30 +1951,20 @@ async function pollStatus() {
 // The callback redirects to /configure/#simkl?error=<message> on failure.
 // This reader shows the error in the Simkl tab so the user sees an actionable
 // result rather than a silent redirect.
-function readSimklCallbackError() {
-  const hash = window.location.hash; // e.g. #simkl?error=...
-  if (!hash || !hash.startsWith('#simkl')) return;
-  const q = new URLSearchParams(hash.slice('#simkl'.length));
-  const error = q.get('error');
-  if (!error) return;
-  // Clear the hash so it doesn't re-trigger on the next poll.
+async function readSimklCallbackError() {
+  if (!window.location.hash.startsWith('#simkl')) return;
+  const q = new URLSearchParams(window.location.hash.slice('#simkl'.length));
+  const profileId = q.get('profile');
+  if (profileId && PROFILES.some(p => p.id === profileId)) {
+    SELECTED = profileId;
+    renderTopBar();
+    renderSelected();
+  }
   history.replaceState(null, '', window.location.pathname);
-  // Show the error in the selected profile's Simkl tab.
-  const card = document.querySelector(`[data-id="${SELECTED}"]`);
-  if (!card) return;
-  const flowEl = card.querySelector('.simkl-flow');
-  if (!flowEl) return;
-  // If the profile has a V1 grant active, show the V1 actions alongside the error.
-  const p = PROFILES.find(x => x.id === SELECTED);
-  const v1Active = p && p.simkl_active_version === 1;
-  const v1Actions = v1Active ? `<div style="margin-top:8px" class="row">
-    <button class="ghost" onclick="syncSimkl('${SELECTED}', this)">Sync watched now</button>
-    <button class="ghost" onclick="disconnectSimkl('${SELECTED}')">Disconnect</button>
-  </div>` : '';
-  flowEl.innerHTML = `<div style="color:var(--err)">✗ ${esc(error)}</div>
-    <div style="margin-top:8px"><button onclick="connectSimklV2('${SELECTED}')">Start V2 connection</button></div>
-    ${v1Actions}
-    <div class="flow-status" style="margin-top:10px"></div>`;
+  if (q.get('error') && SELECTED) SIMKL_UI.set(SELECTED, { message: q.get('error') });
+  const card = document.querySelector('[data-id="' + SELECTED + '"]');
+  if (card) activateTab(card, 'simkl', { silent: true });
+  if (SELECTED) await checkSimklStatus(SELECTED);
 }
 
 load().then(() => readSimklCallbackError());

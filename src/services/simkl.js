@@ -10,6 +10,7 @@
 //   - Reads are 10/s, writes 1/s (the rate governor, a later slice, will pace
 //     the sync traffic; auth calls here are one-offs).
 const governor = require('./governor');
+const http = require('./simklHttp');
 const API = 'https://api.simkl.com';
 const USER_AGENT = 'AI-Recommender/1.0 (+https://github.com/jamesgallagher/Stremio_AI_Recommender)';
 const APP_NAME = 'AI-Recommender';
@@ -35,13 +36,12 @@ function headers(accessToken) {
 // Start: returns { user_code, verification_url, expires_in, interval }. The user
 // enters user_code at verification_url (simkl.com/pin); we then poll.
 async function startPinFlow(clientId) {
-  const res = await fetch(withParams(clientId, '/oauth/pin'), { headers: headers() });
+  const { response: res, data: dc } = await http.json(withParams(clientId, '/oauth/pin'), { headers: headers() });
   if (!res.ok) {
-    const body = (await res.text().catch(() => '')).slice(0, 200);
-    throw new Error(`Simkl PIN request failed (${res.status})${body ? `: ${body}` : ''} — check the Client ID`);
+    throw new Error(`Simkl PIN request failed (${res.status}) — check the Client ID`);
   }
-  const dc = await res.json();
-  if (!dc.user_code) throw new Error('Simkl did not return a user code — check the Client ID');
+
+  if (!dc?.user_code) throw new Error('Simkl did not return a user code — check the Client ID');
   return dc;
 }
 
@@ -49,14 +49,12 @@ async function startPinFlow(clientId) {
 // { result: 'KO' } while pending. Mirrors the Trakt poll shape our portal
 // expects ({ pending } | { token } | { error }).
 async function pollPin(clientId, userCode) {
-  const res = await fetch(withParams(clientId, `/oauth/pin/${encodeURIComponent(userCode)}`), { headers: headers() });
+  const { response: res, data } = await http.json(withParams(clientId, `/oauth/pin/${encodeURIComponent(userCode)}`), { headers: headers() });
   if (res.status === 404) return { error: 'PIN expired — start again' };
   if (!res.ok) {
-    const body = (await res.text().catch(() => '')).slice(0, 200);
-    return { error: `Simkl PIN poll failed (${res.status})${body ? `: ${body}` : ''}` };
+    return { error: `Simkl PIN poll failed (${res.status})` };
   }
-  const data = await res.json();
-  if (data.result === 'OK' && data.access_token) {
+  if (data?.result === 'OK' && data.access_token) {
     // Simkl access tokens are long-lived (no refresh cycle like Trakt).
     return { token: { access_token: data.access_token, connected_at: Date.now() } };
   }
@@ -86,29 +84,14 @@ async function checkConnection(clientId, accessToken) {
 // Returns { name, id } where id is the stable Simkl account ID (user_id)
 // if the provider returns one; name is the display name/username.
 async function accountName(clientId, accessToken) {
-  const res = await fetch(withParams(clientId, '/users/settings'), { headers: headers(accessToken) });
-  if (!res.ok) return null;
-  const data = await res.json();
-  const name = data?.user?.name || data?.user?.username || null;
-  const id = data?.user?.id || data?.user?.user_id || null;
-  return { name, id };
+  const { response, data } = await http.json(withParams(clientId, '/users/settings'), { headers: headers(accessToken) });
+  if (!response.ok) return null;
+  const id = data?.user?.id ?? data?.user?.user_id ?? null;
+  return { name: data?.user?.name || data?.user?.username || null, id };
 }
 
-// Bounded fetch (mandate M6): the manual check must not hang the portal. A
-// timeout is a distinct, visible "unreachable" result, not a silent failure.
-// The provider's one-request check stays out of the recurring background poll.
-const CHECK_TIMEOUT_MS = 10000;
-async function boundedFetch(url, opts = {}) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), CHECK_TIMEOUT_MS);
-  try {
-    return await fetch(url, { ...opts, signal: controller.signal });
-  } catch (err) {
-    if (err.name === 'AbortError') throw new Error('Simkl unreachable (timeout)');
-    throw new Error(`Simkl unreachable: ${err.message}`);
-  } finally {
-    clearTimeout(timer);
-  }
+function boundedFetch(url, opts = {}) {
+  return http.request(url, opts);
 }
 
 // ---- Shared auth resolution (SIMKL-AUTH-1 Step 3) ----
@@ -153,9 +136,11 @@ function resolveAuth(profile) {
 const EXPIRY_MARGIN_MS = 60 * 1000; // refresh 60 s before expiry
 
 async function simklFetch(profile, path, { method = 'GET', extra = {}, body = null, lane = 'simkl_get' } = {}) {
+  const managed = !!require('../config').getProfile(profile.id);
   let auth = resolveAuth(profile);
   if (!auth) throw new Error('Simkl is not connected for this profile');
   let { clientId, token, version } = auth;
+  let didRefresh = false;
   // Proactive expiry check: if the token is expired or about to expire,
   // refresh before sending the request (V2 only). After a successful refresh,
   // re-resolve the persisted active grant so the first API call uses the NEW
@@ -172,6 +157,7 @@ async function simklFetch(profile, path, { method = 'GET', extra = {}, body = nu
         throw new Error('Simkl grant changed before proactive refresh — abort');
       }
       const refreshed = await refreshV2(profile).catch(() => null);
+      didRefresh = true;
       if (refreshed) {
         // Re-read the grant to confirm the refresh persisted for the SAME
         // grant (same client binding, same version).
@@ -200,9 +186,9 @@ async function simklFetch(profile, path, { method = 'GET', extra = {}, body = nu
     // Re-read the grant from the store (falls back to the passed profile if
     // it is not in the store — e.g. a local test profile). A disconnect or
     // account replacement while this call was queued must abort the send.
-    const after = require('../config').getProfile(profile.id) || profile;
-    const current = resolveAuth(after);
-    if (!current || current.token !== token || current.version !== version) {
+    const after = require('../config').getProfile(profile.id) || (managed ? null : profile);
+    const current = after && resolveAuth(after);
+    if (!current || current.token !== token || current.version !== version || current.clientId !== clientId) {
       throw new Error('Simkl grant changed while queued — abort');
     }
     return fetch(withParams(current.clientId, path, extra), {
@@ -213,7 +199,7 @@ async function simklFetch(profile, path, { method = 'GET', extra = {}, body = nu
   });
   if (res.status === 401) {
     // Only refresh an active V2 grant on 401. A V1 grant is never refreshed.
-    if (version === 2) {
+    if (version === 2 && !didRefresh) {
       // Bind the refresh and retry to the grant that sent the failed request.
       // If the stored grant was replaced (different account, disconnect,
       // reauthorization) before 401 handling, abort without refreshing or
@@ -274,7 +260,7 @@ async function refreshV2(profile) {
   const config = require('../config');
   const fresh = config.getProfile(profile.id);
   if (!fresh?.simkl_auth?.access_token || fresh.simkl_auth.version !== 2) return null;
-  if (!fresh.simkl_auth.refresh_token) return null;
+  if (!fresh.simkl_auth.refresh_token || !resolveAuth(fresh)) return null;
   // Key the single-flight to the specific grant (access_token + refresh_token):
   // a concurrent refresh for the SAME grant joins the in-flight one; a
   // different grant (new authorization) starts a fresh refresh.
@@ -289,7 +275,11 @@ async function refreshV2(profile) {
     if (!after?.simkl_auth?.access_token || after.simkl_auth.version !== 2) return null;
     // Update only if the grant still matches (same access_token as before the
     // refresh — a new authorization would have a different token).
-    if (after.simkl_auth.access_token !== fresh.simkl_auth.access_token) return null;
+    if (after.simkl_auth.access_token !== fresh.simkl_auth.access_token
+      || after.simkl_auth.refresh_token !== fresh.simkl_auth.refresh_token
+      || after.simkl_auth.client_id !== fresh.simkl_auth.client_id
+      || after.keys.simkl_v2_client_id !== fresh.keys.simkl_v2_client_id
+      || after.keys.simkl_v2_client_secret !== fresh.keys.simkl_v2_client_secret) return null;
     config.updateProfile(profile.id, {
       simkl_auth: {
         ...after.simkl_auth,
@@ -320,51 +310,71 @@ async function refreshV2(profile) {
 // Simkl's documented stable `error` identifiers (conventions/errors) are parsed
 // by identifier + HTTP status — never by pattern-matching provider prose, and
 // the provider body is never echoed to the browser (M4).
+function checkFingerprint(p) {
+  const version = p.simkl_auth ? (p.simkl_auth.version || 1) : (p.simkl_auth_version || 2);
+  const clientId = p.simkl_auth?.client_id || '';
+  const credential = version === 2 ? 'simkl_v2_client_' : 'simkl_client_';
+  const digest = require('crypto').createHash('sha256').update(JSON.stringify([
+    p.simkl_auth?.access_token || '', p.keys?.[credential + 'id'] || '', p.keys?.[credential + 'secret'] || '',
+  ])).digest('hex').slice(0, 16);
+  return [p.id, version, clientId, digest].join(':');
+}
+
 async function manualCheck(profile) {
+  const result = await manualCheckImpl(profile);
+  return { ...result, check_fingerprint: result.check_fingerprint || checkFingerprint(profile) };
+}
+
+async function manualCheckImpl(profile) {
   const version = profile.simkl_auth_version || 2;
   const auth = profile.simkl_auth;
-  const hasToken = !!(auth && auth.access_token);
-
-  if (hasToken) {
-    // Active token + matching active client ID → verify /sync/activities.
-    const clientId = auth.version === 2 ? profile.keys.simkl_v2_client_id : profile.keys.simkl_client_id;
-    let token = auth.access_token;
-    if (!clientId) {
-      return { state: 'credential_mismatch', message: 'Simkl credential missing — reconnect the account' };
-    }
-    // The active token must be bound to the client ID that minted it (M3). A
-    // changed/replaced credential while connected is a mismatch, never a
-    // user API call with a mismatched pair.
-    if (auth.client_id && auth.client_id !== clientId) {
-      return { state: 'credential_mismatch', message: 'Simkl credential changed since this token was issued — reconnect' };
-    }
+  if (auth?.access_token) {
+    const config = require('../config');
+    const managed = !!config.getProfile(profile.id);
+    let checked = profile;
+    const unchanged = () => {
+      const current = config.getProfile(profile.id) || (managed ? null : checked);
+      return current && checkFingerprint(current) === checkFingerprint(checked);
+    };
+    const mismatch = { state: 'credential_mismatch', message: 'Simkl connection changed or token rejected — reconnect or check again' };
+    const refresh = async () => {
+      if (!unchanged()) return false;
+      const tokens = await refreshV2(checked).catch(() => null);
+      const after = config.getProfile(profile.id);
+      if (!tokens || !after || after.simkl_auth?.access_token !== tokens.access_token || !resolveAuth(after)) return false;
+      checked = after;
+      return true;
+    };
+    if (!resolveAuth(checked) || !unchanged()) return mismatch;
     try {
-      const res = await boundedFetch(withParams(clientId, '/sync/activities'), { headers: headers(token) });
+      let didRefresh = false;
+      if (auth.version === 2 && auth.expires_at && Date.now() >= auth.expires_at - EXPIRY_MARGIN_MS) {
+        if (!await refresh()) return mismatch;
+        didRefresh = true;
+      }
+      let active = resolveAuth(checked);
+      let res = await boundedFetch(withParams(active.clientId, '/sync/activities'), { headers: headers(active.token) });
+      if (!unchanged()) return mismatch;
+      if (res.status === 401 && active.version === 2 && !didRefresh) {
+        if (!await refresh()) return mismatch;
+        didRefresh = true;
+        active = resolveAuth(checked);
+        res = await boundedFetch(withParams(active.clientId, '/sync/activities'), { headers: headers(active.token) });
+        if (!unchanged()) return mismatch;
+      }
       if (res.ok) {
-        const info = await accountName(clientId, token).catch(() => null);
-        return { state: 'connected', message: 'Connected and verified', username: info?.name || auth.username || null, account_id: info?.id || null };
+        const info = await accountName(active.clientId, active.token).catch(() => null);
+        if (!unchanged()) return mismatch;
+        if (info?.id != null && checked.simkl_auth.account_id != null && String(info.id) !== String(checked.simkl_auth.account_id)) return mismatch;
+        return { state: 'connected', message: didRefresh ? 'Connected and verified (token refreshed)' : 'Connected and verified',
+          username: info?.name || checked.simkl_auth.username || null, account_id: info?.id ?? null,
+          check_fingerprint: checkFingerprint(checked) };
       }
-      // V2: a 401 may be an expired token — attempt one refresh before
-      // declaring the grant rejected (Blocker 6).
-      if (res.status === 401 && auth.version === 2) {
-        const refreshed = await refreshV2(profile).catch(() => null);
-        if (refreshed) {
-          const res2 = await boundedFetch(withParams(clientId, '/sync/activities'), { headers: headers(refreshed.access_token) });
-          if (res2.ok) {
-            const info = await accountName(clientId, refreshed.access_token).catch(() => null);
-            return { state: 'connected', message: 'Connected and verified (token refreshed)', username: info?.name || auth.username || null, account_id: info?.id || null };
-          }
-        }
-      }
-      if (res.status === 401 || res.status === 403) {
-        return { state: 'credential_mismatch', message: 'Token rejected by Simkl — reconnect the account' };
-      }
-      if (res.status === 429) {
-        return { state: 'rate_limited', message: 'Simkl rate limit — try again shortly' };
-      }
-      return { state: 'provider_unavailable', message: `Simkl returned ${res.status}` };
+      if (res.status === 401 || res.status === 403) return mismatch;
+      if (res.status === 429) return { state: 'rate_limited', message: 'Simkl rate limit — try again shortly' };
+      return { state: 'provider_unavailable', message: 'Simkl returned ' + res.status };
     } catch (err) {
-      return { state: 'provider_unavailable', message: err.message };
+      return { state: 'provider_unavailable', message: err.message.includes('timeout') ? 'Simkl unreachable (timeout)' : 'Simkl unreachable — try again later' };
     }
   }
 
@@ -377,11 +387,11 @@ async function manualCheck(profile) {
     // One GET /oauth/pin compatibility probe; discard the returned PIN. This
     // tells us whether the V1 app can start the PIN flow (no grant exists yet).
     try {
-      const res = await boundedFetch(withParams(clientId, '/oauth/pin'), { headers: headers() });
+      const { response: res, data } = await http.json(withParams(clientId, '/oauth/pin'), { headers: headers() });
       if (res.ok) {
         return { state: 'v1_ready_unconnected', message: 'V1 app accepted; Simkl account not connected. Click Connect.' };
       }
-      const body = await res.json().catch(() => ({}));
+      const body = data || {};
       // 400 unauthorized_client: Simkl's documented V2-ID-on-V1-endpoint error.
       if (res.status === 400 && body.error === 'unauthorized_client') {
         return { state: 'wrong_auth_version', message: 'This is a V2 app; select AUTH V2 and connect with the new flow.' };
@@ -393,7 +403,7 @@ async function manualCheck(profile) {
       }
       return { state: 'provider_unavailable', message: `Simkl returned ${res.status}` };
     } catch (err) {
-      return { state: 'provider_unavailable', message: err.message };
+      return { state: 'provider_unavailable', message: err.message.includes('timeout') ? 'Simkl unreachable (timeout)' : 'Simkl unreachable — try again later' };
     }
   }
 
@@ -793,6 +803,7 @@ module.exports = {
   pollPin,
   checkConnection,
   manualCheck,
+  checkFingerprint,
   accountName,
   resolveAuth,
   simklFetch,

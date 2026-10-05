@@ -1,7 +1,7 @@
 // Simkl V2 OAuth (authorization code + PKCE S256) — server-side only.
 //
-// The browser never sees the Client Secret, code_verifier, authorization code,
-// or any token (mandate M4). The AIR backend receives the callback, holds the
+// The frontend never receives the Client Secret, code_verifier, or tokens.
+// The browser carries the authorization code to the backend callback, which holds the
 // secret and tokens, and makes Simkl API calls.
 //
 // Flow:
@@ -23,7 +23,7 @@
 // The returned granted scope must include both; a read-only grant is rejected.
 
 const crypto = require('crypto');
-const config = require('../config');
+const http = require('./simklHttp');
 
 const SIMKL_AUTHORIZE = 'https://simkl.com/oauth2/authorize';
 const SIMKL_TOKEN = 'https://api.simkl.com/oauth2/token';
@@ -178,7 +178,7 @@ async function handleCallback(profile, { code, state, iss }) {
   // recorded at startFlow must match the profile's current V2 Client ID.
   // A changed credential means the flow was started with a different app
   // registration; the token would be bound to the old registration.
-  if (flow.client_id !== profile.keys.simkl_v2_client_id) {
+  if (flow.client_id !== profile.keys.simkl_v2_client_id || flow.client_secret !== profile.keys.simkl_v2_client_secret) {
     const err = new Error('V2 Client ID changed during the flow — start again');
     err.state = 'credential_changed';
     throw err;
@@ -195,7 +195,7 @@ async function handleCallback(profile, { code, state, iss }) {
     client_secret: flow.client_secret,
     code_verifier: flow.code_verifier,
   });
-  const res = await fetch(SIMKL_TOKEN, {
+  const { response: res, data } = await http.json(SIMKL_TOKEN, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
@@ -205,7 +205,8 @@ async function handleCallback(profile, { code, state, iss }) {
     err.state = 'exchange_failed';
     throw err;
   }
-  const data = await res.json();
+
+  if (!data || typeof data !== 'object') throw new Error('Simkl returned an invalid token response');
   // Validate the returned grant. Require nonempty access_token AND
   // refresh_token, positive finite expires_in, and exact granted scope members.
   if (!data.access_token || typeof data.access_token !== 'string') {
@@ -254,13 +255,13 @@ async function refreshToken(profile) {
     client_id: profile.keys.simkl_v2_client_id,
     client_secret: profile.keys.simkl_v2_client_secret,
   });
-  const res = await fetch(SIMKL_TOKEN, {
+  const { response: res, data } = await http.json(SIMKL_TOKEN, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
   });
   if (!res.ok) throw new Error(`Simkl token refresh failed (${res.status})`);
-  const data = await res.json();
+
   if (!data.access_token || typeof data.access_token !== 'string') {
     throw new Error('Simkl did not return a refreshed access token');
   }
@@ -285,7 +286,7 @@ async function revokeToken(profile) {
     client_secret: profile.keys.simkl_v2_client_secret,
   });
   try {
-    await fetch(SIMKL_REVOKE, {
+    await http.request(SIMKL_REVOKE, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: body.toString(),

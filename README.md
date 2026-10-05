@@ -136,13 +136,16 @@ supported per profile:
 - **AUTH V2** — OAuth authorization code + PKCE (S256). The browser is
   redirected to Simkl's consent page; Simkl redirects back to the callback
   URI with an authorization code. The addon exchanges the code for tokens
-  server-side. V2 tokens are refreshed on 401 via the refresh-token grant.
+  server-side. V2 tokens are refreshed shortly before expiry or once after a
+  401, using the refresh-token grant.
 
 ### Server app registration
 
 Create a Simkl API app at [simkl.com/settings/developer](https://simkl.com/settings/developer)
 for each family member (or one per profile). Two separate registrations are
-needed if you want both V1 and V2:
+needed if you want both V1 and V2. For V2 choose **Server apps & services**
+(Client ID + secret). AIR's backend handles the callback and token exchange;
+the secret stays on the server. V1 is for existing legacy registrations:
 
 | Field | AUTH V1 | AUTH V2 |
 |---|---|---|
@@ -175,8 +178,11 @@ reported, never a user API call with a mismatched pair).
 
 ### Check connection
 
-The **Check connection** button (`POST /simkl/check`) makes a live one-request
-call to Simkl (`/sync/activities`) and returns a structured state:
+The **Check connection** button (`POST /simkl/check`) verifies the active
+grant with `/sync/activities` and `/users/settings`, refreshing V2 if needed.
+Each provider request, including response parsing, has a 10-second deadline.
+Without a token, V1 checks app readiness using a PIN probe; V2 requires OAuth.
+The button returns a structured state:
 
 | State | Meaning |
 |---|---|
@@ -192,7 +198,16 @@ call to Simkl (`/sync/activities`) and returns a structured state:
 
 Only `connected` is a success badge. A stored token alone is "token stored",
 never "connected" — the passive status poll (`GET /simkl/status`) reads the
-last manual check's state without making a provider call.
+last verification for the current grant without making a provider call.
+
+During reauthorization, the existing grant stays active until the new account
+is verified. A different account or unavailable identity check preserves the
+existing grant and reports failure. A first connection with no prior grant
+may retain an unverified token as "token stored". Disconnect, credential edits,
+or a newer connection attempt prevent an older attempt from replacing tokens.
+Pending connections are held in memory; after a server restart, start Connect
+again. The Configure page follows the specific connection attempt, not the
+previous account's connected status.
 
 ### V2 Client Secret handling (M4)
 

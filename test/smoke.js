@@ -1722,6 +1722,10 @@ ok('simkl-auth T1: V1 profile migrates to preferred V1 without token/ID/secret l
   delete legacyUnconfigured.simkl_auth_version; // force the legacy shape
   config.applyMigrations(legacyUnconfigured);
   assert.strictEqual(legacyUnconfigured.simkl_auth_version, 2, 'unconfigured legacy profile defaults to V2');
+  const existingV2 = { ...legacyUnconfigured, keys: { ...legacyUnconfigured.keys, simkl_client_id: 'retained-v1-id' }, simkl_auth: { version: 2, access_token: 'fake-v2-token', client_id: 'fake-v2-id' } };
+  delete existingV2.simkl_auth_version;
+  config.applyMigrations(existingV2);
+  assert.strictEqual(existingV2.simkl_auth_version, 2, 'active V2 grant defaults to V2 even when old V1 credentials remain');
   config.removeProfile(p3.id);
 
   // (d) Two profiles can select different versions (the preference is per-profile).
@@ -7094,19 +7098,20 @@ async function httpTests() {
         assert.strictEqual(res.status, 302, 'missing issuer redirects');
         const loc = res.headers.get('location');
         assert.ok(loc.includes('error='), 'redirected with an error message');
-        // The flow is NOT consumed (no token exchange happened).
-        assert.ok(simklAuthV2.getFlow(p.id), 'flow still pending after missing-issuer rejection');
+        assert.strictEqual(simklAuthV2.getFlow(p.id), null, 'matching flow consumed after missing-issuer rejection');
       }
       // (b) Wrong issuer → reject.
       {
-        const res = await origFetch(`${BASE}/simkl/oauth2/callback?code=auth-code-1&state=${encodeURIComponent(state)}&iss=https://evil.com`, { redirect: 'manual' });
+        const wrongIssuerFlow = simklAuthV2.startFlow(config.getProfile(p.id), 'https://example.com/simkl/oauth2/callback');
+        const res = await origFetch(`${BASE}/simkl/oauth2/callback?code=auth-code-1&state=${encodeURIComponent(wrongIssuerFlow.state)}&iss=https://evil.com`, { redirect: 'manual' });
         assert.strictEqual(res.status, 302, 'wrong issuer redirects');
         const loc = res.headers.get('location');
         assert.ok(loc.includes('error='), 'redirected with an error message');
-        assert.ok(simklAuthV2.getFlow(p.id), 'flow still pending after wrong-issuer rejection');
+        assert.strictEqual(simklAuthV2.getFlow(p.id), null, 'matching flow consumed after wrong-issuer rejection');
       }
       // (c) Cancellation without matching state → redirect with error message.
       {
+        simklAuthV2.startFlow(config.getProfile(p.id), 'https://example.com/simkl/oauth2/callback');
         const res = await origFetch(`${BASE}/simkl/oauth2/callback?error=access_denied&state=unknown-state`, { redirect: 'manual' });
         assert.strictEqual(res.status, 302, 'unknown-state cancellation redirects');
         const loc = res.headers.get('location');
@@ -8857,10 +8862,178 @@ async function httpTests() {
     config.removeProfile(profA.id);
     config.removeProfile(profB.id);
     process.env.EXTERNAL_URL = savedExternalUrl;
-    console.log('  ✓ T6: Isolation — other-profile/unknown flow IDs cannot complete or reveal state');
+    console.log('  ✓ T6: Isolation — other-profile/unknown flow IDs cannot create or reveal state');
   }
 
-  console.log(`\nAll checks passed (${passed} unit + 59 async/http + T1-T6).`);
+  // T7: real local HTTP, fake provider only, explicit barriers (no sleeps).
+  {
+    const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
+    const within = async promise => {
+      let timer;
+      try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('T7 barrier timed out')), 5000); })]); }
+      finally { clearTimeout(timer); }
+    };
+    for (const change of ['supersede', 'disconnect', 'credential', 'reject']) {
+      const p = config.addProfile('T7-' + change);
+      config.updateProfile(p.id, { keys: { simkl_client_id: 'fake-pin-client' }, simkl_auth_version: 1 });
+      const transport = global.fetch;
+      const entered = deferred(), release = deferred();
+      let starts = 0, pending;
+      global.fetch = async (url, opts) => {
+        const u = new URL(String(url));
+        if (u.hostname !== 'api.simkl.com') return transport(url, opts);
+        if (u.pathname === '/oauth/pin') {
+          const n = ++starts;
+          if (n === 1) {
+            entered.resolve(); await release.promise;
+            if (change === 'reject') throw new Error('Fake provider rejected startup');
+          }
+          return { ok: true, status: 200, json: async () => ({ user_code: 'FAKE-' + n, expires_in: 900, interval: 5 }) };
+        }
+        if (u.pathname.startsWith('/oauth/pin/')) return { ok: true, json: async () => ({ result: 'KO' }) };
+        throw new Error('Unexpected provider request: ' + u.pathname);
+      };
+      try {
+        pending = transport(BASE + '/api/profiles/' + p.id + '/simkl/connect', { method: 'POST', signal: AbortSignal.timeout(5000) });
+        pending.catch(() => {});
+        await within(entered.promise);
+        let newer;
+        if (change === 'supersede' || change === 'reject') {
+          newer = await (await transport(BASE + '/api/profiles/' + p.id + '/simkl/connect', { method: 'POST' })).json();
+          assert.ok(newer.flow_id);
+        } else if (change === 'disconnect') {
+          await transport(BASE + '/api/profiles/' + p.id + '/simkl/disconnect', { method: 'POST' });
+        } else {
+          await transport(BASE + '/api/profiles/' + p.id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ keys: { simkl_client_id: 'changed-client' } }) });
+        }
+        release.resolve();
+        const response = await within(pending);
+        assert.strictEqual(response.status, change === 'reject' ? 400 : 409);
+        if (newer) {
+          const status = await (await transport(BASE + '/api/profiles/' + p.id + '/simkl/status?flow_id=' + newer.flow_id)).json();
+          assert.strictEqual(status.connection_attempt.state, 'pending', 'old startup must not affect newer attempt');
+        } else {
+          const status = await (await transport(BASE + '/api/profiles/' + p.id + '/simkl/status')).json();
+          assert.strictEqual(status.flow, null, 'no late PIN poll installed');
+        }
+        assert.strictEqual(config.getProfile(p.id).simkl_auth, null);
+      } finally {
+        release.resolve();
+        if (pending) await pending.catch(() => {});
+        await transport(BASE + '/api/profiles/' + p.id + '/simkl/disconnect', { method: 'POST' });
+        global.fetch = transport;
+        config.removeProfile(p.id);
+      }
+      console.log('  ✓ T7: held PIN startup — ' + change);
+    }
+  }
+
+  // ---- T8: Identical/unrelated saves do not cancel pending authorization (round 6 Item 2) ----
+  {
+    // T8a: During a pending attempt: identical Simkl save → still pending.
+    const profA = config.addProfile('T8a-Save');
+    config.updateProfile(profA.id, {
+      keys: { simkl_v2_client_id: 'client-A', simkl_v2_client_secret: 'secret-A' },
+      simkl_auth: null,
+      simkl_auth_version: 2,
+    });
+    const connectA = await (await fetch(`${BASE}/api/profiles/${profA.id}/simkl/connect`, { method: 'POST' })).json();
+    assert.ok(connectA.flow_id, 'connect returns flow_id');
+    // PUT the identical Client ID, secret, and preferred version.
+    await fetch(`${BASE}/api/profiles/${profA.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keys: { simkl_v2_client_id: 'client-A', simkl_v2_client_secret: 'secret-A' }, simkl_auth_version: 2 }),
+    });
+    const statusA = await (await fetch(`${BASE}/api/profiles/${profA.id}/simkl/status?flow_id=${connectA.flow_id}`)).json();
+    assert.strictEqual(statusA.connection_attempt.state, 'pending', 'identical save → still pending');
+    config.removeProfile(profA.id);
+    console.log('  ✓ T8a: Identical Simkl save → still pending');
+
+    // T8b: Empty key patch → still pending.
+    const profB = config.addProfile('T8b-Save');
+    config.updateProfile(profB.id, {
+      keys: { simkl_v2_client_id: 'client-B', simkl_v2_client_secret: 'secret-B' },
+      simkl_auth: null,
+      simkl_auth_version: 2,
+    });
+    const connectB = await (await fetch(`${BASE}/api/profiles/${profB.id}/simkl/connect`, { method: 'POST' })).json();
+    // PUT an empty keys patch.
+    await fetch(`${BASE}/api/profiles/${profB.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keys: {} }),
+    });
+    const statusB = await (await fetch(`${BASE}/api/profiles/${profB.id}/simkl/status?flow_id=${connectB.flow_id}`)).json();
+    assert.strictEqual(statusB.connection_attempt.state, 'pending', 'empty key patch → still pending');
+    config.removeProfile(profB.id);
+    console.log('  ✓ T8b: Empty key patch → still pending');
+
+    // T8c: Unrelated API-key change → still pending.
+    const profC = config.addProfile('T8c-Save');
+    config.updateProfile(profC.id, {
+      keys: { simkl_v2_client_id: 'client-C', simkl_v2_client_secret: 'secret-C', mdblist_api_key: 'old-api-key' },
+      simkl_auth: null,
+      simkl_auth_version: 2,
+    });
+    const connectC = await (await fetch(`${BASE}/api/profiles/${profC.id}/simkl/connect`, { method: 'POST' })).json();
+    // PUT an unrelated API key change.
+    await fetch(`${BASE}/api/profiles/${profC.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keys: { mdblist_api_key: 'new-api-key' } }),
+    });
+    const statusC = await (await fetch(`${BASE}/api/profiles/${profC.id}/simkl/status?flow_id=${connectC.flow_id}`)).json();
+    assert.strictEqual(statusC.connection_attempt.state, 'pending', 'unrelated API-key change → still pending');
+    config.removeProfile(profC.id);
+    console.log('  ✓ T8c: Unrelated API-key change → still pending');
+
+    // T8d: Actual target Client ID change → failed.
+    const profD = config.addProfile('T8d-Save');
+    config.updateProfile(profD.id, {
+      keys: { simkl_v2_client_id: 'client-D', simkl_v2_client_secret: 'secret-D' },
+      simkl_auth: null,
+      simkl_auth_version: 2,
+    });
+    const connectD = await (await fetch(`${BASE}/api/profiles/${profD.id}/simkl/connect`, { method: 'POST' })).json();
+    // PUT the actual target Client ID change.
+    await fetch(`${BASE}/api/profiles/${profD.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keys: { simkl_v2_client_id: 'client-D2' } }),
+    });
+    const statusD = await (await fetch(`${BASE}/api/profiles/${profD.id}/simkl/status?flow_id=${connectD.flow_id}`)).json();
+    assert.strictEqual(statusD.connection_attempt.state, 'failed', 'actual Client ID change → failed');
+    config.removeProfile(profD.id);
+    console.log('  ✓ T8d: Actual target Client ID change → failed');
+
+    // T8e: Change back → still failed (terminal).
+    const profE = config.addProfile('T8e-Save');
+    config.updateProfile(profE.id, {
+      keys: { simkl_v2_client_id: 'client-E', simkl_v2_client_secret: 'secret-E' },
+      simkl_auth: null,
+      simkl_auth_version: 2,
+    });
+    const connectE = await (await fetch(`${BASE}/api/profiles/${profE.id}/simkl/connect`, { method: 'POST' })).json();
+    // Change the Client ID (invalidates the attempt).
+    await fetch(`${BASE}/api/profiles/${profE.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keys: { simkl_v2_client_id: 'client-E2' } }),
+    });
+    // Change back to the original Client ID.
+    await fetch(`${BASE}/api/profiles/${profE.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keys: { simkl_v2_client_id: 'client-E' } }),
+    });
+    const statusE = await (await fetch(`${BASE}/api/profiles/${profE.id}/simkl/status?flow_id=${connectE.flow_id}`)).json();
+    assert.strictEqual(statusE.connection_attempt.state, 'failed', 'change back → still failed (terminal)');
+    config.removeProfile(profE.id);
+    console.log('  ✓ T8e: Change back → still failed (terminal)');
+  }
+
+  console.log(`\nAll checks passed (${passed} unit + 59 async/http + T1-T8).`);
   process.exit(0);
 }
 

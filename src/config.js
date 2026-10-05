@@ -199,7 +199,7 @@ function applyMigrations(p) {
   if (p.simkl_auth_version === undefined) {
     const hasV1Token = p.simkl_auth && p.simkl_auth.access_token && p.simkl_auth.version !== 2;
     const hasV1Creds = p.keys.simkl_client_id || p.keys.simkl_client_secret;
-    p.simkl_auth_version = (hasV1Token || hasV1Creds) ? 1 : 2;
+    p.simkl_auth_version = p.simkl_auth?.version === 2 ? 2 : (hasV1Token || hasV1Creds) ? 1 : 2;
   }
   // AUTH V2: bind the active auth object to the client ID that minted it (M3).
   // Existing V1 tokens have no recorded client ID — best-effort bind to the
