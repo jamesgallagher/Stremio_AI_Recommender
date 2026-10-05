@@ -7047,7 +7047,8 @@ async function main() {
     // existed (oldVisible || listSize = listSize), so a short source never
     // published on first build. The fix: min(listSize, oldVisible) where a
     // missing old entry counts as 0 → gate = newVisible >= 0.
-    await it('CB-1 T10. swap gate: first build with short source publishes', async () => {
+    // Exercises the REAL rebuildProfile code path (not a copied formula).
+    await it('CB-1 T10. swap gate: first build with short source publishes (via rebuildProfile)', async () => {
       const origList = mdblist.listItemsPage;
       const origMediaInfo = mdblist.mediaInfoBatch;
       const p = config.addProfile('INT-CB1-T10');
@@ -7057,7 +7058,6 @@ async function main() {
         catalogs: { 'mdb-action-movies': true },
       });
       const profile = config.getProfile(p.id);
-      const def = { type: 'movie', id: 'mdb-action-movies', name: 'Action Movies', source: 'mdblist', user: 'hdlists', slug: 'action', min_imdb: 6, sort: 'imdbpopular' };
       // 15 titles (short source: fewer than list size).
       const items = [];
       for (let i = 1; i <= 15; i++) {
@@ -7066,24 +7066,16 @@ async function main() {
       mdblist.listItemsPage = async () => items;
       mdblist.mediaInfoBatch = async () => new Map();
       try {
-        // Build the catalog.
-        const built = await rebuild.buildExtraCatalog(profile, def, quiet);
-        assert.ok(built.length >= 5, `built at least MIN_METAS: ${built.length}`);
-        // Simulate the swap gate logic (no old entry).
-        const listSize = rs.listSizeFor(profile);
-        const newVisible = rebuild.eligibleVisible(built, profile, def);
-        const oldEntry = null; // first build
-        const oldVisible = oldEntry ? rebuild.eligibleVisible(oldEntry.metas, profile, def) : 0;
-        const gate = newVisible >= Math.min(listSize, oldVisible);
-        assert.ok(gate, `swap gate passes for first build (newVisible=${newVisible}, listSize=${listSize}, oldVisible=${oldVisible})`);
-        // The MIN_METAS floor still applies.
-        assert.ok(built.length >= rebuild.MIN_METAS, `MIN_METAS floor holds: ${built.length} >= ${rebuild.MIN_METAS}`);
-        // Publish it.
-        const meta = { format: 'reserve-v1', list_size: listSize, eligible_at_build: newVisible };
-        store.swapExtra(p.id, def.id, built, meta);
+        // Call the real rebuildProfile — it builds the catalog and applies
+        // the swap gate internally.
+        const results = await rebuild.rebuildProfile(profile, quiet, { extras: true });
+        assert.ok(results['mdb-action-movies'], 'rebuildProfile returned a result for mdb-action-movies');
+        assert.strictEqual(results['mdb-action-movies'].ok, true, `swap gate passes for first build (short source): ${JSON.stringify(results['mdb-action-movies'])}`);
+        assert.ok(results['mdb-action-movies'].count >= rebuild.MIN_METAS, `MIN_METAS floor holds: ${results['mdb-action-movies'].count} >= ${rebuild.MIN_METAS}`);
+        // The cache holds the 15 titles.
         const cache = store.loadCache(p.id);
-        assert.ok(cache.extras[def.id], 'catalog published');
-        assert.strictEqual(cache.extras[def.id].metas.length, built.length, 'all titles stored');
+        assert.ok(cache.extras['mdb-action-movies'], 'catalog published');
+        assert.strictEqual(cache.extras['mdb-action-movies'].metas.length, 15, `cache holds 15 titles: got ${cache.extras['mdb-action-movies'].metas.length}`);
       } finally {
         mdblist.listItemsPage = origList;
         mdblist.mediaInfoBatch = origMediaInfo;

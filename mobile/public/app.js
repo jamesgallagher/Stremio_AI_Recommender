@@ -652,7 +652,7 @@
     try {
       const res = await apiFetch('/watched', { method: 'POST', body: JSON.stringify({ type, imdb_id: m.id, title: m.name }) });
       if (res.ok) {
-        showSnack(isWatchLater ? 'Marked "' + (m.name || 'title') + '" watched — kept in Watch Later' : 'Marked "' + (m.name || 'title') + '" watched', null);
+        showSnack(isWatchLater ? 'Marked “' + (m.name || 'title') + '” watched — kept in Watch Later' : 'Marked “' + (m.name || 'title') + '” watched', null);
         // CB-1: refetch the sheet so the backfilled titles appear (the count
         // stays at list size). If the refetch fails, fall back to optimistic
         // removal — but never drop a cell in a catalog that keeps watched
@@ -670,7 +670,7 @@
     try {
       const res = await apiFetch('/recommend/suppress', { method: 'POST', body: JSON.stringify({ type, imdb_id: m.id, title: m.name }) });
       if (res.ok) {
-        showSnack('Not interested in "' + (m.name || 'title') + '"', null);
+        showSnack('Not interested in “' + (m.name || 'title') + '”', null);
         // CB-1: refetch to show the backfilled title (count stays at list size).
         const ok = await pvRefetch();
         if (!ok) pvDropCell(cell); // fallback: optimistic removal
@@ -683,7 +683,7 @@
     try {
       const res = await apiFetch('/watchlist/remove', { method: 'POST', body: JSON.stringify({ type, imdb_id: m.id, title: m.name }) });
       if (res.ok) {
-        showSnack('Removed "' + (m.name || 'title') + '" from Watch Later', null);
+        showSnack('Removed “' + (m.name || 'title') + '” from Watch Later', null);
         // CB-1: refetch — the Watch Later count may drop (source-sized).
         const ok = await pvRefetch();
         if (!ok) pvDropCell(cell); // fallback: optimistic removal

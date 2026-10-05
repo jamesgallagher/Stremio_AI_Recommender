@@ -546,13 +546,17 @@ async function buildExtraCatalog(profile, def, log = console) {
 
   // If the age gate left fewer than listSize eligible and more pages exist,
   // keep paging and run the age gate on the new titles (within MAX_EXTRA_PAGES).
+  // Stop only when the source is exhausted (!items.length) — a page of
+  // rating-dropped titles doesn't mean the source is exhausted.
   let postAgeEligible = result.filter(isEligible).length;
   while (postAgeEligible < listSize && page < MAX_EXTRA_PAGES) {
     const { metas: pageMetas, items } = await fetchExtraPage(key, def, page, seen, log);
-    if (!items.length || !pageMetas.length) break;
-    const aged = await applyExtraAgeGate(profile, def, pageMetas, log);
-    result.push(...aged);
-    postAgeEligible = result.filter(isEligible).length;
+    if (!items.length) break;
+    if (pageMetas.length) {
+      const aged = await applyExtraAgeGate(profile, def, pageMetas, log);
+      result.push(...aged);
+      postAgeEligible = result.filter(isEligible).length;
+    }
     page++;
   }
 
