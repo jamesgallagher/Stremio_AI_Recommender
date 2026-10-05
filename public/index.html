@@ -1288,18 +1288,22 @@ async function connectSimkl(id) {
       statusEl.innerHTML = `Click <a href="${r.authorize_url}" target="_blank" style="color:var(--accent)">Authorize with Simkl</a> to complete the connection.
         <div class="muted">Callback URI: <code>${esc(cbUri)}</code></div>
         <div class="muted">You'll be redirected back here automatically after authorizing.</div>`;
-      // Bounded poll: the V2 callback stores the token server-side; poll for
-      // up to 10 minutes (the flow TTL) then stop. The poll completes on
-      // `connected` (bounded verification succeeded) or `token_stored`
-      // (token persisted but verification incomplete — never label an
-      // unverified grant `connected`).
+      // Bounded poll: poll the specific connection attempt by flow_id.
+      // Stop only when THAT attempt reaches a terminal state (completed/failed).
       const deadline = Date.now() + 10 * 60e3;
       const poll = setInterval(async () => {
         if (Date.now() > deadline) { clearInterval(poll); checkSimklStatus(id); return; }
         try {
-          const { connected, state } = await api(`/profiles/${id}/simkl/status`);
-          if (connected) { clearInterval(poll); toast('Simkl connected 🎉'); checkSimklStatus(id); }
-          else if (state === 'token_stored') { clearInterval(poll); checkSimklStatus(id); }
+          const { connection_attempt } = await api(`/profiles/${id}/simkl/status?flow_id=${r.flow_id}`);
+          if (connection_attempt && (connection_attempt.state === 'completed' || connection_attempt.state === 'failed')) {
+            clearInterval(poll);
+            if (connection_attempt.state === 'completed') {
+              toast(connection_attempt.result === 'connected' ? 'Simkl connected 🎉' : 'Simkl token stored');
+            } else {
+              statusEl.innerHTML = `<span style="color:var(--err)">${esc(connection_attempt.message)}</span>`;
+            }
+            checkSimklStatus(id);
+          }
         } catch { /* transient */ }
       }, 3000);
     } else {
@@ -1307,14 +1311,21 @@ async function connectSimkl(id) {
       const { user_code, verification_url } = r;
       statusEl.innerHTML = `Go to <a href="${verification_url}" target="_blank" style="color:var(--accent)">${verification_url}</a> and enter:
         <div class="pin">${user_code}</div><div class="muted">Waiting for authorization…</div>`;
-      // Bounded poll: the PIN flow has its own expiry (900s default).
+      // Bounded poll: poll the specific connection attempt by flow_id.
       const deadline = Date.now() + 15 * 60e3;
       const poll = setInterval(async () => {
         if (Date.now() > deadline) { clearInterval(poll); checkSimklStatus(id); return; }
         try {
-          const { connected, flow } = await api(`/profiles/${id}/simkl/status`);
-          if (connected) { clearInterval(poll); toast('Simkl connected 🎉'); checkSimklStatus(id); }
-          else if (flow && flow.state === 'error') { clearInterval(poll); statusEl.innerHTML = `<span style="color:var(--err)">${esc(flow.error)}</span>`; }
+          const { connection_attempt } = await api(`/profiles/${id}/simkl/status?flow_id=${r.flow_id}`);
+          if (connection_attempt && (connection_attempt.state === 'completed' || connection_attempt.state === 'failed')) {
+            clearInterval(poll);
+            if (connection_attempt.state === 'completed') {
+              toast(connection_attempt.result === 'connected' ? 'Simkl connected 🎉' : 'Simkl token stored');
+            } else {
+              statusEl.innerHTML = `<span style="color:var(--err)">${esc(connection_attempt.message)}</span>`;
+            }
+            checkSimklStatus(id);
+          }
         } catch { /* transient */ }
       }, 3000);
     }

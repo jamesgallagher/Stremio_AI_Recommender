@@ -821,6 +821,8 @@ module.exports = {
   parseSeriesProgressItems,
   BULK_GAP_MS,
   withParams,
+  boundedFetch,
+  headers,
   USER_AGENT,
   APP_NAME,
 };

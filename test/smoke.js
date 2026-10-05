@@ -8269,7 +8269,591 @@ async function httpTests() {
     console.log('  ✓ R4 Finding 3c: callback stores check result for new grant (connected + account_id)');
   }
 
-  console.log(`\nAll checks passed (${passed} unit + 59 async/http).`);
+  // ---- T1: Pending browser flow — attempt stays pending without callback ----
+  {
+    const simklConnectionFlow = require('../src/services/simklConnectionFlow');
+    // Set EXTERNAL_URL for V2 tests (required for the callback URI).
+    const origExternalUrl = process.env.EXTERNAL_URL;
+    process.env.EXTERNAL_URL = 'https://localhost:7311';
+    // V2: start from a verified V1 profile.
+    const prof = config.addProfile('T1-V2');
+    config.updateProfile(prof.id, {
+      keys: { simkl_v2_client_id: 'client-A', simkl_v2_client_secret: 'secret-A', simkl_client_id: 'client-A', simkl_client_secret: 'secret-A' },
+      simkl_auth: { access_token: 'old-token', refresh_token: 'old-refresh', version: 1, client_id: 'client-A', account_id: '123', username: 'OldUser' },
+      simkl_auth_version: 2,
+    });
+    // Start V2 connect.
+    const connectRes = await (await fetch(`${BASE}/api/profiles/${prof.id}/simkl/connect`, { method: 'POST' })).json();
+    assert.ok(connectRes.authorize_url, 'V2 connect returns authorize_url');
+    assert.ok(connectRes.flow_id, 'V2 connect returns flow_id');
+    // Wait ≥6s without callback.
+    await new Promise(r => setTimeout(r, 6000));
+    // Poll the status with flow_id.
+    const statusRes = await (await fetch(`${BASE}/api/profiles/${prof.id}/simkl/status?flow_id=${connectRes.flow_id}`)).json();
+    assert.ok(statusRes.connection_attempt, 'status returns connection_attempt');
+    assert.strictEqual(statusRes.connection_attempt.state, 'pending', 'attempt is pending after 6s without callback');
+    assert.strictEqual(statusRes.connection_attempt.result, null, 'no result yet');
+    // No success: the top-level state should not be 'connected'.
+    assert.notStrictEqual(statusRes.state, 'connected', 'top-level state is not connected');
+    config.removeProfile(prof.id);
+    console.log('  ✓ T1a: V2 pending — attempt stays pending without callback, no success');
+
+    // V1 PIN: start from an unverified stored V1 profile.
+    const prof2 = config.addProfile('T1-PIN');
+    config.updateProfile(prof2.id, {
+      keys: { simkl_client_id: 'client-B', simkl_client_secret: 'secret-B' },
+      simkl_auth: { access_token: 'unverified-token', version: 1, client_id: 'client-B' },
+      simkl_auth_version: 1,
+    });
+    // Stub the PIN flow start (external API).
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      if (String(url).includes('/oauth/pin')) {
+        return { ok: true, status: 200, json: async () => ({ user_code: 'ABC123', verification_url: 'https://simkl.com/pin', expires_in: 900, interval: 5 }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    };
+    const connectRes2 = await (await origFetch(`${BASE}/api/profiles/${prof2.id}/simkl/connect`, { method: 'POST' })).json();
+    global.fetch = origFetch;
+    assert.ok(connectRes2.user_code, 'V1 connect returns user_code');
+    assert.ok(connectRes2.flow_id, 'V1 connect returns flow_id');
+    // Wait ≥6s without PIN completion.
+    await new Promise(r => setTimeout(r, 6000));
+    const statusRes2 = await (await origFetch(`${BASE}/api/profiles/${prof2.id}/simkl/status?flow_id=${connectRes2.flow_id}`)).json();
+    assert.strictEqual(statusRes2.connection_attempt.state, 'pending', 'PIN attempt is pending after 6s');
+    config.removeProfile(prof2.id);
+    console.log('  ✓ T1b: V1 PIN pending — attempt stays pending without completion');
+  }
+
+  // ---- T2: Completion — callback/PIN completes the attempt ----
+  {
+    const simklConnectionFlow = require('../src/services/simklConnectionFlow');
+    // V2: start connect, then simulate the callback.
+    const prof = config.addProfile('T2-V2');
+    config.updateProfile(prof.id, {
+      keys: { simkl_v2_client_id: 'client-A', simkl_v2_client_secret: 'secret-A' },
+      simkl_auth: null,
+      simkl_auth_version: 2,
+    });
+    const connectRes = await (await fetch(`${BASE}/api/profiles/${prof.id}/simkl/connect`, { method: 'POST' })).json();
+    assert.ok(connectRes.flow_id, 'connect returns flow_id');
+    // Get the flow state for the callback.
+    const simklAuthV2 = require('../src/services/simklAuthV2');
+    const flow = simklAuthV2.getFlow(prof.id);
+    assert.ok(flow, 'flow exists');
+    // Stub the token exchange and identity verification.
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes('/oauth2/token')) {
+        return { ok: true, status: 200, json: async () => ({ access_token: 'new-token', refresh_token: 'new-refresh', expires_in: 3600, scope: 'media:read media:write', username: 'NewUser' }) };
+      }
+      if (u.includes('/users/settings')) {
+        return { ok: true, status: 200, json: async () => ({ user: { name: 'NewUser', id: 456 } }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    };
+    // Simulate the callback.
+    await origFetch(`${BASE}/simkl/oauth2/callback?code=fake-code&state=${flow.state}&iss=https://simkl.com`);
+    global.fetch = origFetch;
+    // Poll the status with flow_id — the attempt should be completed.
+    const statusRes = await (await origFetch(`${BASE}/api/profiles/${prof.id}/simkl/status?flow_id=${connectRes.flow_id}`)).json();
+    assert.strictEqual(statusRes.connection_attempt.state, 'completed', 'attempt completed');
+    assert.strictEqual(statusRes.connection_attempt.result, 'connected', 'result is connected');
+    // Verify the profile was updated.
+    const updated = config.getProfile(prof.id);
+    assert.ok(updated.simkl_auth, 'profile has simkl_auth');
+    assert.strictEqual(updated.simkl_auth.access_token, 'new-token', 'new token stored');
+    assert.strictEqual(updated.simkl_auth.account_id, '456', 'account_id stored (normalized to string)');
+    assert.strictEqual(updated.simkl_auth.version, 2, 'version 2');
+    // Subsequent status remains truthful.
+    const statusRes2 = await (await origFetch(`${BASE}/api/profiles/${prof.id}/simkl/status`)).json();
+    assert.strictEqual(statusRes2.state, 'connected', 'subsequent status is connected');
+    config.removeProfile(prof.id);
+    console.log('  ✓ T2a: V2 completion — callback completes the attempt, profile updated, subsequent status truthful');
+
+    // V1 PIN: start connect, then simulate PIN completion.
+    const prof2 = config.addProfile('T2-PIN');
+    config.updateProfile(prof2.id, {
+      keys: { simkl_client_id: 'client-B', simkl_client_secret: 'secret-B' },
+      simkl_auth: null,
+      simkl_auth_version: 1,
+    });
+    const origFetch2 = global.fetch;
+    global.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes('/oauth/pin/')) {
+        // PIN poll: return a token (Simkl format: result OK + access_token).
+        return { ok: true, status: 200, json: async () => ({ result: 'OK', access_token: 'pin-token' }) };
+      }
+      if (u.includes('/oauth/pin')) {
+        return { ok: true, status: 200, json: async () => ({ user_code: 'XYZ789', verification_url: 'https://simkl.com/pin', expires_in: 900, interval: 5 }) };
+      }
+      if (u.includes('/users/settings')) {
+        return { ok: true, status: 200, json: async () => ({ user: { name: 'PinUser', id: '789' } }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    };
+    const connectRes2 = await (await origFetch2(`${BASE}/api/profiles/${prof2.id}/simkl/connect`, { method: 'POST' })).json();
+    assert.ok(connectRes2.flow_id, 'PIN connect returns flow_id');
+    // Poll until the attempt completes (PIN poll 5s + bounded verification 10s).
+    let pinStatusRes = null;
+    for (let i = 0; i < 6; i++) {
+      await new Promise(r => setTimeout(r, 5000));
+      pinStatusRes = await (await origFetch2(`${BASE}/api/profiles/${prof2.id}/simkl/status?flow_id=${connectRes2.flow_id}`)).json();
+      if (pinStatusRes.connection_attempt && (pinStatusRes.connection_attempt.state === 'completed' || pinStatusRes.connection_attempt.state === 'failed')) break;
+    }
+    global.fetch = origFetch2;
+    assert.ok(pinStatusRes.connection_attempt, 'connection_attempt exists');
+    assert.strictEqual(pinStatusRes.connection_attempt.state, 'completed', 'PIN attempt completed');
+    assert.strictEqual(pinStatusRes.connection_attempt.result, 'connected', 'PIN result is connected');
+    const updated2 = config.getProfile(prof2.id);
+    assert.ok(updated2.simkl_auth, 'profile has simkl_auth');
+    assert.strictEqual(updated2.simkl_auth.access_token, 'pin-token', 'PIN token stored');
+    config.removeProfile(prof2.id);
+    console.log('  ✓ T2b: V1 PIN completion — PIN poll completes the attempt, profile updated');
+  }
+
+  // ---- T3: Interrupted completion — Disconnect/grant replacement/credential edit/new Connect during verification ----
+  {
+    const simklConnectionFlow = require('../src/services/simklConnectionFlow');
+    // V2: start connect, then disconnect during the callback.
+    const prof = config.addProfile('T3-Disconnect');
+    config.updateProfile(prof.id, {
+      keys: { simkl_v2_client_id: 'client-A', simkl_v2_client_secret: 'secret-A' },
+      simkl_auth: { access_token: 'old-token', refresh_token: 'old-refresh', version: 2, client_id: 'client-A', account_id: '123' },
+      simkl_auth_version: 2,
+    });
+    const simklAuthV2 = require('../src/services/simklAuthV2');
+    const origFetch = global.fetch;
+    const connectRes = await (await origFetch(`${BASE}/api/profiles/${prof.id}/simkl/connect`, { method: 'POST' })).json();
+    const flow = simklAuthV2.getFlow(prof.id);
+    // Disconnect the profile BEFORE the callback (invalidates the attempt).
+    await origFetch(`${BASE}/api/profiles/${prof.id}/simkl/disconnect`, { method: 'POST' });
+    // Now simulate the callback.
+    global.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes('/oauth2/token')) {
+        return { ok: true, status: 200, json: async () => ({ access_token: 'new-token', refresh_token: 'new-refresh', expires_in: 3600, scope: 'media:read media:write' }) };
+      }
+      if (u.includes('/users/settings')) {
+        return { ok: true, status: 200, json: async () => ({ user: { name: 'NewUser', id: 456 } }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    };
+    await origFetch(`${BASE}/simkl/oauth2/callback?code=fake-code&state=${flow.state}&iss=https://simkl.com`);
+    global.fetch = origFetch;
+    // The attempt should be failed (invalidated by disconnect).
+    const statusRes = await (await origFetch(`${BASE}/api/profiles/${prof.id}/simkl/status?flow_id=${connectRes.flow_id}`)).json();
+    assert.strictEqual(statusRes.connection_attempt.state, 'failed', 'attempt failed after disconnect');
+    assert.ok(statusRes.connection_attempt.message.includes('Connection changed'), 'message indicates connection changed');
+    // The profile should NOT have the new token.
+    const updated = config.getProfile(prof.id);
+    assert.strictEqual(updated.simkl_auth, null, 'profile grant is null (disconnect cleared it)');
+    config.removeProfile(prof.id);
+    console.log('  ✓ T3a: Disconnect during callback — no stale promotion, attempt failed');
+
+    // V2: start connect, then replace the grant during verification.
+    const prof2 = config.addProfile('T3-GrantReplace');
+    config.updateProfile(prof2.id, {
+      keys: { simkl_v2_client_id: 'client-A', simkl_v2_client_secret: 'secret-A' },
+      simkl_auth: { access_token: 'old-token', refresh_token: 'old-refresh', version: 2, client_id: 'client-A', account_id: '123' },
+      simkl_auth_version: 2,
+    });
+    const origFetch2 = global.fetch;
+    const connectRes2 = await (await origFetch2(`${BASE}/api/profiles/${prof2.id}/simkl/connect`, { method: 'POST' })).json();
+    const flow2 = simklAuthV2.getFlow(prof2.id);
+    // Replace the grant BEFORE the callback (changes the digest).
+    config.updateProfile(prof2.id, {
+      simkl_auth: { access_token: 'replaced-token', refresh_token: 'replaced-refresh', version: 2, client_id: 'client-A', account_id: '999' },
+    });
+    global.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes('/oauth2/token')) {
+        return { ok: true, status: 200, json: async () => ({ access_token: 'new-token', refresh_token: 'new-refresh', expires_in: 3600, scope: 'media:read media:write' }) };
+      }
+      if (u.includes('/users/settings')) {
+        return { ok: true, status: 200, json: async () => ({ user: { name: 'NewUser', id: 456 } }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    };
+    await origFetch2(`${BASE}/simkl/oauth2/callback?code=fake-code&state=${flow2.state}&iss=https://simkl.com`);
+    global.fetch = origFetch2;
+    const statusRes2 = await (await origFetch2(`${BASE}/api/profiles/${prof2.id}/simkl/status?flow_id=${connectRes2.flow_id}`)).json();
+    assert.strictEqual(statusRes2.connection_attempt.state, 'failed', 'attempt failed after grant replacement');
+    assert.ok(statusRes2.connection_attempt.message.includes('Connection changed'), 'message indicates connection changed');
+    // The profile should NOT have the new token (the old replaced grant is preserved).
+    const updated2 = config.getProfile(prof2.id);
+    assert.strictEqual(updated2.simkl_auth.access_token, 'replaced-token', 'replaced grant preserved');
+    config.removeProfile(prof2.id);
+    console.log('  ✓ T3b: Grant replacement during callback — no stale promotion, attempt failed');
+
+    // V2: start connect, then credential edit during verification.
+    const prof3 = config.addProfile('T3-CredEdit');
+    config.updateProfile(prof3.id, {
+      keys: { simkl_v2_client_id: 'client-A', simkl_v2_client_secret: 'secret-A' },
+      simkl_auth: { access_token: 'old-token', refresh_token: 'old-refresh', version: 2, client_id: 'client-A', account_id: '123' },
+      simkl_auth_version: 2,
+    });
+    const origFetch3 = global.fetch;
+    const connectRes3 = await (await origFetch3(`${BASE}/api/profiles/${prof3.id}/simkl/connect`, { method: 'POST' })).json();
+    const flow3 = simklAuthV2.getFlow(prof3.id);
+    // Edit the credentials BEFORE the callback (changes the digest).
+    config.updateProfile(prof3.id, {
+      keys: { simkl_v2_client_id: 'client-B', simkl_v2_client_secret: 'secret-B' },
+    });
+    global.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes('/oauth2/token')) {
+        return { ok: true, status: 200, json: async () => ({ access_token: 'new-token', refresh_token: 'new-refresh', expires_in: 3600, scope: 'media:read media:write' }) };
+      }
+      if (u.includes('/users/settings')) {
+        return { ok: true, status: 200, json: async () => ({ user: { name: 'NewUser', id: 456 } }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    };
+    await origFetch3(`${BASE}/simkl/oauth2/callback?code=fake-code&state=${flow3.state}&iss=https://simkl.com`);
+    global.fetch = origFetch3;
+    const statusRes3 = await (await origFetch3(`${BASE}/api/profiles/${prof3.id}/simkl/status?flow_id=${connectRes3.flow_id}`)).json();
+    assert.strictEqual(statusRes3.connection_attempt.state, 'failed', 'attempt failed after credential edit');
+    assert.ok(statusRes3.connection_attempt.message.includes('Connection changed'), 'message indicates connection changed');
+    config.removeProfile(prof3.id);
+    console.log('  ✓ T3c: Credential edit during callback — no stale promotion, attempt failed');
+
+    // V2: start connect, then new Connect (supersede) during verification.
+    const prof4 = config.addProfile('T3-NewConnect');
+    config.updateProfile(prof4.id, {
+      keys: { simkl_v2_client_id: 'client-A', simkl_v2_client_secret: 'secret-A' },
+      simkl_auth: { access_token: 'old-token', refresh_token: 'old-refresh', version: 2, client_id: 'client-A', account_id: '123' },
+      simkl_auth_version: 2,
+    });
+    const origFetch4 = global.fetch;
+    const connectRes4 = await (await origFetch4(`${BASE}/api/profiles/${prof4.id}/simkl/connect`, { method: 'POST' })).json();
+    const flow4 = simklAuthV2.getFlow(prof4.id);
+    // Start a new Connect (supersedes the first attempt).
+    const connectRes4b = await (await origFetch4(`${BASE}/api/profiles/${prof4.id}/simkl/connect`, { method: 'POST' })).json();
+    assert.notStrictEqual(connectRes4.flow_id, connectRes4b.flow_id, 'new Connect creates a new flow_id');
+    // Now simulate the callback for the FIRST flow (which was superseded).
+    global.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes('/oauth2/token')) {
+        return { ok: true, status: 200, json: async () => ({ access_token: 'new-token', refresh_token: 'new-refresh', expires_in: 3600, scope: 'media:read media:write' }) };
+      }
+      if (u.includes('/users/settings')) {
+        return { ok: true, status: 200, json: async () => ({ user: { name: 'NewUser', id: 456 } }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    };
+    await origFetch4(`${BASE}/simkl/oauth2/callback?code=fake-code&state=${flow4.state}&iss=https://simkl.com`);
+    global.fetch = origFetch4;
+    // The first attempt should be failed (superseded).
+    const statusRes4 = await (await origFetch4(`${BASE}/api/profiles/${prof4.id}/simkl/status?flow_id=${connectRes4.flow_id}`)).json();
+    assert.strictEqual(statusRes4.connection_attempt.state, 'failed', 'first attempt failed (superseded)');
+    config.removeProfile(prof4.id);
+    console.log('  ✓ T3d: New Connect supersedes — old attempt failed, no stale promotion');
+  }
+
+  // ---- T4: Identity policy — all four §3 outcomes ----
+  {
+    const simklConnectionFlow = require('../src/services/simklConnectionFlow');
+    // Outcome 1: Valid identity + no known old ID → promote (connected).
+    {
+      const prof = config.addProfile('T4-Promote');
+      config.updateProfile(prof.id, {
+        keys: { simkl_v2_client_id: 'client-A', simkl_v2_client_secret: 'secret-A' },
+        simkl_auth: null,
+        simkl_auth_version: 2,
+      });
+      const origFetch = global.fetch;
+      const connectRes = await (await origFetch(`${BASE}/api/profiles/${prof.id}/simkl/connect`, { method: 'POST' })).json();
+      const simklAuthV2 = require('../src/services/simklAuthV2');
+      const flow = simklAuthV2.getFlow(prof.id);
+      global.fetch = async (url, opts) => {
+        const u = String(url);
+        if (u.includes('/oauth2/token')) {
+          return { ok: true, status: 200, json: async () => ({ access_token: 'new-token', refresh_token: 'new-refresh', expires_in: 3600, scope: 'media:read media:write' }) };
+        }
+        if (u.includes('/users/settings')) {
+          return { ok: true, status: 200, json: async () => ({ user: { name: 'User1', id: 123 } }) };
+        }
+        return { ok: true, status: 200, json: async () => ({}) };
+      };
+      await origFetch(`${BASE}/simkl/oauth2/callback?code=fake-code&state=${flow.state}&iss=https://simkl.com`);
+      global.fetch = origFetch;
+      const statusRes = await (await origFetch(`${BASE}/api/profiles/${prof.id}/simkl/status?flow_id=${connectRes.flow_id}`)).json();
+      assert.strictEqual(statusRes.connection_attempt.state, 'completed', 'completed');
+      assert.strictEqual(statusRes.connection_attempt.result, 'connected', 'result is connected');
+      const updated = config.getProfile(prof.id);
+      assert.strictEqual(updated.simkl_auth.account_id, '123', 'account_id stored as string');
+      config.removeProfile(prof.id);
+    }
+    // Outcome 2: Valid identity + known old ID differs → fail (account-mismatch).
+    {
+      const prof = config.addProfile('T4-Mismatch');
+      config.updateProfile(prof.id, {
+        keys: { simkl_v2_client_id: 'client-A', simkl_v2_client_secret: 'secret-A' },
+        simkl_auth: { access_token: 'old-token', refresh_token: 'old-refresh', version: 2, client_id: 'client-A', account_id: '123' },
+        simkl_auth_version: 2,
+      });
+      const origFetch = global.fetch;
+      const connectRes = await (await origFetch(`${BASE}/api/profiles/${prof.id}/simkl/connect`, { method: 'POST' })).json();
+      const simklAuthV2 = require('../src/services/simklAuthV2');
+      const flow = simklAuthV2.getFlow(prof.id);
+      global.fetch = async (url, opts) => {
+        const u = String(url);
+        if (u.includes('/oauth2/token')) {
+          return { ok: true, status: 200, json: async () => ({ access_token: 'new-token', refresh_token: 'new-refresh', expires_in: 3600, scope: 'media:read media:write' }) };
+        }
+        if (u.includes('/users/settings')) {
+          return { ok: true, status: 200, json: async () => ({ user: { name: 'User2', id: 456 } }) };
+        }
+        return { ok: true, status: 200, json: async () => ({}) };
+      };
+      await origFetch(`${BASE}/simkl/oauth2/callback?code=fake-code&state=${flow.state}&iss=https://simkl.com`);
+      global.fetch = origFetch;
+      const statusRes = await (await origFetch(`${BASE}/api/profiles/${prof.id}/simkl/status?flow_id=${connectRes.flow_id}`)).json();
+      assert.strictEqual(statusRes.connection_attempt.state, 'failed', 'failed');
+      assert.ok(statusRes.connection_attempt.message.includes('account mismatch'), 'message indicates account mismatch');
+      // Old grant preserved.
+      const updated = config.getProfile(prof.id);
+      assert.strictEqual(updated.simkl_auth.access_token, 'old-token', 'old grant preserved');
+      config.removeProfile(prof.id);
+    }
+    // Outcome 3: Verification fails + any grant existed → fail (preserve old grant).
+    {
+      const prof = config.addProfile('T4-VerifyFail-Grant');
+      config.updateProfile(prof.id, {
+        keys: { simkl_v2_client_id: 'client-A', simkl_v2_client_secret: 'secret-A' },
+        simkl_auth: { access_token: 'old-token', refresh_token: 'old-refresh', version: 2, client_id: 'client-A', account_id: '123' },
+        simkl_auth_version: 2,
+      });
+      const origFetch = global.fetch;
+      const connectRes = await (await origFetch(`${BASE}/api/profiles/${prof.id}/simkl/connect`, { method: 'POST' })).json();
+      const simklAuthV2 = require('../src/services/simklAuthV2');
+      const flow = simklAuthV2.getFlow(prof.id);
+      global.fetch = async (url, opts) => {
+        const u = String(url);
+        if (u.includes('/oauth2/token')) {
+          return { ok: true, status: 200, json: async () => ({ access_token: 'new-token', refresh_token: 'new-refresh', expires_in: 3600, scope: 'media:read media:write' }) };
+        }
+        if (u.includes('/users/settings')) {
+          // Verification fails: no valid ID.
+          return { ok: true, status: 200, json: async () => ({ user: { name: 'NoID' } }) };
+        }
+        return { ok: true, status: 200, json: async () => ({}) };
+      };
+      await origFetch(`${BASE}/simkl/oauth2/callback?code=fake-code&state=${flow.state}&iss=https://simkl.com`);
+      global.fetch = origFetch;
+      const statusRes = await (await origFetch(`${BASE}/api/profiles/${prof.id}/simkl/status?flow_id=${connectRes.flow_id}`)).json();
+      assert.strictEqual(statusRes.connection_attempt.state, 'failed', 'failed');
+      assert.ok(statusRes.connection_attempt.message.includes('Could not verify'), 'message indicates verification failure');
+      // Old grant preserved.
+      const updated = config.getProfile(prof.id);
+      assert.strictEqual(updated.simkl_auth.access_token, 'old-token', 'old grant preserved');
+      config.removeProfile(prof.id);
+    }
+    // Outcome 4: Verification fails + no grant existed → store token_stored.
+    {
+      const prof = config.addProfile('T4-VerifyFail-NoGrant');
+      config.updateProfile(prof.id, {
+        keys: { simkl_v2_client_id: 'client-A', simkl_v2_client_secret: 'secret-A' },
+        simkl_auth: null,
+        simkl_auth_version: 2,
+      });
+      const origFetch = global.fetch;
+      const connectRes = await (await origFetch(`${BASE}/api/profiles/${prof.id}/simkl/connect`, { method: 'POST' })).json();
+      const simklAuthV2 = require('../src/services/simklAuthV2');
+      const flow = simklAuthV2.getFlow(prof.id);
+      global.fetch = async (url, opts) => {
+        const u = String(url);
+        if (u.includes('/oauth2/token')) {
+          return { ok: true, status: 200, json: async () => ({ access_token: 'new-token', refresh_token: 'new-refresh', expires_in: 3600, scope: 'media:read media:write' }) };
+        }
+        if (u.includes('/users/settings')) {
+          // Verification fails: no valid ID.
+          return { ok: true, status: 200, json: async () => ({ user: { name: 'NoID' } }) };
+        }
+        return { ok: true, status: 200, json: async () => ({}) };
+      };
+      await origFetch(`${BASE}/simkl/oauth2/callback?code=fake-code&state=${flow.state}&iss=https://simkl.com`);
+      global.fetch = origFetch;
+      const statusRes = await (await origFetch(`${BASE}/api/profiles/${prof.id}/simkl/status?flow_id=${connectRes.flow_id}`)).json();
+      assert.strictEqual(statusRes.connection_attempt.state, 'completed', 'completed');
+      assert.strictEqual(statusRes.connection_attempt.result, 'token_stored', 'result is token_stored');
+      const updated = config.getProfile(prof.id);
+      assert.ok(updated.simkl_auth, 'token stored');
+      assert.strictEqual(updated.simkl_auth.access_token, 'new-token', 'new token stored');
+      assert.strictEqual(updated.simkl_auth.account_id, undefined, 'no account_id');
+      config.removeProfile(prof.id);
+    }
+    // Equal IDs represented as number/string.
+    {
+      const prof = config.addProfile('T4-IdNormalize');
+      config.updateProfile(prof.id, {
+        keys: { simkl_v2_client_id: 'client-A', simkl_v2_client_secret: 'secret-A' },
+        simkl_auth: { access_token: 'old-token', refresh_token: 'old-refresh', version: 2, client_id: 'client-A', account_id: 123 },
+        simkl_auth_version: 2,
+      });
+      const origFetch = global.fetch;
+      const connectRes = await (await origFetch(`${BASE}/api/profiles/${prof.id}/simkl/connect`, { method: 'POST' })).json();
+      const simklAuthV2 = require('../src/services/simklAuthV2');
+      const flow = simklAuthV2.getFlow(prof.id);
+      global.fetch = async (url, opts) => {
+        const u = String(url);
+        if (u.includes('/oauth2/token')) {
+          return { ok: true, status: 200, json: async () => ({ access_token: 'new-token', refresh_token: 'new-refresh', expires_in: 3600, scope: 'media:read media:write' }) };
+        }
+        if (u.includes('/users/settings')) {
+          // Same ID as the old grant (123), but as a string.
+          return { ok: true, status: 200, json: async () => ({ user: { name: 'User1', id: '123' } }) };
+        }
+        return { ok: true, status: 200, json: async () => ({}) };
+      };
+      await origFetch(`${BASE}/simkl/oauth2/callback?code=fake-code&state=${flow.state}&iss=https://simkl.com`);
+      global.fetch = origFetch;
+      const statusRes = await (await origFetch(`${BASE}/api/profiles/${prof.id}/simkl/status?flow_id=${connectRes.flow_id}`)).json();
+      // The old account_id is 123 (number), the new is '123' (string). After normalization, they match.
+      assert.strictEqual(statusRes.connection_attempt.state, 'completed', 'completed (IDs match after normalization)');
+      assert.strictEqual(statusRes.connection_attempt.result, 'connected', 'result is connected');
+      config.removeProfile(prof.id);
+    }
+    console.log('  ✓ T4: Identity policy — all four §3 outcomes + ID normalization');
+  }
+
+  // ---- T5: Timeout/malformed identity — never connected ----
+  {
+    const simklConnectionFlow = require('../src/services/simklConnectionFlow');
+    // Timeout: identity fetch never resolves.
+    {
+      const prof = config.addProfile('T5-Timeout');
+      config.updateProfile(prof.id, {
+        keys: { simkl_v2_client_id: 'client-A', simkl_v2_client_secret: 'secret-A' },
+        simkl_auth: null,
+        simkl_auth_version: 2,
+      });
+      const origFetch = global.fetch;
+      const connectRes = await (await origFetch(`${BASE}/api/profiles/${prof.id}/simkl/connect`, { method: 'POST' })).json();
+      const simklAuthV2 = require('../src/services/simklAuthV2');
+      const flow = simklAuthV2.getFlow(prof.id);
+      global.fetch = async (url, opts) => {
+        const u = String(url);
+        if (u.includes('/oauth2/token')) {
+          return { ok: true, status: 200, json: async () => ({ access_token: 'new-token', refresh_token: 'new-refresh', expires_in: 3600, scope: 'media:read media:write' }) };
+        }
+        if (u.includes('/users/settings')) {
+          // Never resolves until the abort signal fires (timeout).
+          return new Promise((resolve, reject) => {
+            opts.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+          });
+        }
+        return { ok: true, status: 200, json: async () => ({}) };
+      };
+      await origFetch(`${BASE}/simkl/oauth2/callback?code=fake-code&state=${flow.state}&iss=https://simkl.com`);
+      global.fetch = origFetch;
+      const statusRes = await (await origFetch(`${BASE}/api/profiles/${prof.id}/simkl/status?flow_id=${connectRes.flow_id}`)).json();
+      // The attempt should be completed with token_stored (verification failed, no grant existed).
+      assert.strictEqual(statusRes.connection_attempt.state, 'completed', 'completed');
+      assert.strictEqual(statusRes.connection_attempt.result, 'token_stored', 'result is token_stored (never connected)');
+      config.removeProfile(prof.id);
+    }
+    // Malformed: 200 {} (no user.id).
+    {
+      const prof = config.addProfile('T5-Empty');
+      config.updateProfile(prof.id, {
+        keys: { simkl_v2_client_id: 'client-A', simkl_v2_client_secret: 'secret-A' },
+        simkl_auth: null,
+        simkl_auth_version: 2,
+      });
+      const origFetch = global.fetch;
+      const connectRes = await (await origFetch(`${BASE}/api/profiles/${prof.id}/simkl/connect`, { method: 'POST' })).json();
+      const simklAuthV2 = require('../src/services/simklAuthV2');
+      const flow = simklAuthV2.getFlow(prof.id);
+      global.fetch = async (url, opts) => {
+        const u = String(url);
+        if (u.includes('/oauth2/token')) {
+          return { ok: true, status: 200, json: async () => ({ access_token: 'new-token', refresh_token: 'new-refresh', expires_in: 3600, scope: 'media:read media:write' }) };
+        }
+        if (u.includes('/users/settings')) {
+          return { ok: true, status: 200, json: async () => ({}) };
+        }
+        return { ok: true, status: 200, json: async () => ({}) };
+      };
+      await origFetch(`${BASE}/simkl/oauth2/callback?code=fake-code&state=${flow.state}&iss=https://simkl.com`);
+      global.fetch = origFetch;
+      const statusRes = await (await origFetch(`${BASE}/api/profiles/${prof.id}/simkl/status?flow_id=${connectRes.flow_id}`)).json();
+      assert.strictEqual(statusRes.connection_attempt.state, 'completed', 'completed');
+      assert.strictEqual(statusRes.connection_attempt.result, 'token_stored', 'result is token_stored (never connected)');
+      config.removeProfile(prof.id);
+    }
+    // Malformed: invalid JSON.
+    {
+      const prof = config.addProfile('T5-InvalidJSON');
+      config.updateProfile(prof.id, {
+        keys: { simkl_v2_client_id: 'client-A', simkl_v2_client_secret: 'secret-A' },
+        simkl_auth: null,
+        simkl_auth_version: 2,
+      });
+      const origFetch = global.fetch;
+      const connectRes = await (await origFetch(`${BASE}/api/profiles/${prof.id}/simkl/connect`, { method: 'POST' })).json();
+      const simklAuthV2 = require('../src/services/simklAuthV2');
+      const flow = simklAuthV2.getFlow(prof.id);
+      global.fetch = async (url, opts) => {
+        const u = String(url);
+        if (u.includes('/oauth2/token')) {
+          return { ok: true, status: 200, json: async () => ({ access_token: 'new-token', refresh_token: 'new-refresh', expires_in: 3600, scope: 'media:read media:write' }) };
+        }
+        if (u.includes('/users/settings')) {
+          // Invalid JSON.
+          return { ok: true, status: 200, json: async () => { throw new Error('Invalid JSON'); } };
+        }
+        return { ok: true, status: 200, json: async () => ({}) };
+      };
+      await origFetch(`${BASE}/simkl/oauth2/callback?code=fake-code&state=${flow.state}&iss=https://simkl.com`);
+      global.fetch = origFetch;
+      const statusRes = await (await origFetch(`${BASE}/api/profiles/${prof.id}/simkl/status?flow_id=${connectRes.flow_id}`)).json();
+      assert.strictEqual(statusRes.connection_attempt.state, 'completed', 'completed');
+      assert.strictEqual(statusRes.connection_attempt.result, 'token_stored', 'result is token_stored (never connected)');
+      config.removeProfile(prof.id);
+    }
+    console.log('  ✓ T5: Timeout/malformed identity — never connected, token_stored');
+  }
+
+  // ---- T6: Isolation — old/unknown/expired/other-profile flow IDs ----
+  {
+    const simklConnectionFlow = require('../src/services/simklConnectionFlow');
+    const savedExternalUrl = process.env.EXTERNAL_URL;
+    // Create two profiles with active attempts.
+    const profA = config.addProfile('T6-A');
+    config.updateProfile(profA.id, {
+      keys: { simkl_v2_client_id: 'client-A', simkl_v2_client_secret: 'secret-A' },
+      simkl_auth: null,
+      simkl_auth_version: 2,
+    });
+    const profB = config.addProfile('T6-B');
+    config.updateProfile(profB.id, {
+      keys: { simkl_v2_client_id: 'client-B', simkl_v2_client_secret: 'secret-B' },
+      simkl_auth: null,
+      simkl_auth_version: 2,
+    });
+    const connectA = await (await fetch(`${BASE}/api/profiles/${profA.id}/simkl/connect`, { method: 'POST' })).json();
+    const connectB = await (await fetch(`${BASE}/api/profiles/${profB.id}/simkl/connect`, { method: 'POST' })).json();
+    // Poll profile A with profile B's flow_id → generic failed.
+    const statusA = await (await fetch(`${BASE}/api/profiles/${profA.id}/simkl/status?flow_id=${connectB.flow_id}`)).json();
+    assert.strictEqual(statusA.connection_attempt.state, 'failed', 'other-profile flow_id → failed');
+    assert.ok(statusA.connection_attempt.message.includes('Unknown or expired'), 'generic message');
+    // Poll profile B with profile A's flow_id → generic failed.
+    const statusB = await (await fetch(`${BASE}/api/profiles/${profB.id}/simkl/status?flow_id=${connectA.flow_id}`)).json();
+    assert.strictEqual(statusB.connection_attempt.state, 'failed', 'other-profile flow_id → failed');
+    // Unknown flow_id → generic failed.
+    const statusUnknown = await (await fetch(`${BASE}/api/profiles/${profA.id}/simkl/status?flow_id=unknown-flow-id`)).json();
+    assert.strictEqual(statusUnknown.connection_attempt.state, 'failed', 'unknown flow_id → failed');
+    config.removeProfile(profA.id);
+    config.removeProfile(profB.id);
+    process.env.EXTERNAL_URL = savedExternalUrl;
+    console.log('  ✓ T6: Isolation — other-profile/unknown flow IDs cannot complete or reveal state');
+  }
+
+  console.log(`\nAll checks passed (${passed} unit + 59 async/http + T1-T6).`);
   process.exit(0);
 }
 
