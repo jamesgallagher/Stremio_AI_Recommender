@@ -8305,21 +8305,28 @@ async function httpTests() {
       simkl_auth: { access_token: 'unverified-token', version: 1, client_id: 'client-B' },
       simkl_auth_version: 1,
     });
-    // Stub the PIN flow start (external API).
+    // Stub the PIN flow start + poll (external API). Keep the stub active
+    // during the wait so the background poll loop uses it (returns pending).
     const origFetch = global.fetch;
     global.fetch = async (url, opts) => {
-      if (String(url).includes('/oauth/pin')) {
+      const u = String(url);
+      if (u.includes('/oauth/pin')) {
+        // Start flow.
         return { ok: true, status: 200, json: async () => ({ user_code: 'ABC123', verification_url: 'https://simkl.com/pin', expires_in: 900, interval: 5 }) };
+      }
+      if (u.includes('/oauth/pin/')) {
+        // Poll: still pending.
+        return { ok: true, status: 200, json: async () => ({ result: 'KO' }) };
       }
       return { ok: true, status: 200, json: async () => ({}) };
     };
     const connectRes2 = await (await origFetch(`${BASE}/api/profiles/${prof2.id}/simkl/connect`, { method: 'POST' })).json();
-    global.fetch = origFetch;
     assert.ok(connectRes2.user_code, 'V1 connect returns user_code');
     assert.ok(connectRes2.flow_id, 'V1 connect returns flow_id');
-    // Wait ≥6s without PIN completion.
+    // Wait ≥6s without PIN completion (stub returns pending).
     await new Promise(r => setTimeout(r, 6000));
     const statusRes2 = await (await origFetch(`${BASE}/api/profiles/${prof2.id}/simkl/status?flow_id=${connectRes2.flow_id}`)).json();
+    global.fetch = origFetch;
     assert.strictEqual(statusRes2.connection_attempt.state, 'pending', 'PIN attempt is pending after 6s');
     config.removeProfile(prof2.id);
     console.log('  ✓ T1b: V1 PIN pending — attempt stays pending without completion');

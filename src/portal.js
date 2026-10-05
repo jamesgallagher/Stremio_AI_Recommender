@@ -294,6 +294,13 @@ router.put('/profiles/:id', (req, res) => {
     recommendationStore.rebuildAfterChange(profile.id)
       .catch((err) => console.warn(`[rec] ${profile.name}: engine-change rebuild failed — ${err.message}`));
   }
+  // §2: On actual relevant credential edits, invalidate the attempt immediately.
+  // Identical saves do nothing. A change followed by changing back must not
+  // revive it (the attempt is terminal once invalidated).
+  if (patch.keys || patch.simkl_auth_version !== undefined) {
+    const simklConnectionFlow = require('./services/simklConnectionFlow');
+    simklConnectionFlow.invalidateAttempts(req.params.id);
+  }
   // Rule: extra-catalog caches can be built "from the configure" — when the
   // toggle set changes and any enabled, buildable catalog has no cache yet,
   // build those in the background (extras only: never burns LLM quota).
@@ -450,6 +457,9 @@ router.get('/profiles/:id/simkl/status', async (req, res) => {
   const profile = config.getProfile(req.params.id);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
   const simklConnectionFlow = require('./services/simklConnectionFlow');
+  // Prune expired attempts (terminal records past polling window, abandoned
+  // pending/verifying attempts). Keeps storage bounded.
+  simklConnectionFlow.pruneExpired();
   const flow = simklFlows.get(profile.id);
   const lastCheck = simklChecks.get(grantFingerprint(profile)) || null;
   // When no manual check has run, derive a lightweight stored-token state
@@ -514,6 +524,9 @@ router.post('/profiles/:id/simkl/connect', async (req, res) => {
       const { authorizeUrl } = simklAuthV2.startFlow(profile, callbackUri);
       // Create a connection attempt (supersedes any previous attempt).
       const flowId = simklConnectionFlow.startAttempt(profile);
+      // Associate the attempt's flow_id with the OAuth flow record so the
+      // callback references THIS specific attempt, not the latest active one.
+      simklAuthV2.setFlowId(profile.id, flowId);
       res.json({ authorize_url: authorizeUrl, flow_id: flowId });
     } catch (err) {
       res.status(400).json({ error: err.message });
@@ -526,22 +539,33 @@ router.post('/profiles/:id/simkl/connect', async (req, res) => {
   if (!clientId) return res.status(400).json({ error: 'Set the Simkl Client ID first' });
   try {
     const dc = await simkl.startPinFlow(clientId);
+    // Set V1 attempt expiry from the provider's returned expiry, not a fixed 15 minutes.
+    const pinExpiry = Date.now() + (dc.expires_in || 900) * 1000;
+    // Create a connection attempt BEFORE the async provider startup so a
+    // delayed PIN-start response cannot supersede a later Connect/Disconnect.
+    const flowId = simklConnectionFlow.startAttempt(profile, pinExpiry);
     const flow = {
       user_code: dc.user_code,
       verification_url: dc.verification_url || 'https://simkl.com/pin',
       state: 'pending', error: null,
-      expires_at: Date.now() + (dc.expires_in || 900) * 1000,
+      expires_at: pinExpiry,
+      flow_id: flowId,
     };
     simklFlows.set(profile.id, flow);
-    // Create a connection attempt (supersedes any previous attempt).
-    const flowId = simklConnectionFlow.startAttempt(profile);
 
     const intervalMs = Math.max(dc.interval || 5, 5) * 1000;
     const poll = setInterval(async () => {
       const current = simklFlows.get(profile.id);
       if (!current || current !== flow || Date.now() > flow.expires_at) {
         clearInterval(poll);
-        if (current === flow && flow.state === 'pending') { flow.state = 'error'; flow.error = 'PIN expired — start again'; }
+        if (current === flow && flow.state === 'pending') {
+          flow.state = 'error'; flow.error = 'PIN expired — start again';
+          // Mark the specific attempt failed on PIN expiry.
+          const expAttempt = simklConnectionFlow.getAttempt(flowId);
+          if (expAttempt && (expAttempt.state === 'pending' || expAttempt.state === 'verifying')) {
+            simklConnectionFlow.completeAttempt(flowId, 'failed', null, 'PIN expired — start again');
+          }
+        }
         return;
       }
       try {
@@ -550,9 +574,12 @@ router.post('/profiles/:id/simkl/connect', async (req, res) => {
         clearInterval(poll);
         if (result.token) {
           // §2: Guarded promotion. The token is in a local variable; not persisted yet.
-          const attempt = simklConnectionFlow.getActiveAttemptForProfile(profile.id);
-          if (!attempt) {
+          // Use the flow_id captured by this PIN operation's closure, not the
+          // latest active attempt (which may have been superseded during polling).
+          const attempt = simklConnectionFlow.getAttempt(flowId);
+          if (!attempt || (attempt.state !== 'pending' && attempt.state !== 'verifying')) {
             flow.state = 'error'; flow.error = 'Connection changed — start again';
+            if (attempt) simklConnectionFlow.completeAttempt(flowId, 'failed', null, 'Connection changed — start again');
             console.error(`[simkl] ${profile.name}: PIN flow — no active attempt`);
             return;
           }
@@ -573,7 +600,7 @@ router.post('/profiles/:id/simkl/connect', async (req, res) => {
           }
           // §3 outcome — no await between guard, grant update, check-cache update, and attempt completion.
           const oldAuth = currentProfile.simkl_auth;
-          const oldAccountId = oldAuth?.account_id || null;
+          const oldAccountId = oldAuth?.account_id ? String(oldAuth.account_id) : null;
           const newAccountId = identity.id || null;
           if (identity.ok) {
             if (oldAccountId && newAccountId && oldAccountId !== newAccountId) {
@@ -622,10 +649,20 @@ router.post('/profiles/:id/simkl/connect', async (req, res) => {
           }
         } else {
           flow.state = 'error'; flow.error = result.error || 'Authorization failed';
+          // Mark the specific attempt failed on provider PIN error.
+          const errAttempt = simklConnectionFlow.getAttempt(flowId);
+          if (errAttempt && (errAttempt.state === 'pending' || errAttempt.state === 'verifying')) {
+            simklConnectionFlow.completeAttempt(flowId, 'failed', null, flow.error);
+          }
           console.error(`[simkl] ${profile.name}: PIN flow failed — ${flow.error}`);
         }
       } catch (err) {
         clearInterval(poll); flow.state = 'error'; flow.error = err.message;
+        // Mark the specific attempt failed on thrown polling error.
+        const throwAttempt = simklConnectionFlow.getAttempt(flowId);
+        if (throwAttempt && (throwAttempt.state === 'pending' || throwAttempt.state === 'verifying')) {
+          simklConnectionFlow.completeAttempt(flowId, 'failed', null, err.message);
+        }
       }
     }, intervalMs);
 
@@ -938,21 +975,25 @@ router.post('/profiles/:id/watched', async (req, res) => {
 router.post('/profiles/:id/simkl/disconnect', async (req, res) => {
   const profile = config.getProfile(req.params.id);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
-  // Invalidate pending/in-flight attempts BEFORE remote revocation.
-  // A completed old revocation must not clear a newer connection.
-  require('./services/simklConnectionFlow').invalidateAttempts(profile.id);
-  // V2: best-effort revoke before clearing (M4 — the token is sent server-side only).
-  if (profile.simkl_auth?.version === 2) {
-    const simklAuthV2 = require('./services/simklAuthV2');
-    try { await simklAuthV2.revokeToken(profile); } catch (err) {
-      console.warn(`[simkl] ${profile.name}: V2 revoke failed — ${err.message}`);
-    }
-  }
+  // Disconnect order: capture old grant for revocation → invalidate attempts
+  // → clear local grant/PIN state/check cache synchronously → await
+  // best-effort revocation of the captured old grant. Do NOT clear anything
+  // again after the await (a newer connection may have been established).
+  const simklConnectionFlow = require('./services/simklConnectionFlow');
+  const oldAuth = profile.simkl_auth;
+  simklConnectionFlow.invalidateAttempts(profile.id);
+  // Clear local state synchronously (before the await).
   config.updateProfile(req.params.id, { simkl_auth: null });
   simklFlows.delete(req.params.id);
-  // Clear all check results for this profile (any grant fingerprint).
   for (const key of simklChecks.keys()) {
     if (key.startsWith(req.params.id + ':')) simklChecks.delete(key);
+  }
+  // Best-effort revocation of the captured old grant (M4 — token sent server-side only).
+  if (oldAuth?.version === 2 && oldAuth?.access_token) {
+    const simklAuthV2 = require('./services/simklAuthV2');
+    try { await simklAuthV2.revokeToken({ simkl_auth: oldAuth, keys: profile.keys }); } catch (err) {
+      console.warn(`[simkl] ${profile.name}: V2 revoke failed — ${err.message}`);
+    }
   }
   res.json({ ok: true });
 });

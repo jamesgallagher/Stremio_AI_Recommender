@@ -1299,10 +1299,23 @@ async function connectSimkl(id) {
             clearInterval(poll);
             if (connection_attempt.state === 'completed') {
               toast(connection_attempt.result === 'connected' ? 'Simkl connected 🎉' : 'Simkl token stored');
+              // Reload profile data so active version/credentials/actions
+              // describe the promoted grant.
+              const { profiles } = await api('/profiles');
+              PROFILES = profiles;
+              renderSelected();
+              checkSimklStatus(id);
             } else {
-              statusEl.innerHTML = `<span style="color:var(--err)">${esc(connection_attempt.message)}</span>`;
+              // Render the terminal failure message as part of the final
+              // flow UI, after the active-grant render. Keep it visible
+              // with existing connection controls.
+              await checkSimklStatus(id);
+              const card = document.querySelector(`[data-id="${id}"]`);
+              const flowEl = card?.querySelector('.simkl-flow');
+              if (flowEl) {
+                flowEl.insertAdjacentHTML('beforeend', `<div style="margin-top:8px"><span style="color:var(--err)">${esc(connection_attempt.message)}</span></div>`);
+              }
             }
-            checkSimklStatus(id);
           }
         } catch { /* transient */ }
       }, 3000);
@@ -1321,10 +1334,23 @@ async function connectSimkl(id) {
             clearInterval(poll);
             if (connection_attempt.state === 'completed') {
               toast(connection_attempt.result === 'connected' ? 'Simkl connected 🎉' : 'Simkl token stored');
+              // Reload profile data so active version/credentials/actions
+              // describe the promoted grant.
+              const { profiles } = await api('/profiles');
+              PROFILES = profiles;
+              renderSelected();
+              checkSimklStatus(id);
             } else {
-              statusEl.innerHTML = `<span style="color:var(--err)">${esc(connection_attempt.message)}</span>`;
+              // Render the terminal failure message as part of the final
+              // flow UI, after the active-grant render. Keep it visible
+              // with existing connection controls.
+              await checkSimklStatus(id);
+              const card = document.querySelector(`[data-id="${id}"]`);
+              const flowEl = card?.querySelector('.simkl-flow');
+              if (flowEl) {
+                flowEl.insertAdjacentHTML('beforeend', `<div style="margin-top:8px"><span style="color:var(--err)">${esc(connection_attempt.message)}</span></div>`);
+              }
             }
-            checkSimklStatus(id);
           }
         } catch { /* transient */ }
       }, 3000);

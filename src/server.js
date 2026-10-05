@@ -152,9 +152,18 @@ app.get('/simkl/oauth2/callback', async (req, res) => {
   // successful cancellation).
   if (error) {
     const config = require('./config');
+    const simklConnectionFlow = require('./services/simklConnectionFlow');
     let consumed = false;
     for (const p of config.listProfiles()) {
-      if (simklAuthV2.getFlow(p.id)?.state === state) {
+      const flowRec = simklAuthV2.getFlow(p.id);
+      if (flowRec?.state === state) {
+        // Mark the specific attempt failed on OAuth cancellation.
+        if (flowRec.flow_id) {
+          const cancelAttempt = simklConnectionFlow.getAttempt(flowRec.flow_id);
+          if (cancelAttempt && (cancelAttempt.state === 'pending' || cancelAttempt.state === 'verifying')) {
+            simklConnectionFlow.completeAttempt(flowRec.flow_id, 'failed', null, 'Connection cancelled — start again');
+          }
+        }
         simklAuthV2.consumeFlow(p.id);
         consumed = true;
         break;
@@ -191,13 +200,19 @@ app.get('/simkl/oauth2/callback', async (req, res) => {
     res.redirect(`/configure/#simkl?error=${encodeURIComponent('V2 flow expired or already used — start the connection again')}`);
     return;
   }
+  // Capture the attempt's flow_id BEFORE the token exchange (which consumes
+  // the flow). This ensures we reference the specific attempt that started
+  // this flow, not a newer one that may have superseded it during the await.
+  const simklConnectionFlow = require('./services/simklConnectionFlow');
+  const flowRecord = simklAuthV2.getFlow(matched.id);
+  const flowId = flowRecord?.flow_id || null;
   try {
     const tokens = await simklAuthV2.handleCallback(matched, { code, state, iss });
     // §2: Guarded promotion. The token is in a local variable; not persisted yet.
-    const simklConnectionFlow = require('./services/simklConnectionFlow');
-    const attempt = simklConnectionFlow.getActiveAttemptForProfile(matched.id);
-    if (!attempt) {
-      // No active attempt for this profile (invalidated or never started).
+    const attempt = flowId ? simklConnectionFlow.getAttempt(flowId) : null;
+    if (!attempt || (attempt.state !== 'pending' && attempt.state !== 'verifying')) {
+      // No active attempt for this profile (invalidated, superseded, or never started).
+      if (attempt) simklConnectionFlow.completeAttempt(attempt.flowId, 'failed', null, 'Connection changed — start again');
       res.redirect(`/configure/#simkl?error=${encodeURIComponent('Connection changed — start again')}`);
       return;
     }
@@ -297,11 +312,12 @@ app.get('/simkl/oauth2/callback', async (req, res) => {
         : err.state === 'invalid_issuer'
           ? 'Unexpected token issuer — start the connection again'
           : 'V2 OAuth failed — start the connection again';
-    // §2: Mark the attempt as failed — no promotion on callback failure.
-    const simklConnectionFlow = require('./services/simklConnectionFlow');
-    const failedAttempt = simklConnectionFlow.getActiveAttemptForProfile(matched.id);
-    if (failedAttempt) {
-      simklConnectionFlow.completeAttempt(failedAttempt.flowId, 'failed', null, 'Connection changed — start again');
+    // §2: Mark the specific attempt as failed — no promotion on callback failure.
+    if (flowId) {
+      const failedAttempt = simklConnectionFlow.getAttempt(flowId);
+      if (failedAttempt && (failedAttempt.state === 'pending' || failedAttempt.state === 'verifying')) {
+        simklConnectionFlow.completeAttempt(failedAttempt.flowId, 'failed', null, 'Connection changed — start again');
+      }
     }
     res.redirect(`/configure/#simkl?error=${encodeURIComponent(msg)}`);
   }

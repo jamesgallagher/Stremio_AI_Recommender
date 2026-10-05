@@ -110,6 +110,13 @@ function consumeFlow(profileId) {
   flows.delete(profileId);
 }
 
+// Associate the connection-attempt flow_id with the OAuth flow record.
+// Called by the portal's connect endpoint after startAttempt.
+function setFlowId(profileId, flowId) {
+  const flow = flows.get(profileId);
+  if (flow) flow.flow_id = flowId;
+}
+
 // Validate the granted scope: must contain exactly the required scope members.
 // A read-only grant (e.g. scope="media:read") is insufficient for this app.
 function validateScope(grantedScope) {
@@ -295,13 +302,14 @@ function getFlow(profileId) {
     flows.delete(profileId);
     return null;
   }
-  return { state: flow.state, expires_at: flow.expires_at, client_id: flow.client_id };
+  return { state: flow.state, expires_at: flow.expires_at, client_id: flow.client_id, flow_id: flow.flow_id || null };
 }
 
 module.exports = {
   startFlow,
   handleCallback,
   consumeFlow,
+  setFlowId,
   refreshToken,
   revokeToken,
   getFlow,

@@ -23,26 +23,40 @@ const V1_POLL_WINDOW_MS = 15 * 60 * 1000; // 15 minutes (PIN expiry)
 
 const attempts = new Map(); // flow_id → attempt record
 
-// Compute a non-disclosed digest of the starting grant + credentials.
+// Compute a non-disclosed digest of the starting grant + target credentials.
 // This is a fingerprint of the specific grant/credential binding at the
 // start of the attempt. It is NOT the raw token or secret.
+//
+// The grant snapshot includes: bound client ID, version, access token,
+// refresh token, and account identity.
+// The credential snapshot includes: the target version's client ID and
+// secret (even when the active grant is another version, e.g. V1→V2
+// migration). Hashing structured data server-side; the digest is never
+// exposed to the browser.
 function grantDigest(profile) {
   const auth = profile.simkl_auth || {};
   const keys = profile.keys || {};
-  const version = auth.version || 1;
-  const clientId = version === 2 ? (keys.simkl_v2_client_id || '') : (keys.simkl_client_id || '');
-  const token = auth.access_token || '';
-  const account = auth.account_id || '';
-  const raw = `${profile.id}:${version}:${clientId}:${token}:${account}`;
+  const targetVersion = profile.simkl_auth_version || 2;
+  // Grant snapshot: the active grant's binding.
+  const grantVersion = auth.version || 1;
+  const grantClientId = grantVersion === 2 ? (keys.simkl_v2_client_id || '') : (keys.simkl_client_id || '');
+  const grantToken = auth.access_token || '';
+  const grantRefresh = auth.refresh_token || '';
+  const grantAccount = auth.account_id || '';
+  // Credential snapshot: the target version's client ID and secret.
+  const credClientId = targetVersion === 2 ? (keys.simkl_v2_client_id || '') : (keys.simkl_client_id || '');
+  const credSecret = targetVersion === 2 ? (keys.simkl_v2_client_secret || '') : (keys.simkl_client_secret || '');
+  const raw = `${profile.id}|${grantVersion}|${grantClientId}|${grantToken}|${grantRefresh}|${grantAccount}|${targetVersion}|${credClientId}|${credSecret}`;
   return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 32);
 }
 
 // Start a new connection attempt. Supersedes any previous attempt for the
 // profile. Returns the flow_id.
-function startAttempt(profile) {
+// expiryOverride: optional absolute timestamp (ms) for V1 provider expiry.
+function startAttempt(profile, expiryOverride) {
   const flowId = crypto.randomUUID();
   const version = profile.simkl_auth_version || 2;
-  const expiry = Date.now() + (version === 2 ? V2_POLL_WINDOW_MS : V1_POLL_WINDOW_MS);
+  const expiry = expiryOverride || Date.now() + (version === 2 ? V2_POLL_WINDOW_MS : V1_POLL_WINDOW_MS);
   const digest = grantDigest(profile);
   // Supersede any previous pending/verifying attempt for this profile.
   for (const [id, rec] of attempts) {
@@ -137,19 +151,32 @@ function invalidateAttempt(flowId) {
   }
 }
 
-// Prune expired terminal attempts.
+// Prune expired attempts: terminal records past their polling window, and
+// abandoned pending/verifying attempts (expired without reaching a terminal
+// state). An expired completed ID must not keep reporting completion.
+// Keep storage bounded, including repeated Connect requests.
 function pruneExpired() {
   const now = Date.now();
   for (const [id, rec] of attempts) {
-    if (now > rec.expiry && (rec.state === 'completed' || rec.state === 'failed')) {
+    if (now > rec.expiry) {
+      // Expire abandoned pending/verifying attempts.
+      if (rec.state === 'pending' || rec.state === 'verifying') {
+        rec.state = 'failed';
+        rec.result = null;
+        rec.message = 'Connection attempt expired';
+      }
+      // Remove expired terminal records.
       attempts.delete(id);
     }
   }
 }
 
 // Bounded identity verification (§3).
-// Limit the whole identity operation (fetch + JSON parse) to 10,000 ms.
-// Abort at the deadline and settle the helper even if fetch does not settle.
+// Race the entire fetch-and-parse operation against a 10,000-ms deadline.
+// On deadline, abort and return the timeout failure regardless of whether
+// fetch/parsing settles. Uses the helper's own signal for its request; does
+// NOT send it through boundedFetch (which replaces the supplied signal and
+// does not bound parsing).
 //
 // Valid identity requires a successful /users/settings response with a
 // nonempty string or finite numeric ID from user.id or user.user_id.
@@ -162,24 +189,35 @@ async function verifyIdentity(clientId, accessToken) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), IDENTITY_TIMEOUT_MS);
   try {
-    const res = await simkl.boundedFetch(
-      simkl.withParams(clientId, '/users/settings'),
-      { headers: simkl.headers(accessToken), signal: controller.signal }
-    );
-    if (!res.ok) return { ok: false, reason: 'failed_http', id: null, name: null };
-    const data = await res.json();
-    const rawId = data?.user?.id ?? data?.user?.user_id;
-    const name = data?.user?.name || null;
-    // Normalize: nonempty string or finite numeric → string.
-    if (typeof rawId === 'string' && rawId.trim() !== '') {
-      return { ok: true, id: rawId.trim(), name };
-    }
-    if (typeof rawId === 'number' && Number.isFinite(rawId)) {
-      return { ok: true, id: String(rawId), name };
-    }
-    return { ok: false, reason: 'invalid_id', id: null, name: null };
+    // The entire fetch + JSON parse operation.
+    const operation = (async () => {
+      const res = await fetch(simkl.withParams(clientId, '/users/settings'), {
+        headers: simkl.headers(accessToken),
+        signal: controller.signal,
+      });
+      if (!res.ok) return { ok: false, reason: 'failed_http', id: null, name: null };
+      const data = await res.json();
+      const rawId = data?.user?.id ?? data?.user?.user_id;
+      const name = data?.user?.name || null;
+      // Normalize: nonempty string or finite numeric → string.
+      if (typeof rawId === 'string' && rawId.trim() !== '') {
+        return { ok: true, id: rawId.trim(), name };
+      }
+      if (typeof rawId === 'number' && Number.isFinite(rawId)) {
+        return { ok: true, id: String(rawId), name };
+      }
+      return { ok: false, reason: 'invalid_id', id: null, name: null };
+    })();
+    // Prevent unhandled rejection if the operation rejects after the timeout
+    // wins the race (e.g. late abort rejection).
+    operation.catch(() => {});
+    // The deadline promise: resolves with a timeout failure at 10,000 ms.
+    const deadline = new Promise((resolve) => {
+      setTimeout(() => resolve({ ok: false, reason: 'timeout', id: null, name: null }), IDENTITY_TIMEOUT_MS);
+    });
+    return await Promise.race([operation, deadline]);
   } catch (err) {
-    if (err.name === 'AbortError' || err.message?.includes('timeout')) {
+    if (err.name === 'AbortError' || controller.signal.aborted) {
       return { ok: false, reason: 'timeout', id: null, name: null };
     }
     return { ok: false, reason: 'network_error', id: null, name: null };
