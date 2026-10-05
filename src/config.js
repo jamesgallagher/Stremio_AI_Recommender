@@ -71,9 +71,14 @@ const DEFAULT_COMPANION = { catalog_only: true };
 
 // Secret fields sealed at rest. The scrobble password_enc is already its own
 // AES blob and the install token is deliberately excluded (see header).
-const SECRET_KEY_FIELDS = ['simkl_client_id', 'simkl_client_secret', 'tmdb_api_key', 'groq_api_key', 'rpdb_api_key', 'mdblist_api_key'];
+// simkl_v2_client_id/secret (AUTH V2): a separate, newly-registered Simkl app
+// (Server apps & services). Kept distinct from the V1 pair — never overwrite a
+// V1 credential with a V2 one, and vice versa (mandate M3).
+const SECRET_KEY_FIELDS = ['simkl_client_id', 'simkl_client_secret', 'simkl_v2_client_id', 'simkl_v2_client_secret', 'tmdb_api_key', 'groq_api_key', 'rpdb_api_key', 'mdblist_api_key'];
+// refresh_token is sealed (AUTH V2): the V2 refresh token is a secret that must
+// never reach the browser or logs.
 const SECRET_TOKEN_FIELDS = ['access_token', 'refresh_token'];
-// Top-level auth objects whose tokens are sealed (Simkl v6).
+// Top-level auth objects whose tokens are sealed (Simkl v6 + AUTH V2).
 const AUTH_OBJECTS = ['simkl_auth'];
 
 let locked = false;
@@ -87,14 +92,23 @@ function newProfile(name) {
     name,
     token: crypto.randomBytes(16).toString('hex'), // unguessable install-URL token
     keys: {
-      simkl_client_id: '', // v6: one Simkl app per profile
+      simkl_client_id: '', // v6: one Simkl app per profile (AUTH V1)
       simkl_client_secret: '',
+      // AUTH V2: a separate, newly-registered Simkl app (Server apps & services).
+      // Kept distinct from the V1 pair — never overwrite one with the other (M3).
+      simkl_v2_client_id: '',
+      simkl_v2_client_secret: '',
       tmdb_api_key: '',
       groq_api_key: '',
       rpdb_api_key: DEFAULT_RPDB_KEY, // rating-overlay posters; free key pre-set
       mdblist_api_key: '', // required: extra catalogs + Common Sense age checks
     },
-    simkl_auth: null, // v6: { access_token, connected_at } — Simkl PIN token
+    simkl_auth: null, // v6: { access_token, connected_at } — Simkl PIN token (V1); V2 adds version/refresh_token/expires_at/scope/client_id
+    // AUTH V1/V2: the preferred connection version — what Connect starts. Does
+    // NOT change the active token's version or client ID (those live in
+    // simkl_auth). New + unconfigured profiles default to V2 (the newer flow);
+    // existing V1 profiles migrate to 1 (see applyMigrations).
+    simkl_auth_version: 2,
     email: '', // the user's email — for the future Mobile Companion passwordless login
     filters: { ...DEFAULT_FILTERS },
     catalogs: {}, // extra-catalog toggles by id; absent/false = off. AI catalogs are always on.
@@ -170,7 +184,28 @@ function applyMigrations(p) {
   // v6: Simkl fields alongside the (still-present) Trakt ones.
   if (p.keys.simkl_client_id === undefined) p.keys.simkl_client_id = '';
   if (p.keys.simkl_client_secret === undefined) p.keys.simkl_client_secret = '';
+  // AUTH V2: the separate V2 app credentials (Server apps & services). Added
+  // alongside the V1 pair — never overwrite one with the other (M3).
+  if (p.keys.simkl_v2_client_id === undefined) p.keys.simkl_v2_client_id = '';
+  if (p.keys.simkl_v2_client_secret === undefined) p.keys.simkl_v2_client_secret = '';
   if (p.simkl_auth === undefined) p.simkl_auth = null;
+  // AUTH V1/V2: the preferred connection version. Existing profiles with any V1
+  // credential or V1 token migrate idempotently to 1; new + completely
+  // unconfigured profiles default to 2 (mandate M1). A V2 auth object (version
+  // 2) implies a V2 preference. Never coerces an unknown value — that's
+  // validated at write time (updateProfile).
+  if (p.simkl_auth_version === undefined) {
+    const hasV1Token = p.simkl_auth && p.simkl_auth.access_token && p.simkl_auth.version !== 2;
+    const hasV1Creds = p.keys.simkl_client_id || p.keys.simkl_client_secret;
+    p.simkl_auth_version = (hasV1Token || hasV1Creds) ? 1 : 2;
+  }
+  // AUTH V2: bind the active auth object to the client ID that minted it (M3).
+  // Existing V1 tokens have no recorded client ID — best-effort bind to the
+  // current V1 credential so a later credential change is detectable. V2 tokens
+  // record their client_id at mint time (never migrated here).
+  if (p.simkl_auth && p.simkl_auth.access_token && p.simkl_auth.client_id === undefined && p.simkl_auth.version !== 2) {
+    p.simkl_auth.client_id = p.keys.simkl_client_id || '';
+  }
   if (p.email === undefined) p.email = '';
   if (p.catalogs === undefined) p.catalogs = {};
   if (p.scrobble === undefined) p.scrobble = { ...DEFAULT_SCROBBLE };
@@ -360,6 +395,16 @@ function updateProfile(id, patch) {
       }
     }
     if (patch.simkl_auth !== undefined) profile.simkl_auth = patch.simkl_auth;
+    // AUTH V1/V2: the preferred connection version. Validate strictly — reject
+    // unknown values rather than silently coercing to the wrong endpoint (M3).
+    // Changing the preference never touches the active token's version or
+    // client ID (those live in simkl_auth and are set only by a successful
+    // authorization).
+    if (patch.simkl_auth_version !== undefined) {
+      const v = Number(patch.simkl_auth_version);
+      if (v !== 1 && v !== 2) throw new Error('simkl_auth_version must be 1 or 2');
+      profile.simkl_auth_version = v;
+    }
     if (patch.scrobble && typeof patch.scrobble === 'object') {
       const s = patch.scrobble;
       if (!profile.scrobble) profile.scrobble = { ...DEFAULT_SCROBBLE };

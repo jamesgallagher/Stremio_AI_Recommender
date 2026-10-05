@@ -90,6 +90,114 @@ async function accountName(clientId, accessToken) {
   return data?.user?.name || data?.user?.username || null;
 }
 
+// Bounded fetch (mandate M6): the manual check must not hang the portal. A
+// timeout is a distinct, visible "unreachable" result, not a silent failure.
+// The provider's one-request check stays out of the recurring background poll.
+const CHECK_TIMEOUT_MS = 10000;
+async function boundedFetch(url, opts = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CHECK_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...opts, signal: controller.signal });
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error('Simkl unreachable (timeout)');
+    throw new Error(`Simkl unreachable: ${err.message}`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ---- Manual Check connection (mandate M6) ----
+// The manual "Check connection" button calls this (POST /simkl/check). It does
+// NOT create a connection flow, authorize a user, or show a PIN, and it does
+// NOT edit profile settings. It returns a structured state + a short safe
+// message (never a generic {connected:false}). Only `connected` is a success
+// badge; a stored token alone is "token stored", never "connected".
+//
+// The state enum (mandate M6): connected, v1_ready_unconnected, not_authorized,
+// wrong_auth_version, client_id_rejected, credential_mismatch, rate_limited,
+// provider_unavailable, missing_configuration.
+//
+// Simkl's documented stable `error` identifiers (conventions/errors) are parsed
+// by identifier + HTTP status — never by pattern-matching provider prose, and
+// the provider body is never echoed to the browser (M4).
+async function manualCheck(profile) {
+  const version = profile.simkl_auth_version || 2;
+  const auth = profile.simkl_auth;
+  const hasToken = !!(auth && auth.access_token);
+
+  if (hasToken) {
+    // Active token + matching active client ID → verify /sync/activities.
+    const clientId = auth.version === 2 ? profile.keys.simkl_v2_client_id : profile.keys.simkl_client_id;
+    const token = auth.access_token;
+    if (!clientId) {
+      return { state: 'credential_mismatch', message: 'Simkl credential missing — reconnect the account' };
+    }
+    // The active token must be bound to the client ID that minted it (M3). A
+    // changed/replaced credential while connected is a mismatch, never a
+    // user API call with a mismatched pair.
+    if (auth.client_id && auth.client_id !== clientId) {
+      return { state: 'credential_mismatch', message: 'Simkl credential changed since this token was issued — reconnect' };
+    }
+    try {
+      const res = await boundedFetch(withParams(clientId, '/sync/activities'), { headers: headers(token) });
+      if (res.ok) {
+        const username = await accountName(clientId, token).catch(() => null);
+        return { state: 'connected', message: 'Connected and verified', username: username || auth.username || null };
+      }
+      if (res.status === 401 || res.status === 403) {
+        return { state: 'credential_mismatch', message: 'Token rejected by Simkl — reconnect the account' };
+      }
+      if (res.status === 429) {
+        return { state: 'rate_limited', message: 'Simkl rate limit — try again shortly' };
+      }
+      return { state: 'provider_unavailable', message: `Simkl returned ${res.status}` };
+    } catch (err) {
+      return { state: 'provider_unavailable', message: err.message };
+    }
+  }
+
+  // No token. Branch on the preferred version (what Connect would start).
+  if (version === 1) {
+    const clientId = profile.keys.simkl_client_id;
+    if (!clientId) {
+      return { state: 'missing_configuration', message: 'Client ID required' };
+    }
+    // One GET /oauth/pin compatibility probe; discard the returned PIN. This
+    // tells us whether the V1 app can start the PIN flow (no grant exists yet).
+    try {
+      const res = await boundedFetch(withParams(clientId, '/oauth/pin'), { headers: headers() });
+      if (res.ok) {
+        return { state: 'v1_ready_unconnected', message: 'V1 app accepted; Simkl account not connected. Click Connect.' };
+      }
+      const body = await res.json().catch(() => ({}));
+      // 400 unauthorized_client: Simkl's documented V2-ID-on-V1-endpoint error.
+      if (res.status === 400 && body.error === 'unauthorized_client') {
+        return { state: 'wrong_auth_version', message: 'This is a V2 app; select AUTH V2 and connect with the new flow.' };
+      }
+      // 412 client_id_failed: an incorrect/suspended ID or an active throttling
+      // block. It does NOT prove the ID is V2 — do not assert that (M6).
+      if (res.status === 412 && body.error === 'client_id_failed') {
+        return { state: 'client_id_rejected', message: 'V1 Client ID rejected (HTTP 412). Check the ID/app registration or a Simkl block.' };
+      }
+      return { state: 'provider_unavailable', message: `Simkl returned ${res.status}` };
+    } catch (err) {
+      return { state: 'provider_unavailable', message: err.message };
+    }
+  }
+
+  // V2 selected, no token. Simkl has no app-only grant — the secret cannot be
+  // validated without a user grant (M6). Name the missing field, or report that
+  // OAuth consent is needed (never a "successful secret test").
+  const v2Id = profile.keys.simkl_v2_client_id;
+  const v2Secret = profile.keys.simkl_v2_client_secret;
+  if (!v2Id || !v2Secret) {
+    const missing = !v2Id ? 'V2 Client ID' : 'V2 Client Secret';
+    return { state: 'missing_configuration', message: `${missing} required` };
+  }
+  return { state: 'not_authorized', message: 'Credentials saved; account not yet verified. Click Connect to complete V2 OAuth.' };
+}
+
 // ---- watched-history read (v6) ----
 // Verified live against the real API (account "James", 2026-08-18): activities
 // returns per-type change timestamps; all-items/{type}/completed returns items
@@ -520,6 +628,7 @@ module.exports = {
   startPinFlow,
   pollPin,
   checkConnection,
+  manualCheck,
   accountName,
   authedGet,
   getActivities,

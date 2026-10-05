@@ -27,18 +27,11 @@ function ok(name, fn) {
   passed++;
   console.log(`  ✓ ${name}`);
 }
-// Async unit tests (e.g. the AGE-1 decision chain): the promise is collected and
-// awaited at the top of the HTTP section, so a failure still fails the run and the
-// pass count lands in `passed`.
+// Async unit tests run serially before the HTTP server starts. They may stub
+// global.fetch, so concurrent execution would corrupt another test's restore.
 const asyncPending = [];
 function okAsync(name, fn) {
-  asyncPending.push(new Promise((resolve, reject) => {
-    Promise.resolve(fn()).then(() => {
-      passed++;
-      console.log(`  ✓ ${name}`);
-      resolve();
-    }, reject);
-  }));
+  asyncPending.push({ name, fn });
 }
 
 console.log('unit:');
@@ -1686,6 +1679,319 @@ ok('config: Simkl fields present + simkl_auth token sealed at rest (v6)', () => 
   assert.strictEqual(fresh.simkl_auth.access_token, 'simkl-token-xyz');
   assert.strictEqual(fresh.simkl_auth.username, 'james');
   config.removeProfile(p.id);
+});
+
+// ---- SIMKL-AUTH-1 T1: per-profile V1/V2 preference + migration (mandate M1) ----
+ok('simkl-auth T1: V1 profile migrates to preferred V1 without token/ID/secret loss; new profile defaults V2; two profiles can pick different versions', () => {
+  // (a) A legacy V1 profile (V1 credentials + a V1 token, no simkl_auth_version,
+  //     no V2 keys, no client_id on the auth) migrates idempotently to preferred
+  //     V1 — token, client ID and secret survive, and the active token is bound
+  //     to the V1 client ID (M3). Tested via the applyMigrations seam.
+  const p1 = config.addProfile('T1-LegacyV1');
+  const legacyV1 = config.getProfile(p1.id);
+  legacyV1.keys.simkl_client_id = 'v1-cid';
+  legacyV1.keys.simkl_client_secret = 'v1-sec';
+  legacyV1.simkl_auth = { access_token: 'v1-token', username: 'james', connected_at: 1 };
+  delete legacyV1.simkl_auth_version; // force the legacy shape
+  delete legacyV1.keys.simkl_v2_client_id;
+  delete legacyV1.keys.simkl_v2_client_secret;
+  config.applyMigrations(legacyV1);
+  assert.strictEqual(legacyV1.simkl_auth_version, 1, 'legacy V1 profile migrates to preferred V1');
+  assert.strictEqual(legacyV1.keys.simkl_client_id, 'v1-cid', 'V1 client ID preserved');
+  assert.strictEqual(legacyV1.keys.simkl_client_secret, 'v1-sec', 'V1 secret preserved');
+  assert.strictEqual(legacyV1.simkl_auth.access_token, 'v1-token', 'V1 token preserved');
+  assert.strictEqual(legacyV1.simkl_auth.version, undefined, 'V1 token has no explicit version (absent = 1)');
+  assert.strictEqual(legacyV1.simkl_auth.client_id, 'v1-cid', 'V1 token bound to the V1 client ID');
+  // Idempotent: running the migration again does not change the result.
+  config.applyMigrations(legacyV1);
+  assert.strictEqual(legacyV1.simkl_auth_version, 1, 'migration is idempotent');
+  config.removeProfile(p1.id);
+
+  // (b) A new profile defaults to preferred V2 (the newer flow).
+  const p2 = config.addProfile('T1-New');
+  const v2 = config.getProfile(p2.id);
+  assert.strictEqual(v2.simkl_auth_version, 2, 'new profile defaults to preferred V2');
+
+  // (c) A completely unconfigured legacy profile (no V1 creds, no token)
+  //     defaults to preferred V2.
+  const p3 = config.addProfile('T1-LegacyUnconfigured');
+  const legacyUnconfigured = config.getProfile(p3.id);
+  legacyUnconfigured.keys.simkl_client_id = '';
+  legacyUnconfigured.keys.simkl_client_secret = '';
+  legacyUnconfigured.simkl_auth = null;
+  delete legacyUnconfigured.simkl_auth_version; // force the legacy shape
+  config.applyMigrations(legacyUnconfigured);
+  assert.strictEqual(legacyUnconfigured.simkl_auth_version, 2, 'unconfigured legacy profile defaults to V2');
+  config.removeProfile(p3.id);
+
+  // (d) Two profiles can select different versions (the preference is per-profile).
+  const p4 = config.addProfile('T1-V1');
+  config.updateProfile(p4.id, { simkl_auth_version: 2 });
+  config.updateProfile(p2.id, { simkl_auth_version: 1 });
+  assert.strictEqual(config.getProfile(p4.id).simkl_auth_version, 2, 'profile 1 selects V2');
+  assert.strictEqual(config.getProfile(p2.id).simkl_auth_version, 1, 'profile 2 selects V1');
+
+  // (e) updateProfile rejects an unknown version rather than coercing (M3).
+  assert.throws(() => config.updateProfile(p4.id, { simkl_auth_version: 3 }), /simkl_auth_version/);
+  config.removeProfile(p4.id); config.removeProfile(p2.id);
+});
+
+// ---- SIMKL-AUTH-1 T2: V1 PIN flow unchanged; V1 token stays bound to V1 client ID ----
+okAsync('simkl-auth T2: V1 PIN flow calls V1 endpoints (no secret, no redirect); a V1 token still uses the V1 client ID after selecting V2 for the next connection', async () => {
+  const simkl = require('../src/services/simkl');
+  const p = config.addProfile('T2-V1');
+  config.updateProfile(p.id, {
+    keys: { simkl_client_id: 'v1-cid', simkl_client_secret: 'v1-sec' },
+    simkl_auth: { access_token: 'v1-token', username: 'james', connected_at: 1, client_id: 'v1-cid' },
+    simkl_auth_version: 2, // the user selected V2 for the NEXT connection
+  });
+  // The active V1 token is still bound to the V1 client ID — selecting V2 for
+  // the next connection does NOT change the active token's version or client ID (M3).
+  const fresh = config.getProfile(p.id);
+  assert.strictEqual(fresh.simkl_auth.access_token, 'v1-token');
+  assert.strictEqual(fresh.simkl_auth.client_id, 'v1-cid', 'V1 token still bound to the V1 client ID');
+  assert.strictEqual(fresh.simkl_auth.version, undefined, 'active token is still V1 (absent version = 1)');
+  assert.strictEqual(fresh.simkl_auth_version, 2, 'preferred (next) version is V2');
+  // The V1 PIN flow still calls the V1 /oauth/pin endpoint with the V1 client
+  // ID and no secret (the PIN path never uses the stored secret).
+  const origFetch = global.fetch;
+  let pinCalls = [];
+  global.fetch = async (url, opts) => {
+    pinCalls.push({ url: String(url), opts });
+    return { ok: true, status: 200, json: async () => ({ user_code: 'ABC123', verification_url: 'https://simkl.com/pin', expires_in: 900, interval: 5 }) };
+  };
+  try {
+    const dc = await simkl.startPinFlow('v1-cid');
+    assert.ok(dc.user_code, 'PIN flow returns a user code');
+    assert.strictEqual(pinCalls.length, 1, 'exactly one V1 /oauth/pin call');
+    assert.ok(pinCalls[0].url.includes('/oauth/pin'), 'V1 PIN endpoint');
+    assert.ok(pinCalls[0].url.includes('client_id=v1-cid'), 'V1 client ID in the query');
+    assert.ok(!pinCalls[0].url.includes('secret'), 'no secret in the V1 PIN request');
+  } finally {
+    global.fetch = origFetch;
+    config.removeProfile(p.id);
+  }
+});
+
+// ---- SIMKL-AUTH-1 T10: James's report — V2 ID in the V1 field, V1 selected, no token ----
+// The manual check must call the V1 PIN endpoint ONCE, receive a fetch-level
+// 400 {"error":"unauthorized_client"}, and return the prominent "select AUTH V2"
+// failure. The old implementation's "not connected" response must fail this test.
+// No PIN is shown and no profile is mutated.
+okAsync('simkl-auth T10: V2 ID + V1 selected + no token → one V1 PIN probe, 400 unauthorized_client → wrong_auth_version (select AUTH V2)', async () => {
+  const simkl = require('../src/services/simkl');
+  const p = config.addProfile('T10-V2InV1');
+  // A V2 Client ID entered in the existing V1 field, V1 selected, no token.
+  config.updateProfile(p.id, {
+    keys: { simkl_client_id: 'v2-cid-in-v1-field' },
+    simkl_auth_version: 1,
+  });
+  const origFetch = global.fetch;
+  let pinCalls = [];
+  global.fetch = async (url) => {
+    pinCalls.push(String(url));
+    return { ok: false, status: 400, json: async () => ({ error: 'unauthorized_client' }) };
+  };
+  try {
+    const result = await simkl.manualCheck(config.getProfile(p.id));
+    assert.strictEqual(result.state, 'wrong_auth_version', 'state is wrong_auth_version');
+    assert.ok(result.message.includes('AUTH V2'), 'message tells the user to select AUTH V2');
+    assert.strictEqual(pinCalls.length, 1, 'exactly one V1 /oauth/pin probe (no retry)');
+    assert.ok(pinCalls[0].includes('/oauth/pin'), 'the probe is the V1 PIN endpoint');
+    // The old "not connected" response is gone — the state is specific.
+    assert.notStrictEqual(result.state, 'not connected');
+    // No profile mutation (no PIN flow started, no token written).
+    const fresh = config.getProfile(p.id);
+    assert.strictEqual(fresh.simkl_auth, null, 'no token written');
+  } finally {
+    global.fetch = origFetch;
+    config.removeProfile(p.id);
+  }
+});
+
+// ---- SIMKL-AUTH-1 T11: the V1 probe's distinct outcomes + V2 consent-needed ----
+okAsync('simkl-auth T11: V1 probe 412 → client_id_rejected (no V2 assertion, no retry); 200 → v1_ready_unconnected; V2 no token → not_authorized; missing/timeout/5xx distinct', async () => {
+  const simkl = require('../src/services/simkl');
+
+  // (a) V1 probe 412 {"error":"client_id_failed"} → client_id_rejected, no retry,
+  //     and the message does NOT assert the ID is V2.
+  {
+    const p = config.addProfile('T11-412');
+    config.updateProfile(p.id, { keys: { simkl_client_id: 'v1-cid' }, simkl_auth_version: 1 });
+    const origFetch = global.fetch;
+    let calls = [];
+    global.fetch = async (url) => {
+      calls.push(String(url));
+      return { ok: false, status: 412, json: async () => ({ error: 'client_id_failed' }) };
+    };
+    try {
+      const result = await simkl.manualCheck(config.getProfile(p.id));
+      assert.strictEqual(result.state, 'client_id_rejected');
+      assert.ok(result.message.includes('412'), 'message cites the 412');
+      assert.ok(!/V2 app|select AUTH V2/i.test(result.message), 'message does NOT assert the ID is V2');
+      assert.strictEqual(calls.length, 1, 'exactly one probe (no retry)');
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
+  }
+
+  // (b) V1 probe 200 → v1_ready_unconnected ("V1 app accepted, not connected"),
+  //     never "Connected".
+  {
+    const p = config.addProfile('T11-200');
+    config.updateProfile(p.id, { keys: { simkl_client_id: 'v1-cid' }, simkl_auth_version: 1 });
+    const origFetch = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ user_code: 'ABC', verification_url: 'https://simkl.com/pin', expires_in: 900, interval: 5 }) });
+    try {
+      const result = await simkl.manualCheck(config.getProfile(p.id));
+      assert.strictEqual(result.state, 'v1_ready_unconnected');
+      assert.ok(result.message.includes('not connected'), 'message says the account is not connected');
+      assert.notStrictEqual(result.state, 'connected', 'never "Connected" on a probe');
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
+  }
+
+  // (c) V2 selected, no token, both creds present → not_authorized (OAuth
+  //     consent needed), and the secret is NOT validated (Simkl has no
+  //     app-only grant — M6).
+  {
+    const p = config.addProfile('T11-V2');
+    config.updateProfile(p.id, {
+      keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+      simkl_auth_version: 2,
+    });
+    const origFetch = global.fetch;
+    let fetchCalled = false;
+    global.fetch = async () => { fetchCalled = true; return { ok: true, status: 200, json: async () => ({}) }; };
+    try {
+      const result = await simkl.manualCheck(config.getProfile(p.id));
+      assert.strictEqual(result.state, 'not_authorized');
+      assert.ok(result.message.includes('OAuth'), 'message says OAuth consent is needed');
+      assert.ok(!fetchCalled, 'no Simkl call — the secret is not validated without a user grant');
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
+  }
+
+  // (d) V2 selected, no token, missing V2 Client ID → missing_configuration
+  //     naming the missing field.
+  {
+    const p = config.addProfile('T11-MissingId');
+    config.updateProfile(p.id, { keys: { simkl_v2_client_secret: 'v2-sec' }, simkl_auth_version: 2 });
+    const result = await simkl.manualCheck(config.getProfile(p.id));
+    assert.strictEqual(result.state, 'missing_configuration');
+    assert.ok(result.message.includes('V2 Client ID'), 'names the missing V2 Client ID');
+    config.removeProfile(p.id);
+  }
+
+  // (e) V2 selected, no token, missing V2 Client Secret → missing_configuration.
+  {
+    const p = config.addProfile('T11-MissingSec');
+    config.updateProfile(p.id, { keys: { simkl_v2_client_id: 'v2-cid' }, simkl_auth_version: 2 });
+    const result = await simkl.manualCheck(config.getProfile(p.id));
+    assert.strictEqual(result.state, 'missing_configuration');
+    assert.ok(result.message.includes('V2 Client Secret'), 'names the missing V2 Client Secret');
+    config.removeProfile(p.id);
+  }
+
+  // (f) V1 selected, no token, missing V1 Client ID → missing_configuration.
+  {
+    const p = config.addProfile('T11-MissingV1Id');
+    config.updateProfile(p.id, { simkl_auth_version: 1 });
+    const result = await simkl.manualCheck(config.getProfile(p.id));
+    assert.strictEqual(result.state, 'missing_configuration');
+    assert.ok(result.message.includes('Client ID'), 'names the missing Client ID');
+    config.removeProfile(p.id);
+  }
+
+  // (g) Provider 5xx → provider_unavailable (distinct from rate_limited).
+  {
+    const p = config.addProfile('T11-5xx');
+    config.updateProfile(p.id, { keys: { simkl_client_id: 'v1-cid' }, simkl_auth_version: 1 });
+    const origFetch = global.fetch;
+    global.fetch = async () => ({ ok: false, status: 503, json: async () => ({}) });
+    try {
+      const result = await simkl.manualCheck(config.getProfile(p.id));
+      assert.strictEqual(result.state, 'provider_unavailable');
+      assert.ok(result.message.includes('503'), 'message cites the 503');
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
+  }
+});
+
+// ---- SIMKL-AUTH-1 T12: active rejected token / changed client ID / provider outage ----
+okAsync('simkl-auth T12: rejected token, changed client ID, and provider outage each yield the correct manual-check state; the passive poll does not repaint a failure as Connected', async () => {
+  const simkl = require('../src/services/simkl');
+
+  // (a) An active token that Simkl rejects (401) → credential_mismatch.
+  {
+    const p = config.addProfile('T12-Rejected');
+    config.updateProfile(p.id, {
+      keys: { simkl_client_id: 'v1-cid' },
+      simkl_auth: { access_token: 'dead-token', client_id: 'v1-cid', connected_at: 1 },
+      simkl_auth_version: 1,
+    });
+    const origFetch = global.fetch;
+    global.fetch = async () => ({ ok: false, status: 401, json: async () => ({ error: 'user_token_required' }) });
+    try {
+      const result = await simkl.manualCheck(config.getProfile(p.id));
+      assert.strictEqual(result.state, 'credential_mismatch');
+      assert.ok(result.message.includes('reconnect'), 'message says to reconnect');
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
+  }
+
+  // (b) A changed Client ID (the active token is bound to a different client ID)
+  //     → credential_mismatch, with NO Simkl call (the mismatch is detected
+  //     locally, never a user API call with a mismatched pair — M3).
+  {
+    const p = config.addProfile('T12-Changed');
+    config.updateProfile(p.id, {
+      keys: { simkl_client_id: 'v1-cid-new' }, // the credential changed
+      simkl_auth: { access_token: 'old-token', client_id: 'v1-cid-old', connected_at: 1 },
+      simkl_auth_version: 1,
+    });
+    const origFetch = global.fetch;
+    let fetchCalled = false;
+    global.fetch = async () => { fetchCalled = true; return { ok: true, status: 200, json: async () => ({}) }; };
+    try {
+      const result = await simkl.manualCheck(config.getProfile(p.id));
+      assert.strictEqual(result.state, 'credential_mismatch');
+      assert.ok(result.message.includes('changed'), 'message says the credential changed');
+      assert.ok(!fetchCalled, 'no Simkl call — the mismatch is detected locally');
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
+  }
+
+  // (c) A provider outage (network failure) → provider_unavailable.
+  {
+    const p = config.addProfile('T12-Outage');
+    config.updateProfile(p.id, {
+      keys: { simkl_client_id: 'v1-cid' },
+      simkl_auth: { access_token: 'token', client_id: 'v1-cid', connected_at: 1 },
+      simkl_auth_version: 1,
+    });
+    const origFetch = global.fetch;
+    global.fetch = async () => { throw new Error('network down'); };
+    try {
+      const result = await simkl.manualCheck(config.getProfile(p.id));
+      assert.strictEqual(result.state, 'provider_unavailable');
+      assert.ok(result.message.includes('unreachable'), 'message says Simkl is unreachable');
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
+  }
 });
 
 // ---- Marquee ME-01: shared cert table + FilterEnvelope (pure) ----
@@ -5053,13 +5359,22 @@ ok('TV-3 S1: the descriptor — serveOrder calibrated + serveOptions returns the
 }
 
 // ---- HTTP surface ----
-console.log('http:');
-require('../src/server');
 const BASE = `http://localhost:${process.env.PORT}`;
 
 async function httpTests() {
-  // Await any async unit tests (AGE-1 decision chain) before the HTTP surface.
-  await Promise.all(asyncPending);
+  // Run async unit tests serially before the HTTP server starts. They may
+  // stub global.fetch, so concurrent execution would corrupt another test's
+  // restore. The after-test assertion identifies any remaining leak.
+  for (const { name, fn } of asyncPending) {
+    const fetchBefore = global.fetch;
+    await fn();
+    assert.strictEqual(global.fetch, fetchBefore, `${name} leaked global.fetch`);
+    passed++;
+    console.log(`  ✓ ${name}`);
+  }
+
+  console.log('http:');
+  require('../src/server');
   // The migrateFromProfiles unit test above seeds the GLOBAL settings with
   // JAMES-* lookup keys. Now that the addon reads GLOBAL keys, clear them so the
   // addon-serve tests start from a known "no keys" baseline (tests that need a
@@ -5768,7 +6083,11 @@ async function httpTests() {
   assert.strictEqual(res.status, 400);
   const sstatus = await (await fetch(`${BASE}/api/profiles/${profile.id}/simkl/status`)).json();
   assert.strictEqual(sstatus.connected, false);
-  assert.strictEqual(sstatus.reason, 'not connected'); // token-less check is network-free
+  // Mandate M6: the passive poll is lightweight (no Simkl call) and reports a
+  // structured state. A token-less profile with no manual check yet is
+  // `not_authorized` — never "connected" on the strength of a stored flag.
+  assert.strictEqual(sstatus.state, 'not_authorized');
+  assert.strictEqual(sstatus.reason, 'Not connected'); // token-less poll is network-free
   const sdis = await fetch(`${BASE}/api/profiles/${profile.id}/simkl/disconnect`, { method: 'POST' });
   assert.strictEqual(sdis.status, 200);
   // Regression (the "Save erased my keys" bug): the PUT key whitelist must

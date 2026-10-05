@@ -60,6 +60,21 @@ function redactKey(v) {
 
 const { baseUrl, normalizeExternal } = require('./baseurl');
 
+// AUTH V2 (mandate M2): the canonical callback URI, derived ONLY from a
+// validated HTTPS EXTERNAL_URL — no request-Host fallback for production V2.
+// A private LAN/test redirect may be allowed only in test configuration; it is
+// never published as the deployment URI. Returns '' when EXTERNAL_URL is
+// absent or not a valid HTTPS origin, so the portal disables V2 Connect with
+// an actionable message rather than publishing a broken redirect.
+function simklV2CallbackUri() {
+  const raw = normalizeExternal(process.env.EXTERNAL_URL);
+  if (!raw) return '';
+  let u;
+  try { u = new URL(raw); } catch { return ''; }
+  if (u.protocol !== 'https:') return '';
+  return `${raw}/simkl/oauth2/callback`;
+}
+
 function publicProfile(p, req) {
   return {
     id: p.id,
@@ -94,6 +109,12 @@ function publicProfile(p, req) {
     keys: {
       simkl_client_id: p.keys.simkl_client_id || '',
       simkl_client_secret: p.keys.simkl_client_secret || '',
+      // AUTH V2: the separate V2 app credentials (pre-filled for the input
+      // fields, like the V1 pair). The V2 client secret is the app's secret —
+      // it is NOT the user's token, so it is safe to pre-fill for editing.
+      // (User access/refresh tokens are never returned — see M4.)
+      simkl_v2_client_id: p.keys.simkl_v2_client_id || '',
+      simkl_v2_client_secret: p.keys.simkl_v2_client_secret || '',
       tmdb_api_key: p.keys.tmdb_api_key || '',
       groq_api_key: p.keys.groq_api_key || '',
       rpdb_api_key: p.keys.rpdb_api_key || '',
@@ -104,6 +125,8 @@ function publicProfile(p, req) {
     keys_set: {
       simkl_client_id: !!p.keys.simkl_client_id,
       simkl_client_secret: !!p.keys.simkl_client_secret,
+      simkl_v2_client_id: !!p.keys.simkl_v2_client_id,
+      simkl_v2_client_secret: !!p.keys.simkl_v2_client_secret,
       tmdb_api_key: !!settings.keyFor(p, 'tmdb_api_key'),
       groq_api_key: !!settings.keyFor(p, 'groq_api_key'),
       rpdb_api_key: !!settings.keyFor(p, 'rpdb_api_key'),
@@ -119,6 +142,19 @@ function publicProfile(p, req) {
     // /simkl/status (the portal calls it on the Simkl tab open).
     simkl_connected: !!p.simkl_auth?.access_token,
     simkl_username: p.simkl_auth?.username || null,
+    // AUTH V1/V2 (M1/M3): the preferred connection version (what Connect
+    // starts) and the active token's version (what is currently connected).
+    // Shown separately when they differ — a V1 token can stay active while the
+    // user has selected V2 for the next connection.
+    simkl_auth_version: p.simkl_auth_version || 2,
+    simkl_active_version: p.simkl_auth?.access_token ? (p.simkl_auth.version === 2 ? 2 : 1) : null,
+    // The canonical V2 callback URI, derived ONLY from a validated HTTPS
+    // EXTERNAL_URL (no request-Host fallback for production V2). Empty when
+    // EXTERNAL_URL is absent/invalid — the portal then disables V2 Connect with
+    // an actionable message. The registered URI and both OAuth requests must
+    // use this exact string (slash/case/port).
+    simkl_v2_callback_uri: simklV2CallbackUri(),
+    simkl_v2_callback_ready: !!simklV2CallbackUri(),
     email: p.email || '', // user email — Mobile Companion passwordless login (stored only for now)
     // Auto-scrobble config — password is never returned, only whether it's set.
     scrobble: {
@@ -202,7 +238,7 @@ router.put('/profiles/:id', (req, res) => {
   if (req.body.keys) {
     // Only overwrite keys that were actually provided (non-empty)
     patch.keys = {};
-    for (const k of ['simkl_client_id', 'simkl_client_secret', 'tmdb_api_key', 'groq_api_key', 'rpdb_api_key', 'mdblist_api_key']) {
+    for (const k of ['simkl_client_id', 'simkl_client_secret', 'simkl_v2_client_id', 'simkl_v2_client_secret', 'tmdb_api_key', 'groq_api_key', 'rpdb_api_key', 'mdblist_api_key']) {
       if (req.body.keys[k]) patch.keys[k] = String(req.body.keys[k]).trim();
     }
     // Explicit clear for optional keys (null -> '' disables the feature)
@@ -210,6 +246,9 @@ router.put('/profiles/:id', (req, res) => {
       if (req.body.keys[k] === null) patch.keys[k] = '';
     }
   }
+  // AUTH V1/V2: the preferred connection version (what Connect starts).
+  // Validated strictly in config.updateProfile (rejects unknown values).
+  if (req.body.simkl_auth_version !== undefined) patch.simkl_auth_version = req.body.simkl_auth_version;
   if (req.body.scrobble && typeof req.body.scrobble === 'object') {
     const s = req.body.scrobble;
     patch.scrobble = {};
@@ -357,8 +396,59 @@ router.post('/profiles/:id/test/:service', async (req, res) => {
   }
 });
 
-// ---- Simkl PIN device flow (v6) ----
+// ---- Simkl PIN device flow (v6) + AUTH V1/V2 (mandate M1/M6) ----
 const simklFlows = new Map(); // profileId -> { user_code, verification_url, state, error, expires_at }
+// Last manual Check-connection result per profile (mandate M6). The passive
+// status poll reads this (lightweight — no Simkl call); only the manual check
+// makes the provider's one-request check. A stored token alone is "token
+// stored", never "connected" — the badge reflects the latest live check.
+const simklChecks = new Map(); // profileId -> { state, message, username, checked_at }
+
+// Manual Check connection (mandate M6): the button's own admin-authenticated
+// endpoint. It does not create a connection flow, authorize a user, or show a
+// PIN, and it does not edit profile settings. Returns the structured state + a
+// short safe message (never a generic {connected:false}).
+router.post('/profiles/:id/simkl/check', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  const result = await simkl.manualCheck(profile);
+  const check = { state: result.state, message: result.message, username: result.username || null, checked_at: Date.now() };
+  simklChecks.set(profile.id, check);
+  res.json({ ...check, connected: result.state === 'connected' });
+});
+
+// Passive status poll (mandate M6): LIGHTWEIGHT — no Simkl call. Returns the
+// last manual check's state (or the stored-token state when no manual check has
+// run yet), so the header badge can never say "Connected" when the latest live
+// check failed. The provider's one-request check is the manual check's job.
+router.get('/profiles/:id/simkl/status', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  const flow = simklFlows.get(profile.id);
+  const lastCheck = simklChecks.get(profile.id) || null;
+  // When no manual check has run, derive a lightweight stored-token state
+  // ("token stored", never "connected") so the badge is honest before the
+  // first live check.
+  let state, message, username;
+  if (lastCheck) {
+    state = lastCheck.state; message = lastCheck.message; username = lastCheck.username;
+  } else if (profile.simkl_auth?.access_token) {
+    state = 'token_stored'; message = 'Token stored — run Check connection to verify live'; username = profile.simkl_auth.username || null;
+  } else {
+    state = 'not_authorized'; message = 'Not connected'; username = null;
+  }
+  let watched_count = 0;
+  try { watched_count = watchedStore.countWatched(profile.id); } catch { /* store may be empty */ }
+  res.json({
+    connected: state === 'connected',
+    state,
+    message,
+    username,
+    reason: state === 'connected' ? null : message,
+    watched_count,
+    flow: flow ? { state: flow.state, user_code: flow.user_code, verification_url: flow.verification_url, error: flow.error } : null,
+  });
+});
 
 router.post('/profiles/:id/simkl/connect', async (req, res) => {
   const profile = config.getProfile(req.params.id);
