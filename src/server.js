@@ -26,14 +26,17 @@ app.set('trust proxy', true); // correct req.protocol/host behind Cloudflare Tun
 
 // Request logging: all /api calls and every error response, with timestamps.
 // docker logs ai-recommender  (or the Unraid log button) shows these.
+// The OAuth callback query is redacted (M4): code/state are sensitive.
 app.use((req, res, next) => {
   const start = Date.now();
   res.on('finish', () => {
     if (res.statusCode >= 400 || req.originalUrl.startsWith('/api') || req.originalUrl.startsWith('/mobile/api')) {
+      let url = req.originalUrl;
+      if (url.startsWith('/simkl/oauth2/callback')) url = '/simkl/oauth2/callback [query redacted]';
       // Duration is server-side handling time (receive → response flushed to the
       // socket); it excludes tunnel transit, so a fast time here + a slow client
       // means the delay is in the network/proxy, not the app.
-      console.log(`[http] ${new Date().toISOString()} ${req.method} ${req.originalUrl} -> ${res.statusCode} (${Date.now() - start}ms)`);
+      console.log(`[http] ${new Date().toISOString()} ${req.method} ${url} -> ${res.statusCode} (${Date.now() - start}ms)`);
     }
   });
   next();
@@ -133,6 +136,41 @@ app.use('/configure', adminAuth, express.static(path.join(__dirname, '..', 'publ
 app.get('/', (req, res) => res.redirect('/configure/'));
 
 app.get('/health', (req, res) => res.json({ ok: true }));
+
+// Simkl V2 OAuth callback — outside admin auth (the browser is redirected
+// back by Simkl with no credentials). The query carries code + state; the
+// code_verifier and client_secret stay server-side (M4). The HTTP log
+// redacts the query so no tokens/verifier ever appear in logs.
+const simklAuthV2 = require('./services/simklAuthV2');
+app.get('/simkl/oauth2/callback', async (req, res) => {
+  const { code, state } = req.query;
+  if (!code || !state) return res.status(400).json({ error: 'Missing code or state' });
+  // The callback is tied to the profile that started the flow. We look up
+  // the profile by matching the state against stored flows.
+  const config = require('./config');
+  let matched = null;
+  for (const p of config.listProfiles()) {
+    if (simklAuthV2.getFlow(p.id)?.state === state) { matched = p; break; }
+  }
+  if (!matched) return res.status(400).json({ error: 'No matching pending V2 flow' });
+  try {
+    const tokens = await simklAuthV2.handleCallback(matched, { code, state });
+    config.updateProfile(matched.id, {
+      simkl_auth: {
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        username: tokens.username || undefined,
+        connected_at: Date.now(),
+        version: 2,
+        client_id: matched.keys.simkl_v2_client_id,
+      },
+    });
+    // Redirect to the portal's Simkl tab so the user sees the result.
+    res.redirect('/configure/#simkl');
+  } catch (err) {
+    res.status(500).json({ error: 'V2 OAuth callback failed' });
+  }
+});
 
 const PORT = parseInt(process.env.PORT || '7000', 10);
 app.listen(PORT, '0.0.0.0', () => {

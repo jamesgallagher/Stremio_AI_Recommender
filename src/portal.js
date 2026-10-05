@@ -453,6 +453,31 @@ router.get('/profiles/:id/simkl/status', async (req, res) => {
 router.post('/profiles/:id/simkl/connect', async (req, res) => {
   const profile = config.getProfile(req.params.id);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  const version = profile.simkl_auth_version || 2;
+
+  if (version === 2) {
+    // V2: OAuth authorization code + PKCE. The browser opens the authorize URL;
+    // Simkl redirects back to /simkl/oauth2/callback with code + state.
+    const callbackUri = simklV2CallbackUri();
+    if (!callbackUri) {
+      return res.status(400).json({ error: 'Set EXTERNAL_URL (HTTPS) to enable V2 OAuth' });
+    }
+    const v2Id = profile.keys.simkl_v2_client_id;
+    const v2Secret = profile.keys.simkl_v2_client_secret;
+    if (!v2Id || !v2Secret) {
+      return res.status(400).json({ error: 'Set the V2 Client ID and Secret first' });
+    }
+    try {
+      const simklAuthV2 = require('./services/simklAuthV2');
+      const { authorizeUrl } = simklAuthV2.startFlow(profile, callbackUri);
+      res.json({ authorize_url: authorizeUrl });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+    return;
+  }
+
+  // V1: PIN device flow (unchanged).
   const clientId = profile.keys.simkl_client_id;
   if (!clientId) return res.status(400).json({ error: 'Set the Simkl Client ID first' });
   try {

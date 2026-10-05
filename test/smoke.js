@@ -1773,6 +1773,116 @@ okAsync('simkl-auth T2: V1 PIN flow calls V1 endpoints (no secret, no redirect);
   }
 });
 
+// ---- SIMKL-AUTH-1 T3: V2 authorize URL — PKCE S256, state, redirect_uri ----
+okAsync('simkl-auth T3: V2 connect returns an authorize URL with PKCE S256, state, and the registered redirect_uri', async () => {
+  const simklAuthV2 = require('../src/services/simklAuthV2');
+  const p = config.addProfile('T3-V2');
+  config.updateProfile(p.id, {
+    keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+    simkl_auth_version: 2,
+  });
+  // PKCE: code_verifier is 43 base64url chars; code_challenge = BASE64URL(SHA256(verifier))
+  const { codeVerifier, codeChallenge } = simklAuthV2.generatePkce();
+  assert.strictEqual(codeVerifier.length, 43, 'code_verifier is 43 chars');
+  assert.ok(/^[A-Za-z0-9\-_]+$/.test(codeVerifier), 'code_verifier is base64url');
+  const expected = require('crypto').createHash('sha256').update(codeVerifier).digest('base64url');
+  assert.strictEqual(codeChallenge, expected, 'code_challenge = BASE64URL(SHA256(verifier))');
+  // Authorize URL carries the required params
+  const url = simklAuthV2.buildAuthorizeUrl({
+    clientId: 'v2-cid', redirectUri: 'https://example.com/simkl/oauth2/callback',
+    state: 'test-state', codeChallenge,
+  });
+  const u = new URL(url);
+  assert.strictEqual(u.searchParams.get('client_id'), 'v2-cid');
+  assert.strictEqual(u.searchParams.get('redirect_uri'), 'https://example.com/simkl/oauth2/callback');
+  assert.strictEqual(u.searchParams.get('response_type'), 'code');
+  assert.strictEqual(u.searchParams.get('scope'), 'all');
+  assert.strictEqual(u.searchParams.get('state'), 'test-state');
+  assert.strictEqual(u.searchParams.get('code_challenge'), codeChallenge);
+  assert.strictEqual(u.searchParams.get('code_challenge_method'), 'S256');
+  config.removeProfile(p.id);
+});
+
+// ---- SIMKL-AUTH-1 T4: V2 callback — state validation, token exchange, storage ----
+okAsync('simkl-auth T4: V2 callback validates state, exchanges code for tokens, stores them; a wrong state is rejected', async () => {
+  const simklAuthV2 = require('../src/services/simklAuthV2');
+  const p = config.addProfile('T4-V2');
+  config.updateProfile(p.id, {
+    keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+    simkl_auth_version: 2,
+  });
+  const p2 = config.getProfile(p.id); // re-fetch after update
+  const { authorizeUrl, state } = simklAuthV2.startFlow(p2, 'https://example.com/simkl/oauth2/callback');
+  assert.ok(authorizeUrl.includes('simkl.com/oauth2/authorize'), 'authorize URL points to Simkl');
+  // Stub the token endpoint
+  const origFetch = global.fetch;
+  let tokenCalls = [];
+  global.fetch = async (url, opts) => {
+    tokenCalls.push({ url: String(url), opts });
+    return { ok: true, status: 200, json: async () => ({ access_token: 'v2-access', refresh_token: 'v2-refresh', expires_in: 3600, username: 'james' }) };
+  };
+  try {
+    // Correct state → token exchange succeeds
+    const tokens = await simklAuthV2.handleCallback(p2, { code: 'auth-code-123', state });
+    assert.strictEqual(tokens.access_token, 'v2-access');
+    assert.strictEqual(tokens.refresh_token, 'v2-refresh');
+    assert.strictEqual(tokens.username, 'james');
+    // The token endpoint was called with the right grant_type and code_verifier
+    assert.strictEqual(tokenCalls.length, 1);
+    assert.ok(tokenCalls[0].url.includes('api.simkl.com/oauth2/token'));
+    const body = tokenCalls[0].opts.body;
+    assert.ok(body.includes('grant_type=authorization_code'));
+    assert.ok(body.includes('code=auth-code-123'));
+    assert.ok(body.includes('code_verifier='), 'code_verifier sent server-side');
+    assert.ok(body.includes('client_secret=v2-sec'), 'client_secret sent server-side');
+    // Flow consumed (no pending flow)
+    assert.strictEqual(simklAuthV2.getFlow(p.id), null, 'flow consumed after callback');
+    // Wrong state → rejected
+    const p3 = config.addProfile('T4-V2-wrong');
+    config.updateProfile(p3.id, {
+      keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+      simkl_auth_version: 2,
+    });
+    const p3f = config.getProfile(p3.id);
+    simklAuthV2.startFlow(p3f, 'https://example.com/simkl/oauth2/callback');
+    await assert.rejects(() => simklAuthV2.handleCallback(p3f, { code: 'auth-code-456', state: 'wrong-state' }), /State mismatch/);
+    config.removeProfile(p3.id);
+  } finally {
+    global.fetch = origFetch;
+    config.removeProfile(p.id);
+  }
+});
+
+// ---- SIMKL-AUTH-1 T7: V2 disconnect — /oauth2/revoke ----
+okAsync('simkl-auth T7: V2 disconnect revokes the token via /oauth2/revoke', async () => {
+  const simklAuthV2 = require('../src/services/simklAuthV2');
+  const p = config.addProfile('T7-V2');
+  config.updateProfile(p.id, {
+    keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+    simkl_auth: { access_token: 'v2-access', refresh_token: 'v2-refresh', version: 2, client_id: 'v2-cid', connected_at: 1 },
+    simkl_auth_version: 2,
+  });
+  const pf = config.getProfile(p.id); // re-fetch after update
+  const origFetch = global.fetch;
+  let revokeCalls = [];
+  global.fetch = async (url, opts) => {
+    revokeCalls.push({ url: String(url), opts });
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  try {
+    await simklAuthV2.revokeToken(pf);
+    assert.strictEqual(revokeCalls.length, 1);
+    assert.ok(revokeCalls[0].url.includes('api.simkl.com/oauth2/revoke'));
+    const body = revokeCalls[0].opts.body;
+    assert.ok(body.includes('token=v2-access'));
+    assert.ok(body.includes('client_id=v2-cid'));
+    assert.ok(body.includes('client_secret=v2-sec'));
+  } finally {
+    global.fetch = origFetch;
+    config.removeProfile(p.id);
+  }
+});
+
 // ---- SIMKL-AUTH-1 T10: James's report — V2 ID in the V1 field, V1 selected, no token ----
 // The manual check must call the V1 PIN endpoint ONCE, receive a fetch-level
 // 400 {"error":"unauthorized_client"}, and return the prominent "select AUTH V2"
