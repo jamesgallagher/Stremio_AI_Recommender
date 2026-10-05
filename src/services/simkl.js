@@ -114,23 +114,37 @@ async function boundedFetch(url, opts = {}) {
 // The active token is always the one stored in simkl_auth, regardless of the
 // preferred version (simkl_auth_version). Selecting V2 for the NEXT connection
 // does NOT change the active token's version (M3).
+// Rejects a stored grant/client-ID mismatch before any request (Blocker 6):
+// if the active token's bound client_id differs from the current credential,
+// the token is unusable (it was minted by a different app registration).
 function resolveAuth(profile) {
   const auth = profile.simkl_auth;
   if (!auth?.access_token) return null;
   const version = auth.version || 1; // absent version = V1
   const clientId = version === 2 ? profile.keys.simkl_v2_client_id : profile.keys.simkl_client_id;
   if (!clientId) return null;
-  return { clientId, token: auth.access_token };
+  // Reject a stored grant/client-ID mismatch: the token is bound to the
+  // client_id that minted it. A changed credential means the token is
+  // unusable (credential_mismatch), never a user API call with a mismatched pair.
+  if (auth.client_id && auth.client_id !== clientId) return null;
+  return { clientId, token: auth.access_token, version };
 }
 
 // simklFetch: the shared adapter for all Simkl API calls. Resolves the active
 // token via resolveAuth, applies the rate governor, and handles auth errors.
 // All Simkl call sites use this instead of directly referencing
 // profile.keys.simkl_client_id / profile.simkl_auth.
+//
+// Refresh policy (Blocker 6):
+//   - Only an ACTIVE V2 grant is refreshed (version === 2 on the token).
+//   - Only on 401 (expired/invalid token). A 403 is NOT a refresh trigger
+//     (it may be insufficient scope, which a refresh cannot fix).
+//   - A V1 grant whose *preferred next* version is 2 is NOT refreshed
+//     (the user has not yet connected V2; the V1 token is still valid).
 async function simklFetch(profile, path, { method = 'GET', extra = {}, body = null, lane = 'simkl_get' } = {}) {
   const auth = resolveAuth(profile);
   if (!auth) throw new Error('Simkl is not connected for this profile');
-  const { clientId, token } = auth;
+  const { clientId, token, version } = auth;
   const res = await governor.schedule(lane, () =>
     fetch(withParams(clientId, path, extra), {
       method,
@@ -138,9 +152,11 @@ async function simklFetch(profile, path, { method = 'GET', extra = {}, body = nu
       ...(body ? { body: JSON.stringify(body) } : {}),
     })
   );
-  if (res.status === 401 || res.status === 403) {
-    // V2: attempt one refresh + replay (single-flight, non-rotating).
-    if (auth.token && (profile.simkl_auth?.version === 2 || profile.simkl_auth_version === 2)) {
+  if (res.status === 401) {
+    // Only refresh an active V2 grant on 401. A V1 grant is never refreshed
+    // (V1 tokens are long-lived; a 401 means the token is dead → reconnect).
+    // A 403 is handled below (no refresh).
+    if (version === 2) {
       const refreshed = await refreshV2(profile).catch(() => null);
       if (refreshed) {
         const res2 = await governor.schedule(lane, () =>
@@ -155,29 +171,56 @@ async function simklFetch(profile, path, { method = 'GET', extra = {}, body = nu
     }
     throw new Error('Simkl token rejected — reconnect the account');
   }
+  if (res.status === 403) {
+    // 403 is NOT a refresh trigger: it may be insufficient scope (a refresh
+    // cannot fix that) or a permission error. Report it directly.
+    throw new Error('Simkl access denied (403) — check the token scope or reconnect');
+  }
   if (!res.ok) throw new Error(`Simkl ${method} ${path} failed (${res.status})`);
   return res;
 }
 
 // V2 token refresh (single-flight, non-rotating refresh token, one replay).
-// A concurrent refresh is in-flight: the second caller waits for the first.
+// Blocker 6: re-read the latest grant before refreshing, key the single-flight
+// to that specific grant (not just the profile), update only if the grant
+// still matches after the refresh (a disconnect or new V2 authorization during
+// the refresh must not be reversed), and persist the new absolute expiry.
 const refreshInFlight = new Map(); // profileId → Promise
 async function refreshV2(profile) {
-  const existing = refreshInFlight.get(profile.id);
+  // Re-read the latest grant from the store (the `profile` argument may be
+  // a stale snapshot from before the refresh started).
+  const config = require('../config');
+  const fresh = config.getProfile(profile.id);
+  if (!fresh?.simkl_auth?.access_token || fresh.simkl_auth.version !== 2) return null;
+  if (!fresh.simkl_auth.refresh_token) return null;
+  // Key the single-flight to the specific grant (access_token + refresh_token):
+  // a concurrent refresh for the SAME grant joins the in-flight one; a
+  // different grant (new authorization) starts a fresh refresh.
+  const grantKey = `${profile.id}:${fresh.simkl_auth.access_token}:${fresh.simkl_auth.refresh_token}`;
+  const existing = refreshInFlight.get(grantKey);
   if (existing) return existing;
   const simklAuthV2 = require('./simklAuthV2');
-  const promise = simklAuthV2.refreshToken(profile).then((tokens) => {
-    // Store the refreshed access token; the refresh_token is non-rotating
-    // (Simkl returns the same refresh_token on each refresh).
-    const config = require('../config');
+  const promise = simklAuthV2.refreshToken(fresh).then((tokens) => {
+    // Re-read the grant after the refresh: a disconnect or new V2
+    // authorization during the refresh must not be reversed.
+    const after = config.getProfile(profile.id);
+    if (!after?.simkl_auth?.access_token || after.simkl_auth.version !== 2) return tokens;
+    // Update only if the grant still matches (same access_token as before the
+    // refresh — a new authorization would have a different token).
+    if (after.simkl_auth.access_token !== fresh.simkl_auth.access_token) return tokens;
     config.updateProfile(profile.id, {
-      simkl_auth: { ...profile.simkl_auth, access_token: tokens.access_token, refresh_token: tokens.refresh_token || profile.simkl_auth?.refresh_token },
+      simkl_auth: {
+        ...after.simkl_auth,
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token || after.simkl_auth.refresh_token,
+        expires_at: tokens.expires_at || null,
+      },
     });
     return tokens;
   }).finally(() => {
-    refreshInFlight.delete(profile.id);
+    refreshInFlight.delete(grantKey);
   });
-  refreshInFlight.set(profile.id, promise);
+  refreshInFlight.set(grantKey, promise);
   return promise;
 }
 
@@ -203,7 +246,7 @@ async function manualCheck(profile) {
   if (hasToken) {
     // Active token + matching active client ID → verify /sync/activities.
     const clientId = auth.version === 2 ? profile.keys.simkl_v2_client_id : profile.keys.simkl_client_id;
-    const token = auth.access_token;
+    let token = auth.access_token;
     if (!clientId) {
       return { state: 'credential_mismatch', message: 'Simkl credential missing — reconnect the account' };
     }
@@ -218,6 +261,18 @@ async function manualCheck(profile) {
       if (res.ok) {
         const username = await accountName(clientId, token).catch(() => null);
         return { state: 'connected', message: 'Connected and verified', username: username || auth.username || null };
+      }
+      // V2: a 401 may be an expired token — attempt one refresh before
+      // declaring the grant rejected (Blocker 6).
+      if (res.status === 401 && auth.version === 2) {
+        const refreshed = await refreshV2(profile).catch(() => null);
+        if (refreshed) {
+          const res2 = await boundedFetch(withParams(clientId, '/sync/activities'), { headers: headers(refreshed.access_token) });
+          if (res2.ok) {
+            const username = await accountName(clientId, refreshed.access_token).catch(() => null);
+            return { state: 'connected', message: 'Connected and verified (token refreshed)', username: username || auth.username || null };
+          }
+        }
       }
       if (res.status === 401 || res.status === 403) {
         return { state: 'credential_mismatch', message: 'Token rejected by Simkl — reconnect the account' };

@@ -76,8 +76,10 @@ const DEFAULT_COMPANION = { catalog_only: true };
 // V1 credential with a V2 one, and vice versa (mandate M3).
 const SECRET_KEY_FIELDS = ['simkl_client_id', 'simkl_client_secret', 'simkl_v2_client_id', 'simkl_v2_client_secret', 'tmdb_api_key', 'groq_api_key', 'rpdb_api_key', 'mdblist_api_key'];
 // refresh_token is sealed (AUTH V2): the V2 refresh token is a secret that must
-// never reach the browser or logs.
-const SECRET_TOKEN_FIELDS = ['access_token', 'refresh_token'];
+// never reach the browser or logs. client_id is the credential that minted the
+// token (M3) — sealed so the migration's best-effort V1 bind (which runs before
+// unseal) round-trips to plaintext, matching the current credential on read.
+const SECRET_TOKEN_FIELDS = ['access_token', 'refresh_token', 'client_id'];
 // Top-level auth objects whose tokens are sealed (Simkl v6 + AUTH V2).
 const AUTH_OBJECTS = ['simkl_auth'];
 

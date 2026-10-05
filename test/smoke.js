@@ -1796,102 +1796,277 @@ okAsync('simkl-auth T3: V2 connect returns an authorize URL with PKCE S256, stat
   assert.strictEqual(u.searchParams.get('client_id'), 'v2-cid');
   assert.strictEqual(u.searchParams.get('redirect_uri'), 'https://example.com/simkl/oauth2/callback');
   assert.strictEqual(u.searchParams.get('response_type'), 'code');
-  assert.strictEqual(u.searchParams.get('scope'), 'all');
+  // Blocker 1: the requested scope is media:read media:write (per Simkl's
+  // authorization-code reference), NOT the broad "all" scope.
+  assert.strictEqual(u.searchParams.get('scope'), 'media:read media:write');
   assert.strictEqual(u.searchParams.get('state'), 'test-state');
   assert.strictEqual(u.searchParams.get('code_challenge'), codeChallenge);
   assert.strictEqual(u.searchParams.get('code_challenge_method'), 'S256');
   config.removeProfile(p.id);
 });
 
-// ---- SIMKL-AUTH-1 T4: V2 callback — state validation, token exchange, storage ----
-okAsync('simkl-auth T4: V2 callback validates state, exchanges code for tokens, stores them; a wrong state is rejected', async () => {
+// ---- SIMKL-AUTH-1 T4: V2 callback — state, issuer, scope validation + replay guard ----
+okAsync('simkl-auth T4: V2 callback validates state, issuer, and granted scope; a wrong state, replay, wrong issuer, read-only scope, or missing token is rejected', async () => {
   const simklAuthV2 = require('../src/services/simklAuthV2');
-  const p = config.addProfile('T4-V2');
-  config.updateProfile(p.id, {
-    keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
-    simkl_auth_version: 2,
-  });
-  const p2 = config.getProfile(p.id); // re-fetch after update
-  const { authorizeUrl, state } = simklAuthV2.startFlow(p2, 'https://example.com/simkl/oauth2/callback');
-  assert.ok(authorizeUrl.includes('simkl.com/oauth2/authorize'), 'authorize URL points to Simkl');
-  // Stub the token endpoint
-  const origFetch = global.fetch;
-  let tokenCalls = [];
-  global.fetch = async (url, opts) => {
-    tokenCalls.push({ url: String(url), opts });
-    return { ok: true, status: 200, json: async () => ({ access_token: 'v2-access', refresh_token: 'v2-refresh', expires_in: 3600, username: 'james' }) };
-  };
-  try {
-    // Correct state → token exchange succeeds
-    const tokens = await simklAuthV2.handleCallback(p2, { code: 'auth-code-123', state });
-    assert.strictEqual(tokens.access_token, 'v2-access');
-    assert.strictEqual(tokens.refresh_token, 'v2-refresh');
-    assert.strictEqual(tokens.username, 'james');
-    // The token endpoint was called with the right grant_type and code_verifier
-    assert.strictEqual(tokenCalls.length, 1);
-    assert.ok(tokenCalls[0].url.includes('api.simkl.com/oauth2/token'));
-    const body = tokenCalls[0].opts.body;
-    assert.ok(body.includes('grant_type=authorization_code'));
-    assert.ok(body.includes('code=auth-code-123'));
-    assert.ok(body.includes('code_verifier='), 'code_verifier sent server-side');
-    assert.ok(body.includes('client_secret=v2-sec'), 'client_secret sent server-side');
-    // Flow consumed (no pending flow)
-    assert.strictEqual(simklAuthV2.getFlow(p.id), null, 'flow consumed after callback');
-    // Wrong state → rejected
-    const p3 = config.addProfile('T4-V2-wrong');
-    config.updateProfile(p3.id, {
+
+  // (a) Correct state → token exchange succeeds (full scope).
+  {
+    const p = config.addProfile('T4-OK');
+    config.updateProfile(p.id, {
       keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
       simkl_auth_version: 2,
     });
-    const p3f = config.getProfile(p3.id);
-    simklAuthV2.startFlow(p3f, 'https://example.com/simkl/oauth2/callback');
-    await assert.rejects(() => simklAuthV2.handleCallback(p3f, { code: 'auth-code-456', state: 'wrong-state' }), /State mismatch/);
-    config.removeProfile(p3.id);
-  } finally {
-    global.fetch = origFetch;
-    config.removeProfile(p.id);
+    const p2 = config.getProfile(p.id); // re-fetch after update
+    const { authorizeUrl, state } = simklAuthV2.startFlow(p2, 'https://example.com/simkl/oauth2/callback');
+    assert.ok(authorizeUrl.includes('simkl.com/oauth2/authorize'), 'authorize URL points to Simkl');
+    // Stub the token endpoint (returns the full grant).
+    const origFetch = global.fetch;
+    let tokenCalls = [];
+    global.fetch = async (url, opts) => {
+      tokenCalls.push({ url: String(url), opts });
+      return { ok: true, status: 200, json: async () => ({ access_token: 'v2-access', refresh_token: 'v2-refresh', expires_in: 3600, scope: 'media:read media:write', iss: 'https://simkl.com', username: 'james' }) };
+    };
+    try {
+      const tokens = await simklAuthV2.handleCallback(p2, { code: 'auth-code-123', state });
+      assert.strictEqual(tokens.access_token, 'v2-access');
+      assert.strictEqual(tokens.refresh_token, 'v2-refresh');
+      assert.strictEqual(tokens.username, 'james');
+      assert.strictEqual(tokens.scope, 'media:read media:write');
+      assert.ok(tokens.expires_at > Date.now(), 'absolute expiry computed from expires_in');
+      // The token endpoint was called with the right grant_type and code_verifier
+      assert.strictEqual(tokenCalls.length, 1);
+      assert.ok(tokenCalls[0].url.includes('api.simkl.com/oauth2/token'));
+      const body = tokenCalls[0].opts.body;
+      assert.ok(body.includes('grant_type=authorization_code'));
+      assert.ok(body.includes('code=auth-code-123'));
+      assert.ok(body.includes('code_verifier='), 'code_verifier sent server-side');
+      assert.ok(body.includes('client_secret=v2-sec'), 'client_secret sent server-side');
+      // Flow consumed (no pending flow)
+      assert.strictEqual(simklAuthV2.getFlow(p.id), null, 'flow consumed after callback');
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
+  }
+
+  // (b) Wrong state → rejected (state_mismatch).
+  {
+    const p = config.addProfile('T4-WrongState');
+    config.updateProfile(p.id, {
+      keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+      simkl_auth_version: 2,
+    });
+    const pf = config.getProfile(p.id);
+    simklAuthV2.startFlow(pf, 'https://example.com/simkl/oauth2/callback');
+    const origFetch = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({}) });
+    try {
+      await assert.rejects(() => simklAuthV2.handleCallback(pf, { code: 'auth-code-456', state: 'wrong-state' }),
+        (err) => err.state === 'state_mismatch');
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
+  }
+
+  // (c) Replay: a second callback with the same state is rejected (the flow was
+  //     consumed BEFORE the first exchange — the replay guard).
+  {
+    const p = config.addProfile('T4-Replay');
+    config.updateProfile(p.id, {
+      keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+      simkl_auth_version: 2,
+    });
+    const pf = config.getProfile(p.id);
+    const { state } = simklAuthV2.startFlow(pf, 'https://example.com/simkl/oauth2/callback');
+    const origFetch = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ access_token: 'v2-access', refresh_token: 'v2-refresh', expires_in: 3600, scope: 'media:read media:write', iss: 'https://simkl.com' }) });
+    try {
+      await simklAuthV2.handleCallback(pf, { code: 'auth-code-1', state }); // first: succeeds
+      // second replay with the same state → rejected (no pending flow).
+      await assert.rejects(() => simklAuthV2.handleCallback(pf, { code: 'auth-code-1', state }),
+        (err) => err.state === 'expired');
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
+  }
+
+  // (d) Wrong issuer → rejected (invalid_issuer).
+  {
+    const p = config.addProfile('T4-BadIssuer');
+    config.updateProfile(p.id, {
+      keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+      simkl_auth_version: 2,
+    });
+    const pf = config.getProfile(p.id);
+    const { state } = simklAuthV2.startFlow(pf, 'https://example.com/simkl/oauth2/callback');
+    const origFetch = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ access_token: 'v2-access', refresh_token: 'v2-refresh', expires_in: 3600, scope: 'media:read media:write', iss: 'https://evil.com' }) });
+    try {
+      await assert.rejects(() => simklAuthV2.handleCallback(pf, { code: 'auth-code-1', state }),
+        (err) => err.state === 'invalid_issuer');
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
+  }
+
+  // (e) Insufficient scope (read-only grant) → rejected (insufficient_scope).
+  {
+    const p = config.addProfile('T4-ReadOnly');
+    config.updateProfile(p.id, {
+      keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+      simkl_auth_version: 2,
+    });
+    const pf = config.getProfile(p.id);
+    const { state } = simklAuthV2.startFlow(pf, 'https://example.com/simkl/oauth2/callback');
+    const origFetch = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ access_token: 'v2-access', refresh_token: 'v2-refresh', expires_in: 3600, scope: 'media:read', iss: 'https://simkl.com' }) });
+    try {
+      await assert.rejects(() => simklAuthV2.handleCallback(pf, { code: 'auth-code-1', state }),
+        (err) => err.state === 'insufficient_scope');
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
+  }
+
+  // (f) Missing access token → rejected (malformed_token).
+  {
+    const p = config.addProfile('T4-NoToken');
+    config.updateProfile(p.id, {
+      keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+      simkl_auth_version: 2,
+    });
+    const pf = config.getProfile(p.id);
+    const { state } = simklAuthV2.startFlow(pf, 'https://example.com/simkl/oauth2/callback');
+    const origFetch = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ refresh_token: 'v2-refresh', expires_in: 3600, scope: 'media:read media:write', iss: 'https://simkl.com' }) });
+    try {
+      await assert.rejects(() => simklAuthV2.handleCallback(pf, { code: 'auth-code-1', state }),
+        (err) => err.state === 'malformed_token');
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
   }
 });
 
-// ---- SIMKL-AUTH-1 T5: V2 token refresh — single-flight, non-rotating ----
-okAsync('simkl-auth T5: V2 refresh is single-flight (one token call for concurrent callers) and the refresh_token is non-rotating', async () => {
+// ---- SIMKL-AUTH-1 T5: V2 token refresh — single-flight, non-rotating, grant-keyed ----
+okAsync('simkl-auth T5: V2 refresh is single-flight, non-rotating, re-reads the latest grant, and never restores a grant disconnected during the refresh', async () => {
   const simkl = require('../src/services/simkl');
-  const p = config.addProfile('T5-V2');
-  config.updateProfile(p.id, {
-    keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
-    simkl_auth: { access_token: 'v2-access', refresh_token: 'v2-refresh', version: 2, client_id: 'v2-cid', connected_at: 1 },
-    simkl_auth_version: 2,
-  });
-  const pf = config.getProfile(p.id);
-  const origFetch = global.fetch;
-  let tokenCalls = [];
-  global.fetch = async (url, opts) => {
-    tokenCalls.push({ url: String(url), opts });
-    return { ok: true, status: 200, json: async () => ({ access_token: 'v2-refreshed', refresh_token: 'v2-refresh', expires_in: 3600 }) };
-  };
-  try {
-    // Two concurrent refresh calls → exactly one token endpoint call (single-flight).
-    const [r1, r2] = await Promise.all([
-      simkl.refreshV2(pf),
-      simkl.refreshV2(pf),
-    ]);
-    assert.strictEqual(r1.access_token, 'v2-refreshed');
-    assert.strictEqual(r2.access_token, 'v2-refreshed');
-    assert.strictEqual(tokenCalls.length, 1, 'exactly one refresh token call (single-flight)');
-    // The token endpoint was called with grant_type=refresh_token.
-    assert.ok(tokenCalls[0].url.includes('api.simkl.com/oauth2/token'));
-    const body = tokenCalls[0].opts.body;
-    assert.ok(body.includes('grant_type=refresh_token'));
-    assert.ok(body.includes('refresh_token=v2-refresh'));
-    assert.ok(body.includes('client_id=v2-cid'));
-    assert.ok(body.includes('client_secret=v2-sec'));
-    // Non-rotating: the stored refresh_token is unchanged.
-    const fresh = config.getProfile(p.id);
-    assert.strictEqual(fresh.simkl_auth.refresh_token, 'v2-refresh', 'refresh_token is non-rotating');
-    assert.strictEqual(fresh.simkl_auth.access_token, 'v2-refreshed', 'access_token updated');
-  } finally {
-    global.fetch = origFetch;
-    config.removeProfile(p.id);
+
+  // (a) Two concurrent refresh calls → exactly one token endpoint call
+  //     (single-flight), and the refresh_token is non-rotating.
+  {
+    const p = config.addProfile('T5-V2');
+    config.updateProfile(p.id, {
+      keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+      simkl_auth: { access_token: 'v2-access', refresh_token: 'v2-refresh', version: 2, client_id: 'v2-cid', connected_at: 1 },
+      simkl_auth_version: 2,
+    });
+    const pf = config.getProfile(p.id);
+    const origFetch = global.fetch;
+    let tokenCalls = [];
+    global.fetch = async (url, opts) => {
+      tokenCalls.push({ url: String(url), opts });
+      return { ok: true, status: 200, json: async () => ({ access_token: 'v2-refreshed', refresh_token: 'v2-refresh', expires_in: 3600 }) };
+    };
+    try {
+      // Two concurrent refresh calls → exactly one token endpoint call (single-flight).
+      const [r1, r2] = await Promise.all([
+        simkl.refreshV2(pf),
+        simkl.refreshV2(pf),
+      ]);
+      assert.strictEqual(r1.access_token, 'v2-refreshed');
+      assert.strictEqual(r2.access_token, 'v2-refreshed');
+      assert.strictEqual(tokenCalls.length, 1, 'exactly one refresh token call (single-flight)');
+      // The token endpoint was called with grant_type=refresh_token.
+      assert.ok(tokenCalls[0].url.includes('api.simkl.com/oauth2/token'));
+      const body = tokenCalls[0].opts.body;
+      assert.ok(body.includes('grant_type=refresh_token'));
+      assert.ok(body.includes('refresh_token=v2-refresh'));
+      assert.ok(body.includes('client_id=v2-cid'));
+      assert.ok(body.includes('client_secret=v2-sec'));
+      // Non-rotating: the stored refresh_token is unchanged.
+      const fresh = config.getProfile(p.id);
+      assert.strictEqual(fresh.simkl_auth.refresh_token, 'v2-refresh', 'refresh_token is non-rotating');
+      assert.strictEqual(fresh.simkl_auth.access_token, 'v2-refreshed', 'access_token updated');
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
+  }
+
+  // (b) refreshV2 re-reads the LATEST grant from the store (a stale snapshot
+  //     argument does not pin an old grant — Blocker 6).
+  {
+    const p = config.addProfile('T5-Stale');
+    config.updateProfile(p.id, {
+      keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+      simkl_auth: { access_token: 'v2-access-A', refresh_token: 'v2-refresh-A', version: 2, client_id: 'v2-cid', connected_at: 1 },
+      simkl_auth_version: 2,
+    });
+    const staleSnapshot = config.getProfile(p.id); // grant A
+    // The store's grant changes to B before the refresh (a new authorization).
+    config.updateProfile(p.id, {
+      simkl_auth: { access_token: 'v2-access-B', refresh_token: 'v2-refresh-B', version: 2, client_id: 'v2-cid', connected_at: 2 },
+    });
+    const origFetch = global.fetch;
+    let tokenCalls = [];
+    global.fetch = async (url, opts) => {
+      tokenCalls.push({ url: String(url), opts });
+      return { ok: true, status: 200, json: async () => ({ access_token: 'v2-refreshed', refresh_token: 'v2-refresh-B', expires_in: 3600 }) };
+    };
+    try {
+      const r = await simkl.refreshV2(staleSnapshot);
+      // The refresh used the LATEST grant's refresh token (B), not the stale A.
+      assert.strictEqual(tokenCalls.length, 1, 'exactly one refresh call');
+      assert.ok(tokenCalls[0].opts.body.includes('refresh_token=v2-refresh-B'), 'latest grant refresh token used');
+      assert.ok(!tokenCalls[0].opts.body.includes('refresh_token=v2-refresh-A'), 'stale grant refresh token NOT used');
+      // The stored grant is updated (it still matches after the refresh).
+      const fresh = config.getProfile(p.id);
+      assert.strictEqual(fresh.simkl_auth.access_token, 'v2-refreshed', 'access_token updated to the latest grant');
+      assert.strictEqual(fresh.simkl_auth.refresh_token, 'v2-refresh-B', 'refresh_token stays B');
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
+  }
+
+  // (c) A disconnect during the refresh must NOT be reversed (the refresh
+  //     updates only if the grant still matches after the refresh — Blocker 6).
+  {
+    const p = config.addProfile('T5-Disconnect');
+    config.updateProfile(p.id, {
+      keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+      simkl_auth: { access_token: 'v2-access-A', refresh_token: 'v2-refresh-A', version: 2, client_id: 'v2-cid', connected_at: 1 },
+      simkl_auth_version: 2,
+    });
+    const pf = config.getProfile(p.id);
+    const origFetch = global.fetch;
+    let tokenResolve = null;
+    global.fetch = async (url) => {
+      if (String(url).includes('/oauth2/token')) {
+        // Hold the token call open so we can disconnect during the refresh.
+        return new Promise((resolve) => { tokenResolve = resolve; });
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    };
+    try {
+      const refreshPromise = simkl.refreshV2(pf); // starts, hits the token endpoint, waits
+      // While the token call is in flight, disconnect the profile.
+      config.updateProfile(p.id, { simkl_auth: null });
+      // Now resolve the token call with a refreshed grant.
+      tokenResolve({ ok: true, status: 200, json: async () => ({ access_token: 'v2-refreshed', refresh_token: 'v2-refresh-A', expires_in: 3600 }) });
+      await refreshPromise;
+      // The refresh must NOT restore the disconnected grant.
+      assert.strictEqual(config.getProfile(p.id).simkl_auth, null, 'disconnect during refresh is not reversed');
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(p.id);
+    }
   }
 });
 
@@ -2118,34 +2293,48 @@ okAsync('simkl-auth T7: V2 disconnect revokes the token via /oauth2/revoke', asy
 });
 
 // ---- SIMKL-AUTH-1 T8: browser UI — the Simkl tab renders the V1/V2 selector + V2 fields ----
-ok('simkl-auth T8: the portal Simkl tab renders the auth version selector and V2 client fields; the connect flow branches on version', () => {
+okAsync('simkl-auth T8: the portal never returns the V2 Client Secret to the browser (M4); the real /api/profiles JSON carries the version, the V2 ID, and a masked secret preview', async () => {
+  const portal = require('../src/portal');
+  const express = require('express');
+  const http = require('http');
   const p = config.addProfile('T8-UI');
   config.updateProfile(p.id, {
     keys: { simkl_client_id: 'v1-cid', simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
     simkl_auth_version: 2,
   });
   const pf = config.getProfile(p.id);
-  // publicProfile exposes the V2 fields for the UI to render.
-  const portal = require('../src/portal');
+  // (a) publicProfile: the V2 secret is NEVER in `keys` (M4); a masked preview is present.
   const mockReq = { protocol: 'http', get: () => 'localhost:7311' };
   const pub = portal.publicProfile(pf, mockReq);
   assert.strictEqual(pub.simkl_auth_version, 2, 'auth version in publicProfile');
   assert.strictEqual(pub.keys.simkl_v2_client_id, 'v2-cid', 'V2 client ID in publicProfile');
-  assert.strictEqual(pub.keys.simkl_v2_client_secret, 'v2-sec', 'V2 client secret in publicProfile');
+  assert.ok(!('simkl_v2_client_secret' in pub.keys), 'V2 client secret is ABSENT from publicProfile (M4)');
+  assert.ok(pub.keys_preview.simkl_v2_client_secret, 'masked V2 secret preview present');
+  assert.ok(!pub.keys_preview.simkl_v2_client_secret.includes('v2-sec'), 'masked preview does not leak the real secret');
   assert.ok(pub.simkl_v2_callback_ready !== undefined, 'V2 callback readiness flag present');
-  // The portal's /simkl/status endpoint returns the structured state (M6).
-  // The connect endpoint branches by preferred version: V2 → authorize_url, V1 → PIN.
-  // This is verified by T3 (V2 authorize URL) and T2 (V1 PIN flow).
-  // The UI HTML includes the auth version selector and V2 fields (verified by
-  // the static HTML content below).
-  const fs = require('fs');
-  const html = fs.readFileSync(require('path').join(__dirname, '..', 'public', 'index.html'), 'utf8');
-  assert.ok(html.includes('data-auth-version'), 'HTML has the auth version selector');
-  assert.ok(html.includes('simkl_v2_client_id'), 'HTML has the V2 client ID field');
-  assert.ok(html.includes('simkl_v2_client_secret'), 'HTML has the V2 client secret field');
-  assert.ok(html.includes('AUTH V1'), 'HTML shows AUTH V1 option');
-  assert.ok(html.includes('AUTH V2'), 'HTML shows AUTH V2 option');
-  config.removeProfile(p.id);
+  // (b) The real /api/profiles HTTP surface: the same M4 guarantee over the wire
+  //     (a real request, not a static HTML string assertion).
+  const origFetch = global.fetch;
+  try {
+    const app = express();
+    app.use(portal.router);
+    const server = http.createServer(app);
+    await new Promise((resolve) => server.listen(0, resolve));
+    const port = server.address().port;
+    const res = await origFetch(`http://127.0.0.1:${port}/profiles`);
+    assert.strictEqual(res.status, 200);
+    const body = await res.json();
+    const mine = body.profiles.find((x) => x.id === p.id);
+    assert.ok(mine, 'profile present in /api/profiles');
+    assert.strictEqual(mine.keys.simkl_v2_client_id, 'v2-cid', 'V2 client ID over the wire');
+    assert.ok(!('simkl_v2_client_secret' in mine.keys), 'V2 secret ABSENT over the wire (M4)');
+    assert.ok(!JSON.stringify(mine).includes('v2-sec'), 'the real V2 secret appears nowhere in the response');
+    assert.ok(mine.keys_preview.simkl_v2_client_secret, 'masked preview over the wire');
+    server.close();
+  } finally {
+    global.fetch = origFetch;
+    config.removeProfile(p.id);
+  }
 });
 
 // ---- SIMKL-AUTH-1 T10: James's report — V2 ID in the V1 field, V1 selected, no token ----
@@ -2366,6 +2555,52 @@ okAsync('simkl-auth T12: rejected token, changed client ID, and provider outage 
       global.fetch = origFetch;
       config.removeProfile(p.id);
     }
+  }
+});
+
+// ---- SIMKL-AUTH-1 T14: a V2 Client ID changed during the flow is detected at callback ----
+okAsync('simkl-auth T14: a V2 Client ID changed during the flow is detected at callback (credential_changed — the token would be bound to the old registration)', async () => {
+  const simklAuthV2 = require('../src/services/simklAuthV2');
+  const p = config.addProfile('T14-Changed');
+  config.updateProfile(p.id, {
+    keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+    simkl_auth_version: 2,
+  });
+  const pf = config.getProfile(p.id);
+  const { state } = simklAuthV2.startFlow(pf, 'https://example.com/simkl/oauth2/callback');
+  // The user changes the V2 Client ID during the flow (a different app registration).
+  config.updateProfile(p.id, { keys: { simkl_v2_client_id: 'v2-cid-NEW' } });
+  const origFetch = global.fetch;
+  global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ access_token: 'v2-access', refresh_token: 'v2-refresh', expires_in: 3600, scope: 'media:read media:write', iss: 'https://simkl.com' }) });
+  try {
+    await assert.rejects(() => simklAuthV2.handleCallback(config.getProfile(p.id), { code: 'auth-code-1', state }),
+      (err) => err.state === 'credential_changed');
+  } finally {
+    global.fetch = origFetch;
+    config.removeProfile(p.id);
+  }
+});
+
+// ---- SIMKL-AUTH-1 T15: refreshV2 returns null when there is no refresh token ----
+okAsync('simkl-auth T15: refreshV2 returns null when a V2 grant has no refresh token (no Simkl call)', async () => {
+  const simkl = require('../src/services/simkl');
+  const p = config.addProfile('T15-NoRefresh');
+  config.updateProfile(p.id, {
+    keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+    simkl_auth: { access_token: 'v2-access', version: 2, client_id: 'v2-cid', connected_at: 1 }, // no refresh_token
+    simkl_auth_version: 2,
+  });
+  const pf = config.getProfile(p.id);
+  const origFetch = global.fetch;
+  let fetchCalled = false;
+  global.fetch = async () => { fetchCalled = true; return { ok: true, status: 200, json: async () => ({}) }; };
+  try {
+    const r = await simkl.refreshV2(pf);
+    assert.strictEqual(r, null, 'no refresh token → null');
+    assert.ok(!fetchCalled, 'no Simkl call');
+  } finally {
+    global.fetch = origFetch;
+    config.removeProfile(p.id);
   }
 });
 
@@ -6483,6 +6718,36 @@ async function httpTests() {
   const st2 = await (await fetch(`${BASE}/api/profiles/${profile.id}/simkl/status`)).json();
   assert.strictEqual(st2.watched_count, 0);
   console.log('  ✓ Simkl keys persist (PUT whitelist) + watched sync/count wired to SQLite');
+
+  // Simkl V2 OAuth callback — cancellation (Blocker 2). A cancelled consent
+  // (error=access_denied) redirects to the portal and preserves the existing
+  // grant (no overwrite, no Simkl call).
+  {
+    const simklAuthV2 = require('../src/services/simklAuthV2');
+    const cancelProfile = config.addProfile('T13-Cancel');
+    config.updateProfile(cancelProfile.id, {
+      keys: { simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+      simkl_auth: { access_token: 'v2-existing', refresh_token: 'v2-refresh', version: 2, client_id: 'v2-cid', connected_at: 1 },
+      simkl_auth_version: 2,
+    });
+    // Start a flow so there's a pending state, then cancel it.
+    const { state } = simklAuthV2.startFlow(config.getProfile(cancelProfile.id), 'https://example.com/simkl/oauth2/callback');
+    const origFetch = global.fetch;
+    // If the cancellation path makes a Simkl call, that's a bug.
+    global.fetch = async () => { throw new Error('Simkl must not be called on cancellation'); };
+    try {
+      // The cancellation redirects to the portal (fetch follows the 302 to the
+      // /configure/ page). The existing grant is preserved (no overwrite).
+      const res = await origFetch(`${BASE}/simkl/oauth2/callback?error=access_denied&state=${encodeURIComponent(state)}`);
+      assert.strictEqual(res.status, 200, 'cancellation lands on the portal page');
+      assert.ok(res.url.includes('/configure/'), 'redirected to the portal');
+      // The existing grant is preserved (no overwrite).
+      assert.strictEqual(config.getProfile(cancelProfile.id).simkl_auth.access_token, 'v2-existing', 'existing grant preserved on cancellation');
+    } finally {
+      global.fetch = origFetch;
+      config.removeProfile(cancelProfile.id);
+    }
+  }
 
   // Recommendation builder + suppress (no-network paths). The build is enqueued
   // on the job queue and answered 202; poll /job until it finishes. No watched

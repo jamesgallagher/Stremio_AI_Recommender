@@ -106,15 +106,14 @@ function publicProfile(p, req) {
     // Full key values — returned only to the admin-authed portal so each key
     // input can be pre-filled (with a show/hide toggle). This endpoint is
     // behind adminAuth; the public /addon surface never sees these.
+    // The V2 Client Secret is NEVER returned to the browser (M4): the input
+    // is blank and replace-only, preserving the stored secret on an
+    // untouched or empty save.
     keys: {
       simkl_client_id: p.keys.simkl_client_id || '',
       simkl_client_secret: p.keys.simkl_client_secret || '',
-      // AUTH V2: the separate V2 app credentials (pre-filled for the input
-      // fields, like the V1 pair). The V2 client secret is the app's secret —
-      // it is NOT the user's token, so it is safe to pre-fill for editing.
-      // (User access/refresh tokens are never returned — see M4.)
       simkl_v2_client_id: p.keys.simkl_v2_client_id || '',
-      simkl_v2_client_secret: p.keys.simkl_v2_client_secret || '',
+      // simkl_v2_client_secret is deliberately absent (M4).
       tmdb_api_key: p.keys.tmdb_api_key || '',
       groq_api_key: p.keys.groq_api_key || '',
       rpdb_api_key: p.keys.rpdb_api_key || '',
@@ -137,6 +136,7 @@ function publicProfile(p, req) {
       groq_api_key: redactKey(p.keys.groq_api_key),
       rpdb_api_key: redactKey(p.keys.rpdb_api_key),
       mdblist_api_key: redactKey(p.keys.mdblist_api_key),
+      simkl_v2_client_secret: redactKey(p.keys.simkl_v2_client_secret),
     },
     // Simkl: whether a token is STORED. Live validity is checked separately via
     // /simkl/status (the portal calls it on the Simkl tab open).
@@ -526,23 +526,6 @@ router.post('/profiles/:id/simkl/connect', async (req, res) => {
 });
 
 // LIVE status — verifies the token against Simkl, never trusts a stored flag.
-// This is the fix for the v5 bug where dead tokens still showed "connected".
-router.get('/profiles/:id/simkl/status', async (req, res) => {
-  const profile = config.getProfile(req.params.id);
-  if (!profile) return res.status(404).json({ error: 'Profile not found' });
-  const flow = simklFlows.get(profile.id);
-  const check = await simkl.checkConnection(profile.keys.simkl_client_id, profile.simkl_auth?.access_token);
-  let watched_count = 0;
-  try { watched_count = watchedStore.countWatched(profile.id); } catch { /* store may be empty */ }
-  res.json({
-    connected: check.valid,
-    username: check.username || profile.simkl_auth?.username || null,
-    reason: check.valid ? null : check.reason,
-    watched_count,
-    flow: flow ? { state: flow.state, user_code: flow.user_code, verification_url: flow.verification_url, error: flow.error } : null,
-  });
-});
-
 // Manual watched-history sync from Simkl (also runs in the background later).
 router.post('/profiles/:id/simkl/sync', async (req, res) => {
   const profile = config.getProfile(req.params.id);

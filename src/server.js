@@ -143,7 +143,14 @@ app.get('/health', (req, res) => res.json({ ok: true }));
 // redacts the query so no tokens/verifier ever appear in logs.
 const simklAuthV2 = require('./services/simklAuthV2');
 app.get('/simkl/oauth2/callback', async (req, res) => {
-  const { code, state } = req.query;
+  const { code, state, error } = req.query;
+  // Cancellation: Simkl redirects back with error=access_denied when the user
+  // denies or closes the consent page. This is NOT a failure — the existing
+  // grant (if any) is preserved and the user is redirected to the portal.
+  if (error) {
+    res.redirect('/configure/#simkl');
+    return;
+  }
   if (!code || !state) return res.status(400).json({ error: 'Missing code or state' });
   // The callback is tied to the profile that started the flow. We look up
   // the profile by matching the state against stored flows.
@@ -152,13 +159,22 @@ app.get('/simkl/oauth2/callback', async (req, res) => {
   for (const p of config.listProfiles()) {
     if (simklAuthV2.getFlow(p.id)?.state === state) { matched = p; break; }
   }
-  if (!matched) return res.status(400).json({ error: 'No matching pending V2 flow' });
+  if (!matched) {
+    // No matching pending flow: the flow expired or was already consumed
+    // (replay). Redirect to the portal with a message; the existing grant
+    // is preserved.
+    res.redirect('/configure/#simkl');
+    return;
+  }
   try {
     const tokens = await simklAuthV2.handleCallback(matched, { code, state });
+    // Persist the full grant: absolute expiry, scope, account identity.
     config.updateProfile(matched.id, {
       simkl_auth: {
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
+        expires_at: tokens.expires_at,
+        scope: tokens.scope,
         username: tokens.username || undefined,
         connected_at: Date.now(),
         version: 2,
@@ -168,7 +184,16 @@ app.get('/simkl/oauth2/callback', async (req, res) => {
     // Redirect to the portal's Simkl tab so the user sees the result.
     res.redirect('/configure/#simkl');
   } catch (err) {
-    res.status(500).json({ error: 'V2 OAuth callback failed' });
+    // A failed exchange (bad code, expired, wrong issuer, insufficient scope,
+    // credential change) must NOT overwrite the existing grant. Redirect to
+    // the portal with a safe, actionable message. Never echo the provider
+    // body to the browser (M4).
+    const msg = err.state === 'credential_changed'
+      ? 'Simkl Client ID changed during the flow — start again'
+      : err.state === 'insufficient_scope'
+        ? 'Simkl granted a read-only token — re-authorize with the full scope'
+        : 'V2 OAuth failed — start the connection again';
+    res.redirect(`/configure/#simkl?error=${encodeURIComponent(msg)}`);
   }
 });
 

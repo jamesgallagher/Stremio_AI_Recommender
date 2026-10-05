@@ -9,12 +9,18 @@
 //      returns the authorize URL for the browser to open.
 //   2. Browser redirects to Simkl's consent page.
 //   3. Simkl redirects back to GET /simkl/oauth2/callback?code=...&state=...
+//      (or ?error=access_denied&state=... on cancellation).
 //   4. The callback handler validates state, exchanges the code for tokens
-//      (POST /oauth2/token), and stores them in the profile.
+//      (POST /oauth2/token), validates the returned grant, and stores them
+//      in the profile. A failed/cancelled/replayed callback preserves any
+//      existing active grant.
 //
 // PKCE (RFC 7636):
 //   code_verifier: 43-128 random chars (unpadded base64url)
 //   code_challenge: BASE64URL(SHA256(code_verifier)) — S256 method
+//
+// Scope: media:read media:write (per Simkl's authorization-code reference).
+// The returned granted scope must include both; a read-only grant is rejected.
 
 const crypto = require('crypto');
 const config = require('../config');
@@ -22,12 +28,16 @@ const config = require('../config');
 const SIMKL_AUTHORIZE = 'https://simkl.com/oauth2/authorize';
 const SIMKL_TOKEN = 'https://api.simkl.com/oauth2/token';
 const SIMKL_REVOKE = 'https://api.simkl.com/oauth2/revoke';
-const SCOPE = 'all'; // Simkl V2 default scope
+const SCOPE = 'media:read media:write';
+const EXPECTED_ISS = 'https://simkl.com';
+const FLOW_TTL_MS = 10 * 60 * 1000; // 10 min
+const MAX_PENDING_FLOWS = 50; // cap to prevent unbounded memory growth
 
-// In-memory flow state: profileId → { state, code_verifier, redirect_uri, expires_at }
+// In-memory flow state: profileId → flow record.
 // The state is a random opaque string; the code_verifier is never sent to the
 // browser (M4). The redirect_uri must match what was registered on the Simkl
-// app AND what we send to the token endpoint.
+// app AND what we send to the token endpoint. The initiating Client ID is
+// recorded so a credential change during the flow is detected.
 const flows = new Map();
 
 // Generate a cryptographically random string of the given byte length,
@@ -60,43 +70,90 @@ function buildAuthorizeUrl({ clientId, redirectUri, state, codeChallenge }) {
 
 // Start a V2 authorization flow for a profile. Returns the authorize URL and
 // stores the flow state in memory. The code_verifier stays server-side (M4).
+// The initiating Client ID is recorded so a credential change during the flow
+// is detected at callback time.
 function startFlow(profile, redirectUri) {
   const clientId = profile.keys.simkl_v2_client_id;
   if (!clientId) throw new Error('V2 Client ID required');
+  // Enforce the pending-flow cap (prevent unbounded memory growth).
+  if (flows.size >= MAX_PENDING_FLOWS) {
+    // Expire the oldest flow to make room.
+    let oldestId = null, oldestExp = Infinity;
+    for (const [id, f] of flows) {
+      if (f.expires_at < oldestExp) { oldestExp = f.expires_at; oldestId = id; }
+    }
+    if (oldestId) flows.delete(oldestId);
+  }
+  // Expire any existing flow for this profile (one flow per profile).
+  if (flows.has(profile.id)) flows.delete(profile.id);
   const { codeVerifier, codeChallenge } = generatePkce();
   const state = randomBase64Url(16); // 22 chars
   const flow = {
     state,
     code_verifier: codeVerifier,
     redirect_uri: redirectUri,
-    expires_at: Date.now() + 10 * 60 * 1000, // 10 min
+    expires_at: Date.now() + FLOW_TTL_MS,
+    // Record the initiating credentials so a change during the flow is detected.
+    client_id: clientId,
+    client_secret: profile.keys.simkl_v2_client_secret,
+    profile_id: profile.id,
   };
   flows.set(profile.id, flow);
   const authorizeUrl = buildAuthorizeUrl({ clientId, redirectUri, state, codeChallenge });
   return { authorizeUrl, state };
 }
 
-// Handle the callback: validate state, exchange code for tokens.
-// Returns { access_token, refresh_token, expires_in, username? } or throws.
+// Handle the callback: validate state, exchange code for tokens, validate the
+// returned grant. Consumes the flow BEFORE the token exchange (a replayed or
+// failed callback cannot re-use the state). A failed/cancelled/replayed
+// callback preserves any existing active grant (the caller does not overwrite
+// simkl_auth on failure).
+//
+// Returns { access_token, refresh_token, expires_at, scope, username } or
+// throws a structured error { message, state } where state is one of:
+//   'cancelled', 'expired', 'state_mismatch', 'exchange_failed',
+//   'invalid_issuer', 'insufficient_scope', 'malformed_token',
+//   'credential_changed'
 async function handleCallback(profile, { code, state }) {
   const flow = flows.get(profile.id);
-  if (!flow) throw new Error('No pending V2 flow for this profile');
+  if (!flow) {
+    const err = new Error('No pending V2 flow for this profile');
+    err.state = 'expired';
+    throw err;
+  }
+  // Consume the flow BEFORE the exchange: a replayed callback (same state,
+  // second time) finds no pending flow and fails. This is the replay guard.
+  flows.delete(profile.id);
+
   if (Date.now() > flow.expires_at) {
-    flows.delete(profile.id);
-    throw new Error('V2 flow expired — start again');
+    const err = new Error('V2 flow expired — start again');
+    err.state = 'expired';
+    throw err;
   }
   if (flow.state !== state) {
-    flows.delete(profile.id);
-    throw new Error('State mismatch (possible CSRF) — start again');
+    const err = new Error('State mismatch (possible CSRF) — start again');
+    err.state = 'state_mismatch';
+    throw err;
+  }
+  // Detect a credential change during the flow: the initiating Client ID
+  // recorded at startFlow must match the profile's current V2 Client ID.
+  // A changed credential means the flow was started with a different app
+  // registration; the token would be bound to the old registration.
+  if (flow.client_id !== profile.keys.simkl_v2_client_id) {
+    const err = new Error('V2 Client ID changed during the flow — start again');
+    err.state = 'credential_changed';
+    throw err;
   }
   // Exchange the authorization code for tokens. The client_secret is sent
   // server-side only (M4). PKCE code_verifier is included (S256).
+  // Use the INITIATING credentials (recorded at startFlow), not the profile's
+  // current credentials (which may have changed).
   const body = new URLSearchParams({
     grant_type: 'authorization_code',
     code,
     redirect_uri: flow.redirect_uri,
-    client_id: profile.keys.simkl_v2_client_id,
-    client_secret: profile.keys.simkl_v2_client_secret,
+    client_id: flow.client_id,
+    client_secret: flow.client_secret,
     code_verifier: flow.code_verifier,
   });
   const res = await fetch(SIMKL_TOKEN, {
@@ -105,17 +162,38 @@ async function handleCallback(profile, { code, state }) {
     body: body.toString(),
   });
   if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    // Never echo the provider body to the browser (M4).
-    throw new Error(`Simkl token exchange failed (${res.status})`);
+    const err = new Error(`Simkl token exchange failed (${res.status})`);
+    err.state = 'exchange_failed';
+    throw err;
   }
   const data = await res.json();
-  if (!data.access_token) throw new Error('Simkl did not return an access token');
-  flows.delete(profile.id); // flow consumed
+  // Validate the returned grant.
+  if (!data.access_token) {
+    const err = new Error('Simkl did not return an access token');
+    err.state = 'malformed_token';
+    throw err;
+  }
+  // Validate the issuer.
+  if (data.iss && data.iss !== EXPECTED_ISS) {
+    const err = new Error('Unexpected token issuer');
+    err.state = 'invalid_issuer';
+    throw err;
+  }
+  // Validate the granted scope: must include media:read and media:write.
+  // A read-only grant (e.g. scope="media:read") is insufficient for this app.
+  const grantedScope = data.scope || '';
+  if (!grantedScope.includes('media:read') || !grantedScope.includes('media:write')) {
+    const err = new Error('Insufficient scope — Simkl granted a read-only or restricted token');
+    err.state = 'insufficient_scope';
+    throw err;
+  }
+  // Compute absolute expiry (expires_in is relative seconds).
+  const expiresAt = data.expires_in ? Date.now() + data.expires_in * 1000 : null;
   return {
     access_token: data.access_token,
     refresh_token: data.refresh_token || null,
-    expires_in: data.expires_in || null,
+    expires_at: expiresAt,
+    scope: grantedScope,
     username: data.username || null,
   };
 }
@@ -165,6 +243,7 @@ async function revokeToken(profile) {
 }
 
 // Get the pending flow for a profile (for the portal's status endpoint).
+// Never exposes the code_verifier or client_secret (M4).
 function getFlow(profileId) {
   const flow = flows.get(profileId);
   if (!flow) return null;
@@ -172,8 +251,7 @@ function getFlow(profileId) {
     flows.delete(profileId);
     return null;
   }
-  // Never expose the code_verifier (M4).
-  return { state: flow.state, expires_at: flow.expires_at };
+  return { state: flow.state, expires_at: flow.expires_at, client_id: flow.client_id };
 }
 
 module.exports = {
