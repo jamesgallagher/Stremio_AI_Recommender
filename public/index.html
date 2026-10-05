@@ -348,16 +348,27 @@ function render(profiles) {
       </div>
 
       <div class="tab-panel" data-tab="simkl">
-        <div class="muted" style="margin-top:4px">v6 tracker. Create a Simkl API app for <b>${esc(p.name)}</b> (redirect URI can be anything), paste the Client ID (and Secret), Save, then Connect. The status below is verified <b>live</b> against Simkl.</div>
+        <div class="muted" style="margin-top:4px">v6 tracker. Create a Simkl API app for <b>${esc(p.name)}</b>, paste the Client ID (and Secret), Save, then Connect. The status below is verified <b>live</b> against Simkl.</div>
         <label style="margin-top:12px">User email <span class="muted">— for the Mobile Companion (passwordless login, coming soon)</span></label>
         <input type="email" data-email value="${esc(p.email || '')}" placeholder="name@example.com" autocomplete="off" spellcheck="false" ${IGNORE_PW_MANAGERS}>
         <div class="muted" style="font-size:11px;margin-top:3px">Stored for now. The companion app will email a one-time passcode to this address so <b>${esc(p.name)}</b> can manage their recommendations from a phone.</div>
+        <div style="margin-top:12px"><label>Auth version</label>
+          <select data-auth-version>
+            <option value="1" ${p.simkl_auth_version === 1 ? 'selected' : ''}>AUTH V1 (PIN device flow)</option>
+            <option value="2" ${p.simkl_auth_version === 2 ? 'selected' : ''}>AUTH V2 (OAuth + PKCE)</option>
+          </select>
+          <div class="muted" style="font-size:11px;margin-top:3px">V2 requires a public HTTPS <code>EXTERNAL_URL</code> for the callback. The active token's version is independent of this preference (selecting V2 does not change an existing V1 token).</div>
+        </div>
         <div class="keys-list" style="margin-top:12px">
           <div><label>Client ID
               <a class="getkey" href="https://simkl.com/settings/developer/new/" target="_blank" rel="noopener">get key ↗</a></label>
             ${keyRow(p.id, 'simkl_client_id', p.keys.simkl_client_id)}</div>
           <div><label>Client Secret <span class="muted">(optional for PIN)</span></label>
             ${keyRow(p.id, 'simkl_client_secret', p.keys.simkl_client_secret)}</div>
+          <div><label>V2 Client ID</label>
+            ${keyRow(p.id, 'simkl_v2_client_id', p.keys.simkl_v2_client_id)}</div>
+          <div><label>V2 Client Secret</label>
+            ${keyRow(p.id, 'simkl_v2_client_secret', p.keys.simkl_v2_client_secret)}</div>
         </div>
         <div style="margin-top:10px"><button onclick="saveSimkl('${p.id}')">Save</button>
           <button class="ghost" onclick="checkSimklStatus('${p.id}')">Check connection</button></div>
@@ -1032,11 +1043,12 @@ async function saveKeys(id, silent = false) {
   if (!silent) { dirty = false; toast('Keys saved'); pollStatus(); }
 }
 
-// Simkl tab Save: the user email (Mobile Companion login) + the Simkl client keys.
+// Simkl tab Save: the user email (Mobile Companion login) + the Simkl client keys + auth version.
 async function saveSimkl(id) {
   const card = document.querySelector(`[data-id="${id}"]`);
   const email = (card.querySelector('[data-email]')?.value || '').trim();
-  await api('/profiles/' + id, { method: 'PUT', body: { email } });
+  const authVersion = parseInt(card.querySelector('[data-auth-version]').value, 10);
+  await api('/profiles/' + id, { method: 'PUT', body: { email, simkl_auth_version: authVersion } });
   await saveKeys(id, true); // persist the Simkl Client ID/Secret silently
   dirty = false; toast('Saved'); pollStatus();
 }
@@ -1205,14 +1217,27 @@ async function connectSimkl(id) {
   const statusEl = card.querySelector('.simkl-flow .flow-status');
   try {
     await saveKeys(id, true); // persist the Client ID if just typed
-    const { user_code, verification_url } = await api(`/profiles/${id}/simkl/connect`, { method: 'POST' });
-    statusEl.innerHTML = `Go to <a href="${verification_url}" target="_blank" style="color:var(--accent)">${verification_url}</a> and enter:
-      <div class="pin">${user_code}</div><div class="muted">Waiting for authorization…</div>`;
-    const poll = setInterval(async () => {
-      const { connected, flow } = await api(`/profiles/${id}/simkl/status`);
-      if (connected) { clearInterval(poll); toast('Simkl connected 🎉'); checkSimklStatus(id); }
-      else if (flow && flow.state === 'error') { clearInterval(poll); statusEl.innerHTML = `<span style="color:var(--err)">${esc(flow.error)}</span>`; }
-    }, 3000);
+    const r = await api(`/profiles/${id}/simkl/connect`, { method: 'POST' });
+    if (r.authorize_url) {
+      // V2 OAuth: the user clicks the authorize URL in their browser.
+      statusEl.innerHTML = `Click <a href="${r.authorize_url}" target="_blank" style="color:var(--accent)">Authorize with Simkl</a> to complete the connection.
+        <div class="muted">You'll be redirected back here automatically after authorizing.</div>`;
+      // Poll for the token to arrive (the callback stores it server-side).
+      const poll = setInterval(async () => {
+        const { connected } = await api(`/profiles/${id}/simkl/status`);
+        if (connected) { clearInterval(poll); toast('Simkl connected 🎉'); checkSimklStatus(id); }
+      }, 3000);
+    } else {
+      // V1 PIN flow.
+      const { user_code, verification_url } = r;
+      statusEl.innerHTML = `Go to <a href="${verification_url}" target="_blank" style="color:var(--accent)">${verification_url}</a> and enter:
+        <div class="pin">${user_code}</div><div class="muted">Waiting for authorization…</div>`;
+      const poll = setInterval(async () => {
+        const { connected, flow } = await api(`/profiles/${id}/simkl/status`);
+        if (connected) { clearInterval(poll); toast('Simkl connected 🎉'); checkSimklStatus(id); }
+        else if (flow && flow.state === 'error') { clearInterval(poll); statusEl.innerHTML = `<span style="color:var(--err)">${esc(flow.error)}</span>`; }
+      }, 3000);
+    }
   } catch (err) {
     statusEl.innerHTML = `<span style="color:var(--err)">${esc(err.message)}</span>`;
   }

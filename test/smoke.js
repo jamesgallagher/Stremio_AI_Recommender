@@ -2117,6 +2117,37 @@ okAsync('simkl-auth T7: V2 disconnect revokes the token via /oauth2/revoke', asy
   }
 });
 
+// ---- SIMKL-AUTH-1 T8: browser UI — the Simkl tab renders the V1/V2 selector + V2 fields ----
+ok('simkl-auth T8: the portal Simkl tab renders the auth version selector and V2 client fields; the connect flow branches on version', () => {
+  const p = config.addProfile('T8-UI');
+  config.updateProfile(p.id, {
+    keys: { simkl_client_id: 'v1-cid', simkl_v2_client_id: 'v2-cid', simkl_v2_client_secret: 'v2-sec' },
+    simkl_auth_version: 2,
+  });
+  const pf = config.getProfile(p.id);
+  // publicProfile exposes the V2 fields for the UI to render.
+  const portal = require('../src/portal');
+  const mockReq = { protocol: 'http', get: () => 'localhost:7311' };
+  const pub = portal.publicProfile(pf, mockReq);
+  assert.strictEqual(pub.simkl_auth_version, 2, 'auth version in publicProfile');
+  assert.strictEqual(pub.keys.simkl_v2_client_id, 'v2-cid', 'V2 client ID in publicProfile');
+  assert.strictEqual(pub.keys.simkl_v2_client_secret, 'v2-sec', 'V2 client secret in publicProfile');
+  assert.ok(pub.simkl_v2_callback_ready !== undefined, 'V2 callback readiness flag present');
+  // The portal's /simkl/status endpoint returns the structured state (M6).
+  // The connect endpoint branches by preferred version: V2 → authorize_url, V1 → PIN.
+  // This is verified by T3 (V2 authorize URL) and T2 (V1 PIN flow).
+  // The UI HTML includes the auth version selector and V2 fields (verified by
+  // the static HTML content below).
+  const fs = require('fs');
+  const html = fs.readFileSync(require('path').join(__dirname, '..', 'public', 'index.html'), 'utf8');
+  assert.ok(html.includes('data-auth-version'), 'HTML has the auth version selector');
+  assert.ok(html.includes('simkl_v2_client_id'), 'HTML has the V2 client ID field');
+  assert.ok(html.includes('simkl_v2_client_secret'), 'HTML has the V2 client secret field');
+  assert.ok(html.includes('AUTH V1'), 'HTML shows AUTH V1 option');
+  assert.ok(html.includes('AUTH V2'), 'HTML shows AUTH V2 option');
+  config.removeProfile(p.id);
+});
+
 // ---- SIMKL-AUTH-1 T10: James's report — V2 ID in the V1 field, V1 selected, no token ----
 // The manual check must call the V1 PIN endpoint ONCE, receive a fetch-level
 // 400 {"error":"unauthorized_client"}, and return the prominent "select AUTH V2"

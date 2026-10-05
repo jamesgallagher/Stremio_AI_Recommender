@@ -1115,4 +1115,4 @@ router.post('/settings/test-llm', async (req, res) => {
   }
 });
 
-module.exports = { router };
+module.exports = { router, publicProfile };
