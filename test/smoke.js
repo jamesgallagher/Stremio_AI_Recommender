@@ -84,15 +84,15 @@ ok('catalogs: registry, defaults, and per-source requirements', () => {
   assert.strictEqual(catalogs.EXTRA_CATALOGS.length, 14); // v6 registry: 2 Watch Later + 12 curated
   // New genre lists from the overhaul are present
   assert.ok(catalogs.getExtra('mdb-romcom-movies') && catalogs.getExtra('mdb-war-movies') && catalogs.getExtra('mdb-horror-movies'));
-  // Kids lists: 50 titles, rating-gated at 6.0 (the site's "60"), off by default
+  // Kids lists: rating-gated at 6.0 (the site's "60"), off by default. CB-1:
+  // no per-catalog target — every non-Watch-Later catalog is sized by the
+  // profile's list-size setting, so NO catalog definition carries a `target`.
   const kidsM = catalogs.getExtra('mdb-kids-movies');
   const kidsS = catalogs.getExtra('mdb-kids-series');
-  assert.strictEqual(kidsM.target, 50);
-  assert.strictEqual(kidsS.target, 50);
   assert.strictEqual(kidsM.min_imdb, 6);
   assert.strictEqual(kidsS.type, 'series');
   assert.ok(!kidsM.default_on && !kidsS.default_on); // opt-in per profile
-  assert.strictEqual(catalogs.getExtra('mdb-action-movies').target, undefined); // others keep the 20 default
+  assert.ok(catalogs.EXTRA_CATALOGS.every((d) => d.target === undefined), 'no catalog definition carries a target (CB-1)');
   const ids = catalogs.EXTRA_CATALOGS.map(d => d.id);
   assert.strictEqual(new Set(ids).size, ids.length);
   assert.ok(catalogs.EXTRA_CATALOGS.every(d => d.type === 'movie' || d.type === 'series'));
@@ -123,7 +123,7 @@ ok('catalogs: registry, defaults, and per-source requirements', () => {
   const anime = catalogs.getExtra('trakt-anime-teen-series');
   assert.strictEqual(anime.source, 'mdblist'); // v6: snoak/trending-anime-shows on MDBList
   assert.strictEqual(anime.type, 'series');
-  assert.strictEqual(anime.target, 50);
+  assert.strictEqual(anime.target, undefined); // CB-1: no per-catalog target (sized by the list-size setting)
   assert.strictEqual(anime.min_imdb, 6);   // list's imdb_ratings=6-10
   assert.strictEqual(anime.min_profile_age, 14); // TV-14 band (AGE-2: the real TV-14 tier)
   assert.ok(!anime.default_on);

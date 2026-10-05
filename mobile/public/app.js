@@ -604,7 +604,10 @@
     // MW-02: on the two Watch Later rows the ✕ REMOVES from the list (MW-04) and
     // the eye keeps the cell (Watch Later keeps watched — WL-KW); on every other
     // catalog the ✕ is "not interested" (suppress) and the eye drops the cell.
+    // CB-1: the dedupe_watched flag from the preview DTO is the authoritative
+    // source for whether watched titles are removed (true) or kept (false).
     const isWatchLater = data.source === 'simkl_plantowatch';
+    const dedupeWatched = data.dedupe_watched !== false;
     const grid = document.createElement('div'); grid.className = 'preview-grid';
     data.metas.forEach((m) => {
       const cell = document.createElement('div'); cell.className = 'pv-cell';
@@ -619,7 +622,7 @@
       const eye = document.createElement('button'); eye.type = 'button'; eye.className = 'pv-act pv-watch';
       const eyeLbl = isWatchLater ? 'Mark as watched (kept in Watch Later)' : 'Mark as watched';
       eye.title = eyeLbl; eye.setAttribute('aria-label', eyeLbl + ': ' + (m.name || '')); eye.innerHTML = EYE_ICON;
-      eye.addEventListener('click', (e) => { e.stopPropagation(); pvMarkWatched(m, data.type, cell, isWatchLater); });
+      eye.addEventListener('click', (e) => { e.stopPropagation(); pvMarkWatched(m, data.type, cell, isWatchLater, dedupeWatched); });
       const nope = document.createElement('button'); nope.type = 'button'; nope.className = 'pv-act pv-nope';
       const xLbl = isWatchLater ? 'Remove from Watch Later' : 'Not interested';
       nope.title = xLbl; nope.setAttribute('aria-label', xLbl + ': ' + (m.name || '')); nope.textContent = '✕';
@@ -645,12 +648,19 @@
   // behaviour can't drift: watched → MW-00 /api/watched, not-interested →
   // /api/recommend/suppress, Watch Later ✕ → MW-04 /api/watchlist/remove. Feedback
   // rides the recs snackbar (z-index above the sheet); the sheet never shows age.
-  async function pvMarkWatched(m, type, cell, isWatchLater) {
+  async function pvMarkWatched(m, type, cell, isWatchLater, dedupeWatched) {
     try {
       const res = await apiFetch('/watched', { method: 'POST', body: JSON.stringify({ type, imdb_id: m.id, title: m.name }) });
       if (res.ok) {
         showSnack(isWatchLater ? 'Marked “' + (m.name || 'title') + '” watched — kept in Watch Later' : 'Marked “' + (m.name || 'title') + '” watched', null);
-        if (!isWatchLater) pvDropCell(cell); // Watch Later keeps watched — leave the cell (WL-KW)
+        // CB-1: refetch the sheet so the backfilled titles appear (the count
+        // stays at list size). If the refetch fails, fall back to optimistic
+        // removal — but never drop a cell in a catalog that keeps watched
+        // titles (Watch Later, Christmas). The dedupeWatched flag from the
+        // preview DTO is the authoritative source: false means the catalog
+        // keeps watched titles (Christmas, Watch Later).
+        const ok = await pvRefetch();
+        if (!ok && dedupeWatched) pvDropCell(cell);
       } else if (res.status === 400) showSnack('Couldn’t mark watched — connect Simkl in the portal first', null);
       else showSnack('Couldn’t mark watched — try again', null);
     } catch { showSnack('Couldn’t mark watched — try again.', null); }
@@ -659,7 +669,12 @@
   async function pvNotInterested(m, type, cell) {
     try {
       const res = await apiFetch('/recommend/suppress', { method: 'POST', body: JSON.stringify({ type, imdb_id: m.id, title: m.name }) });
-      if (res.ok) { showSnack('Not interested in “' + (m.name || 'title') + '”', null); pvDropCell(cell); }
+      if (res.ok) {
+        showSnack('Not interested in “' + (m.name || 'title') + '”', null);
+        // CB-1: refetch to show the backfilled title (count stays at list size).
+        const ok = await pvRefetch();
+        if (!ok) pvDropCell(cell); // fallback: optimistic removal
+      }
       else showSnack('Couldn’t update — try again', null);
     } catch { showSnack('Couldn’t update — try again.', null); }
   }
@@ -667,13 +682,21 @@
   async function pvRemoveFromWatchlist(m, type, cell) {
     try {
       const res = await apiFetch('/watchlist/remove', { method: 'POST', body: JSON.stringify({ type, imdb_id: m.id, title: m.name }) });
-      if (res.ok) { showSnack('Removed “' + (m.name || 'title') + '” from Watch Later', null); pvDropCell(cell); }
+      if (res.ok) {
+        showSnack('Removed “' + (m.name || 'title') + '” from Watch Later', null);
+        // CB-1: refetch — the Watch Later count may drop (source-sized).
+        const ok = await pvRefetch();
+        if (!ok) pvDropCell(cell); // fallback: optimistic removal
+      }
       else if (res.status === 400) showSnack('Couldn’t remove — connect Simkl in the portal first', null);
       else showSnack('Couldn’t remove — try again', null);
     } catch { showSnack('Couldn’t remove — try again.', null); }
   }
 
+  let pvCatalogId = null; // CB-1: the catalog whose preview is open (for refetch after actions)
+
   async function openCatalogPreview(catalogId, title) {
+    pvCatalogId = catalogId;
     pvEls.title.textContent = title || 'Preview'; pvEls.count.textContent = '';
     pvMsg('Loading…'); pvEls.sheet.hidden = false;
     try {
@@ -682,6 +705,25 @@
       if (!res.ok) { pvMsg(data.error || 'Couldn’t load preview.', 'err'); return; }
       renderPreview(data);
     } catch { pvMsg('Couldn’t load preview — try again.', 'err'); }
+  }
+
+  // CB-1: refetch the preview sheet after a successful action (watched /
+  // not-interested / watchlist-remove). The refetch shows the backfilled
+  // titles (the reserve) so the count stays at list size. If the refetch
+  // fails, fall back to the optimistic removal (the cell stays dropped).
+  // Guard: ignore the response if the sheet has closed or now shows a
+  // different catalog (capture the id before the call and compare after).
+  async function pvRefetch() {
+    if (!pvCatalogId) return false;
+    const catalogId = pvCatalogId;
+    try {
+      const res = await apiFetch('/catalogs/' + encodeURIComponent(catalogId) + '/preview');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) return false;
+      if (pvCatalogId !== catalogId) return false;
+      renderPreview(data);
+      return true;
+    } catch { return false; }
   }
 
   async function loadSettings() {

@@ -107,8 +107,17 @@ function servedCatalog(profile, catalogId, { record = false } = {}) {
     const suppressed = recommendationStore.dontRecommendImdbSet(profile.id);
     served = served.filter((m) => !suppressed.has(m.id));
   }
+  // CB-1: the ONE size — every non-Watch-Later catalog serves exactly
+  // listSizeFor(profile) titles. Watch Later is source-sized (shows whatever
+  // is on the Simkl list, no padding, no sizing by the setting).
+  if (extraDef.source !== 'simkl_plantowatch') {
+    const listSize = recommendationStore.listSizeFor(profile);
+    served = served.slice(0, listSize);
+  }
   const metas = applyRpdb(served, rpdbKey);
-  return { id: extraDef.id, name: extraDef.name, type: extraDef.type, source: extraDef.source, requirement_met: reqMet, state: 'ok', metas };
+  // CB-1: send the dedupe_watched flag so the client knows whether watched
+  // titles are removed (true) or kept (false) — not inferred from source.
+  return { id: extraDef.id, name: extraDef.name, type: extraDef.type, source: extraDef.source, dedupe_watched: extraDef.dedupe_watched !== false, requirement_met: reqMet, state: 'ok', metas };
 }
 
 module.exports = { AI_CATALOGS, applyRpdb, servedCatalog };
