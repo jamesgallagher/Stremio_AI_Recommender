@@ -189,7 +189,10 @@ async function simklFetch(profile, path, { method = 'GET', extra = {}, body = nu
   // the send is aborted (the captured token no longer belongs to the active
   // grant) rather than fired with a stale token.
   const res = await governor.schedule(lane, async () => {
-    const after = require('../config').getProfile(profile.id);
+    // Re-read the grant from the store (falls back to the passed profile if
+    // it is not in the store — e.g. a local test profile). A disconnect or
+    // account replacement while this call was queued must abort the send.
+    const after = require('../config').getProfile(profile.id) || profile;
     const current = resolveAuth(after);
     if (!current || current.token !== token || current.version !== version) {
       throw new Error('Simkl grant changed while queued — abort');
@@ -212,6 +215,7 @@ async function simklFetch(profile, path, { method = 'GET', extra = {}, body = nu
         if (after?.simkl_auth?.access_token === refreshed.access_token && after.simkl_auth.version === 2) {
           const res2 = await governor.schedule(lane, async () => {
             const after2 = require('../config').getProfile(profile.id);
+            if (!after2) throw new Error('Simkl grant changed while queued — abort');
             const current = resolveAuth(after2);
             if (!current || current.token !== refreshed.access_token || current.version !== 2) {
               throw new Error('Simkl grant changed while queued — abort');
