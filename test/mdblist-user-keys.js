@@ -677,8 +677,9 @@ function fp(key) {
 }
 
 // ---- Test 17 (R4): Actual rebuildProfile call via jobs.enqueue with per-catalog results.
-// Seeds old cache, calls the real rebuild through jobs.enqueue, verifies:
-// - cache preservation (old data survives deferred rebuild)
+// Seeds the REAL profile cache via store.swapExtra, calls the real rebuild
+// through jobs.enqueue, verifies:
+// - cache preservation (old extra cache survives deferred rebuild)
 // - stored disjoint summary (ok/deferred/failed counts)
 // - specific catalog assertion: result['mdb-popular-movies'].deferred === true
 {
@@ -698,14 +699,14 @@ function fp(key) {
   });
   const updatedProfile = config.getProfile(profile.id);
 
-  // Seed old cache: simulate a previous successful rebuild by writing a
-  // catalog file with known data.
-  const path = require('path');
-  const fs = require('fs');
-  const cacheDir = path.join(TEST_DATA_DIR, 'catalogs', updatedProfile.id);
-  fs.mkdirSync(cacheDir, { recursive: true });
-  const oldData = { items: [{ id: 'tt1234', title: 'Old Movie' }], generated_at: Date.now() - 86400e3 };
-  fs.writeFileSync(path.join(cacheDir, 'mdb-popular-movies.json'), JSON.stringify(oldData));
+  // Seed the REAL profile cache with a previous successful build's extra metas.
+  // The application reads extras from the profile cache (extras[catalogId].metas),
+  // not from a per-catalog file. A deferred rebuild must leave this cache untouched.
+  const store = require('../src/store');
+  const catId = 'mdb-popular-movies';
+  const oldMetas = [{ id: 'tt1234', type: 'movie', name: 'Old Movie' }];
+  store.swapExtra(updatedProfile.id, catId, oldMetas);
+  const oldEntry = structuredClone(store.loadCache(updatedProfile.id).extras[catId]);
 
   // Mock the MDBList transport: calls will hit the 429 cooldown and defer.
   const realFetch = global.fetch;
@@ -731,10 +732,10 @@ function fp(key) {
     assert.ok(result['mdb-popular-movies'].retry_after_ms > 0, 'mdb-popular-movies has retry_after_ms');
     assert.equal(result['mdb-popular-movies'].provider, 'mdblist', 'mdb-popular-movies provider is mdblist');
 
-    // Cache preservation: old data survives the deferred rebuild.
-    const cached = JSON.parse(fs.readFileSync(path.join(cacheDir, 'mdb-popular-movies.json'), 'utf8'));
-    assert.ok(cached.items && cached.items.length > 0, 'old cache preserved');
-    assert.equal(cached.items[0].id, 'tt1234', 'old cache item intact');
+    // Cache preservation: the REAL extra cache survives the deferred rebuild.
+    // A deferred rebuild must NOT swap the extra cache (no swapExtra on failure),
+    // so the seeded entry is byte-for-byte unchanged.
+    assert.deepStrictEqual(store.loadCache(updatedProfile.id).extras[catId], oldEntry, 'old extra cache preserved (not replaced)');
 
     // Stored disjoint summary: verify the job's summary has correct counts.
     const jobState = jobs.snapshot(updatedProfile.id);
@@ -748,7 +749,7 @@ function fp(key) {
     config.removeProfile(profile.id);
   }
 
-  console.log('  ✓ test 17: actual rebuildProfile via jobs.enqueue — cache preserved, disjoint summary, specific catalog deferred');
+  console.log('  ✓ test 17: actual rebuildProfile via jobs.enqueue — real extra cache preserved, disjoint summary, specific catalog deferred');
 }
 
 // ---- Test 18 (R4): Named blocker from HTTP route.
@@ -1075,9 +1076,12 @@ function fp(key) {
 }
 
 // ---- Test 23 (Review3): Polling updates MDBList status fragment.
-// Calls the actual GET /api/profiles endpoint before and after a cooldown
-// to verify the mdblist_status fragment changes. Drives polling before/after
-// completion and preserves an unsaved input draft (form field unchanged).
+// Mounts the application's actual URL structure (/api + /configure), calls
+// the real GET /api/profiles endpoint before and after a cooldown to verify
+// the mdblist_status fragment changes. In the browser, drives the real page
+// pollStatus() before/after changing provider state and asserts the status
+// fragment changes (cooldown set AND recovery after cleared) while the
+// unsaved input value, focus, and Advanced tab are preserved.
 {
   governor._reset();
   jobs._reset();
@@ -1090,12 +1094,17 @@ function fp(key) {
   const profile = config.addProfile('Polling-Test');
   config.updateProfile(profile.id, { keys: { mdblist_api_key: 'test-polling' } });
 
+  // Mount the application's actual URL structure: /api for the portal
+  // router and /configure for the static public/ directory (the page the
+  // browser navigates to).
   const app = express();
-  app.use(portal.router);
+  app.use('/api', portal.router);
+  app.use('/configure', express.static(path.join(__dirname, '..', 'public')));
   const server = http.createServer(app);
   await new Promise((resolve) => server.listen(0, resolve));
   const port = server.address().port;
 
+  let browser;
   try {
     // Set a 30s cooldown on the profile's key.
     const fp23 = fp('test-polling');
@@ -1103,7 +1112,7 @@ function fp(key) {
     governor.noteResponse('mdblist', res30s, fp23);
 
     // Poll BEFORE completion: the status should show backing_off.
-    const res1 = await fetch(`http://127.0.0.1:${port}/profiles`);
+    const res1 = await fetch(`http://127.0.0.1:${port}/api/profiles`);
     assert.equal(res1.status, 200, 'GET /api/profiles returns 200');
     const data1 = await res1.json();
     const profile1 = data1.profiles.find((p) => p.id === profile.id);
@@ -1117,7 +1126,7 @@ function fp(key) {
     governor._reset();
 
     // Poll AFTER completion: the status should show no backoff.
-    const res2 = await fetch(`http://127.0.0.1:${port}/profiles`);
+    const res2 = await fetch(`http://127.0.0.1:${port}/api/profiles`);
     assert.equal(res2.status, 200, 'GET /api/profiles returns 200 (after reset)');
     const data2 = await res2.json();
     const profile2 = data2.profiles.find((p) => p.id === profile.id);
@@ -1132,62 +1141,82 @@ function fp(key) {
     const reloaded = config.getProfile(profile.id);
     assert.equal(reloaded.keys.mdblist_api_key, 'test-polling', 'unsaved input draft preserved');
 
-    // Chromium regression: enter an unsaved draft, call real page pollStatus
-    // before/after changing provider state, assert status fragment changed
-    // and input value/focus/tab preserved.
+    // Chromium regression: navigate to the real page with the intended
+    // profile selected and Advanced open, enter an unsaved draft, call the
+    // real page pollStatus() before/after changing provider state, and assert
+    // the status fragment changes (cooldown set AND recovery after cleared)
+    // while the unsaved input value, focus, and Advanced tab are preserved.
     if (process.argv.includes('--browser')) {
       const { chromium } = require('playwright');
-      const browser = await chromium.launch({ headless: true });
+      browser = await chromium.launch({ headless: true });
       const context = await browser.newContext();
       const page = await context.newPage();
 
-      // Navigate to the portal
-      await page.goto(`http://127.0.0.1:${port}/`);
+      // Navigate to the real page with the intended profile selected and
+      // Advanced open (not the default profile/tab).
+      await page.goto(`http://127.0.0.1:${port}/configure/#simkl?profile=${profile.id}`);
 
-      // Wait for the profile card to render
-      await page.waitForSelector(`[data-id="${profile.id}"]`);
+      // Wait for the profile card to render with the Advanced tab.
+      const card = page.locator(`.card[data-id="${profile.id}"]`);
+      await card.getByRole('button', { name: 'Advanced', exact: true }).waitFor();
 
-      // Enter an unsaved draft: set the MDBList key input to a new value
-      const keyInput = page.locator(`[data-id="${profile.id}"] input[data-key="mdblist_api_key"]`);
+      // The Advanced tab must be active (not the default Filters tab).
+      assert.equal(await card.getAttribute('data-active-tab'), 'advanced', 'Advanced tab active before polling');
+
+      // Enter an unsaved draft: set the MDBList key input to a new value.
+      const keyInput = card.locator('input[data-key="mdblist_api_key"]');
       await keyInput.fill('draft-value-not-saved');
+      await keyInput.focus();
       const draftValue = await keyInput.inputValue();
       assert.equal(draftValue, 'draft-value-not-saved', 'unsaved draft entered');
 
-      // Record the current MDBList status fragment
-      const statusEl = page.locator(`[data-id="${profile.id}"] #mdblist-status-${profile.id}`);
-      const statusBefore = await statusEl.innerHTML();
+      // The status fragment renders the key-source label, not the secret.
+      const statusEl = card.locator(`#mdblist-status-${profile.id}`);
+      const statusBefore = await statusEl.innerText();
+      assert.ok(statusBefore.includes('User key'), 'status shows rendered key-source label "User key"');
+      assert.ok(!statusBefore.includes('test-polling'), 'secret does not appear in status markup');
 
-      // Call the real page's pollStatus()
+      // Call the real page's pollStatus() — the status fragment is updated
+      // in place without a full re-render.
       await page.evaluate(() => pollStatus());
       await page.waitForTimeout(200);
+      const statusAfterPoll = await statusEl.innerText();
+      assert.ok(statusAfterPoll.includes('User key'), 'status still shows key-source label after poll');
+      assert.ok(!statusAfterPoll.includes('test-polling'), 'secret still absent after poll');
 
-      // The status fragment should still show the same state (no change yet)
-      const statusAfterPoll = await statusEl.innerHTML();
-      assert.ok(statusAfterPoll.includes('test-polling') || statusAfterPoll.includes('user'), 'status fragment present after poll');
+      // Change the provider state: set a cooldown. The status fragment must
+      // change to show the backoff.
+      const fp23b = fp('test-polling');
+      const res30sB = { status: 429, headers: { get: (h) => h.toLowerCase() === 'retry-after' ? '30' : null } };
+      governor.noteResponse('mdblist', res30sB, fp23b);
 
-      // Now change the provider state: set a cooldown
-      const fp23 = fp('test-polling');
-      const res30s = { status: 429, headers: { get: (h) => h.toLowerCase() === 'retry-after' ? '30' : null } };
-      governor.noteResponse('mdblist', res30s, fp23);
-
-      // Call pollStatus again — the status fragment should change
       await page.evaluate(() => pollStatus());
       await page.waitForTimeout(200);
-      const statusAfterCooldown = await statusEl.innerHTML();
-      assert.ok(statusAfterCooldown.includes('backing off') || statusAfterCooldown.includes('cooldown'), 'status fragment changed after cooldown');
+      const statusAfterCooldown = await statusEl.innerText();
+      assert.ok(statusAfterCooldown.includes('backing off'), 'status fragment changed to show backoff after cooldown set');
 
-      // Assert the unsaved draft is preserved (input value unchanged)
-      const draftAfter = await keyInput.inputValue();
-      assert.equal(draftAfter, 'draft-value-not-saved', 'unsaved draft preserved after pollStatus');
+      // The unsaved input value, focus, and Advanced tab are preserved.
+      assert.equal(await keyInput.inputValue(), 'draft-value-not-saved', 'unsaved draft preserved after cooldown poll');
+      assert.equal(await keyInput.evaluate((el) => document.activeElement === el), true, 'input focus preserved after cooldown poll');
+      assert.equal(await card.getAttribute('data-active-tab'), 'advanced', 'Advanced tab active after cooldown poll');
 
-      // Assert focus is preserved (the input is still focused)
-      const isFocused = await page.evaluate(() => document.activeElement === document.querySelector(`[data-id="${profile.id}"] input[data-key="mdblist_api_key"]`));
-      assert.ok(isFocused, 'input focus preserved');
+      // Clear the cooldown (recovery). The status fragment must change back.
+      governor._reset();
+      await page.evaluate(() => pollStatus());
+      await page.waitForTimeout(200);
+      const statusAfterRecovery = await statusEl.innerText();
+      assert.ok(!statusAfterRecovery.includes('backing off'), 'status fragment recovered (no backoff) after cooldown cleared');
+      assert.ok(statusAfterRecovery.includes('User key'), 'status still shows key-source label after recovery');
 
-      await browser.close();
-      console.log('  ✓ test 23b: Chromium — pollStatus preserves unsaved draft, focus, tab');
+      // The unsaved input value, focus, and Advanced tab are still preserved.
+      assert.equal(await keyInput.inputValue(), 'draft-value-not-saved', 'unsaved draft preserved after recovery poll');
+      assert.equal(await keyInput.evaluate((el) => document.activeElement === el), true, 'input focus preserved after recovery poll');
+      assert.equal(await card.getAttribute('data-active-tab'), 'advanced', 'Advanced tab active after recovery poll');
+
+      console.log('  ✓ test 23b: Chromium — pollStatus preserves unsaved draft, focus, tab; status changes on cooldown set and recovery');
     }
   } finally {
+    if (browser) await browser.close();
     server.close();
     config.removeProfile(profile.id);
   }
@@ -1263,154 +1292,207 @@ function fp(key) {
   console.log('  ✓ test 25: GC does not delete a bucket with in-flight work (Issue 2 fix)');
 }
 
-// ---- Test 26: FIFO ownership — network rejection does not remove another entry.
-// A rejects after starting, B's pacing wake is held, C is queued.
-// Before releasing B, C must not start. Then release B and assert starts A/B/C,
-// all promises settled, min 250ms start spacing, counters match actual sends.
-// Also covers non-head expiry: expired entry never starts/counts, remaining settle.
+// ---- Test 26: FIFO ownership — held-admission-wake regression.
+// A caller's network failure must never edit the admission queue after its
+// entry was released. Capture/hold only the first pacing-timer callback;
+// start A with a deferred network promise, then B/C; attach Promise.allSettled
+// immediately. Reject A after B's timer is captured. While B's wake remains
+// held, assert starts are exactly [A]. Release the wake; assert [A,B,C],
+// settlement, start spacing, and actual-send counts. Red on 8483b3b, green
+// on 0745c88. No live network or long wait required.
 {
   governor._reset();
 
-  const fp26 = fp('test-fifo-ownership');
-  const sendTimes = [];
-  const sendOrder = [];
+  const fp26 = fp('test-fifo-held-wake');
+  const startTimes = [];
+  const startOrder = [];
 
-  // A: starts, then rejects (network failure)
-  const fnA = async () => {
-    sendTimes.push(Date.now());
-    sendOrder.push('A');
-    throw new Error('network rejection');
+  // Intercept global.setTimeout to capture/hold only the first pacing-timer
+  // callback (0 < ms < 30000). The 30s admission expiry timer (ms === 30000)
+  // is passed through untouched.
+  const nativeTimer = global.setTimeout;
+  let heldWake;
+  let holdNext = true;
+  global.setTimeout = (fn, ms, ...args) => {
+    if (holdNext && ms > 0 && ms < 30000) {
+      holdNext = false;
+      heldWake = () => fn(...args);
+      return nativeTimer(() => {}, 0);
+    }
+    return nativeTimer(fn, ms, ...args);
   };
 
-  // B: starts after 250ms pacing, holds for 500ms, then succeeds
-  const fnB = async () => {
-    sendTimes.push(Date.now());
-    sendOrder.push('B');
-    await new Promise((r) => setTimeout(r, 500)); // hold the slot
-    return { res: { status: 200, ok: true }, body: null };
-  };
+  try {
+    // A: starts, then returns a deferred network promise (rejectable).
+    let rejectA;
+    const pA = governor.schedule('mdblist', () => {
+      startTimes.push(Date.now());
+      startOrder.push('A');
+      return new Promise((r, j) => { rejectA = j; });
+    }, fp26);
 
-  // C: starts after B releases, succeeds
-  const fnC = async () => {
-    sendTimes.push(Date.now());
-    sendOrder.push('C');
-    return { res: { status: 200, ok: true }, body: null };
-  };
+    // B: starts after 250ms pacing, returns {status:200}.
+    const pB = governor.schedule('mdblist', async () => {
+      startTimes.push(Date.now());
+      startOrder.push('B');
+      return { res: { status: 200, ok: true }, body: null };
+    }, fp26);
 
-  const pA = governor.schedule('mdblist', fnA, fp26);
-  const pB = governor.schedule('mdblist', fnB, fp26);
-  const pC = governor.schedule('mdblist', fnC, fp26);
-  // Handle A's rejection to avoid unhandled rejection
-  pA.catch(() => {});
+    // C: starts after B releases, returns {status:200}.
+    const pC = governor.schedule('mdblist', async () => {
+      startTimes.push(Date.now());
+      startOrder.push('C');
+      return { res: { status: 200, ok: true }, body: null };
+    }, fp26);
 
-  // Wait for A to start and reject
-  await new Promise((r) => setTimeout(r, 100));
-  assert.ok(sendOrder.includes('A'), 'A started');
+    // Attach Promise.allSettled immediately (before any await).
+    const completed = Promise.allSettled([pA, pB, pC]);
 
-  // A rejected — in the old code, this would shift B from the queue.
-  // In the new code, B is still in the queue and C is still waiting.
-  // B's pacing wait (250ms) should still be in effect.
+    // Wait for A to start and for B's pacing timer to be captured.
+    await new Promise((r) => nativeTimer(r, 20));
+    // Reject A's network promise (network failure).
+    rejectA(new Error('fake network failure'));
 
-  // Wait for B to start (after 250ms pacing from A)
-  await new Promise((r) => setTimeout(r, 350));
-  assert.ok(sendOrder.includes('B'), 'B started after 250ms pacing');
+    // Wait for the pacing window to elapse (B's wake remains held).
+    await new Promise((r) => nativeTimer(r, 350));
 
-  // C must NOT have started yet (C's admission starts at 250ms after B's admission)
-  // B's admission completes at ~250ms, so C's admission starts at ~500ms.
-  // At 350ms, C should not have started yet.
-  assert.ok(!sendOrder.includes('C'), 'C did not start before its 250ms pacing from B');
+    // While B's wake remains held, only A has started. In the old code, A's
+    // network rejection would re-wake B (shifting the admission queue), so B
+    // would have started here — this is the demonstrated old bug.
+    assert.deepStrictEqual(startOrder, ['A'], 'only A started while B\'s admission wake is held');
 
-  // Wait for all to settle
-  const [rA, rB, rC] = await Promise.allSettled([pA, pB, pC]);
+    // Release B's held admission wake.
+    heldWake();
+    const [rA, rB, rC] = await completed;
 
-  assert.equal(rA.status, 'rejected', 'A rejected');
-  assert.equal(rB.status, 'fulfilled', 'B succeeded');
-  assert.equal(rC.status, 'fulfilled', 'C succeeded');
+    // FIFO order: A, B, C.
+    assert.deepStrictEqual(startOrder, ['A', 'B', 'C'], 'FIFO order A, B, C');
 
-  // C must have started after B
-  const idxA = sendOrder.indexOf('A');
-  const idxB = sendOrder.indexOf('B');
-  const idxC = sendOrder.indexOf('C');
-  assert.ok(idxB < idxC, 'C started after B');
+    // Settlement: A rejected, B fulfilled, C fulfilled.
+    assert.equal(rA.status, 'rejected', 'A rejected (network failure)');
+    assert.equal(rB.status, 'fulfilled', 'B fulfilled');
+    assert.equal(rC.status, 'fulfilled', 'C fulfilled');
 
-  // Min 250ms spacing between B and C
-  const gapBC = sendTimes[idxC] - sendTimes[idxB];
-  assert.ok(gapBC >= 250, `C started ${gapBC}ms after B (expected >=250ms pacing)`);
+    // Start spacing: B >= 250ms after A, C >= 250ms after B.
+    const gapAB = startTimes[1] - startTimes[0];
+    const gapBC = startTimes[2] - startTimes[1];
+    assert.ok(gapAB >= 250, `B started ${gapAB}ms after A (expected >= 250ms pacing)`);
+    assert.ok(gapBC >= 250, `C started ${gapBC}ms after B (expected >= 250ms pacing)`);
 
-  // Counters: all three had admission complete (recordStart called for each)
-  const stats26 = governor.credentialStats(fp26);
-  assert.equal(stats26.calls, 3, '3 admissions counted (A, B, C)');
+    // Actual-send counts: 3 admissions (A, B, C).
+    const stats26 = governor.credentialStats(fp26);
+    assert.equal(stats26.calls, 3, '3 admissions counted (A, B, C)');
+  } finally {
+    // Restore timers and release every barrier.
+    global.setTimeout = nativeTimer;
+  }
 
-  console.log('  ✓ test 26: FIFO ownership — network rejection does not remove another entry');
+  console.log('  ✓ test 26: FIFO ownership — held-admission-wake regression (network rejection does not remove another entry)');
+}
 
-  // ---- Non-head expiry: current head has one admission worker, expired entry
-  // never starts/counts, remaining promises settle.
-  // The expiry callback only calls wakeNext when idx === 0 (head removed).
-  // We verify by queueing three entries, letting the head process, and
-  // confirming the non-head entries are processed in order (no premature wake).
+// ---- Test 26b: non-head expiry — controlled timer callbacks.
+// Expire a queued non-head entry while the head's admission wake is held.
+// Assert the expired promise rejects with defer, its fn never starts/counts,
+// the head retains its admission worker, and remaining callers settle in
+// order after releasing the head. This is genuine expiry coverage, not an
+// ordinary three-call FIFO success test.
+{
   governor._reset();
+
   const fp26b = fp('test-fifo-nonhead-expiry');
-  const sendTimesB = [];
-  const sendOrderB = [];
+  const startOrder = [];
 
-  // Head: slow fn (600ms), holds the slot
-  const fnHead = async () => {
-    sendTimesB.push(Date.now());
-    sendOrderB.push('head');
-    await new Promise((r) => setTimeout(r, 600));
-    return { res: { status: 200, ok: true }, body: null };
+  // Intercept global.setTimeout to capture pacing timers (0 < ms < 30000)
+  // and 30s admission expiry timers (ms === 30000). Only the FIRST pacing
+  // timer (B's) is held; subsequent pacing timers (C's) fire naturally. All
+  // 30s expiry timers are held so we can fire B's manually.
+  const nativeTimer = global.setTimeout;
+  let holdFirstPacing = true;
+  const pacingTimers = [];
+  const expiryTimers = [];
+  global.setTimeout = (fn, ms, ...args) => {
+    if (ms > 0 && ms < 30000) {
+      if (holdFirstPacing) {
+        holdFirstPacing = false;
+        pacingTimers.push(() => fn(...args));
+        return nativeTimer(() => {}, 0);
+      }
+      return nativeTimer(fn, ms, ...args);
+    } else if (ms === 30000) {
+      expiryTimers.push(fn);
+      return nativeTimer(() => {}, 0);
+    }
+    return nativeTimer(fn, ms, ...args);
   };
 
-  // Second entry (non-head)
-  const fnSecond = async () => {
-    sendTimesB.push(Date.now());
-    sendOrderB.push('second');
-    return { res: { status: 200, ok: true }, body: null };
-  };
+  try {
+    // A (head): admission completes, network op in progress (held by a
+    // barrier — the head's admission worker is retained).
+    let releaseA;
+    const pA = governor.schedule('mdblist', () => {
+      startOrder.push('A');
+      return new Promise((r) => { releaseA = r; });
+    }, fp26b);
 
-  // Third entry (behind the second)
-  const fnThird = async () => {
-    sendTimesB.push(Date.now());
-    sendOrderB.push('third');
-    return { res: { status: 200, ok: true }, body: null };
-  };
+    // B (non-head): woken, admission sleeps 250ms (pacing timer), held.
+    const pB = governor.schedule('mdblist', async () => {
+      startOrder.push('B');
+      return { res: { status: 200, ok: true }, body: null };
+    }, fp26b);
 
-  const pHead = governor.schedule('mdblist', fnHead, fp26b);
-  const pSecond = governor.schedule('mdblist', fnSecond, fp26b);
-  const pThird = governor.schedule('mdblist', fnThird, fp26b);
+    // C (non-head): queued behind B.
+    const pC = governor.schedule('mdblist', async () => {
+      startOrder.push('C');
+      return { res: { status: 200, ok: true }, body: null };
+    }, fp26b);
 
-  // Wait for head to start
-  await new Promise((r) => setTimeout(r, 100));
-  assert.ok(sendOrderB.includes('head'), 'head started');
+    // Attach Promise.allSettled immediately (before any await).
+    const completed = Promise.allSettled([pA, pB, pC]);
 
-  // Wait for head to complete (600ms)
-  await pHead;
+    // Wait for A's admission to complete and B's pacing timer to be captured.
+    // expiryTimers = [A's 30s (cleared by A's admission), B's 30s, C's 30s].
+    // pacingTimers = [B's pacing] (held).
+    await new Promise((r) => nativeTimer(r, 50));
+    assert.ok(startOrder.includes('A'), 'A started (head)');
+    assert.ok(!startOrder.includes('B'), 'B not started (pacing held)');
+    assert.ok(expiryTimers.length >= 2, 'B\'s 30s expiry timer captured');
+    assert.ok(pacingTimers.length >= 1, 'B\'s pacing timer captured');
 
-  // 'second' should start after head completes (250ms pacing)
-  await new Promise((r) => setTimeout(r, 400));
-  assert.ok(sendOrderB.includes('second'), 'second started after head completed');
+    // Expire the queued non-head entry B: fire B's 30s expiry timer (the
+    // second 30s timer). B is removed from the queue and its promise rejects
+    // with defer. B's fn never starts (its admission was held) and never
+    // counts (no recordStart for B). Since B was the head of the queue and
+    // C remains, wakeNext wakes C; C's pacing timer fires naturally.
+    expiryTimers[1]();
 
-  // 'third' should start after 'second' (250ms pacing)
-  await new Promise((r) => setTimeout(r, 400));
-  assert.ok(sendOrderB.includes('third'), 'third started after second');
+    // Release the head's barrier (A's network op completes).
+    releaseA();
 
-  // All promises settled
-  const [rHead, rSecond, rThird] = await Promise.allSettled([pHead, pSecond, pThird]);
-  assert.equal(rHead.status, 'fulfilled', 'head fulfilled');
-  assert.equal(rSecond.status, 'fulfilled', 'second fulfilled');
-  assert.equal(rThird.status, 'fulfilled', 'third fulfilled');
+    // Await all promises. C's admission completes naturally (its pacing
+    // timer fires), so all three settle.
+    const [rA, rB, rC] = await completed;
 
-  // Verify ordering: head < second < third
-  const idxHead = sendOrderB.indexOf('head');
-  const idxSecond = sendOrderB.indexOf('second');
-  const idxThird = sendOrderB.indexOf('third');
-  assert.ok(idxHead < idxSecond && idxSecond < idxThird, 'FIFO order preserved');
+    // B's promise rejected with defer.
+    assert.equal(rB.status, 'rejected', 'B rejected (admission expired)');
+    assert.equal(rB.reason.defer, true, 'B rejected with defer');
 
-  // Counters: 3 admissions
-  const stats26b = governor.credentialStats(fp26b);
-  assert.equal(stats26b.calls, 3, '3 admissions counted');
+    // B's fn never started.
+    assert.ok(!startOrder.includes('B'), 'B\'s fn never started');
 
-  console.log('  ✓ test 26b: non-head expiry — FIFO order preserved, no premature wake');
+    // B's fn never counted: only A and C had admission complete.
+    const stats26b = governor.credentialStats(fp26b);
+    assert.equal(stats26b.calls, 2, '2 admissions counted (A and C, not B)');
+
+    // A and C fulfilled; FIFO order A, C (B expired).
+    assert.equal(rA.status, 'fulfilled', 'A fulfilled');
+    assert.equal(rC.status, 'fulfilled', 'C fulfilled');
+    assert.deepStrictEqual(startOrder, ['A', 'C'], 'FIFO order A, C (B expired)');
+  } finally {
+    // Restore timers and release every barrier.
+    global.setTimeout = nativeTimer;
+  }
+
+  console.log('  ✓ test 26b: non-head expiry — expired entry rejects with defer, never starts/counts; head retains worker; remaining settle in order');
 }
 
 // Clean up the test data directory (also on failure).
