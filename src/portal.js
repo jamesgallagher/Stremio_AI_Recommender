@@ -285,7 +285,19 @@ router.put('/profiles/:id', (req, res) => {
   }
   // Capture the profile before the update for credential-change detection.
   const beforeProfile = config.getProfile(req.params.id);
-  const { profile, engineChanged } = config.updateProfile(req.params.id, patch);
+  let result;
+  try {
+    result = config.updateProfile(req.params.id, patch);
+  } catch (err) {
+    // Email uniqueness conflict (or any other write-boundary validation
+    // failure): no partial change was made (mutateProfiles is atomic).
+    // Return 409 with a clear message.
+    if (err.message && err.message.includes('is already used by profile')) {
+      return res.status(409).json({ error: err.message });
+    }
+    throw err;
+  }
+  const { profile, engineChanged } = result;
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
   // SC-03: an engine change (a new per-type selection, or an age-limit raise that
   // revoked an unrestricted engine) replaces that type's candidate producer —
@@ -402,6 +414,43 @@ async function testTvdb(profile) {
   }
 }
 
+// Per-profile MDBList user-key test (Advanced → API Keys). Unlike the global
+// Server Config test (testMdblist, which uses settings.keyFor — global-first),
+// this tests the EXACT per-profile key. Modes: {key: <draft>} tests an unsaved
+// draft; {use_saved: true} tests the stored user key server-side. A missing
+// user key reports missing (no silent fallback to the global key). Conflicting
+// modes are rejected.
+// NOTE: This route must be registered BEFORE test/:service (Express matches
+// routes in registration order; test/:service would otherwise catch mdblist-user).
+router.post('/profiles/:id/test/mdblist-user', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  const { key, use_saved } = req.body || {};
+  if (key !== undefined && use_saved) {
+    return res.status(400).json({ error: 'Conflicting modes: send either {key} or {use_saved}, not both' });
+  }
+  let testKey;
+  if (use_saved) {
+    testKey = profile.keys.mdblist_api_key;
+    if (!testKey) return res.json({ ok: false, error: 'MDBList user key not set' });
+  } else if (key !== undefined) {
+    testKey = String(key).trim();
+    if (!testKey) return res.json({ ok: false, error: 'MDBList user key not set' });
+  } else {
+    // No draft, no use_saved — test the stored user key.
+    testKey = profile.keys.mdblist_api_key;
+    if (!testKey) return res.json({ ok: false, error: 'MDBList user key not set' });
+  }
+  try {
+    const r = await mdblistService.testKey(testKey);
+    console.log(`[test] ${profile.name}/mdblist-user: OK — ${r.sampleAge ? r.sampleAge + '+' : 'not rated'}`);
+    res.json({ ok: true, detail: `MDBList user key valid (sample Common Sense lookup: ${r.sampleAge ? r.sampleAge + '+' : 'not rated'})` });
+  } catch (err) {
+    console.error(`[test] ${profile.name}/mdblist-user: FAIL — ${err.message}`);
+    res.json({ ok: false, error: `MDBList user key test failed: ${err.message}` });
+  }
+});
+
 router.post('/profiles/:id/test/:service', async (req, res) => {
   const profile = config.getProfile(req.params.id);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
@@ -445,14 +494,25 @@ function grantFingerprint(p) {
 router.post('/profiles/:id/simkl/check', async (req, res) => {
   const profile = config.getProfile(req.params.id);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
-  let result = await simkl.manualCheck(profile);
+  // Optional numeric `version` (the SELECTED version from the portal). When
+  // absent, the profile's stored preference is used (legacy callers retain
+  // current active-grant verification behavior).
+  const rawVersion = req.body?.version;
+  const version = (rawVersion === 1 || rawVersion === 2) ? rawVersion : undefined;
+  let result = await simkl.manualCheck(profile, { version });
   const current = config.getProfile(profile.id);
   if (!current || result.check_fingerprint !== grantFingerprint(current)) {
     return res.json({ state: 'credential_mismatch', message: 'Simkl connection changed — check again', connected: false });
   }
-  const check = { state: result.state, message: result.message, username: result.username || null, account_id: result.account_id || null, checked_at: Date.now() };
-  simklChecks.set(grantFingerprint(current), check);
-  res.json({ ...check, connected: result.state === 'connected' });
+  // Keep the SELECTED readiness out of the OLD grant's verification cache/badge
+  // when the selected version does not match the active grant's version.
+  const activeVersion = current.simkl_auth?.access_token ? (current.simkl_auth.version || 1) : null;
+  const selectedMatchesActive = version === undefined || activeVersion === version;
+  if (selectedMatchesActive) {
+    const check = { state: result.state, message: result.message, username: result.username || null, account_id: result.account_id || null, checked_at: Date.now() };
+    simklChecks.set(grantFingerprint(current), check);
+  }
+  res.json({ state: result.state, message: result.message, username: result.username || null, account_id: result.account_id || null, connected: result.state === 'connected' });
 });
 
 // Passive status poll (mandate M6): LIGHTWEIGHT — no Simkl call. Returns the
@@ -1258,14 +1318,35 @@ router.put('/settings', (req, res) => {
 
 // Test one global lookup key by reusing the per-profile testers (they only read
 // `.keys`). Key comes from the request body so an unsaved value can be tested.
+// TVDB: the saved key is redacted in the GET (a display mask), so the portal
+// never sends the mask as a key. Modes: {use_saved: true} resolves the saved
+// decrypted key server-side; {key: <draft>} tests an unsaved replacement
+// without persisting it. Conflicting modes are rejected.
 const SETTINGS_KEY_TESTERS = { tmdb: testTmdb, mdblist: testMdblist, rpdb: testRpdb, groq: testGroq, tvdb: testTvdb };
 router.post('/settings/test/:service', async (req, res) => {
   const tester = SETTINGS_KEY_TESTERS[req.params.service];
   if (!tester) return res.status(400).json({ error: 'Unknown service' });
   const field = req.params.service === 'groq' ? 'groq_api_key' : `${req.params.service}_api_key`;
-  const key = req.body.key;
+  const { key, use_saved } = req.body || {};
+  if (key !== undefined && use_saved) {
+    return res.status(400).json({ error: 'Conflicting modes: send either {key} or {use_saved}, not both' });
+  }
+  let testKey;
+  if (use_saved && req.params.service === 'tvdb') {
+    // TVDB: resolve the saved decrypted key server-side (never echo the raw
+    // key to the browser).
+    const s = settings.getSettings();
+    testKey = s?.keys?.tvdb_api_key;
+    if (!testKey) return res.json({ ok: false, error: 'TVDB key not set (optional — TV-14 age chain)' });
+  } else if (key !== undefined) {
+    testKey = String(key).trim();
+    if (!testKey) return res.json({ ok: false, error: 'Key not set' });
+  } else {
+    testKey = '';
+    return res.json({ ok: false, error: 'Key not set' });
+  }
   try {
-    const result = await tester({ keys: { [field]: key } });
+    const result = await tester({ keys: { [field]: testKey } });
     res.json(result);
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });

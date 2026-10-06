@@ -320,15 +320,56 @@ function checkFingerprint(p) {
   return [p.id, version, clientId, digest].join(':');
 }
 
-async function manualCheck(profile) {
-  const result = await manualCheckImpl(profile);
+async function manualCheck(profile, opts = {}) {
+  const result = await manualCheckImpl(profile, opts);
   return { ...result, check_fingerprint: result.check_fingerprint || checkFingerprint(profile) };
 }
 
-async function manualCheckImpl(profile) {
-  const version = profile.simkl_auth_version || 2;
+async function manualCheckImpl(profile, { version: requestedVersion } = {}) {
+  // An explicit numeric `version` (the SELECTED version from the portal)
+  // targets that version's readiness. When absent, the profile's stored
+  // preference (legacy callers) is used — the current active-grant behavior.
+  const version = (requestedVersion === 1 || requestedVersion === 2) ? requestedVersion : (profile.simkl_auth_version || 2);
   const auth = profile.simkl_auth;
   if (auth?.access_token) {
+    const activeVersion = auth.version || 1;
+    // When the SELECTED version does not match the active grant's version,
+    // check the selected version's readiness (NOT the old grant). This keeps
+    // the selected readiness out of the old grant's verification cache/badge.
+    if (activeVersion !== version) {
+      if (version === 2) {
+        const v2Id = profile.keys.simkl_v2_client_id;
+        const v2Secret = profile.keys.simkl_v2_client_secret;
+        if (!v2Id || !v2Secret) {
+          const missing = !v2Id ? 'V2 Client ID' : 'V2 Client Secret';
+          return { state: 'missing_configuration', message: `${missing} required` };
+        }
+        // V2 readiness cannot prove the secret valid without OAuth — say so,
+        // and note the V1 connection remains active.
+        return { state: 'not_authorized', message: 'V2 credentials saved. Authorize V2 to verify them. Your V1 connection remains active.' };
+      }
+      // V1 selected, active grant is V2. Check V1's readiness (no token).
+      const v1Id = profile.keys.simkl_client_id;
+      if (!v1Id) {
+        return { state: 'missing_configuration', message: 'Client ID required' };
+      }
+      try {
+        const { response: res, data } = await http.json(withParams(v1Id, '/oauth/pin'), { headers: headers() });
+        if (res.ok) {
+          return { state: 'v1_ready_unconnected', message: 'V1 app accepted; Simkl account not connected. Click Connect.' };
+        }
+        const body = data || {};
+        if (res.status === 400 && body.error === 'unauthorized_client') {
+          return { state: 'wrong_auth_version', message: 'This is a V2 app; select AUTH V2 and connect with the new flow.' };
+        }
+        if (res.status === 412 && body.error === 'client_id_failed') {
+          return { state: 'client_id_rejected', message: 'V1 Client ID rejected (HTTP 412). Check the ID/app registration or a Simkl block.' };
+        }
+        return { state: 'provider_unavailable', message: `Simkl returned ${res.status}` };
+      } catch (err) {
+        return { state: 'provider_unavailable', message: err.message.includes('timeout') ? 'Simkl unreachable (timeout)' : 'Simkl unreachable — try again later' };
+      }
+    }
     const config = require('../config');
     const managed = !!config.getProfile(profile.id);
     let checked = profile;

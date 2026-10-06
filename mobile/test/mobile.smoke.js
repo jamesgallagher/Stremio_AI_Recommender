@@ -130,8 +130,16 @@ async function unitTests() {
     assert.deepStrictEqual([r0.ok, r0.issued, r0.reason], [true, false, 'none']);
     assert.strictEqual(otpStore.newestUnusedOtp(auth.normalizeEmail(none)), null);
     // two matches -> config error, generic ok, nothing stored
+    // (simulate preexisting/legacy duplicates by writing directly to the store,
+    //  bypassing the write-boundary uniqueness check)
     auth._resetRateLimits();
-    const dup = uniqEmail(); seedProfile('Dup1', dup); seedProfile('Dup2', dup);
+    const dup = uniqEmail();
+    seedProfile('Dup1', dup);
+    const dup2 = config.addProfile('Dup2');
+    const raw = store.loadProfiles();
+    const rawDup2 = raw.profiles.find((p) => p.id === dup2.id);
+    rawDup2.email = dup;
+    store.saveProfiles(raw);
     const r2 = await auth.requestOtp(dup, { sendMail: send });
     assert.deepStrictEqual([r2.ok, r2.issued, r2.reason], [true, false, 'ambiguous']);
     assert.strictEqual(otpStore.newestUnusedOtp(auth.normalizeEmail(dup)), null);
