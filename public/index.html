@@ -587,9 +587,28 @@ function render(profiles) {
 
         <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
           <b>API Keys</b>
-          <div class="muted" style="margin-top:4px">Per-profile MDBList key. The server key continues to be used for normal operation at this stage.</div>
+          <div class="muted" style="margin-top:4px">Per-profile MDBList key. A personal key takes priority over the server key; without one, the server key is used. Neither set: MDBList lookups are unavailable (kids age rules fail-closed).</div>
           <label style="margin-top:8px">MDBList</label>
           ${mdblistKeyRow(p.id, p.keys.mdblist_api_key)}
+          ${(() => {
+            const ms = p.status?.mdblist_status;
+            if (!ms) return '';
+            const sourceLabel = ms.source === 'user' ? 'User key' : ms.source === 'server' ? 'Server fallback' : 'No key';
+            let html = `<div class="muted" style="font-size:11px;margin-top:6px">Key source: <b>${sourceLabel}</b>`;
+            if (ms.backing_off) html += ` — backing off (${Math.ceil((ms.backoff_ms_left || 0) / 1000)}s left)`;
+            if (ms.circuit_open) html += ` — circuit open (${Math.ceil((ms.circuit_ms_left || 0) / 1000)}s left)`;
+            if (ms.queue_position) html += ` — queue position ${ms.queue_position}`;
+            html += '</div>';
+            // Deferred/partial result from the most recent rebuild
+            const job = p.status?.job;
+            if (job && job.state === 'error' && job.deferred) {
+              const retrySec = Math.ceil((job.retry_after_ms || 0) / 1000);
+              html += `<div class="muted" style="font-size:11px;margin-top:4px">Deferred: MDBList provider cooldown (~${retrySec}s). Old catalogs intact; next queued work starts after.</div>`;
+            } else if (job && job.state === 'error' && job.circuit_open) {
+              html += `<div class="muted" style="font-size:11px;margin-top:4px">Circuit breaker open: MDBList transport failures. Old catalogs intact.</div>`;
+            }
+            return html;
+          })()}
         </div>
 
         <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">

@@ -5,11 +5,12 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node --experimental-sqlite src/server.js",
-    "test": "node --experimental-sqlite test/smoke.js && node --experimental-sqlite test/integration.js && node --experimental-sqlite mobile/test/mobile.smoke.js && node --experimental-sqlite test/simkl.lifecycle.js",
+    "test": "node --experimental-sqlite test/smoke.js && node --experimental-sqlite test/integration.js && node --experimental-sqlite mobile/test/mobile.smoke.js && node --experimental-sqlite test/simkl.lifecycle.js && node --experimental-sqlite test/mdblist-user-keys.js",
     "test:simkl": "node --experimental-sqlite test/simkl.lifecycle.js",
     "test:simkl:browser": "node --experimental-sqlite test/simkl.lifecycle.js --browser",
     "test:integration": "node --experimental-sqlite test/integration.js",
-    "test:mobile": "node --experimental-sqlite mobile/test/mobile.smoke.js"
+    "test:mobile": "node --experimental-sqlite mobile/test/mobile.smoke.js",
+    "test:mdblist": "node --experimental-sqlite test/mdblist-user-keys.js"
   },
   "engines": {
     "node": ">=22"

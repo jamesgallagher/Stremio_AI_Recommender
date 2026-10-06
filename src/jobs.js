@@ -76,10 +76,23 @@ async function pump() {
   });
   try {
     const result = await job.run(progress);
+    // Carry structured per-catalog outcomes (deferred/partial) in the job result
     setProgress(job.profileId, { state: 'done', pct: 100, label: 'Done', finished_at: Date.now(), result: result || null });
     job.resolve(result);
   } catch (err) {
-    setProgress(job.profileId, { state: 'error', label: `Failed: ${err.message}`, error: err.message, finished_at: Date.now() });
+    // Preserve structured defer/circuit metadata so the portal can show
+    // actionable retry information (retry_after_ms, provider, deferred flag).
+    const patch = { state: 'error', label: `Failed: ${err.message}`, error: err.message, finished_at: Date.now() };
+    if (err.defer) {
+      patch.deferred = true;
+      patch.retry_after_ms = err.retryAfterMs || 0;
+      patch.provider = 'mdblist';
+    }
+    if (err.circuitOpen) {
+      patch.circuit_open = true;
+      patch.provider = 'mdblist';
+    }
+    setProgress(job.profileId, patch);
     job.reject(err);
   } finally {
     active = null;

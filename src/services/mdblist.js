@@ -20,6 +20,34 @@ const BATCH_SIZE = 50;
 const PER_TITLE_CAP = 25; // ceiling on the per-title fallback (quota guard)
 const MDBLIST_TIMEOUT_MS = 15000; // 15s deadline for fetch + body parse
 
+// Shared MDBList request helper: races the entire fetch+parse operation
+// against an independently rejecting 15s deadline. The deadline starts once
+// the governed slot begins (after pacing wait), so rate-governor waiting is
+// not charged against the actual request deadline. Body parsing is inside the
+// governed operation so transport/body timeouts participate in breaker
+// accounting. Preserves HTTP status/headers for 429 (quota backoff) and 5xx
+// (transport failure) handling.
+async function mdblistRequest(url, options = {}, apiKey) {
+  const fp = keyFingerprint(apiKey);
+  const result = await governor.schedule('mdblist', async () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), MDBLIST_TIMEOUT_MS);
+    try {
+      const res = await fetch(url, { ...options, signal: controller.signal });
+      const body = await res.json(); // body parse inside the governed operation
+      return { res, body };
+    } finally {
+      clearTimeout(timer);
+    }
+  }, fp);
+  if (!result.res.ok) {
+    const err = new Error(`MDBList request failed (${result.res.status})`);
+    err.status = result.res.status;
+    throw err;
+  }
+  return result.body;
+}
+
 // The Common Sense age is MDBList's `age_rating` (a number). `commonsense` is
 // a BOOLEAN availability flag — reading IT as the age produced NaN, so every
 // title looked unrated and strict mode dropped entire kids catalogs. Older/
@@ -49,22 +77,8 @@ function parseCommonSenseAge(data) {
 async function fetchJson(url) {
   // Extract the apikey from the URL for the governor's per-credential partitioning
   const match = url.match(/apikey=([^&]+)/);
-  const fp = keyFingerprint(match ? decodeURIComponent(match[1]) : '');
-  // 15s deadline covers both the fetch and the body parse. Timer cleanup +
-  // best-effort abort; the timeout settles even if a fake transport ignores abort.
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), MDBLIST_TIMEOUT_MS);
-  try {
-    const res = await governor.schedule('mdblist', () => fetch(url, { headers: { 'User-Agent': USER_AGENT }, signal: controller.signal }), fp);
-    if (!res.ok) {
-      const err = new Error(`MDBList request failed (${res.status})`);
-      err.status = res.status;
-      throw err;
-    }
-    return await res.json();
-  } finally {
-    clearTimeout(timer);
-  }
+  const apiKey = match ? decodeURIComponent(match[1]) : '';
+  return mdblistRequest(url, { headers: { 'User-Agent': USER_AGENT } }, apiKey);
 }
 
 // Returns the Common Sense age (number) or null if CSM has not rated it.
@@ -209,32 +223,17 @@ async function listItemsPage(apiKey, user, slug, type, { limit = 50, offset = 0,
 async function mediaInfoBatch(apiKey, type, imdbIds) {
   if (!imdbIds.length) return new Map();
   const mediaType = type === 'series' ? 'show' : 'movie';
-  const fp = keyFingerprint(apiKey);
-  // 15s deadline covers both the fetch and the body parse
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), MDBLIST_TIMEOUT_MS);
-  try {
-    const res = await governor.schedule('mdblist', () => fetch(`${API}/imdb/${mediaType}?apikey=${encodeURIComponent(apiKey)}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'User-Agent': USER_AGENT },
-      body: JSON.stringify({ ids: imdbIds }),
-      signal: controller.signal,
-    }), fp);
-    if (!res.ok) {
-      const err = new Error(`MDBList batch lookup failed (${res.status})`);
-      err.status = res.status;
-      throw err;
-    }
-    const arr = await res.json();
-    const map = new Map();
-    for (const m of Array.isArray(arr) ? arr : []) {
-      const id = m?.ids?.imdb || m?.imdbid;
-      if (id) map.set(id, m);
-    }
-    return map;
-  } finally {
-    clearTimeout(timer);
+  const arr = await mdblistRequest(`${API}/imdb/${mediaType}?apikey=${encodeURIComponent(apiKey)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'User-Agent': USER_AGENT },
+    body: JSON.stringify({ ids: imdbIds }),
+  }, apiKey);
+  const map = new Map();
+  for (const m of Array.isArray(arr) ? arr : []) {
+    const id = m?.ids?.imdb || m?.imdbid;
+    if (id) map.set(id, m);
   }
+  return map;
 }
 
 // IMDb rating from either a list item (append_to_response=ratings) or a

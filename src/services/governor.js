@@ -116,6 +116,16 @@ function reserve(service, keyFingerprint, nowMs = Date.now()) {
   return Math.max(0, at - nowMs);
 }
 
+// Compute the would-be wait for a slot WITHOUT claiming it (no side effects).
+// Used by schedule() to check the defer threshold before committing a slot,
+// so deferred/cancelled work does not create artificial slots or consume
+// request counters.
+function pendingWait(service, keyFingerprint, nowMs = Date.now()) {
+  const s = stateFor(service, keyFingerprint);
+  const at = Math.max(nowMs, s.nextAt, s.backoffUntil);
+  return Math.max(0, at - nowMs);
+}
+
 // Record a response so a 429 backs off subsequent calls. No-op for non-429 or
 // non-Response values. Exported for testing.
 function noteResponse(service, res, keyFingerprint, nowMs = Date.now()) {
@@ -129,10 +139,11 @@ function noteResponse(service, res, keyFingerprint, nowMs = Date.now()) {
   s.lastActivity = nowMs;
 }
 
-// The one entry point: pace, run fn (which returns a fetch Response), note 429.
-// Also drives the circuit breaker for services that opt in: an open breaker
-// fails fast (no slot, no network); otherwise the outcome (2xx-4xx reachable
-// vs 5xx/thrown down) is recorded. 429 is rate, not down — never a breaker fail.
+// The one entry point: pace, run fn (which returns a fetch Response or
+// {res, body} for MDBList), note 429. Also drives the circuit breaker for
+// services that opt in: an open breaker fails fast (no slot, no network);
+// otherwise the outcome (2xx-4xx reachable vs 5xx/thrown down) is recorded.
+// 429 is rate, not down — never a breaker fail.
 // `keyFingerprint` partitions MDBList pacing per credential (equal keys share
 // a bucket; distinct keys have independent rate limits).
 const MDBLIST_MAX_SLOT_WAIT_MS = 30000;
@@ -144,24 +155,43 @@ async function schedule(service, fn, keyFingerprint) {
     err.circuitOpen = true;
     throw err;
   }
-  const wait = reserve(service, keyFingerprint);
-  // MDBList: if the reserved slot would require waiting > 30s (e.g. a long
-  // 429 backoff from another credential's key), fail/defer promptly rather
-  // than holding the job queue. The caller defers and the next profile starts.
-  if (service === 'mdblist' && wait > MDBLIST_MAX_SLOT_WAIT_MS) {
-    const err = new Error(`MDBList slot wait ${wait}ms exceeds 30s — deferring`);
+  // Check the defer threshold BEFORE claiming a slot: deferred work must not
+  // create artificial slots or consume request counters.
+  const wouldWait = pendingWait(service, keyFingerprint);
+  if (service === 'mdblist' && wouldWait > MDBLIST_MAX_SLOT_WAIT_MS) {
+    const err = new Error(`MDBList slot wait ${wouldWait}ms exceeds 30s — deferring`);
     err.defer = true;
-    err.retryAfterMs = wait;
+    err.retryAfterMs = wouldWait;
     throw err;
   }
+  const wait = reserve(service, keyFingerprint);
   if (wait > 0) await sleep(wait);
+  // Recheck cooldown/breaker immediately before send: during the pacing sleep
+  // another call may have received a 429 with a long Retry-After, moving the
+  // allowed slot beyond the 30s bound. Defer promptly in that case.
+  if (service === 'mdblist') {
+    if (lim.breaker && isOpen(service, keyFingerprint)) {
+      const err = new Error(`MDBList circuit open — skipping (cooldown)`);
+      err.circuitOpen = true;
+      throw err;
+    }
+    const reWait = pendingWait(service, keyFingerprint);
+    if (reWait > MDBLIST_MAX_SLOT_WAIT_MS) {
+      const err = new Error(`MDBList slot wait ${reWait}ms exceeds 30s — deferring`);
+      err.defer = true;
+      err.retryAfterMs = reWait;
+      throw err;
+    }
+  }
   try {
-    const res = await fn();
+    const result = await fn();
+    // fn may return a Response directly (tmdb, simkl) or {res, body} (mdblist).
+    const res = result && result.res ? result.res : result;
     noteResponse(service, res, keyFingerprint);
     noteOutcome(service, !(res && typeof res.status === 'number' && res.status >= 500), keyFingerprint);
-    return res;
+    return result;
   } catch (err) {
-    noteOutcome(service, false, keyFingerprint); // connection-level failure = the service is down
+    noteOutcome(service, false, keyFingerprint); // transport/body timeout = the service is down
     throw err;
   }
 }
@@ -172,13 +202,19 @@ async function schedule(service, fn, keyFingerprint) {
 // `key_source` label (never the raw key or full fingerprint).
 const IDLE_BUCKET_MS = 86400e3; // 24h — idle MDBList buckets are GC'd
 
+// Internal stats (used by portal profile status to query a specific
+// credential's bucket). Exposes fingerprints as property names — never
+// returned to clients.
 function stats(nowMs = Date.now()) {
   const out = {};
   for (const [service, s] of states) {
-    // GC idle MDBList buckets (prevents unbounded state growth from many profiles)
+    // GC idle MDBList buckets: never evict a bucket with an active cooldown
+    // (backoffUntil in the future) or an open circuit breaker (openUntil in
+    // the future), even if lastActivity is old. A 48h cooldown must survive
+    // the 24h idle threshold.
     if (service.startsWith('mdblist:') && s.lastActivity && nowMs - s.lastActivity > IDLE_BUCKET_MS) {
-      states.delete(service);
-      continue;
+      const active = s.backoffUntil > nowMs || s.openUntil > nowMs;
+      if (!active) { states.delete(service); continue; }
     }
     const lim = service.startsWith('mdblist:') ? LIMITS.mdblist : (LIMITS[service] || {});
     const entry = {
@@ -204,6 +240,59 @@ function stats(nowMs = Date.now()) {
   return out;
 }
 
+// Public diagnostics (for GET /api/governor): never exposes raw keys or
+// fingerprints. MDBList entries are summarized as aggregate counts without
+// per-credential identifiers.
+function publicStats(nowMs = Date.now()) {
+  const internal = stats(nowMs);
+  const out = {};
+  for (const [service, entry] of Object.entries(internal)) {
+    if (service === 'mdblist') {
+      // Aggregate all per-credential MDBList buckets into a single public entry
+      const agg = {
+        calls: 0, today: 0, daily_cap: LIMITS.mdblist.dailyCap || null,
+        throttled: 0, backing_off: false, backoff_ms_left: 0,
+        circuit_open: false, circuit_ms_left: 0, tripped: 0,
+        credentials: 0,
+      };
+      for (const cred of Object.values(entry)) {
+        agg.calls += cred.calls;
+        agg.today += cred.today;
+        agg.throttled += cred.throttled;
+        agg.backing_off = agg.backing_off || cred.backing_off;
+        agg.backoff_ms_left = Math.max(agg.backoff_ms_left, cred.backoff_ms_left);
+        agg.circuit_open = agg.circuit_open || cred.circuit_open;
+        agg.circuit_ms_left = Math.max(agg.circuit_ms_left, cred.circuit_ms_left);
+        agg.tripped += cred.tripped;
+        agg.credentials += 1;
+      }
+      out.mdblist = agg;
+    } else {
+      out[service] = entry;
+    }
+  }
+  return out;
+}
+
+// Internal per-credential lookup: given a fingerprint, return that credential's
+// stats entry (or null if no state exists yet). Used by portal profile status
+// to query the resolved bucket without exposing fingerprints publicly.
+function credentialStats(keyFingerprint, nowMs = Date.now()) {
+  const s = states.get('mdblist:' + keyFingerprint);
+  if (!s) return null;
+  return {
+    calls: s.calls,
+    today: s.day === Math.floor(nowMs / DAY_MS) ? s.dayCalls : 0,
+    daily_cap: LIMITS.mdblist.dailyCap || null,
+    throttled: s.throttled,
+    backing_off: s.backoffUntil > nowMs,
+    backoff_ms_left: Math.max(0, s.backoffUntil - nowMs),
+    circuit_open: s.openUntil > nowMs,
+    circuit_ms_left: Math.max(0, s.openUntil - nowMs),
+    tripped: s.tripped,
+  };
+}
+
 function _reset() { states.clear(); }
 
-module.exports = { schedule, reserve, noteResponse, noteOutcome, isOpen, stats, LIMITS, _reset };
+module.exports = { schedule, reserve, pendingWait, noteResponse, noteOutcome, isOpen, stats, publicStats, credentialStats, LIMITS, _reset };

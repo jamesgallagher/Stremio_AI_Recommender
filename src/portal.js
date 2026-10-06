@@ -49,8 +49,9 @@ router.get('/version', (req, res) => {
 // Rate-governor snapshot: per-service call totals, today's count vs any daily
 // cap, and current throttle/backoff state. Observability for the heavy paths
 // (Simkl 1-POST/s write cap, TMDB build volume, Jikan 60/min) — GET /api/governor.
+// Uses publicStats() which never exposes raw keys or fingerprints.
 router.get('/governor', (req, res) => {
-  res.json({ stats: require('./services/governor').stats() });
+  res.json({ stats: require('./services/governor').publicStats() });
 });
 
 function redactKey(v) {
@@ -179,25 +180,28 @@ function publicProfile(p, req) {
     status: (() => {
       const st = rebuild.status(p);
       const job = jobs.snapshot(p.id);
-      // MDBList provider status: show cooldown/deferred state for this profile's key
+      // MDBList provider status: show key source, cooldown/deferred state for
+      // this profile's key. Rendered even before the first request (source is
+      // known from key resolution; stats are null until a call occurs).
       const { key, source } = settings.resolveMdblistKey(p);
-      let mdblist_status = null;
+      const mdblist_status = { source };
       if (key) {
         const crypto = require('crypto');
         const fp = crypto.createHash('sha256').update(key).digest('hex').slice(0, 16);
-        const govStats = require('./services/governor').stats();
-        const mdbStats = govStats.mdblist?.[fp];
-        if (mdbStats) {
-          mdblist_status = {
-            source,
-            backing_off: mdbStats.backing_off,
-            backoff_ms_left: mdbStats.backoff_ms_left,
-            circuit_open: mdbStats.circuit_open,
-            circuit_ms_left: mdbStats.circuit_ms_left,
-            calls: mdbStats.calls,
-            today: mdbStats.today,
-          };
+        const credStats = require('./services/governor').credentialStats(fp);
+        if (credStats) {
+          mdblist_status.backing_off = credStats.backing_off;
+          mdblist_status.backoff_ms_left = credStats.backoff_ms_left;
+          mdblist_status.circuit_open = credStats.circuit_open;
+          mdblist_status.circuit_ms_left = credStats.circuit_ms_left;
+          mdblist_status.calls = credStats.calls;
+          mdblist_status.today = credStats.today;
         }
+      }
+      // Queue position: named preceding job if this profile is waiting
+      if (job && job.state === 'queued') {
+        mdblist_status.queue_position = jobs.queuePosition(p.id);
+        mdblist_status.queue_blocker = job.label || 'queued';
       }
       return { ...st, job, rebuilding: st.rebuilding || jobs.isBusy(p.id), mdblist_status };
     })(),

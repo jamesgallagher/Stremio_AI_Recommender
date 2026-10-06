@@ -611,7 +611,19 @@ async function rebuildProfile(profile, log = console, opts = {}, onProgress = ()
             }
           }
         } catch (err) {
-          results[def.id] = { ok: false, error: err.message };
+          // Preserve actionable per-catalog deferred/provider/retry-at metadata
+          // so the portal and job queue can show a truthful partial outcome.
+          const entry = { ok: false, error: err.message };
+          if (err.defer) {
+            entry.deferred = true;
+            entry.retry_after_ms = err.retryAfterMs || 0;
+            entry.provider = 'mdblist';
+          }
+          if (err.circuitOpen) {
+            entry.circuit_open = true;
+            entry.provider = 'mdblist';
+          }
+          results[def.id] = entry;
           log.warn(`[extra] ${profile.name}/${def.id} failed: ${err.message} — kept previous list`);
         }
         done++;
