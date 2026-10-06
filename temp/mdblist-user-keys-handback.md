@@ -67,13 +67,13 @@ Shared `mdblistRequest(url, options, apiKey)` helper:
 - `portal.js`: resolves the active job's profile name for `queue_blocker` (e.g., "Siobhan (extras)")
 - `public/index.html`: renders `job.summary` for state:done partial results ("Partial: 2/3 catalogs rebuilt, 1 deferred (MDBList cooldown ~7200s)"); shows named blocker ("blocked by Siobhan (extras)")
 
-## Tests (all pass on final head `29291e3`)
+## Tests (all pass on final head `7c9df26`)
 
 - **smoke:** 216 unit + 59 async/http + T1-T8 + Card 1
 - **integration:** 271 checks
 - **mobile:** 75 unit + http
 - **simkl.lifecycle:** 21 checks
-- **mdblist-user-keys:** 25 acceptance cases (unique DATA_DIR per run, real entry points, provider-boundary fakes with controlled clocks/barriers)
+- **mdblist-user-keys:** 26 numbered acceptance cases + T26b subcheck (controlled-timer non-head expiry) + T23b subcheck (Chromium pollStatus regression, `--browser` flag) — unique DATA_DIR per run, real entry points, provider-boundary fakes with controlled clocks/barriers
 
 ## Acceptance coverage
 
