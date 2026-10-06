@@ -7353,8 +7353,9 @@ async function main() {
     // the single muted chain explainer (AGE-2: one explainer for every tier)
     assert.ok(html.includes('Common Sense Media age'), 'chain explainer present');
 
-    // (b) the TVDB key row in Server Config
-    assert.ok(html.includes("keyRowS('tvdb', 'tvdb_api_key', keys.tvdb_api_key)"), 'TVDB key row present in Server Config');
+    // (b) the TVDB key row in Server Config (replace-only: the saved key is
+    // redacted in the GET, so the input is always empty — "Saved securely")
+    assert.ok(html.includes("tvdbKeyRow(keys.tvdb_api_key)"), 'TVDB key row present in Server Config');
 
     // (c) saving age_limit 14 stores 14
     const p = config.addProfile('INT-U1');

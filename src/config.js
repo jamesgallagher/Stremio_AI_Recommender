@@ -315,7 +315,20 @@ function updateProfile(id, patch) {
     // already run inside mutateProfiles, so both fields exist here).
     const beforeEngines = { movie: profile.filters.engine_movie, series: profile.filters.engine_series };
     if (patch.name !== undefined) profile.name = String(patch.name);
-    if (patch.email !== undefined) profile.email = String(patch.email || '').trim();
+    if (patch.email !== undefined) {
+      // Normalize consistently with the Mobile Companion lookup (trim + case
+      // fold). Enforce uniqueness of NONEMPTY emails across profiles at the
+      // configuration write boundary (not just the browser). The same
+      // profile's current normalized address is allowed (a no-op save); an
+      // empty email is allowed for profiles not using Companion. A conflict
+      // throws (no partial change) and the portal returns HTTP 409.
+      const email = String(patch.email || '').trim().toLowerCase();
+      if (email) {
+        const conflict = data.profiles.find((p) => p.id !== id && String(p.email || '').trim().toLowerCase() === email);
+        if (conflict) throw new Error(`Email "${email}" is already used by profile "${conflict.name}". Choose a unique address or clear it.`);
+      }
+      profile.email = email;
+    }
     if (patch.keys) Object.assign(profile.keys, patch.keys);
     if (patch.filters) {
       const f = patch.filters;

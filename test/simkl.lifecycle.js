@@ -211,10 +211,33 @@ async function run() {
       context.on('page', p => p.on('pageerror', e => errors.push(e.message)));
       page.on('pageerror', e => errors.push(e.message));
       const uiId = add('BrowserTarget');
+      // Navigate using #simkl?profile=<id> which selects the profile AND
+      // activates the Advanced tab (readSimklCallbackError reads the hash).
       await page.goto(base + '/configure/#simkl?profile=' + uiId);
       const card = page.locator('[data-id="' + uiId + '"]');
-      await card.getByRole('button', { name: 'Check connection', exact: true }).click();
-      await card.getByRole('button', { name: 'Reauthorize with V2 (OAuth)', exact: true }).click();
+      // The profile has a stored V1 token (active) but preferred V2.
+      // The editor is visible; the flow shows "Token stored".
+      await card.locator('[data-simkl-editor]').waitFor({ state: 'visible' });
+      await card.locator('.simkl-flow').filter({ hasText: 'Token stored' }).waitFor();
+      // Explicitly select V1 (the active version) before checking.
+      // An explicit V2 Check is readiness, not V1 verification.
+      await card.locator('[data-auth-version]').selectOption('1');
+      // Click "Check connection" in the flow area (scoped to .simkl-flow
+      // to avoid ambiguity with any editor check button).
+      await card.locator('.simkl-flow').getByRole('button', { name: 'Check connection', exact: true }).click();
+      // After verification, the connected summary shows "✓ Connected".
+      await card.locator('.simkl-flow').filter({ hasText: '✓ Connected' }).waitFor();
+      // The badge shows "Simkl connected".
+      await card.locator('.hdr-badge').filter({ hasText: 'Simkl connected' }).waitFor();
+      // The editor is hidden after verification (connected state).
+      await card.locator('[data-simkl-editor]').waitFor({ state: 'hidden' });
+      // Click "Change connection" to reveal the editor.
+      await card.locator('.simkl-flow').getByRole('button', { name: 'Change connection', exact: true }).click();
+      await card.locator('[data-simkl-editor]').waitFor({ state: 'visible' });
+      // Select V2 in the version selector.
+      await card.locator('[data-auth-version]').selectOption('2');
+      // Click "Connect" to start the V2 OAuth flow.
+      await card.getByRole('button', { name: 'Connect', exact: true }).click();
       await page.waitForTimeout(6500);
       const link = card.getByRole('link', { name: 'Authorize with Simkl', exact: true });
       assert.equal(await link.count(), 1);
@@ -230,7 +253,10 @@ async function run() {
       await failureTab.close();
       pass('browser real callback failure retained after status render');
       consent = 'good';
-      await card.getByRole('button', { name: 'Reauthorize with V2 (OAuth)', exact: true }).click();
+      // Reveal the editor again and click Connect for V2.
+      await card.locator('.simkl-flow').getByRole('button', { name: 'Change connection', exact: true }).click();
+      await card.locator('[data-simkl-editor]').waitFor({ state: 'visible' });
+      await card.getByRole('button', { name: 'Connect', exact: true }).click();
       let failedReload = false;
       await card.getByRole('link', { name: 'Authorize with Simkl', exact: true }).waitFor();
       await page.route('**/api/profiles', r => {
@@ -242,11 +268,69 @@ async function run() {
       await page.waitForFunction(id => PROFILES.find(p => p.id === id)?.simkl_active_version === 2, uiId);
       assert.equal(config.getProfile(uiId).simkl_auth.version, 2);
       assert.equal(failedReload, true, 'completion retries a failed profile reload');
-      assert.equal(await card.getByRole('button', { name: 'Reauthorize with V2 (OAuth)', exact: true }).count(), 0);
+      // After successful V2 connection, the connected summary shows "✓ Connected".
+      await card.locator('.simkl-flow').filter({ hasText: '✓ Connected' }).waitFor();
+      assert.equal(await card.locator('.simkl-flow').getByRole('button', { name: 'Change connection', exact: true }).count(), 1);
       await successTab.waitForSelector('[data-id="' + uiId + '"]');
       assert.equal(await successTab.locator('#userSelect').inputValue(), uiId);
       assert.deepEqual(errors, []);
       pass('browser actual success refreshes original tab and selects correct callback profile');
+
+      // ---- Browser regression: active state preserved separately from target readiness ----
+      // A verified V1 account: Change connection, select V2, Check.
+      // The badge must remain "Simkl connected" with Sync/Disconnect/Change,
+      // and the V2 target note is appended once.
+      {
+        const regId = add('RegTarget');
+        // Force a full page load (hash-only change doesn't re-trigger load()).
+        await page.goto(base + '/configure/');
+        await page.goto(base + '/configure/#simkl?profile=' + regId);
+        const regCard = page.locator('[data-id="' + regId + '"]');
+        // Wait for the editor to render (checkSimklStatus is async via readSimklCallbackError).
+        await regCard.locator('[data-simkl-editor]').waitFor({ state: 'visible' });
+        // Select V1 (active version) before waiting for the Check button.
+        await regCard.locator('[data-auth-version]').selectOption('1');
+        // Wait for the Check button to appear (renderSimklFlow is async after checkSimklStatus).
+        await regCard.locator('.simkl-flow').getByRole('button', { name: 'Check connection', exact: true }).waitFor();
+        await regCard.locator('.simkl-flow').getByRole('button', { name: 'Check connection', exact: true }).click();
+        await regCard.locator('.simkl-flow').filter({ hasText: '✓ Connected' }).waitFor();
+        // Record the active details: username and watched count.
+        const flowText = await regCard.locator('.simkl-flow').innerText();
+        assert.ok(flowText.includes('Fake User'), 'active username present');
+        assert.ok(flowText.includes('watched title'), 'watched count present');
+        // Sync and Disconnect buttons are present.
+        assert.equal(await regCard.locator('.simkl-flow').getByRole('button', { name: 'Sync watched now', exact: true }).count(), 1);
+        assert.equal(await regCard.locator('.simkl-flow').getByRole('button', { name: 'Disconnect from Simkl', exact: true }).count(), 1);
+        // Change connection to reveal the editor.
+        await regCard.locator('.simkl-flow').getByRole('button', { name: 'Change connection', exact: true }).click();
+        await regCard.locator('[data-simkl-editor]').waitFor({ state: 'visible' });
+        // Select V2 and check (target readiness).
+        await regCard.locator('[data-auth-version]').selectOption('2');
+        await regCard.locator('[data-simkl-editor]').getByRole('button', { name: 'Check connection', exact: true }).click();
+        // Wait for the target check response to render before asserting badge/controls.
+        await regCard.locator('.simkl-flow').filter({ hasText: 'Target AUTH V2' }).waitFor();
+        // The badge must still show "Simkl connected" (active V1 state preserved).
+        await regCard.locator('.hdr-badge').filter({ hasText: 'Simkl connected' }).waitFor();
+        // The active details remain: username, watched count, Sync/Disconnect.
+        const flowText2 = await regCard.locator('.simkl-flow').innerText();
+        assert.ok(flowText2.includes('Fake User'), 'active username preserved after target check');
+        assert.ok(flowText2.includes('watched title'), 'watched count preserved after target check');
+        assert.equal(await regCard.locator('.simkl-flow').getByRole('button', { name: 'Sync watched now', exact: true }).count(), 1, 'Sync preserved');
+        assert.equal(await regCard.locator('.simkl-flow').getByRole('button', { name: 'Disconnect from Simkl', exact: true }).count(), 1, 'Disconnect preserved');
+        // The V2 target note is appended once.
+        assert.ok(flowText2.includes('Target AUTH V2'), 'target note present');
+        const targetNoteCount = (flowText2.match(/Target AUTH V2/g) || []).length;
+        assert.equal(targetNoteCount, 1, 'target note appended exactly once');
+        // A passive render retains the truthful active state + one supplementary note.
+        await page.evaluate(id => checkSimklStatus(id), regId);
+        const flowText3 = await regCard.locator('.simkl-flow').innerText();
+        assert.ok(flowText3.includes('Fake User'), 'passive render retains active username');
+        assert.ok(flowText3.includes('Target AUTH V2'), 'passive render retains target note');
+        const passiveNoteCount = (flowText3.match(/Target AUTH V2/g) || []).length;
+        assert.equal(passiveNoteCount, 1, 'passive render has exactly one target note');
+        config.removeProfile(regId);
+        pass('browser active state preserved separately from target readiness');
+      }
     }
     console.log('All Simkl lifecycle checks passed (' + checks + ').');
   } finally {

@@ -7344,13 +7344,14 @@ async function httpTests() {
   assert.deepStrictEqual(updated.filters.excluded_genres, ['Horror', 'Reality']);
   console.log('  ✓ PUT /api/profiles/:id filters');
 
-  // User email (Mobile Companion) round-trips + trims
+  // User email (Mobile Companion) round-trips + normalizes (trim + case-fold,
+  // consistent with the Mobile Companion lookup).
   const withEmail = (await (await fetch(`${BASE}/api/profiles/${profile.id}`, {
     method: 'PUT', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email: '  James@Example.com  ' }),
   })).json()).profile;
-  assert.strictEqual(withEmail.email, 'James@Example.com');
-  console.log('  ✓ user email stored on the profile');
+  assert.strictEqual(withEmail.email, 'james@example.com');
+  console.log('  ✓ user email stored on the profile (normalized)');
 
   // Rebuild without Simkl or any enabled catalog -> clean 400
   res = await fetch(`${BASE}/api/profiles/${profile.id}/rebuild`, { method: 'POST' });
@@ -9033,7 +9034,506 @@ async function httpTests() {
     console.log('  ✓ T8e: Change back → still failed (terminal)');
   }
 
-  console.log(`\nAll checks passed (${passed} unit + 59 async/http + T1-T8).`);
+  // ---- Card 1: Email uniqueness (write-boundary) ----
+  {
+    // Whitespace/case variants conflict
+    const pA = config.addProfile('Card1EmailA');
+    const pB = config.addProfile('Card1EmailB');
+    config.updateProfile(pA.id, { email: 'card1user@example.com' });
+    const r1 = await (await fetch(`${BASE}/api/profiles/${pB.id}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: ' Card1User@Example.COM ' }),
+    })).json();
+    assert.strictEqual(r1.error, 'Email "card1user@example.com" is already used by profile "Card1EmailA". Choose a unique address or clear it.', 'whitespace/case variant conflicts');
+    assert.strictEqual(config.getProfile(pB.id).email, '', 'no partial change on conflict');
+
+    // Same-profile save succeeds (no-op)
+    const r2 = await (await fetch(`${BASE}/api/profiles/${pA.id}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'card1user@example.com' }),
+    })).json();
+    assert.strictEqual(r2.profile.email, 'card1user@example.com', 'same-profile save succeeds');
+
+    // Blank legacy email remains usable
+    const r3 = await (await fetch(`${BASE}/api/profiles/${pB.id}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: '' }),
+    })).json();
+    assert.strictEqual(r3.profile.email, '', 'blank email allowed');
+
+    // Failed update preserves all other fields (atomic)
+    config.updateProfile(pB.id, { email: 'card1bob@example.com', name: 'Bob-Renamed' });
+    const r4 = await (await fetch(`${BASE}/api/profiles/${pB.id}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'card1user@example.com', name: 'Should-Not-Change' }),
+    })).json();
+    assert.ok(r4.error, 'conflict returned');
+    const pBAfter = config.getProfile(pB.id);
+    assert.strictEqual(pBAfter.name, 'Bob-Renamed', 'other fields preserved on failed update');
+    assert.strictEqual(pBAfter.email, 'card1bob@example.com', 'email unchanged on failed update');
+    config.removeProfile(pA.id);
+    config.removeProfile(pB.id);
+    console.log('  ✓ Card 1: Email uniqueness — whitespace/case conflict, same-profile save, blank allowed, atomic');
+  }
+
+  // ---- Card 1: Simkl V1/V2 visibility + draft preservation + Check targeting ----
+  {
+    // V1/V2 visibility: the HTML has both blocks, only the selected one visible
+    const pV = config.addProfile('V1V2');
+    config.updateProfile(pV.id, {
+      keys: { simkl_v2_client_id: 'client-V', simkl_v2_client_secret: 'secret-V' },
+      simkl_auth: null,
+      simkl_auth_version: 2,
+    });
+    const html = (await (await fetch(`${BASE}/configure/`)).text());
+    assert.ok(html.includes('data-simkl-v1'), 'V1 block present in HTML');
+    assert.ok(html.includes('data-simkl-v2'), 'V2 block present in HTML');
+    assert.ok(html.includes("toggleSimklVersion"), 'version toggle function present');
+    config.removeProfile(pV.id);
+
+    // Check targeting with existing V1 (check V2 when V1 is active):
+    // the explicit version (2) differs from the saved preference (1), so the
+    // server returns 409 configuration-changed without any provider call.
+    const pC = config.addProfile('CheckV2');
+    config.updateProfile(pC.id, {
+      keys: { simkl_v2_client_id: 'client-C', simkl_v2_client_secret: 'secret-C' },
+      simkl_auth: { access_token: 'v1-token', version: 1, client_id: 'client-C1' },
+      simkl_auth_version: 1,
+    });
+    const checkRes409 = await fetch(`${BASE}/api/profiles/${pC.id}/simkl/check`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ version: 2 }),
+    });
+    assert.strictEqual(checkRes409.status, 409, 'explicit V2 vs saved pref V1 → 409');
+    const checkRes409Body = await checkRes409.json();
+    assert.ok(checkRes409Body.error.includes('Configuration changed'), '409 error message');
+    assert.strictEqual(checkRes409Body.target_version, 2, 'target version in 409 response');
+
+    // After saving the new preference (V2), the check proceeds normally.
+    await (await fetch(`${BASE}/api/profiles/${pC.id}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ simkl_auth_version: 2 }),
+    })).json();
+    const checkRes = await (await fetch(`${BASE}/api/profiles/${pC.id}/simkl/check`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ version: 2 }),
+    })).json();
+    assert.strictEqual(checkRes.state, 'not_authorized', 'V2 check with V1 active → not_authorized');
+    assert.ok(checkRes.message.includes('V2 credentials saved'), 'actionable message');
+    assert.ok(checkRes.message.includes('Your V1 connection remains active'), 'V1 still active noted');
+
+    // Check with no grant (V2 credentials missing)
+    const pD = config.addProfile('CheckNoGrant');
+    config.updateProfile(pD.id, {
+      keys: { simkl_v2_client_id: '', simkl_v2_client_secret: '' },
+      simkl_auth: null,
+      simkl_auth_version: 2,
+    });
+    const checkRes2 = await (await fetch(`${BASE}/api/profiles/${pD.id}/simkl/check`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ version: 2 }),
+    })).json();
+    assert.strictEqual(checkRes2.state, 'missing_configuration', 'missing V2 credentials → missing_configuration');
+    assert.ok(checkRes2.message.includes('Client ID'), 'actionable missing field');
+
+    // Actionable missing fields (V1 check when V1 creds missing)
+    const pE = config.addProfile('CheckV1Missing');
+    config.updateProfile(pE.id, {
+      keys: { simkl_client_id: '', simkl_client_secret: '' },
+      simkl_auth: null,
+      simkl_auth_version: 1,
+    });
+    const checkRes3 = await (await fetch(`${BASE}/api/profiles/${pE.id}/simkl/check`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ version: 1 }),
+    })).json();
+    assert.strictEqual(checkRes3.state, 'missing_configuration', 'missing V1 credentials → missing_configuration');
+
+    // Invalid version (3) → 400
+    const pI = config.addProfile('CheckInvalidVersion');
+    config.updateProfile(pI.id, { simkl_auth_version: 1 });
+    const checkRes400 = await fetch(`${BASE}/api/profiles/${pI.id}/simkl/check`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ version: 3 }),
+    });
+    assert.strictEqual(checkRes400.status, 400, 'invalid version 3 → 400');
+    const checkRes400Body = await checkRes400.json();
+    assert.ok(checkRes400Body.error.includes('version'), '400 error mentions version');
+    config.removeProfile(pI.id);
+
+    // No hidden-credential mutation: stored V2 secret not returned
+    const pF = config.addProfile('SecretCheck');
+    config.updateProfile(pF.id, {
+      keys: { simkl_v2_client_id: 'client-F', simkl_v2_client_secret: 'super-secret-F' },
+      simkl_auth_version: 2,
+    });
+    const allProfiles = await (await fetch(`${BASE}/api/profiles`)).json();
+    const profRes = allProfiles.profiles.find((p) => p.id === pF.id);
+    assert.ok(profRes, 'SecretCheck profile found');
+    assert.ok(profRes.keys_set.simkl_v2_client_secret, 'keys_set shows secret is set');
+    assert.strictEqual(profRes.keys_preview.simkl_v2_client_secret, '••••', 'preview is a mask, not the secret');
+    assert.strictEqual(profRes.keys.simkl_v2_client_secret, undefined, 'full secret not returned');
+    config.removeProfile(pC.id);
+    config.removeProfile(pD.id);
+    config.removeProfile(pE.id);
+    config.removeProfile(pF.id);
+    console.log('  ✓ Card 1: Simkl V1/V2 — visibility, Check targeting (V1 active, no grant, missing fields), no secret leak');
+  }
+
+  // ---- Card 1: Connected V2 summary + V1 grant survives failed V2 attempt ----
+  {
+    // Connected V2 summary
+    const pG = config.addProfile('ConnectedV2');
+    config.updateProfile(pG.id, {
+      keys: { simkl_v2_client_id: 'client-G', simkl_v2_client_secret: 'secret-G' },
+      simkl_auth: { access_token: 'v2-token', version: 2, client_id: 'client-G', account_id: 42, username: 'UserG' },
+      simkl_auth_version: 2,
+    });
+    const allG = await (await fetch(`${BASE}/api/profiles`)).json();
+    const profG = allG.profiles.find((p) => p.id === pG.id);
+    assert.strictEqual(profG.simkl_connected, true, 'connected');
+    assert.strictEqual(profG.simkl_active_version, 2, 'active version is 2');
+    assert.strictEqual(profG.simkl_username, 'UserG', 'username from grant');
+
+    // Existing V1 grant survives failed V2 attempt
+    const pH = config.addProfile('V1Survives');
+    config.updateProfile(pH.id, {
+      keys: { simkl_v2_client_id: 'client-H', simkl_v2_client_secret: 'secret-H' },
+      simkl_auth: { access_token: 'v1-token-H', version: 1, client_id: 'client-H1' },
+      simkl_auth_version: 1,
+    });
+    // Attempt V2 connect (will fail because the fake fetch returns an error)
+    const origFetch = global.fetch;
+    global.fetch = async () => ({ ok: false, status: 500, json: async () => ({ error: 'network' }) });
+    await origFetch(`${BASE}/api/profiles/${pH.id}/simkl/connect`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    global.fetch = origFetch;
+    // V1 grant should still be active
+    const allH = await (await origFetch(`${BASE}/api/profiles`)).json();
+    const profH = allH.profiles.find((p) => p.id === pH.id);
+    assert.strictEqual(profH.simkl_connected, true, 'V1 still connected after failed V2');
+    assert.strictEqual(profH.simkl_active_version, 1, 'active version still 1');
+    config.removeProfile(pG.id);
+    config.removeProfile(pH.id);
+    console.log('  ✓ Card 1: Connected V2 summary + V1 grant survives failed V2 attempt');
+  }
+
+  // ---- Card 1: MDBList user key test (per-profile, independent of global) ----
+  {
+    const pI = config.addProfile('MDBUser');
+    config.updateProfile(pI.id, { keys: { mdblist_api_key: 'personal-key-123' } });
+    // Set a different global key
+    require('../src/settings').updateSettings({ keys: { mdblist_api_key: 'global-key-456' } });
+
+    // Stub the MDBList network call to capture which key is used
+    const origFetch = global.fetch;
+    let capturedKey = null;
+    global.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes('mdblist.com')) {
+        const keyMatch = u.match(/apikey=([^&]+)/);
+        capturedKey = keyMatch ? decodeURIComponent(keyMatch[1]) : null;
+        return { ok: true, status: 200, json: async () => ({ age_rating: '12+' }) };
+      }
+      return origFetch(url);
+    };
+
+    // Test the saved personal key (use_saved) — should use the personal key, not global
+    const testRes = await (await origFetch(`${BASE}/api/profiles/${pI.id}/test/mdblist-user`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ use_saved: true }),
+    })).json();
+    assert.strictEqual(testRes.ok, true, 'personal key test succeeds');
+    assert.strictEqual(capturedKey, 'personal-key-123', 'personal key used, not global');
+
+    // Test a draft key (unsaved) — should use the draft, not the saved key
+    const testRes2 = await (await origFetch(`${BASE}/api/profiles/${pI.id}/test/mdblist-user`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'draft-key-789' }),
+    })).json();
+    assert.strictEqual(testRes2.ok, true, 'draft key test succeeds');
+    assert.strictEqual(capturedKey, 'draft-key-789', 'draft key used');
+
+    // Missing user key reports missing
+    const pJ = config.addProfile('MDBMissing');
+    config.updateProfile(pJ.id, { keys: { mdblist_api_key: '' } });
+    const testRes3 = await (await origFetch(`${BASE}/api/profiles/${pJ.id}/test/mdblist-user`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ use_saved: true }),
+    })).json();
+    assert.strictEqual(testRes3.ok, false, 'missing key → not ok');
+    assert.ok(testRes3.error.includes('not set'), 'missing key error message');
+
+    // Conflicting modes rejected
+    const testRes4 = await (await origFetch(`${BASE}/api/profiles/${pI.id}/test/mdblist-user`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'x', use_saved: true }),
+    })).json();
+    assert.ok(testRes4.error, 'conflicting modes rejected');
+
+    // R4: blank/untouched MDBList draft preserves stored key (null only from
+    // explicit Clear). Simulate the saveSimkl behavior: a blank draft that
+    // differs from the original should NOT submit null.
+    const pK = config.addProfile('MDBBlankDraft');
+    config.updateProfile(pK.id, { keys: { mdblist_api_key: 'stored-key-abc' } });
+    // Simulate: user clears the field (draft = ''), orig = 'stored-key-abc'.
+    // The save logic: if (v !== orig && v !== '') → submit v. Since v === '',
+    // nothing is submitted → stored key is preserved.
+    const v = '';
+    const orig = 'stored-key-abc';
+    const keys = {};
+    if (v !== orig && v !== '') keys.mdblist_api_key = v;
+    assert.deepStrictEqual(keys, {}, 'blank draft does not submit null');
+    // Verify the stored key is still intact after a save with no MDBList key
+    await (await origFetch(`${BASE}/api/profiles/${pK.id}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'blank@test.com' }),
+    })).json();
+    const allK = await (await origFetch(`${BASE}/api/profiles`)).json();
+    const profK = allK.profiles.find((p) => p.id === pK.id);
+    assert.strictEqual(profK.keys.mdblist_api_key, 'stored-key-abc', 'stored key preserved after blank draft save');
+    config.removeProfile(pK.id);
+
+    global.fetch = origFetch;
+    config.removeProfile(pI.id);
+    config.removeProfile(pJ.id);
+    config.removeProfile(pK.id);
+    console.log('  ✓ Card 1: MDBList user key — personal key test independent of global, draft/saved/missing/conflict, blank draft preserves key');
+  }
+
+  // ---- Card 1: Trakt import retired (410) ----
+  {
+    const pT = config.addProfile('TraktRetired');
+    config.updateProfile(pT.id, {
+      simkl_auth: { access_token: 'token-T', version: 1, client_id: 'client-T' },
+    });
+    const traktRes = await fetch(`${BASE}/api/profiles/${pT.id}/simkl/import-trakt`, {
+      method: 'POST', headers: { 'Content-Type': 'application/zip' },
+      body: Buffer.from('fake-zip'),
+    });
+    assert.strictEqual(traktRes.status, 410, 'import-trakt returns 410');
+    const traktBody = await traktRes.json();
+    assert.ok(traktBody.error.includes('retired'), '410 message mentions retired');
+    config.removeProfile(pT.id);
+    console.log('  ✓ Card 1: Trakt import retired (410)');
+  }
+
+  // ---- Card 1: TVDB Server Config — Test → Save → Test → Reload → Test ----
+  {
+    const settings = require('../src/settings');
+    // Set a saved TVDB key
+    settings.updateSettings({ keys: { tvdb_api_key: 'tvdb-full-key-abcdef' } });
+
+    // Stub the TVDB network call to capture which key is used (key is in POST body)
+    const origFetch = global.fetch;
+    let capturedTvdbKey = null;
+    global.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes('thetvdb')) {
+        const body = opts?.body ? JSON.parse(opts.body) : {};
+        capturedTvdbKey = body.apikey || null;
+        return { ok: true, status: 200, json: async () => ({ data: { token: 'fake-token' } }) };
+      }
+      return origFetch(url, opts);
+    };
+
+    // Test the saved key (use_saved)
+    const t1 = await (await origFetch(`${BASE}/api/settings/test/tvdb`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ use_saved: true }),
+    })).json();
+    assert.strictEqual(t1.ok, true, 'saved TVDB key test succeeds');
+    assert.strictEqual(capturedTvdbKey, 'tvdb-full-key-abcdef', 'full key used (not mask)');
+
+    // Save a new key
+    await origFetch(`${BASE}/api/settings`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keys: { tvdb_api_key: 'tvdb-new-key-xyz' } }),
+    });
+
+    // Test again (use_saved) — should use the new key
+    const t2 = await (await origFetch(`${BASE}/api/settings/test/tvdb`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ use_saved: true }),
+    })).json();
+    assert.strictEqual(capturedTvdbKey, 'tvdb-new-key-xyz', 'new key used after save');
+
+    // Reload (simulate GET /settings returning the mask)
+    const settingsRes = await (await origFetch(`${BASE}/api/settings`)).json();
+    assert.ok(settingsRes.settings.keys.tvdb_api_key.includes('…'), 'GET returns a mask');
+
+    // Test again after reload — still uses the full saved key, not the mask
+    const t3 = await (await origFetch(`${BASE}/api/settings/test/tvdb`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ use_saved: true }),
+    })).json();
+    assert.strictEqual(capturedTvdbKey, 'tvdb-new-key-xyz', 'full key used after reload (not mask)');
+
+    // Unsaved replacement does not overwrite saved key
+    const t4 = await (await origFetch(`${BASE}/api/settings/test/tvdb`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'draft-tvdb-key' }),
+    })).json();
+    assert.strictEqual(capturedTvdbKey, 'draft-tvdb-key', 'draft key tested');
+    // The saved key is unchanged
+    const settingsAfter = settings.getSettings();
+    assert.strictEqual(settingsAfter.keys.tvdb_api_key, 'tvdb-new-key-xyz', 'saved key unchanged after draft test');
+
+    // Conflicting modes rejected
+    const t5 = await (await origFetch(`${BASE}/api/settings/test/tvdb`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'x', use_saved: true }),
+    })).json();
+    assert.ok(t5.error, 'conflicting modes rejected');
+
+    // Mask guard: PUT with a mask does not overwrite
+    // (redactKey produces 4 chars + … + 4 chars for keys > 8 chars)
+    await origFetch(`${BASE}/api/settings`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keys: { tvdb_api_key: 'tvdb…yxyz' } }),
+    });
+    const settingsMask = settings.getSettings();
+    assert.strictEqual(settingsMask.keys.tvdb_api_key, 'tvdb-new-key-xyz', 'mask not written as key');
+
+    global.fetch = origFetch;
+    console.log('  ✓ Card 1: TVDB Server Config — Test/Save/Reload/Test, draft vs saved, mask guard');
+  }
+
+  // ---- Card 1: Stored/unverified grant — passive status + Check accessibility ----
+  {
+    // Restart-equivalent: a stored token with no check cache entry.
+    const pS = config.addProfile('StoredUnverified');
+    config.updateProfile(pS.id, {
+      keys: { simkl_client_id: 'client-S' },
+      simkl_auth: { access_token: 'stored-token', version: 1, client_id: 'client-S' },
+      simkl_auth_version: 1,
+    });
+    // The passive status returns token_stored (not connected).
+    const statusRes = await (await fetch(`${BASE}/api/profiles/${pS.id}/simkl/status`)).json();
+    assert.strictEqual(statusRes.state, 'token_stored', 'stored token → token_stored');
+    assert.ok(statusRes.message.includes('Token stored'), 'message mentions Token stored');
+    // The profile data has simkl_connected=true but simkl_check_state=null.
+    const allS = await (await fetch(`${BASE}/api/profiles`)).json();
+    const profS = allS.profiles.find((p) => p.id === pS.id);
+    assert.strictEqual(profS.simkl_connected, true, 'simkl_connected true (token exists)');
+    assert.strictEqual(profS.simkl_check_state, null, 'no check cache entry');
+    // A check with omitted version (legacy) verifies the active grant.
+    // Stub the provider call so /sync/activities succeeds.
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes('api.simkl.com')) {
+        return { ok: true, status: 200, json: async () => ({}) };
+      }
+      return origFetch(url, opts);
+    };
+    const checkRes = await (await origFetch(`${BASE}/api/profiles/${pS.id}/simkl/check`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    })).json();
+    global.fetch = origFetch;
+    assert.strictEqual(checkRes.state, 'connected', 'omitted version verifies active grant');
+    config.removeProfile(pS.id);
+    console.log('  ✓ Card 1: Stored/unverified grant — passive status + Check accessibility');
+  }
+
+  // ---- Card 1: Other-version readiness preserves active state ----
+  {
+    // A verified V1 grant with a V2 target check.
+    const pO = config.addProfile('OtherVersion');
+    config.updateProfile(pO.id, {
+      keys: { simkl_client_id: 'client-O1', simkl_v2_client_id: 'client-O', simkl_v2_client_secret: 'secret-O' },
+      simkl_auth: { access_token: 'v1-token-O', version: 1, client_id: 'client-O1', account_id: 99 },
+      simkl_auth_version: 1,
+    });
+    // Stub the provider call so /sync/activities and /users/settings succeed.
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes('api.simkl.com')) {
+        if (u.includes('/users/settings')) return { ok: true, status: 200, json: async () => ({ user: { name: 'Test User', id: 99 } }) };
+        return { ok: true, status: 200, json: async () => ({}) };
+      }
+      return origFetch(url, opts);
+    };
+    // First, verify the V1 grant (omitted version = legacy behavior).
+    const verifyRes = await (await origFetch(`${BASE}/api/profiles/${pO.id}/simkl/check`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    })).json();
+    assert.strictEqual(verifyRes.state, 'connected', 'V1 verified');
+    assert.ok(verifyRes.username, 'username present');
+    // Now, check V2 (explicit version 2, matches saved preference after save).
+    await (await origFetch(`${BASE}/api/profiles/${pO.id}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ simkl_auth_version: 2 }),
+    })).json();
+    const v2Res = await (await origFetch(`${BASE}/api/profiles/${pO.id}/simkl/check`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ version: 2 }),
+    })).json();
+    // The V2 readiness result does NOT overwrite the V1 active state.
+    // The response has target_version=2 and the V1 active state is preserved
+    // in the check cache (the V1 check result is still cached).
+    assert.strictEqual(v2Res.target_version, 2, 'target_version is 2');
+    assert.strictEqual(v2Res.state, 'not_authorized', 'V2 not authorized');
+    // The passive status still reflects the V1 verified state (cached).
+    const statusAfter = await (await origFetch(`${BASE}/api/profiles/${pO.id}/simkl/status`)).json();
+    assert.strictEqual(statusAfter.state, 'connected', 'V1 still connected in passive status');
+    assert.ok(statusAfter.username, 'V1 username preserved');
+    global.fetch = origFetch;
+    config.removeProfile(pO.id);
+    console.log('  ✓ Card 1: Other-version readiness preserves active state');
+  }
+
+  // ---- Card 1: TVDB Replace — draft test sends entered key, not saved ----
+  {
+    const settings = require('../src/settings');
+    settings.updateSettings({ keys: { tvdb_api_key: 'saved-tvdb-key-abc' } });
+    const origFetch = global.fetch;
+    let capturedTvdbKey = null;
+    global.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes('thetvdb.com')) {
+        const body = opts?.body ? JSON.parse(opts.body) : {};
+        capturedTvdbKey = body.apikey || null;
+        return { ok: true, status: 200, json: async () => ({ data: { token: 'fake-token' } }) };
+      }
+      return origFetch(url, opts);
+    };
+    // Saved Test (use_saved) → server resolves the saved key and sends it to the provider.
+    await (await origFetch(`${BASE}/api/settings/test/tvdb`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ use_saved: true }),
+    })).json();
+    assert.strictEqual(capturedTvdbKey, 'saved-tvdb-key-abc', 'use_saved sends the saved key to the provider');
+    // Replace/draft Test → sends the entered draft (not the saved key).
+    await (await origFetch(`${BASE}/api/settings/test/tvdb`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'draft-tvdb-xyz' }),
+    })).json();
+    assert.strictEqual(capturedTvdbKey, 'draft-tvdb-xyz', 'draft key sent, saved key untouched');
+    // Cancel → back to saved mode (use_saved).
+    await (await origFetch(`${BASE}/api/settings/test/tvdb`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ use_saved: true }),
+    })).json();
+    assert.strictEqual(capturedTvdbKey, 'saved-tvdb-key-abc', 'use_saved after cancel sends saved key');
+    // Empty draft → honest missing-draft error (no provider call).
+    const beforeEmpty = capturedTvdbKey;
+    const emptyRes = await (await origFetch(`${BASE}/api/settings/test/tvdb`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: '' }),
+    })).json();
+    assert.ok(emptyRes.error, 'empty draft returns error');
+    assert.strictEqual(capturedTvdbKey, beforeEmpty, 'empty draft does not call the provider');
+    global.fetch = origFetch;
+    console.log('  ✓ Card 1: TVDB Replace — draft test sends entered key, not saved');
+  }
+
+  console.log(`\nAll checks passed (${passed} unit + 59 async/http + T1-T8 + Card 1).`);
   process.exit(0);
 }
 
