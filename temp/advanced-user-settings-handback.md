@@ -56,7 +56,29 @@
 | Card 1: Other-version readiness | `credential_mismatch` (same fixture issue) + missing username | `connected` (V1 verified) + `not_authorized` (V2 target) + V1 state preserved |
 | Card 1: TVDB Replace draft | `capturedTvdbKey = null` (stub checked wrong body field) | `capturedTvdbKey = 'draft-tvdb-xyz'` (draft sent, saved key untouched) |
 
-## Tests (all pass on final head `3086c7d`)
+## Review round 3 fixes (3 issues)
+
+**Commit:** `73f576f` on `feature/advanced-user-settings`
+
+| Issue | Fix |
+|-------|-----|
+| **Active state preserved separately from target readiness** | `renderSimklFlow` now uses the passive active grant state (from `/simkl/status`) as the authoritative badge/controls. An explicit other-version check stores its result as `SIMKL_UI.targetResult`, appended as a separate labelled note. Never reinterprets `targetResult.state` as `activeState`. `checkSimklLive` fetches passive status on target mismatch; matching-version checks render their actual verification result. Later passive renders retain the target note; a newer Check/selection/connection clears or replaces it. |
+| **Drafts edited while Save is pending** | `saveSimkl` captures submitted values and field nodes BEFORE the PUT. After success, updates originals to the acknowledged submitted values (not current DOM). Collapses a secret row to "Saved securely" ONLY if its current draft still equals the acknowledged value. If changed meanwhile, leaves it visible and dirty with original set to the acknowledged stored value so a subsequent Save submits the later draft correctly. |
+| **Browser harness executable** | Corrected to use `/configure/#simkl?profile=<id>` (selects profile + activates Advanced tab). Explicitly selects V1 before checking (BrowserTarget has active V1 but preferred V2). Check button scoped to `.simkl-flow` to avoid ambiguity. Assertions use "✓ Connected" (not substring "verified live" which also matches "not yet verified live"). Added browser regression: active state preserved separately from target readiness. |
+
+### Browser harness corrections
+
+- **URL:** `/configure/#simkl?profile=<id>` (the `readSimklCallbackError` function reads the hash to select the profile and activate the Advanced tab)
+- **Version selection:** Explicitly select V1 before checking (BrowserTarget has active V1 but preferred V2; an explicit V2 Check is readiness, not V1 verification)
+- **Check button scope:** Scoped to `.simkl-flow` to avoid ambiguity with any editor check button
+- **Assertions:** Use "✓ Connected" and "Simkl connected" badge (not substring "verified live" which also matches "not yet verified live")
+- **New regression:** Verify V1 → record username/watched count/Sync/Disconnect → select V2 → Check → assert all active details/controls remain + V2 note appended once → passive render retains truthful state + one note
+
+### Playwright status
+
+**Playwright is not installed on this machine.** The 21 non-browser lifecycle checks pass. The `--browser` section (including the new active-state regression) requires `npm install playwright` to run. The browser test code is verified correct by inspection against the updated UI. **James must hand back a candidate for Chet's execution** — browser code inspection is not a passing run, and fixture repairs are not red/green proof of a production regression.
+
+## Tests (all pass on final head `73f576f`)
 
 - **smoke:** 216 unit + 59 async/http + T1-T8 + Card 1 (10 focused checks)
 - **integration:** 271 checks
@@ -94,6 +116,10 @@
 | Other-version readiness appends target result, preserves active state | `Card 1: Other-version readiness` |
 | TVDB Replace keeps Test button; draft test sends entered key, not saved | `Card 1: TVDB Replace` |
 | Saved-secret draft of non-selected version preserved after save | `saveSimkl` code (block-scoped, committed-fields-only) |
+| Active state (badge/username/watched/Sync/Disconnect) preserved after other-version Check | Browser regression (requires Playwright) |
+| Target note appended exactly once; passive render retains it | Browser regression (requires Playwright) |
+| Draft edited while Save pending survives (not collapsed to Saved securely) | `saveSimkl` code (captured values + current-DOM check) |
+| Browser harness uses correct URL/version/locator/assertions | `test/simkl.lifecycle.js --browser` (requires Playwright) |
 
 ## Notes for Card 2
 
