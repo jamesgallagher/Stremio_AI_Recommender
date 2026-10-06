@@ -194,7 +194,7 @@ function stats(nowMs = Date.now()) {
     };
     if (service.startsWith('mdblist:')) {
       // Group under the mdblist lane with a fingerprint suffix
-      const fp = service.slice(7); // strip 'mdblist:' prefix
+      const fp = service.slice(8); // strip 'mdblist:' prefix (8 chars)
       if (!out.mdblist) out.mdblist = {};
       out.mdblist[fp] = entry;
     } else {
