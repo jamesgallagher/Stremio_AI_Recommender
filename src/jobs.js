@@ -85,17 +85,43 @@ async function pump() {
   if (active || !queue.length) return;
   const job = queue.shift();
   active = job;
-  // Reset stale deferred/circuit/result flags from a previous job so a new
-  // job starts with a clean state.
-  setProgress(job.profileId, { kind: job.kind, state: 'running', pct: 0, label: 'Starting…', started_at: Date.now(), deferred: null, circuit_open: null, retry_after_ms: null, result: null });
+  // Reset stale deferred/circuit/result/summary flags from a previous job so a
+  // new job starts with a clean state.
+  setProgress(job.profileId, { kind: job.kind, state: 'running', pct: 0, label: 'Starting…', started_at: Date.now(), deferred: null, circuit_open: null, retry_after_ms: null, retry_at: null, result: null, summary: null, provider: null });
   const progress = (pct, label) => setProgress(job.profileId, {
     pct: Math.max(0, Math.min(100, Math.round(pct))),
     ...(label ? { label } : {}),
   });
   try {
     const result = await job.run(progress);
-    // Carry structured per-catalog outcomes (deferred/partial) in the job result
-    setProgress(job.profileId, { state: 'done', pct: 100, label: 'Done', finished_at: Date.now(), result: result || null });
+    // Compute the extras summary at job completion (extras jobs only), from
+    // the actual per-catalog outcomes. Do NOT mutate the stored result.
+    let summary = null;
+    let label = 'Done';
+    if (job.kind === 'extras' && result) {
+      const total = Object.keys(result).length;
+      let ok = 0, failed = 0, deferred = 0;
+      let maxRetryMs = 0;
+      for (const [catId, catResult] of Object.entries(result)) {
+        if (catResult.ok) ok++;
+        else {
+          failed++;
+          if (catResult.deferred) {
+            deferred++;
+            maxRetryMs = Math.max(maxRetryMs, catResult.retry_after_ms || 0);
+          }
+        }
+      }
+      if (failed > 0) {
+        summary = { total, ok, failed, deferred, retry_after_ms: maxRetryMs };
+        label = deferred > 0
+          ? `Partial: ${ok}/${total} rebuilt, ${deferred} deferred`
+          : `Partial: ${ok}/${total} rebuilt, ${failed} failed`;
+      }
+    }
+    // Store an absolute retry instant so polling can decay the remaining time.
+    const retryAt = summary && summary.retry_after_ms > 0 ? Date.now() + summary.retry_after_ms : null;
+    setProgress(job.profileId, { state: 'done', pct: 100, label, finished_at: Date.now(), result: result || null, summary, retry_at: retryAt });
     job.resolve(result);
   } catch (err) {
     // Preserve structured defer/circuit metadata so the portal can show
@@ -104,6 +130,7 @@ async function pump() {
     if (err.defer) {
       patch.deferred = true;
       patch.retry_after_ms = err.retryAfterMs || 0;
+      patch.retry_at = Date.now() + (err.retryAfterMs || 0);
       patch.provider = 'mdblist';
     }
     if (err.circuitOpen) {

@@ -3,7 +3,7 @@
 **Branch:** `feature/mdblist-user-keys`
 **Base:** latest `v7`
 **Version:** 7.41.0-beta
-**Tested SHA:** `a7a6944` (second review head) → this commit (R1/R2/R4 fixes)
+**Tested SHA:** `f439b6f` (third review head) → this commit (Review3 fixes)
 
 ## Scope
 

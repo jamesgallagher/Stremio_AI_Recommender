@@ -205,31 +205,25 @@ function publicProfile(p, req) {
         const activeInfo = jobs.activeJobInfo();
         if (activeInfo) {
           // Resolve the active job's profile name (safe: only name, no secrets)
-          const activeProfile = config.profiles.find((pr) => pr.id === activeInfo.profileId);
+          const activeProfile = config.getProfile(activeInfo.profileId);
           mdblist_status.queue_blocker = activeProfile ? `${activeProfile.name} (${activeInfo.kind})` : activeInfo.kind;
         }
       }
-      // Derive a truthful extras-job summary from actual per-catalog results.
-      // The job can complete with partial/deferred results; it must not
-      // pretend all catalogs rebuilt.
-      if (job && job.result) {
-        const results = job.result;
-        const total = Object.keys(results).length;
-        let ok = 0, failed = 0, deferred = 0;
-        let maxRetryMs = 0;
-        for (const [catId, catResult] of Object.entries(results)) {
-          if (catResult.ok) ok++;
-          else {
-            failed++;
-            if (catResult.deferred) {
-              deferred++;
-              maxRetryMs = Math.max(maxRetryMs, catResult.retry_after_ms || 0);
-            }
-          }
+      // The extras summary is computed at job completion (jobs.js pump) for
+      // extras jobs only. Here we read it without mutating the stored snapshot.
+      // A persisted retry interval decays via the absolute retry_at instant.
+      let jobOut = job;
+      if (job && job.summary) {
+        // Return a copy with the decayed retry time (never mutate the stored snapshot).
+        const summary = { ...job.summary };
+        if (job.retry_at && job.retry_at > Date.now()) {
+          summary.retry_after_ms = job.retry_at - Date.now();
+        } else if (job.retry_at) {
+          summary.retry_after_ms = 0;
         }
-        job.summary = { total, ok, failed, deferred, retry_after_ms: maxRetryMs };
+        jobOut = { ...job, summary };
       }
-      return { ...st, job, rebuilding: st.rebuilding || jobs.isBusy(p.id), mdblist_status };
+      return { ...st, job: jobOut, rebuilding: st.rebuilding || jobs.isBusy(p.id), mdblist_status };
     })(),
   };
 }

@@ -12,6 +12,13 @@
 // chain (llm.js: custom → Groq primary → Groq backup), so the governor only
 // paces here — it does not rotate keys.
 //
+// MDBList uses a per-credential FIFO admission gate (not reserve): a caller can
+// send only when BOTH the provider cooldown has expired AND at least
+// minIntervalMs has elapsed since the previous ACTUAL start for that credential.
+// Both conditions are re-evaluated after every await (a cooldown extension can
+// happen during any wait). Simultaneously awakened callers are serialized via
+// the FIFO queue — only the head admits at a time.
+//
 // Deliberately NOT a retry layer: callers keep their own error handling. A call
 // that hits 429 still surfaces to its caller; the governor just makes the NEXT
 // call wait. Pacing is the primary defence; backoff is the safety net.
@@ -44,6 +51,8 @@ const LIMITS = {
 
 const DEFAULT_BACKOFF_MS = 5000; // when a 429 carries no usable Retry-After
 const DAY_MS = 86400e3;
+const MDBLIST_MAX_ADMISSION_WAIT_MS = 30000; // 30s defer threshold
+const IDLE_BUCKET_MS = 86400e3; // 24h — idle MDBList buckets are GC'd
 
 const states = new Map();
 // For MDBList, states are partitioned by key fingerprint so equal keys share
@@ -58,7 +67,7 @@ function stateFor(service, keyFingerprint) {
   const k = stateKey(service, keyFingerprint);
   let s = states.get(k);
   if (!s) {
-    s = { nextAt: 0, backoffUntil: 0, calls: 0, throttled: 0, lastThrottledAt: 0, day: 0, dayCalls: 0, fails: 0, openUntil: 0, tripped: 0, lastActivity: 0 };
+    s = { nextAt: 0, backoffUntil: 0, calls: 0, throttled: 0, lastThrottledAt: 0, day: 0, dayCalls: 0, fails: 0, openUntil: 0, tripped: 0, lastActivity: 0, lastStart: 0 };
     states.set(k, s);
   }
   return s;
@@ -102,9 +111,8 @@ function parseRetryAfter(value, nowMs) {
 
 // Reserve the next slot for a service and return the ms to wait before the call
 // may run. SYNCHRONOUS on purpose: the slot is claimed before any await, so two
-// concurrent callers get distinct, spaced slots. Exported for testing.
-// For MDBList, `count` is false: the request is counted only when fn actually
-// starts (not on reserve), so deferred/cancelled work does not inflate counters.
+// concurrent callers get distinct, spaced slots. Used by non-MDBList services.
+// MDBList uses the FIFO admission gate instead (see mdblistSchedule).
 function reserve(service, keyFingerprint, nowMs = Date.now(), { count = true } = {}) {
   const lim = LIMITS[service] || { minIntervalMs: 0 };
   const s = stateFor(service, keyFingerprint);
@@ -121,26 +129,44 @@ function reserve(service, keyFingerprint, nowMs = Date.now(), { count = true } =
 }
 
 // Compute the would-be wait for a slot WITHOUT claiming it (no side effects).
-// Used by schedule() to check the defer threshold before committing a slot,
-// so deferred/cancelled work does not create artificial slots or consume
-// request counters.
+// For MDBList, this reflects the actual admission gate (cooldown + pacing).
 function pendingWait(service, keyFingerprint, nowMs = Date.now()) {
   const s = stateFor(service, keyFingerprint);
+  if (service === 'mdblist') {
+    const lim = LIMITS.mdblist;
+    const earliest = Math.max(s.backoffUntil, (s.lastStart || 0) + lim.minIntervalMs);
+    return Math.max(0, earliest - nowMs);
+  }
   const at = Math.max(nowMs, s.nextAt, s.backoffUntil);
   return Math.max(0, at - nowMs);
 }
 
 // Record a response so a 429 backs off subsequent calls. No-op for non-429 or
-// non-Response values. Exported for testing.
+// non-Response values. A later shorter 429 must NOT shorten an existing longer
+// cooldown (invariant 5).
 function noteResponse(service, res, keyFingerprint, nowMs = Date.now()) {
   if (!res || typeof res.status !== 'number' || res.status !== 429) return;
   const s = stateFor(service, keyFingerprint);
   const retryAfter = res.headers && typeof res.headers.get === 'function'
     ? parseRetryAfter(res.headers.get('retry-after'), nowMs) : 0;
-  s.backoffUntil = nowMs + (retryAfter || DEFAULT_BACKOFF_MS);
+  const newBackoff = nowMs + (retryAfter || DEFAULT_BACKOFF_MS);
+  // Never shorten an existing longer cooldown.
+  s.backoffUntil = Math.max(s.backoffUntil, newBackoff);
   s.throttled += 1;
   s.lastThrottledAt = nowMs;
   s.lastActivity = nowMs;
+}
+
+// GC idle MDBList buckets on the request/state path (invariant 6). A bucket is
+// evicted only when it is idle (no recent activity) AND has no active cooldown,
+// no open breaker, and no pending/in-flight work.
+function gcIdleBuckets(nowMs = Date.now()) {
+  for (const [key, s] of states) {
+    if (key.startsWith('mdblist:') && s.lastActivity && nowMs - s.lastActivity > IDLE_BUCKET_MS) {
+      const active = s.backoffUntil > nowMs || s.openUntil > nowMs || (s.queue && s.queue.length > 0);
+      if (!active) states.delete(key);
+    }
+  }
 }
 
 // The one entry point: pace, run fn (which returns a fetch Response or
@@ -150,96 +176,148 @@ function noteResponse(service, res, keyFingerprint, nowMs = Date.now()) {
 // 429 is rate, not down — never a breaker fail.
 // `keyFingerprint` partitions MDBList pacing per credential (equal keys share
 // a bucket; distinct keys have independent rate limits).
-const MDBLIST_MAX_SLOT_WAIT_MS = 30000;
-
 async function schedule(service, fn, keyFingerprint) {
   const lim = LIMITS[service] || {};
+
+  if (service === 'mdblist') {
+    return mdblistSchedule(fn, keyFingerprint);
+  }
+
+  // Non-MDBList: reserve + sleep + fn (unchanged policy).
   if (lim.breaker && isOpen(service, keyFingerprint)) {
     const err = new Error(`${service} circuit open — skipping (cooldown)`);
     err.circuitOpen = true;
     throw err;
   }
-  // Check the defer threshold BEFORE claiming a slot: deferred work must not
-  // create artificial slots or consume request counters.
-  const wouldWait = pendingWait(service, keyFingerprint);
-  if (service === 'mdblist' && wouldWait > MDBLIST_MAX_SLOT_WAIT_MS) {
-    const err = new Error(`MDBList slot wait ${wouldWait}ms exceeds 30s — deferring`);
-    err.defer = true;
-    err.retryAfterMs = wouldWait;
-    throw err;
-  }
-  // MDBList: do NOT count the request on reserve (counted when fn starts).
-  const wait = reserve(service, keyFingerprint, undefined, { count: service !== 'mdblist' });
+  const wait = reserve(service, keyFingerprint, undefined, { count: true });
   if (wait > 0) await sleep(wait);
-  // Recheck cooldown/breaker immediately before send: during the pacing sleep
-  // another call may have received a 429 (short or long Retry-After), moving
-  // the allowed slot. A new cooldown within the wait budget must be waited out;
-  // beyond it, defer. Do not use the tail of s.nextAt as proof that this
-  // caller's already-reserved slot is invalid: it includes later callers'
-  // reservations. Keep this caller's slot identity/time separate from
-  // provider cooldown.
-  if (service === 'mdblist') {
-    if (lim.breaker && isOpen(service, keyFingerprint)) {
-      // Un-reserve: the slot was reserved but no request was sent.
-      const s = stateFor(service, keyFingerprint);
-      s.nextAt = Math.max(0, s.nextAt - lim.minIntervalMs);
-      const err = new Error(`MDBList circuit open — skipping (cooldown)`);
-      err.circuitOpen = true;
-      throw err;
-    }
-    // Inspect actual credential backoff state: a new cooldown (even short)
-    // must be honored. If backoffUntil is in the future, wait it out (if
-    // within 30s) or defer (if beyond).
-    const s = stateFor(service, keyFingerprint);
-    const nowMs = Date.now();
-    if (s.backoffUntil > nowMs) {
-      const backoffWait = s.backoffUntil - nowMs;
-      if (backoffWait > MDBLIST_MAX_SLOT_WAIT_MS) {
-        // Un-reserve: the slot was reserved but no request was sent.
-        s.nextAt = Math.max(0, s.nextAt - lim.minIntervalMs);
-        const err = new Error(`MDBList backoff ${backoffWait}ms exceeds 30s — deferring`);
-        err.defer = true;
-        err.retryAfterMs = backoffWait;
-        throw err;
-      }
-      // Wait out the short cooldown, then recheck.
-      await sleep(backoffWait);
-      // Recheck after the wait: another 429 may have extended the backoff.
-      const s2 = stateFor(service, keyFingerprint);
-      if (s2.backoffUntil > Date.now()) {
-        const extendedWait = s2.backoffUntil - Date.now();
-        if (extendedWait > MDBLIST_MAX_SLOT_WAIT_MS) {
-          s2.nextAt = Math.max(0, s2.nextAt - lim.minIntervalMs);
-          const err = new Error(`MDBList backoff ${extendedWait}ms exceeds 30s — deferring`);
-          err.defer = true;
-          err.retryAfterMs = extendedWait;
-          throw err;
-        }
-      }
-      if (lim.breaker && isOpen(service, keyFingerprint)) {
-        const s3 = stateFor(service, keyFingerprint);
-        s3.nextAt = Math.max(0, s3.nextAt - lim.minIntervalMs);
-        const err = new Error(`MDBList circuit open — skipping (cooldown)`);
-        err.circuitOpen = true;
-        throw err;
-      }
-    }
-    // Count the request now (fn is about to start).
-    const sCount = stateFor(service, keyFingerprint);
-    sCount.calls += 1;
-    const day = Math.floor(Date.now() / DAY_MS);
-    if (sCount.day !== day) { sCount.day = day; sCount.dayCalls = 0; }
-    sCount.dayCalls += 1;
-  }
   try {
     const result = await fn();
-    // fn may return a Response directly (tmdb, simkl) or {res, body} (mdblist).
     const res = result && result.res ? result.res : result;
     noteResponse(service, res, keyFingerprint);
     noteOutcome(service, !(res && typeof res.status === 'number' && res.status >= 500), keyFingerprint);
     return result;
   } catch (err) {
-    noteOutcome(service, false, keyFingerprint); // transport/body timeout = the service is down
+    noteOutcome(service, false, keyFingerprint);
+    throw err;
+  }
+}
+
+// MDBList: per-credential FIFO admission gate.
+// A caller can send when BOTH:
+//   1. Provider cooldown has expired (backoffUntil <= now)
+//   2. At least minIntervalMs since the previous ACTUAL start for this credential
+// Both are re-evaluated after every await (a cooldown extension can happen during
+// any wait). Simultaneously awakened callers are serialized via the FIFO queue —
+// only the head admits at a time. A start wait exceeding the 30s budget defers
+// without sending/counting. Breaker opening while waiting aborts admission.
+async function mdblistSchedule(fn, keyFingerprint) {
+  const s = stateFor('mdblist', keyFingerprint);
+
+  // GC idle buckets on the request path.
+  gcIdleBuckets();
+
+  if (!s.queue) s.queue = [];
+
+  const entry = { fn, entryTime: Date.now(), promise: null };
+  entry.promise = new Promise((resolve, reject) => {
+    entry.resolve = resolve;
+    entry.reject = reject;
+  });
+  s.queue.push(entry);
+
+  // If we're not the head, wait for our turn.
+  if (s.queue[0] !== entry) {
+    return entry.promise;
+  }
+
+  // We're the head: try to admit.
+  try {
+    const result = await mdblistAdmit(s, keyFingerprint, fn, entry.entryTime);
+    s.queue.shift();
+    wakeNext(s, keyFingerprint);
+    return result;
+  } catch (err) {
+    s.queue.shift();
+    wakeNext(s, keyFingerprint);
+    throw err;
+  }
+}
+
+// Wake the next caller in the FIFO queue (if any).
+function wakeNext(s, keyFingerprint) {
+  if (!s.queue || s.queue.length === 0) return;
+  const next = s.queue[0];
+  (async () => {
+    try {
+      const result = await mdblistAdmit(s, keyFingerprint, next.fn, next.entryTime);
+      s.queue.shift();
+      next.resolve(result);
+      wakeNext(s, keyFingerprint);
+    } catch (err) {
+      s.queue.shift();
+      next.reject(err);
+      wakeNext(s, keyFingerprint);
+    }
+  })();
+}
+
+// The admission loop: re-evaluate cooldown + pacing after every await.
+// A single sleep is insufficient — a cooldown extension can happen during any
+// wait, so we loop until both conditions are satisfied.
+async function mdblistAdmit(s, keyFingerprint, fn, entryTime) {
+  const lim = LIMITS.mdblist;
+
+  while (true) {
+    const now = Date.now();
+
+    // Breaker open → abort admission.
+    if (lim.breaker && s.openUntil > now) {
+      const err = new Error(`MDBList circuit open — skipping (cooldown)`);
+      err.circuitOpen = true;
+      throw err;
+    }
+
+    // Compute the earliest time we can send:
+    //   cooldown: backoffUntil
+    //   pacing:   lastStart + minIntervalMs
+    const earliest = Math.max(s.backoffUntil, (s.lastStart || 0) + lim.minIntervalMs);
+
+    if (earliest <= now) {
+      break; // Both conditions satisfied — we can send now.
+    }
+
+    // 30s budget: if the total wait from this caller's entry exceeds 30s, defer.
+    const totalWait = earliest - entryTime;
+    if (totalWait > MDBLIST_MAX_ADMISSION_WAIT_MS) {
+      const waitMs = earliest - now;
+      const err = new Error(`MDBList admission wait ${waitMs}ms exceeds 30s — deferring`);
+      err.defer = true;
+      err.retryAfterMs = waitMs;
+      throw err;
+    }
+
+    // Sleep until the earliest time, then recheck (cooldown may have extended).
+    await sleep(earliest - now);
+  }
+
+  // Actual send: count it, record the start time.
+  const sendTime = Date.now();
+  s.lastStart = sendTime;
+  s.calls += 1;
+  const day = Math.floor(sendTime / DAY_MS);
+  if (s.day !== day) { s.day = day; s.dayCalls = 0; }
+  s.dayCalls += 1;
+  s.lastActivity = sendTime;
+
+  try {
+    const result = await fn();
+    const res = result && result.res ? result.res : result;
+    noteResponse('mdblist', res, keyFingerprint);
+    noteOutcome('mdblist', !(res && typeof res.status === 'number' && res.status >= 500), keyFingerprint);
+    return result;
+  } catch (err) {
+    noteOutcome('mdblist', false, keyFingerprint);
     throw err;
   }
 }
@@ -248,7 +326,6 @@ async function schedule(service, fn, keyFingerprint) {
 // today's count vs any daily cap, and current throttle/backoff state.
 // For MDBList, per-fingerprint entries are grouped under `mdblist` with a
 // `key_source` label (never the raw key or full fingerprint).
-const IDLE_BUCKET_MS = 86400e3; // 24h — idle MDBList buckets are GC'd
 
 // Internal stats (used by portal profile status to query a specific
 // credential's bucket). Exposes fingerprints as property names — never
@@ -261,7 +338,7 @@ function stats(nowMs = Date.now()) {
     // the future), even if lastActivity is old. A 48h cooldown must survive
     // the 24h idle threshold.
     if (service.startsWith('mdblist:') && s.lastActivity && nowMs - s.lastActivity > IDLE_BUCKET_MS) {
-      const active = s.backoffUntil > nowMs || s.openUntil > nowMs;
+      const active = s.backoffUntil > nowMs || s.openUntil > nowMs || (s.queue && s.queue.length > 0);
       if (!active) { states.delete(service); continue; }
     }
     const lim = service.startsWith('mdblist:') ? LIMITS.mdblist : (LIMITS[service] || {});
@@ -343,4 +420,4 @@ function credentialStats(keyFingerprint, nowMs = Date.now()) {
 
 function _reset() { states.clear(); }
 
-module.exports = { schedule, reserve, pendingWait, noteResponse, noteOutcome, isOpen, stats, publicStats, credentialStats, LIMITS, _reset };
+module.exports = { schedule, reserve, pendingWait, noteResponse, noteOutcome, isOpen, stats, publicStats, credentialStats, LIMITS, _reset, gcIdleBuckets };
