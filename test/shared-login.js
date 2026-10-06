@@ -174,6 +174,30 @@ function makeLegacy(name, email, createdAt) {
     }
   });
 
+  // ---- T7: 30-day absolute session ----
+  await ok('T7 30-day absolute session: createSession, resolve at t0+10d, touch doesn\'t change expiry, t0+30d-1ms works, t0+30d+1ms null', () => {
+    resetStore();
+    const a = config.createInitialAdmin({ name: 'AdminA', email: 'a@example.com' });
+    const day = 24 * 3600e3;
+    const t0 = Date.parse('2026-06-01T00:00:00Z');
+    const { token } = auth.createSession(a.id, { nowMs: t0 });
+    // Resolve at t0+10d works
+    const d1 = auth.resolveSessionDetail(token, { nowMs: t0 + 10 * day });
+    assert.ok(d1, 'resolve at t0+10d works');
+    assert.strictEqual(d1.profile.id, a.id);
+    assert.strictEqual(d1.expiresAt, t0 + 30 * day, 'expiresAt is absolute 30d');
+    // Touch (via resolve) doesn't change expiresAt
+    const d2 = auth.resolveSessionDetail(token, { nowMs: t0 + 20 * day });
+    assert.ok(d2, 'resolve at t0+20d works');
+    assert.strictEqual(d2.expiresAt, t0 + 30 * day, 'expiresAt unchanged after touch');
+    // Resolve at t0+30d-1ms works
+    const d3 = auth.resolveSessionDetail(token, { nowMs: t0 + 30 * day - 1 });
+    assert.ok(d3, 'resolve at t0+30d-1ms works');
+    // Resolve at t0+30d+1ms → null
+    const d4 = auth.resolveSessionDetail(token, { nowMs: t0 + 30 * day + 1 });
+    assert.strictEqual(d4, null, 'resolve at t0+30d+1ms is null');
+  });
+
   console.log(`\nshared-login unit: all ${passed} checks passed.`);
 })().catch((err) => {
   console.error('\n✗ SHARED-LOGIN FAILED:', err && err.stack ? err.stack : err);
