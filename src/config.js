@@ -88,6 +88,9 @@ function secretsLocked() {
   return locked;
 }
 
+// AUTH-1: errors with a stable code the HTTP layer maps to a status.
+function accountError(code, message) { const e = new Error(message); e.code = code; return e; }
+
 function newProfile(name) {
   return {
     id: crypto.randomUUID(),
@@ -112,6 +115,7 @@ function newProfile(name) {
     // existing V1 profiles migrate to 1 (see applyMigrations).
     simkl_auth_version: 2,
     email: '', // the user's email — for the future Mobile Companion passwordless login
+    is_admin: false, // AUTH-1: only admins can open /configure and /api. See createInitialAdmin.
     filters: { ...DEFAULT_FILTERS },
     catalogs: {}, // extra-catalog toggles by id; absent/false = off. AI catalogs are always on.
     scrobble: { ...DEFAULT_SCROBBLE },
@@ -209,6 +213,7 @@ function applyMigrations(p) {
     p.simkl_auth.client_id = p.keys.simkl_client_id || '';
   }
   if (p.email === undefined) p.email = '';
+  if (p.is_admin !== true) p.is_admin = false;
   if (p.catalogs === undefined) p.catalogs = {};
   if (p.scrobble === undefined) p.scrobble = { ...DEFAULT_SCROBBLE };
   // Mobile Companion prefs (v6.35): default new + older profiles to catalog-only.
@@ -329,6 +334,15 @@ function updateProfile(id, patch) {
       }
       profile.email = email;
     }
+    if (patch.is_admin !== undefined) {
+      if (typeof patch.is_admin !== 'boolean') throw accountError('BAD_ADMIN_FLAG', 'is_admin must be true or false.');
+      const wasAdmin = profile.is_admin === true;
+      if (wasAdmin && !patch.is_admin && !data.profiles.some((p) => p.id !== id && p.is_admin === true)) {
+        throw accountError('LAST_ADMIN', 'There must always be at least one admin. Make another profile an admin first.');
+      }
+      profile.is_admin = patch.is_admin;
+    }
+    if (profile.is_admin === true && !profile.email) throw accountError('ADMIN_NEEDS_EMAIL', 'An admin needs an email address to sign in.');
     if (patch.keys) Object.assign(profile.keys, patch.keys);
     if (patch.filters) {
       const f = patch.filters;
@@ -450,12 +464,56 @@ function updateProfile(id, patch) {
 function removeProfile(id) {
   let removed = false;
   mutateProfiles((data) => {
+    const target = data.profiles.find((p) => p.id === id);
+    if (target && target.is_admin === true && !data.profiles.some((p) => p.id !== id && p.is_admin === true)) {
+      throw accountError('LAST_ADMIN', 'There must always be at least one admin. Make another profile an admin first.');
+    }
     const before = data.profiles.length;
     data.profiles = data.profiles.filter((p) => p.id !== id);
     removed = data.profiles.length < before;
   });
   if (removed) store.deleteCache(id);
   return removed;
+}
+
+// AUTH-1 boot migration: an install that predates admin users has profiles but no
+// admin. Promote exactly one: the oldest profile (created_at asc, array order breaks
+// ties / missing created_at counts as 0) that has a non-empty email. Writes ONLY when
+// it promotes. Returns { promoted: <name>|null, reason: 'has-admin'|'no-profiles'|'no-email'|'promoted' }.
+function promoteFirstAdminIfMissing() {
+  const profiles = listProfiles();
+  if (profiles.length === 0) return { promoted: null, reason: 'no-profiles' };
+  if (profiles.some((p) => p.is_admin === true)) return { promoted: null, reason: 'has-admin' };
+  const withEmail = profiles.filter((p) => p.email);
+  if (!withEmail.length) return { promoted: null, reason: 'no-email' };
+  const chosen = withEmail.slice().sort((a, b) => (a.created_at || 0) - (b.created_at || 0))[0];
+  let promotedName = null;
+  mutateProfiles((data) => {
+    // Re-check inside the mutator so we never act on stale data.
+    if (data.profiles.some((p) => p.is_admin === true)) return;
+    const target = data.profiles.find((p) => p.id === chosen.id);
+    if (!target || !target.email) return;
+    target.is_admin = true;
+    promotedName = target.name;
+  });
+  return { promoted: promotedName, reason: 'promoted' };
+}
+
+// AUTH-1 Initial User Creation: create the first (admin) profile on an empty
+// install. Used only by the setup wizard.
+function createInitialAdmin({ name, email }) {
+  const nm = String(name || '').trim();
+  if (nm.length < 1 || nm.length > 40) throw accountError('BAD_NAME', 'Enter a name (up to 40 characters).');
+  const em = String(email || '').trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) throw accountError('BAD_EMAIL', 'Enter a valid email address.');
+  const profile = newProfile(nm);
+  profile.email = em;
+  profile.is_admin = true;
+  mutateProfiles((data) => {
+    if (data.profiles.length > 0) throw accountError('SETUP_DONE', 'Setup is already complete — sign in instead.');
+    data.profiles.push(profile);
+  });
+  return profile;
 }
 
 // Startup: encrypt any plaintext secrets in place (one-time), or report the
@@ -495,5 +553,7 @@ module.exports = {
   removeProfile,
   secretsLocked,
   migrateSecrets,
+  promoteFirstAdminIfMissing,
+  createInitialAdmin,
   applyMigrations, // test seam: the field-level migrations (incl. the AGE-2 age_limit rounding)
 };
