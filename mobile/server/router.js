@@ -9,6 +9,9 @@ const express = require('express');
 const path = require('path');
 const auth = require('./auth');
 const handlers = require('./handlers');
+const config = require('../../src/config');
+const sessionAuth = require('../../src/sessionAuth');
+const { readCookie, setSessionCookie, clearSessionCookies, sessionFromRequest, COOKIE } = sessionAuth;
 
 const router = express.Router();
 router.use(express.json());
@@ -23,41 +26,13 @@ router.use((req, res, next) => {
   next();
 });
 
-const COOKIE = 'mobile_sid';
-// Secure cookies need HTTPS (production runs behind the Cloudflare Tunnel).
-// MOBILE_INSECURE_COOKIE=1 drops Secure for bare-HTTP LAN testing only.
-const secureCookies = process.env.MOBILE_INSECURE_COOKIE !== '1';
-
-// Minimal cookie reader — avoids adding cookie-parser. Returns '' if absent.
-function readCookie(req, name) {
-  const raw = req.headers.cookie || '';
-  for (const part of raw.split(';')) {
-    const i = part.indexOf('=');
-    if (i === -1) continue;
-    if (part.slice(0, i).trim() === name) return decodeURIComponent(part.slice(i + 1).trim());
-  }
-  return '';
-}
-
-function setSessionCookie(res, token) {
-  const attrs = [`${COOKIE}=${token}`, 'HttpOnly', 'Path=/mobile', 'SameSite=Lax', `Max-Age=${auth.SESSION_DAYS * 24 * 3600}`];
-  if (secureCookies) attrs.push('Secure');
-  res.append('Set-Cookie', attrs.join('; '));
-}
-function clearSessionCookie(res) {
-  const attrs = [`${COOKIE}=`, 'HttpOnly', 'Path=/mobile', 'SameSite=Lax', 'Max-Age=0'];
-  if (secureCookies) attrs.push('Secure');
-  res.append('Set-Cookie', attrs.join('; '));
-}
-
 // THE isolation guard: attaches req.profile from the session cookie, or 401.
 // Every data route (Steps 3–4) uses req.profile.id, never a client-supplied id.
 function requireSession(req, res, next) {
-  const token = readCookie(req, COOKIE);
-  const profile = auth.resolveSession(token);
-  if (!profile) return res.status(401).json({ error: 'Not signed in' });
-  req.profile = profile;
-  req.sessionToken = token;
+  const session = sessionFromRequest(req, res);
+  if (!session) return res.status(401).json({ error: 'Not signed in' });
+  req.profile = session.profile;
+  req.sessionToken = session.token;
   next();
 }
 
@@ -95,14 +70,54 @@ router.post('/api/auth/verify', (req, res) => {
     return res.status(401).json({ error: 'Invalid or expired code' });
   }
   console.log(`[mobile] verify OK for ${who} -> ${result.profile.name}`);
-  setSessionCookie(res, result.token);
+  setSessionCookie(res, result.token, Math.floor((result.expiresAt - Date.now()) / 1000));
+  res.json({ ok: true, profile: result.profile });
+});
+
+// ---- setup (public, only when zero profiles) ----
+router.get('/api/setup', (req, res) => {
+  res.json({ needs_setup: config.listProfiles().length === 0 });
+});
+
+router.post('/api/setup/request', async (req, res) => {
+  const { name, email } = req.body || {};
+  try {
+    const r = await auth.requestSetupOtp({ name, email }, { appUrl: appUrl() });
+    if (!r.ok) {
+      const statusMap = { BAD_NAME: 400, BAD_EMAIL: 400, SETUP_DONE: 409, RATE_LIMITED: 429 };
+      res.status(statusMap[r.code] || 400).json({ error: r.code });
+      return;
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(`[setup] request errored: ${err.message}`);
+    res.status(503).json({ error: 'Setup request failed' });
+  }
+});
+
+router.post('/api/setup/verify', (req, res) => {
+  const { email, code } = req.body || {};
+  let result;
+  try {
+    result = auth.verifySetupOtp(email, code);
+  } catch (err) {
+    console.error(`[setup] verify errored: ${err.message}`);
+    res.status(503).json({ error: 'Verification failed — please try again' });
+    return;
+  }
+  if (!result.ok) {
+    console.warn(`[setup] verify DENIED for ${email} — reason=${result.reason}`);
+    res.status(401).json({ error: 'Invalid or expired code' });
+    return;
+  }
+  setSessionCookie(res, result.token, Math.floor((result.expiresAt - Date.now()) / 1000));
   res.json({ ok: true, profile: result.profile });
 });
 
 // ---- session-guarded ----
 router.post('/api/auth/logout', requireSession, (req, res) => {
   auth.logout(req.sessionToken);
-  clearSessionCookie(res);
+  clearSessionCookies(res);
   res.json({ ok: true });
 });
 
@@ -111,6 +126,7 @@ router.get('/api/me', requireSession, (req, res) => {
     profile: {
       id: req.profile.id,
       name: req.profile.name,
+      is_admin: req.profile.is_admin === true,
       simkl_connected: !!req.profile.simkl_auth?.access_token,
     },
   });
@@ -168,4 +184,4 @@ router.use((req, res, next) => {
   });
 });
 
-module.exports = { router, requireSession, readCookie, setSessionCookie, clearSessionCookie, COOKIE };
+module.exports = { router, requireSession, readCookie, setSessionCookie, clearSessionCookies, COOKIE };

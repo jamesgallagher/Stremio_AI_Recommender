@@ -1304,9 +1304,9 @@ async function httpTests() {
     });
     assert.strictEqual(vres.status, 200);
     const setCookie = vres.headers.get('set-cookie') || '';
-    assert.ok(setCookie.includes('mobile_sid='), 'session cookie is set');
+    assert.ok(setCookie.includes('air_sid='), 'session cookie is set');
     assert.ok(/HttpOnly/i.test(setCookie), 'cookie is HttpOnly');
-    const cookie = setCookie.split(';')[0]; // mobile_sid=<token>
+    const cookie = setCookie.split(';')[0]; // air_sid=<token>
     assert.strictEqual((await vres.json()).profile.id, p.id);
 
     const me = await fetch(`${BASE}/mobile/api/me`, { headers: { Cookie: cookie } });
@@ -1315,7 +1315,7 @@ async function httpTests() {
     assert.strictEqual(meBody.profile.id, p.id);
     assert.strictEqual(meBody.profile.simkl_connected, false);
 
-    assert.strictEqual((await fetch(`${BASE}/mobile/api/me`, { headers: { Cookie: 'mobile_sid=deadbeef' } })).status, 401);
+    assert.strictEqual((await fetch(`${BASE}/mobile/api/me`, { headers: { Cookie: 'air_sid=deadbeef' } })).status, 401);
 
     const lo = await fetch(`${BASE}/mobile/api/auth/logout`, { method: 'POST', headers: { Cookie: cookie } });
     assert.strictEqual(lo.status, 200);
