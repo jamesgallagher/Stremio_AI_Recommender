@@ -230,6 +230,7 @@
       <button onclick="addProfile()">Add</button>
       <div class="grow"></div>
       <button class="ghost" id="serverCfgBtn" onclick="toggleServerConfig()">⚙ Server Config</button>
+      <button class="ghost" onclick="logout()">Logout</button>
     </div>
   </div>
 
@@ -362,6 +363,14 @@ async function api(path, opts = {}) {
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && data.auth === 'signin') {
+    // Session expired — redirect to sign-in (preserves the return path).
+    window.location.href = '/mobile/?next=' + encodeURIComponent(window.location.pathname);
+    return;
+  }
+  if (res.status === 403 && data.auth === 'forbidden') {
+    throw new Error('This profile is not an admin. Enable the Admin checkbox in Advanced → Account.');
+  }
   if (!res.ok) throw new Error(data.error || res.statusText);
   return data;
 }
@@ -677,6 +686,10 @@ function render(profiles) {
           <label>Email <span class="muted">— for the Mobile Companion</span></label>
           <input type="email" data-email value="${esc(p.email || '')}" placeholder="name@example.com" autocomplete="off" spellcheck="false" ${IGNORE_PW_MANAGERS}>
           <div class="hint">Receives one-time passwords (OTPs) for the Mobile Companion. Must be unique across profiles.</div>
+          <label style="margin-top:14px;display:flex;align-items:center;gap:8px;cursor:pointer">
+            <input type="checkbox" data-is-admin ${p.is_admin ? 'checked' : ''}> Admin
+          </label>
+          <div class="hint">Admins can open this portal and the /api surface. At least one profile must stay an admin.</div>
         </div>
 
         <div class="sec-title">Simkl</div>
@@ -762,9 +775,9 @@ function render(profiles) {
           </div>
         </div>
 
-        <div class="save-bar" data-note="— saves the email, Simkl credentials &amp; MDBList key">
+        <div class="save-bar" data-note="— saves the email, Admin flag, Simkl credentials &amp; MDBList key">
           <button onclick="saveAdvanced('${p.id}')">Save</button>
-          <span class="muted save-note">— saves the email, Simkl credentials &amp; MDBList key</span>
+          <span class="muted save-note">— saves the email, Admin flag, Simkl credentials &amp; MDBList key</span>
         </div>
       </div>
     </div>`;
@@ -1316,6 +1329,11 @@ function applyServerConfigVisibility() {
 }
 function toggleServerConfig() { cfgForced = !cfgForced; applyServerConfigVisibility(); }
 
+async function logout() {
+  try { await api('/auth/logout', { method: 'POST', body: {} }); } catch {}
+  window.location.href = '/mobile/?next=' + encodeURIComponent(window.location.pathname);
+}
+
 async function load() {
   if (!GENRES.length) GENRES = (await api('/genres')).genres;
   if (!ENGINES.length) ENGINES = (await api('/engines')).engines || [];
@@ -1373,6 +1391,7 @@ async function saveKeys(id, silent = false) {
 async function saveAdvanced(id) {
   const card = document.querySelector(`[data-id="${id}"]`);
   const email = (card.querySelector('[data-email]')?.value || '').trim();
+  const is_admin = card.querySelector('[data-is-admin]')?.checked || false;
   const authVersion = parseInt(card.querySelector('[data-auth-version]').value, 10);
   // Only the selected version's credential block is in scope — the hidden
   // version's drafts are never submitted.
@@ -1398,7 +1417,7 @@ async function saveAdvanced(id) {
       captured.mdblist_api_key = { value: v, node: mdb };
     }
   }
-  await api('/profiles/' + id, { method: 'PUT', body: { email, simkl_auth_version: authVersion, ...(Object.keys(keys).length ? { keys } : {}) } });
+  await api('/profiles/' + id, { method: 'PUT', body: { email, is_admin, simkl_auth_version: authVersion, ...(Object.keys(keys).length ? { keys } : {}) } });
   // After success, update originals to the ACKNOWLEDGED submitted values (not
   // current DOM values, which may have changed while awaiting). Only touch
   // fields acknowledged by this request.
