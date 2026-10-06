@@ -306,7 +306,9 @@ async function run() {
         await regCard.locator('[data-simkl-editor]').waitFor({ state: 'visible' });
         // Select V2 and check (target readiness).
         await regCard.locator('[data-auth-version]').selectOption('2');
-        await regCard.locator('.simkl-flow').getByRole('button', { name: 'Check connection', exact: true }).click();
+        await regCard.locator('[data-simkl-editor]').getByRole('button', { name: 'Check connection', exact: true }).click();
+        // Wait for the target check response to render before asserting badge/controls.
+        await regCard.locator('.simkl-flow').filter({ hasText: 'Target AUTH V2' }).waitFor();
         // The badge must still show "Simkl connected" (active V1 state preserved).
         await regCard.locator('.hdr-badge').filter({ hasText: 'Simkl connected' }).waitFor();
         // The active details remain: username, watched count, Sync/Disconnect.
