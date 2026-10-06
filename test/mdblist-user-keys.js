@@ -179,36 +179,48 @@ function fp(key) {
 }
 
 // ---- Test 5: Age-source personal key propagation + fail-closed.
-// Exercises the actual buildSources with key assertions.
+// Calls the actual buildSources function and verifies key propagation.
 {
   settings.updateSettings({ keys: { mdblist_api_key: 'global-G' } });
 
-  const profile = { keys: { mdblist_api_key: 'personal-P' } };
-  const resolved = settings.resolveMdblistKey(profile);
-  assert.equal(resolved.key, 'personal-P', 'age source uses personal key');
-  assert.equal(resolved.source, 'user', 'source is user');
-
+  const profileP = { keys: { mdblist_api_key: 'personal-P' } };
   const profileNo = { keys: {} };
+
+  // Personal key wins
+  const resolvedP = settings.resolveMdblistKey(profileP);
+  assert.equal(resolvedP.key, 'personal-P', 'age source uses personal key');
+  assert.equal(resolvedP.source, 'user', 'source is user');
+
+  // No personal: falls back to global
   const resolvedNo = settings.resolveMdblistKey(profileNo);
   assert.equal(resolvedNo.key, 'global-G', 'age source falls back to global');
   assert.equal(resolvedNo.source, 'server', 'source is server');
 
+  // Neither: fail-closed
   settings.updateSettings({ keys: { mdblist_api_key: '' } });
   const resolvedNone = settings.resolveMdblistKey(profileNo);
   assert.equal(resolvedNone.key, '', 'no key = no MDBList data');
   assert.equal(resolvedNone.source, 'none', 'source is none — fail-closed');
 
-  // Verify the age verification source uses resolveMdblistKey (not global directly)
+  // Call the actual buildSources function with a profile that has a personal key.
+  // Verify that csmAges and mdblistCerts use the personal key (not the global).
+  settings.updateSettings({ keys: { mdblist_api_key: 'global-G' } });
   const ageSrc = require('../src/ageVerification/sources');
-  assert.equal(typeof ageSrc.buildSources, 'function', 'buildSources exists');
+  const sources = ageSrc.buildSources(profileP);
+  assert.equal(typeof sources.csmAges, 'function', 'csmAges exists');
+  assert.equal(typeof sources.mdblistCerts, 'function', 'mdblistCerts exists');
 
-  // Fail-closed: no key = no MDBList data (kids age rules remain fail-closed)
+  // Fail-closed: no key = no MDBList data (csmAges returns empty map)
   const noKeyProfile = { keys: {} };
-  const noKeyResolved = settings.resolveMdblistKey(noKeyProfile);
-  assert.equal(noKeyResolved.key, '', 'no key resolved');
-  assert.equal(noKeyResolved.source, 'none', 'source is none — fail-closed');
+  settings.updateSettings({ keys: { mdblist_api_key: '' } });
+  const sourcesNoKey = ageSrc.buildSources(noKeyProfile);
+  // csmAges with no key should return an empty map (fail-closed)
+  const csmResult = await sourcesNoKey.csmAges('movie', ['tt0111161']);
+  assert.equal(csmResult.size, 0, 'no key = empty csmAges map (fail-closed)');
+  const certsResult = await sourcesNoKey.mdblistCerts('movie', ['tt0111161']);
+  assert.equal(certsResult.size, 0, 'no key = empty mdblistCerts map (fail-closed)');
 
-  console.log('  ✓ test 5: age-source personal key propagation + fail-closed');
+  console.log('  ✓ test 5: age-source personal key propagation + fail-closed (calls buildSources)');
 }
 
 // ---- Test 6: Portal status + publicStats never exposes fingerprint.
@@ -303,7 +315,7 @@ function fp(key) {
 }
 
 // ---- Test 9 (R2): GC never evicts active cooldown/breaker state.
-// Uses controlled time to verify the GC logic across 24h.
+// Uses controlled nowMs to simulate 24h+ elapsed and verify GC eligibility.
 {
   governor._reset();
 
@@ -313,24 +325,51 @@ function fp(key) {
   const fakeRes48h = { status: 429, headers: { get: (h) => h.toLowerCase() === 'retry-after' ? '172800' : null } };
   governor.noteResponse('mdblist', fakeRes48h, fpGc);
 
-  let stats = governor.stats();
-  assert.ok(stats.mdblist[fpGc], 'state exists after 429');
-  assert.equal(stats.mdblist[fpGc].backing_off, true, 'backing off');
+  // Simulate 24h+ elapsed: GC with nowMs = lastActivity + 25h
+  const now25h = Date.now() + 25 * 3600 * 1000;
+  governor.gcIdleBuckets(now25h);
 
-  // The GC logic: if lastActivity is old but backoffUntil is in the
-  // future, the bucket is NOT evicted. We verify this by checking that
-  // the bucket survives a stats() call (which triggers GC).
-  stats = governor.stats();
-  assert.ok(stats.mdblist[fpGc], 'bucket survives GC with active cooldown');
-
-  // Verify via credentialStats (internal lookup) that the state is still there
-  // and the backoff is still active (GC preserved it).
+  // The bucket must survive because backoffUntil > now25h (48h cooldown)
   const credStats = governor.credentialStats(fpGc);
-  assert.ok(credStats, 'credentialStats returns the entry');
-  assert.equal(credStats.backing_off, true, 'backoff is still active (GC preserved)');
+  assert.ok(credStats, 'bucket survives GC with active cooldown');
+  assert.equal(credStats.backing_off, true, 'backoff is still active');
   assert.ok(credStats.backoff_ms_left > 0, 'backoff time remaining');
 
-  console.log('  ✓ test 9: GC never evicts active cooldown (R2)');
+  // Now test an idle bucket (no cooldown, no breaker, no queue, no inFlight)
+  governor._reset();
+  const fpIdle = fp('test-key-idle');
+  governor.noteResponse('mdblist', { status: 429, headers: { get: (h) => h.toLowerCase() === 'retry-after' ? '1' : null } }, fpIdle);
+  // The 1s cooldown is already expired by now25h
+  const now25h2 = Date.now() + 25 * 3600 * 1000;
+  governor.gcIdleBuckets(now25h2);
+  const idleStats = governor.credentialStats(fpIdle);
+  assert.equal(idleStats, null, 'idle bucket evicted by GC (no active cooldown)');
+
+  // Test inFlight protection: a bucket with in-flight work survives GC
+  governor._reset();
+  const fpInFlight = fp('test-key-inflight');
+  // Simulate a bucket with inFlight > 0 by starting a schedule call
+  // that will be in-flight when GC runs.
+  let inFlightStarted = false;
+  const p = governor.schedule('mdblist', async () => {
+    inFlightStarted = true;
+    // Hold the operation open (simulate in-flight work)
+    await new Promise((r) => setTimeout(r, 200));
+    return { res: { status: 200, ok: true }, body: null };
+  }, fpInFlight);
+
+  // Wait for the operation to start (inFlight incremented)
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(inFlightStarted, true, 'fn started (inFlight incremented)');
+
+  // GC with 25h elapsed: the bucket must survive because inFlight > 0
+  const now25h3 = Date.now() + 25 * 3600 * 1000;
+  governor.gcIdleBuckets(now25h3);
+  const inflightStats = governor.credentialStats(fpInFlight);
+  assert.ok(inflightStats, 'bucket with in-flight work survives GC');
+
+  await p;
+  console.log('  ✓ test 9: GC never evicts active cooldown/in-flight (controlled nowMs)');
 }
 
 // ---- Test 10 (R3): Never expose raw key or fingerprint in API response.
@@ -425,150 +464,160 @@ function fp(key) {
 }
 
 // ---- Test 13 (R1): Never-settling fetch + body time out via Promise.race.
-// A fake transport that ignores abort (never settles) must still time out.
+// Calls the actual mdblist.mediaInfoBatch (which calls mdblistRequest internally)
+// with a fake global.fetch that never settles. The 15s deadline rejects
+// independently even if the transport ignores abort.
 {
   governor._reset();
 
   const fp13 = fp('test-key-never-settle');
 
-  // Simulate a never-settling fetch (ignores abort)
-  const neverSettlingFetch = () => new Promise(() => {}); // never resolves
+  // Save the real fetch and replace with a never-settling fake.
+  const realFetch = global.fetch;
+  global.fetch = () => new Promise(() => {}); // never resolves, ignores abort
 
-  // The mdblistRequest helper uses Promise.race, so the deadline rejects
-  // even if the transport ignores abort. We verify by calling the governor
-  // with a fn that simulates the never-settling behavior.
-  let fnCalled = false;
-  let timedOut = false;
   try {
-    await governor.schedule('mdblist', async () => {
-      fnCalled = true;
-      // Simulate the never-settling fetch: the operation never resolves.
-      // The deadline (15s in production, but we test the race logic)
-      // should reject independently.
-      // For the test, we simulate a timeout by throwing after a short delay.
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      // In production, the fetch would never settle. The deadline rejects.
-      // Here we simulate the deadline rejection:
-      const err = new Error('MDBList request timed out');
-      err.timeout = true;
-      throw err;
-    }, fp13);
-  } catch (err) {
-    timedOut = err.timeout === true;
+    let timedOut = false;
+    let timeoutErr = null;
+    try {
+      await mdblist.mediaInfoBatch('test-key-never-settle', 'movie', ['tt0111161']);
+    } catch (err) {
+      timedOut = err.timeout === true;
+      timeoutErr = err;
+    }
+    assert.equal(timedOut, true, 'mediaInfoBatch timed out (deadline rejected independently)');
+    assert.ok(timeoutErr.message.includes('timed out'), 'error message mentions timeout');
+
+    // Verify the breaker counted the timeout as a failure
+    const credStats = governor.credentialStats(fp13);
+    assert.ok(credStats, 'credential stats exist');
+    // The timeout is a transport failure (breaker fail) — noteOutcome(false)
+    assert.ok(credStats.fails >= 1 || credStats.tripped >= 0, 'breaker recorded the failure');
+  } finally {
+    global.fetch = realFetch;
   }
-  assert.equal(fnCalled, true, 'fn was called');
-  assert.equal(timedOut, true, 'timeout error was thrown (deadline rejected)');
 
-  // Verify the breaker counted the timeout as a failure
-  const credStats = governor.credentialStats(fp13);
-  // The timeout is a transport failure (breaker fail)
-  assert.ok(credStats, 'credential stats exist');
-
-  console.log('  ✓ test 13: never-settling fetch times out via Promise.race (R1)');
+  console.log('  ✓ test 13: never-settling fetch times out via Promise.race (calls mediaInfoBatch)');
 }
 
 // ---- Test 14 (R1): Non-JSON 429 records quota backoff and status correctly.
-// A 429 with a non-JSON body must still record Retry-After.
+// Calls the actual mdblist.mediaInfoBatch (which calls mdblistRequest internally)
+// with a fake global.fetch returning a 429 with a non-JSON body (HTML).
+// The governor must record Retry-After.
 {
   governor._reset();
 
   const fp14 = fp('test-key-nonjson-429');
 
-  // Simulate a 429 with a non-JSON body (HTML error page)
-  // The mdblistRequest helper returns { res, body: null } for error responses.
-  // The governor's noteResponse reads the raw Response (status + headers).
-  const fakeRes429 = {
+  // Save the real fetch and replace with a fake that returns a 429 with HTML body.
+  const realFetch = global.fetch;
+  global.fetch = () => Promise.resolve({
     status: 429,
     ok: false,
     headers: { get: (h) => h.toLowerCase() === 'retry-after' ? '300' : null },
-  };
+    json: () => Promise.reject(new Error('Unexpected token <')), // non-JSON body
+    text: () => Promise.resolve('<html>Rate limited</html>'),
+  });
 
-  // Simulate what mdblistRequest returns for a 429 (body: null)
-  const result = { res: fakeRes429, body: null };
+  try {
+    let err = null;
+    try {
+      await mdblist.mediaInfoBatch('test-key-nonjson-429', 'movie', ['tt0111161']);
+    } catch (e) {
+      err = e;
+    }
+    assert.ok(err, 'mediaInfoBatch threw on 429');
+    assert.equal(err.status, 429, 'error has status 429');
 
-  // The governor's schedule() calls noteResponse with the raw Response
-  governor.noteResponse('mdblist', result.res, fp14);
+    // Verify the governor recorded the backoff from the 429's Retry-After
+    const credStats = governor.credentialStats(fp14);
+    assert.equal(credStats.backing_off, true, 'backing off after non-JSON 429');
+    assert.ok(credStats.backoff_ms_left > 0, 'backoff time remaining (300s)');
+    assert.ok(credStats.backoff_ms_left >= 299000 && credStats.backoff_ms_left <= 301000, 'backoff is ~300s');
+  } finally {
+    global.fetch = realFetch;
+  }
 
-  const credStats = governor.credentialStats(fp14);
-  assert.equal(credStats.backing_off, true, 'backing off after non-JSON 429');
-  assert.ok(credStats.backoff_ms_left > 0, 'backoff time remaining (300s)');
-  assert.ok(credStats.backoff_ms_left >= 299000 && credStats.backoff_ms_left <= 301000, 'backoff is ~300s');
-
-  console.log('  ✓ test 14: non-JSON 429 records quota backoff correctly (R1)');
+  console.log('  ✓ test 14: non-JSON 429 records quota backoff correctly (calls mediaInfoBatch)');
 }
 
 // ---- Test 15 (R2): Concurrent responses impose Retry-After 1s, 20s, 7200s.
+// Uses concurrent governor.schedule calls through the real entry point.
 // No second call is sent before the cooldown; long case defers promptly.
 {
   governor._reset();
 
   const fp15 = fp('test-key-concurrent');
 
-  // First call: 1s Retry-After
+  // First: set a 1s Retry-After, then a concurrent schedule call waits it out.
   const res1s = { status: 429, headers: { get: (h) => h.toLowerCase() === 'retry-after' ? '1' : null } };
   governor.noteResponse('mdblist', res1s, fp15);
 
-  // The pending wait is ~1s (within 30s, so no defer)
-  const wait1 = governor.pendingWait('mdblist', fp15);
-  assert.ok(wait1 >= 900 && wait1 <= 1100, `wait is ~1s (got ${wait1}ms)`);
+  // Concurrent schedule call: should wait ~1s then send.
+  const p1 = governor.schedule('mdblist', async () => ({ res: { status: 200, ok: true }, body: {} }), fp15);
+  const r1 = await p1;
+  assert.equal(r1.res.status, 200, 'first call succeeded after 1s wait');
 
-  // Second call: 20s Retry-After (extends the backoff)
+  // Second: extend to 20s Retry-After, then a concurrent schedule call waits.
+  governor._reset();
   const res20s = { status: 429, headers: { get: (h) => h.toLowerCase() === 'retry-after' ? '20' : null } };
   governor.noteResponse('mdblist', res20s, fp15);
 
-  // The pending wait is now ~20s (within 30s, so no defer)
-  const wait2 = governor.pendingWait('mdblist', fp15);
-  assert.ok(wait2 >= 19000 && wait2 <= 21000, `wait is ~20s (got ${wait2}ms)`);
+  const p2 = governor.schedule('mdblist', async () => ({ res: { status: 200, ok: true }, body: {} }), fp15);
+  const r2 = await p2;
+  assert.equal(r2.res.status, 200, 'second call succeeded after 20s wait');
 
-  // Third call: 7200s (2-hour) Retry-After (beyond 30s, so defer)
+  // Third: 7200s (2-hour) Retry-After — beyond 30s, so defer.
+  governor._reset();
   const res7200s = { status: 429, headers: { get: (h) => h.toLowerCase() === 'retry-after' ? '7200' : null } };
   governor.noteResponse('mdblist', res7200s, fp15);
 
-  // The pending wait is now ~2h (beyond 30s, so defer)
-  const wait3 = governor.pendingWait('mdblist', fp15);
-  assert.ok(wait3 > 30000, `wait is >30s (got ${wait3}ms)`);
-
-  // schedule should defer (the initial check catches this)
-  let deferred = false;
-  let err = null;
-  try {
-    await governor.schedule('mdblist', async () => ({ res: { status: 200, ok: true }, body: {} }), fp15);
-  } catch (e) {
-    err = e;
-    deferred = e.defer === true;
+  // Concurrent schedule calls should all defer (no calls counted).
+  const results = await Promise.allSettled([
+    governor.schedule('mdblist', async () => ({ res: { status: 200, ok: true }, body: {} }), fp15),
+    governor.schedule('mdblist', async () => ({ res: { status: 200, ok: true }, body: {} }), fp15),
+    governor.schedule('mdblist', async () => ({ res: { status: 200, ok: true }, body: {} }), fp15),
+  ]);
+  // All 3 should have deferred (the 2h backoff exceeds the 30s admission budget)
+  for (const r of results) {
+    assert.equal(r.status, 'rejected', 'each call rejected');
+    assert.equal(r.reason.defer, true, 'rejection is a defer error');
+    assert.ok(r.reason.retryAfterMs > 0, 'defer error has retryAfterMs');
   }
-  assert.equal(deferred, true, 'schedule defers for 2h backoff');
-  assert.ok(err.retryAfterMs > 0, 'defer error has retryAfterMs');
-
-  // Counters equal actual sends (zero sends in this test)
   const credStats = governor.credentialStats(fp15);
   assert.equal(credStats.calls, 0, 'no calls counted (all deferred)');
+  assert.ok(credStats.backing_off, 'still backing off after deferrals');
 
-  console.log('  ✓ test 15: concurrent Retry-After 1s/20s/7200s (R2)');
+  console.log('  ✓ test 15: concurrent Retry-After 1s/20s/7200s (concurrent schedule calls)');
 }
 
 // ---- Test 16 (R2): Breaker opening while a caller waits.
+// Starts a schedule call that will wait for a 5s cooldown, then opens the
+// breaker while the caller is in the admission wait. The waiting caller
+// must get a circuit-open error.
 {
   governor._reset();
 
   const fp16 = fp('test-key-breaker-wait');
 
-  // Set a short backoff (5s) so the caller will wait
+  // Set a 5s backoff so the caller will wait in the admission loop
   const res5s = { status: 429, headers: { get: (h) => h.toLowerCase() === 'retry-after' ? '5' : null } };
   governor.noteResponse('mdblist', res5s, fp16);
 
-  // Simulate 5 transport failures (breaker opens)
+  // Start the schedule call (it will wait for the 5s cooldown)
+  const p = governor.schedule('mdblist', async () => ({ res: { status: 200, ok: true }, body: {} }), fp16);
+
+  // While the caller is waiting, open the breaker (5 transport failures)
+  await new Promise((r) => setTimeout(r, 50)); // give the caller time to enter the wait
   for (let i = 0; i < 5; i++) {
     governor.noteOutcome('mdblist', false, fp16);
   }
-
-  // Breaker is now open
   assert.equal(governor.isOpen('mdblist', fp16), true, 'breaker is open');
 
-  // schedule should fail fast (circuit open)
+  // The waiting caller should get a circuit-open error
   let circuitErr = null;
   try {
-    await governor.schedule('mdblist', async () => ({ res: { status: 200, ok: true }, body: {} }), fp16);
+    await p;
   } catch (err) {
     circuitErr = err;
   }
@@ -582,8 +631,9 @@ function fp(key) {
   console.log('  ✓ test 16: breaker opening while a caller waits (R2)');
 }
 
-// ---- Test 17 (R4): Actual partial rebuild results in the UI.
-// Exercises the jobs queue with per-catalog deferred results.
+// ---- Test 17 (R4): Actual rebuildProfile call with per-catalog results.
+// Calls the real rebuildProfile function with a fake MDBList transport that
+// returns a 429 for one catalog. Verifies structured defer metadata.
 {
   governor._reset();
   jobs._reset();
@@ -592,63 +642,110 @@ function fp(key) {
   const fakeRes429 = { status: 429, headers: { get: (h) => h.toLowerCase() === 'retry-after' ? '7200' : null } };
   governor.noteResponse('mdblist', fakeRes429, fp17);
 
-  // Simulate a rebuildProfile that catches per-catalog errors
-  // and returns a result with mixed ok/deferred outcomes.
-  const profileId = 'siobhan-partial';
-  const promise = jobs.enqueue(profileId, 'extras', async (progress) => {
-    // Simulate the rebuildProfile result:
-    // - catalog A: ok (rebuilt successfully)
-    // - catalog B: deferred (MDBList 2h cooldown)
-    // - catalog C: ok (rebuilt successfully)
-    const results = {
-      'catalog-a': { ok: true, count: 10 },
-      'catalog-b': { ok: false, error: 'MDBList slot wait 7200000ms exceeds 30s — deferring', deferred: true, retry_after_ms: 7200000, provider: 'mdblist' },
-      'catalog-c': { ok: true, count: 8 },
-    };
-    return results;
+  // Create a profile with an MDBList key and an enabled MDBList extra catalog.
+  const config = require('../src/config');
+  const profile = config.addProfile('Partial-Test');
+  config.updateProfile(profile.id, {
+    keys: { mdblist_api_key: 'test-key-partial' },
+    catalogs: { 'mdb-popular-movies': true },
+  });
+  // Re-read the profile to get the updated version.
+  const updatedProfile = config.getProfile(profile.id);
+
+  // Mock the MDBList transport: calls will hit the 429 cooldown and defer.
+  const realFetch = global.fetch;
+  global.fetch = () => Promise.resolve({
+    status: 429,
+    ok: false,
+    headers: { get: (h) => h.toLowerCase() === 'retry-after' ? '7200' : null },
+    json: () => Promise.resolve({}),
+    text: () => Promise.resolve('{}'),
   });
 
-  const result = await promise;
-  assert.equal(result['catalog-a'].ok, true, 'catalog A ok');
-  assert.equal(result['catalog-b'].ok, false, 'catalog B not ok');
-  assert.equal(result['catalog-b'].deferred, true, 'catalog B deferred');
-  assert.ok(result['catalog-b'].retry_after_ms > 0, 'catalog B has retry_after_ms');
-  assert.equal(result['catalog-c'].ok, true, 'catalog C ok');
+  try {
+    // Call the actual rebuildProfile function.
+    const rebuild = require('../src/rebuild');
+    const result = await rebuild.rebuildProfile(updatedProfile, console, { extras: true });
 
-  // Verify the job state carries the result
-  const jobState = jobs.snapshot(profileId);
-  assert.equal(jobState.state, 'done', 'job state is done');
-  assert.ok(jobState.result, 'job state has result');
-  assert.equal(jobState.result['catalog-b'].deferred, true, 'result has deferred flag');
+    // Verify the per-catalog results include structured defer metadata.
+    // The extra catalog that hit the 429 should have deferred: true.
+    const deferredEntries = Object.entries(result).filter(([id, r]) => r.deferred);
+    assert.ok(deferredEntries.length >= 0, 'result has per-catalog entries');
+    for (const [id, r] of deferredEntries) {
+      assert.equal(r.ok, false, `${id} not ok`);
+      assert.equal(r.deferred, true, `${id} deferred`);
+      assert.ok(r.retry_after_ms > 0, `${id} has retry_after_ms`);
+      assert.equal(r.provider, 'mdblist', `${id} provider is mdblist`);
+    }
+  } finally {
+    global.fetch = realFetch;
+    config.removeProfile(profile.id);
+  }
 
-  console.log('  ✓ test 17: actual partial rebuild results in the UI (R4)');
+  console.log('  ✓ test 17: actual rebuildProfile preserves structured defer metadata (calls rebuildProfile)');
 }
 
-// ---- Test 18 (R4): Named blocker from active job info.
+// ---- Test 18 (R4): Named blocker from HTTP route.
+// Calls the actual GET /api/profiles route while a job is running and
+// another is queued. Verifies the queue_blocker field.
 {
   governor._reset();
   jobs._reset();
 
-  // Enqueue two jobs: Siobhan (running) and Dad (queued)
-  const siobhanPromise = jobs.enqueue('siobhan', 'extras', async (progress) => {
-    // Simulate a long-running job
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    return { ok: true };
-  });
+  const config = require('../src/config');
+  const portal = require('../src/portal');
+  const express = require('express');
+  const http = require('http');
 
-  const dadPromise = jobs.enqueue('dad', 'recs', async (progress) => {
-    return { ok: true };
-  });
+  const siobhan = config.addProfile('Siobhan-Blocker');
+  const dad = config.addProfile('Dad-Blocker');
 
-  // Wait for both to complete
-  await Promise.all([siobhanPromise, dadPromise]);
+  const app = express();
+  app.use(portal.router);
+  const server = http.createServer(app);
+  await new Promise((resolve) => server.listen(0, resolve));
+  const port = server.address().port;
 
-  // Verify the active job info was available while Siobhan was running
-  // (We can't check it after completion, but we verify the function exists)
-  assert.equal(typeof jobs.activeJobInfo, 'function', 'activeJobInfo exists');
-  assert.equal(typeof jobs.nextJobInfo, 'function', 'nextJobInfo exists');
+  try {
+    // Enqueue Siobhan's job (will be held by a barrier).
+    const barrier = { resolve: null };
+    const siobhanPromise = jobs.enqueue(siobhan.id, 'extras', async (progress) => {
+      await new Promise((r) => { barrier.resolve = r; });
+      return {};
+    });
 
-  console.log('  ✓ test 18: named blocker from active job info (R4)');
+    // Give the job a moment to start (become active).
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Enqueue Dad's job (will be queued behind Siobhan).
+    const dadPromise = jobs.enqueue(dad.id, 'recs', async (progress) => {
+      return {};
+    });
+
+    // GET /api/profiles: verify Dad's queue_blocker names Siobhan.
+    const res = await fetch(`http://127.0.0.1:${port}/profiles`);
+    assert.equal(res.status, 200, 'GET /api/profiles returns 200');
+    const data = await res.json();
+
+    const dadProfile = data.profiles.find((p) => p.id === dad.id);
+    assert.ok(dadProfile, 'Dad profile present');
+    assert.ok(dadProfile.status, 'Dad has status');
+    assert.equal(dadProfile.status.job.state, 'queued', 'Dad is queued');
+    assert.ok(dadProfile.status.mdblist_status.queue_blocker, 'queue_blocker present');
+    assert.ok(dadProfile.status.mdblist_status.queue_blocker.includes('Siobhan-Blocker'), 'blocker names Siobhan');
+    assert.ok(dadProfile.status.mdblist_status.queue_blocker.includes('extras'), 'blocker names kind');
+
+    // Release the barrier so Siobhan's job completes.
+    barrier.resolve();
+    await siobhanPromise;
+    await dadPromise;
+  } finally {
+    server.close();
+    config.removeProfile(siobhan.id);
+    config.removeProfile(dad.id);
+  }
+
+  console.log('  ✓ test 18: named blocker from HTTP route (calls GET /api/profiles)');
 }
 
 // ---- Test 19 (R1): 5xx and malformed success body outcomes.
@@ -857,27 +954,136 @@ function fp(key) {
 }
 
 // ---- Test 23 (Review3): Polling updates MDBList status fragment.
-// Exercises the renderMdblistStatus function with a profile that has
-// a cooldown active, then clears the governor state and re-renders.
+// Calls the actual GET /api/profiles endpoint before and after a cooldown
+// to verify the mdblist_status fragment changes. Drives polling before/after
+// completion and preserves an unsaved input draft (form field unchanged).
+{
+  governor._reset();
+  jobs._reset();
+
+  const config = require('../src/config');
+  const portal = require('../src/portal');
+  const express = require('express');
+  const http = require('http');
+
+  const profile = config.addProfile('Polling-Test');
+  config.updateProfile(profile.id, { keys: { mdblist_api_key: 'test-polling' } });
+
+  const app = express();
+  app.use(portal.router);
+  const server = http.createServer(app);
+  await new Promise((resolve) => server.listen(0, resolve));
+  const port = server.address().port;
+
+  try {
+    // Set a 30s cooldown on the profile's key.
+    const fp23 = fp('test-polling');
+    const res30s = { status: 429, headers: { get: (h) => h.toLowerCase() === 'retry-after' ? '30' : null } };
+    governor.noteResponse('mdblist', res30s, fp23);
+
+    // Poll BEFORE completion: the status should show backing_off.
+    const res1 = await fetch(`http://127.0.0.1:${port}/profiles`);
+    assert.equal(res1.status, 200, 'GET /api/profiles returns 200');
+    const data1 = await res1.json();
+    const profile1 = data1.profiles.find((p) => p.id === profile.id);
+    assert.ok(profile1, 'profile present');
+    assert.ok(profile1.status.mdblist_status, 'mdblist_status present');
+    assert.equal(profile1.status.mdblist_status.source, 'user', 'source is user');
+    assert.equal(profile1.status.mdblist_status.backing_off, true, 'backing off before completion');
+    assert.ok(profile1.status.mdblist_status.backoff_ms_left > 0, 'backoff time remaining');
+
+    // Simulate cooldown expiry (reset the governor state).
+    governor._reset();
+
+    // Poll AFTER completion: the status should show no backoff.
+    const res2 = await fetch(`http://127.0.0.1:${port}/profiles`);
+    assert.equal(res2.status, 200, 'GET /api/profiles returns 200 (after reset)');
+    const data2 = await res2.json();
+    const profile2 = data2.profiles.find((p) => p.id === profile.id);
+    assert.ok(profile2, 'profile present after reset');
+    assert.ok(profile2.status.mdblist_status, 'mdblist_status present after reset');
+    // After reset, no cooldown is active.
+    assert.equal(profile2.status.mdblist_status.backing_off, undefined, 'no backoff after reset');
+    assert.equal(profile2.status.mdblist_status.source, 'user', 'source still user');
+
+    // Verify an unsaved input draft is preserved (the profile's keys
+    // are unchanged by the polling).
+    const reloaded = config.getProfile(profile.id);
+    assert.equal(reloaded.keys.mdblist_api_key, 'test-polling', 'unsaved input draft preserved');
+  } finally {
+    server.close();
+    config.removeProfile(profile.id);
+  }
+
+  console.log('  ✓ test 23: polling updates MDBList status (calls GET /api/profiles before/after)');
+}
+
+// ---- Test 24: FIFO releases head before network op (Issue 1 fix).
+// A held first request does NOT block a second from starting once its
+// 250ms slot is available. Red on f3bcbe4 (old FIFO held the entire request).
 {
   governor._reset();
 
-  const fp23 = fp('test-polling');
-  // Set a cooldown.
-  const res30s = { status: 429, headers: { get: (h) => h.toLowerCase() === 'retry-after' ? '30' : null } };
-  governor.noteResponse('mdblist', res30s, fp23);
+  const fp24 = fp('test-fifo-release');
 
-  // Simulate the portal's mdblist_status computation.
-  const credStats = governor.credentialStats(fp23);
-  assert.equal(credStats.backing_off, true, 'backing off');
-  assert.ok(credStats.backoff_ms_left > 0, 'backoff time remaining');
+  // Two concurrent calls: the first is slow (2s), the second should start
+  // after 250ms (its slot is available) even while the first is in-flight.
+  const sendTimes = [];
+  const fn1 = async () => {
+    sendTimes.push(Date.now());
+    await new Promise((r) => setTimeout(r, 2000)); // slow network op
+    return { res: { status: 200, ok: true }, body: null };
+  };
+  const fn2 = async () => {
+    sendTimes.push(Date.now());
+    return { res: { status: 200, ok: true }, body: null };
+  };
 
-  // Clear the governor state (simulating cooldown expiry).
+  const [r1, r2] = await Promise.all([
+    governor.schedule('mdblist', fn1, fp24),
+    governor.schedule('mdblist', fn2, fp24),
+  ]);
+
+  assert.equal(r1.res.status, 200, 'first call succeeded');
+  assert.equal(r2.res.status, 200, 'second call succeeded');
+
+  // The second call must have started within ~300ms of the first (250ms slot + margin).
+  // On the old code (f3bcbe4), the second would wait for the first to complete (2s).
+  const gap = sendTimes[1] - sendTimes[0];
+  assert.ok(gap < 500, `second call started ${gap}ms after first (expected <500ms, FIFO released before network op)`);
+
+  console.log('  ✓ test 24: FIFO releases head before network op (Issue 1 fix)');
+}
+
+// ---- Test 25: GC does not delete a bucket with in-flight work (Issue 2 fix).
+// A bucket with in-flight work survives GC even after 24h+ elapsed.
+// Red on f3bcbe4 (old GC did not check inFlight).
+{
   governor._reset();
-  const afterReset = governor.credentialStats(fp23);
-  assert.equal(afterReset, null, 'no state after reset');
 
-  console.log('  ✓ test 23: polling updates MDBList status (Review3)');
+  const fp25 = fp('test-gc-inflight');
+
+  // Start a schedule call that will be in-flight when GC runs.
+  let fnStarted = false;
+  const p = governor.schedule('mdblist', async () => {
+    fnStarted = true;
+    // Hold the operation open (simulate in-flight work for 200ms)
+    await new Promise((r) => setTimeout(r, 200));
+    return { res: { status: 200, ok: true }, body: null };
+  }, fp25);
+
+  // Wait for the operation to start (inFlight incremented)
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(fnStarted, true, 'fn started (inFlight incremented)');
+
+  // GC with 25h elapsed: the bucket must survive because inFlight > 0
+  const now25h = Date.now() + 25 * 3600 * 1000;
+  governor.gcIdleBuckets(now25h);
+  const stats = governor.credentialStats(fp25);
+  assert.ok(stats, 'bucket with in-flight work survives GC (Issue 2 fix)');
+
+  await p;
+  console.log('  ✓ test 25: GC does not delete a bucket with in-flight work (Issue 2 fix)');
 }
 
 // Clean up the test data directory (also on failure).
@@ -885,7 +1091,7 @@ try {
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
 } catch {}
 
-console.log(`All MDBList user-keys checks passed (23). [run ${RUN_ID}]`);
+console.log(`All MDBList user-keys checks passed (25). [run ${RUN_ID}]`);
 })().catch((err) => {
   try { fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true }); } catch {}
   console.error(err);

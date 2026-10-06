@@ -222,6 +222,9 @@ function publicProfile(p, req) {
           summary.retry_after_ms = 0;
         }
         jobOut = { ...job, summary };
+      } else if (job && job.deferred && job.retry_at) {
+        // Top-level deferred error: decay retry_after_ms from the absolute retry_at.
+        jobOut = { ...job, retry_after_ms: job.retry_at > Date.now() ? job.retry_at - Date.now() : 0 };
       }
       return { ...st, job: jobOut, rebuilding: st.rebuilding || jobs.isBusy(p.id), mdblist_status };
     })(),

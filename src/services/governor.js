@@ -163,7 +163,7 @@ function noteResponse(service, res, keyFingerprint, nowMs = Date.now()) {
 function gcIdleBuckets(nowMs = Date.now()) {
   for (const [key, s] of states) {
     if (key.startsWith('mdblist:') && s.lastActivity && nowMs - s.lastActivity > IDLE_BUCKET_MS) {
-      const active = s.backoffUntil > nowMs || s.openUntil > nowMs || (s.queue && s.queue.length > 0);
+      const active = s.backoffUntil > nowMs || s.openUntil > nowMs || (s.queue && s.queue.length > 0) || (s.inFlight && s.inFlight > 0);
       if (!active) states.delete(key);
     }
   }
@@ -204,57 +204,98 @@ async function schedule(service, fn, keyFingerprint) {
 }
 
 // MDBList: per-credential FIFO admission gate.
-// A caller can send when BOTH:
-//   1. Provider cooldown has expired (backoffUntil <= now)
-//   2. At least minIntervalMs since the previous ACTUAL start for this credential
-// Both are re-evaluated after every await (a cooldown extension can happen during
-// any wait). Simultaneously awakened callers are serialized via the FIFO queue —
-// only the head admits at a time. A start wait exceeding the 30s budget defers
-// without sending/counting. Breaker opening while waiting aborts admission.
+// Admission owns waiting, FIFO ordering, cooldown/breaker checks, and the
+// synchronous update of lastStart/counters. It finishes at the instant fn is
+// about to start. The network operation (fn) is tracked separately (inFlight)
+// and runs AFTER the FIFO head is released, so a held first request does not
+// prevent a second from starting once its 250ms slot is available.
+//
+// Every queued entry has an independent 30-second admission expiry starting
+// at enqueue. Expiry settles even while earlier work is pending. Expired
+// entries can never call fn later.
 async function mdblistSchedule(fn, keyFingerprint) {
-  const s = stateFor('mdblist', keyFingerprint);
-
-  // GC idle buckets on the request path.
+  // GC BEFORE acquiring/creating the bucket (Issue 2: prevent GC from
+  // deleting the bucket a resumed caller is using).
   gcIdleBuckets();
 
+  const s = stateFor('mdblist', keyFingerprint);
   if (!s.queue) s.queue = [];
+  if (s.inFlight === undefined) s.inFlight = 0;
 
-  const entry = { fn, entryTime: Date.now(), promise: null };
+  const entry = { fn, entryTime: Date.now(), promise: null, timer: null };
   entry.promise = new Promise((resolve, reject) => {
     entry.resolve = resolve;
     entry.reject = reject;
   });
   s.queue.push(entry);
 
-  // If we're not the head, wait for our turn.
+  // Independent 30s admission expiry timer (starts at enqueue).
+  entry.timer = setTimeout(() => {
+    const idx = s.queue.indexOf(entry);
+    if (idx >= 0) {
+      s.queue.splice(idx, 1);
+      const err = new Error(`MDBList admission expired (30s) — deferring`);
+      err.defer = true;
+      err.retryAfterMs = 0;
+      entry.reject(err);
+      if (s.queue.length > 0) wakeNext(s, keyFingerprint);
+    }
+  }, MDBLIST_MAX_ADMISSION_WAIT_MS);
+
+  // If we're not the head, wait for our turn (admission will be triggered
+  // by wakeNext when the previous head releases).
   if (s.queue[0] !== entry) {
-    return entry.promise;
+    return new Promise((resolve, reject) => {
+      entry.promise.then(async () => {
+        try {
+          resolve(await runMdblistFn(fn, s, keyFingerprint));
+        } catch (err) {
+          reject(err);
+        }
+      }).catch(reject);
+    });
   }
 
-  // We're the head: try to admit.
+  // We're the head: run admission (wait for cooldown + pacing), then fn.
   try {
-    const result = await mdblistAdmit(s, keyFingerprint, fn, entry.entryTime);
+    clearTimeout(entry.timer);
+    await mdblistAdmitWait(s, entry.entryTime);
+
+    // Admission complete: update lastStart/counters synchronously.
+    recordStart(s);
+
+    // Remove from FIFO and release the next admission BEFORE the network op.
     s.queue.shift();
     wakeNext(s, keyFingerprint);
-    return result;
+
+    // Network operation (tracked as in-flight).
+    return await runMdblistFn(fn, s, keyFingerprint);
   } catch (err) {
+    clearTimeout(entry.timer);
     s.queue.shift();
     wakeNext(s, keyFingerprint);
     throw err;
   }
 }
 
-// Wake the next caller in the FIFO queue (if any).
+// Wake the next caller in the FIFO queue (if any). Admission only (no fn).
 function wakeNext(s, keyFingerprint) {
   if (!s.queue || s.queue.length === 0) return;
   const next = s.queue[0];
   (async () => {
     try {
-      const result = await mdblistAdmit(s, keyFingerprint, next.fn, next.entryTime);
+      clearTimeout(next.timer);
+      await mdblistAdmitWait(s, next.entryTime);
+
+      // Admission complete: update lastStart/counters synchronously.
+      recordStart(s);
+
+      // Remove from FIFO and release the next admission.
       s.queue.shift();
-      next.resolve(result);
+      next.resolve(); // Signal: admission complete, caller now runs fn.
       wakeNext(s, keyFingerprint);
     } catch (err) {
+      clearTimeout(next.timer);
       s.queue.shift();
       next.reject(err);
       wakeNext(s, keyFingerprint);
@@ -262,11 +303,19 @@ function wakeNext(s, keyFingerprint) {
   })();
 }
 
-// The admission loop: re-evaluate cooldown + pacing after every await.
+// The admission wait: re-evaluate cooldown + pacing after every await.
 // A single sleep is insufficient — a cooldown extension can happen during any
 // wait, so we loop until both conditions are satisfied.
-async function mdblistAdmit(s, keyFingerprint, fn, entryTime) {
+async function mdblistAdmitWait(s, entryTime) {
   const lim = LIMITS.mdblist;
+
+  // Check if already expired (was waiting in queue for >30s).
+  if (Date.now() - entryTime > MDBLIST_MAX_ADMISSION_WAIT_MS) {
+    const err = new Error(`MDBList admission expired (30s) — deferring`);
+    err.defer = true;
+    err.retryAfterMs = 0;
+    throw err;
+  }
 
   while (true) {
     const now = Date.now();
@@ -275,6 +324,14 @@ async function mdblistAdmit(s, keyFingerprint, fn, entryTime) {
     if (lim.breaker && s.openUntil > now) {
       const err = new Error(`MDBList circuit open — skipping (cooldown)`);
       err.circuitOpen = true;
+      throw err;
+    }
+
+    // 30s budget: check elapsed admission time.
+    if (now - entryTime > MDBLIST_MAX_ADMISSION_WAIT_MS) {
+      const err = new Error(`MDBList admission expired (30s) — deferring`);
+      err.defer = true;
+      err.retryAfterMs = 0;
       throw err;
     }
 
@@ -287,9 +344,8 @@ async function mdblistAdmit(s, keyFingerprint, fn, entryTime) {
       break; // Both conditions satisfied — we can send now.
     }
 
-    // 30s budget: if the total wait from this caller's entry exceeds 30s, defer.
-    const totalWait = earliest - entryTime;
-    if (totalWait > MDBLIST_MAX_ADMISSION_WAIT_MS) {
+    // Check if waiting until earliest would exceed the 30s budget.
+    if (earliest - entryTime > MDBLIST_MAX_ADMISSION_WAIT_MS) {
       const waitMs = earliest - now;
       const err = new Error(`MDBList admission wait ${waitMs}ms exceeds 30s — deferring`);
       err.defer = true;
@@ -300,8 +356,10 @@ async function mdblistAdmit(s, keyFingerprint, fn, entryTime) {
     // Sleep until the earliest time, then recheck (cooldown may have extended).
     await sleep(earliest - now);
   }
+}
 
-  // Actual send: count it, record the start time.
+// Record an actual start: update lastStart and counters synchronously.
+function recordStart(s) {
   const sendTime = Date.now();
   s.lastStart = sendTime;
   s.calls += 1;
@@ -309,7 +367,12 @@ async function mdblistAdmit(s, keyFingerprint, fn, entryTime) {
   if (s.day !== day) { s.day = day; s.dayCalls = 0; }
   s.dayCalls += 1;
   s.lastActivity = sendTime;
+}
 
+// Run the network operation (fn), tracked as in-flight. Response/breaker
+// accounting is retained here.
+async function runMdblistFn(fn, s, keyFingerprint) {
+  s.inFlight += 1;
   try {
     const result = await fn();
     const res = result && result.res ? result.res : result;
@@ -319,6 +382,8 @@ async function mdblistAdmit(s, keyFingerprint, fn, entryTime) {
   } catch (err) {
     noteOutcome('mdblist', false, keyFingerprint);
     throw err;
+  } finally {
+    s.inFlight -= 1;
   }
 }
 
@@ -338,7 +403,7 @@ function stats(nowMs = Date.now()) {
     // the future), even if lastActivity is old. A 48h cooldown must survive
     // the 24h idle threshold.
     if (service.startsWith('mdblist:') && s.lastActivity && nowMs - s.lastActivity > IDLE_BUCKET_MS) {
-      const active = s.backoffUntil > nowMs || s.openUntil > nowMs || (s.queue && s.queue.length > 0);
+      const active = s.backoffUntil > nowMs || s.openUntil > nowMs || (s.queue && s.queue.length > 0) || (s.inFlight && s.inFlight > 0);
       if (!active) { states.delete(service); continue; }
     }
     const lim = service.startsWith('mdblist:') ? LIMITS.mdblist : (LIMITS[service] || {});

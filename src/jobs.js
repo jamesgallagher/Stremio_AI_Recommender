@@ -103,20 +103,16 @@ async function pump() {
       let ok = 0, failed = 0, deferred = 0;
       let maxRetryMs = 0;
       for (const [catId, catResult] of Object.entries(result)) {
-        if (catResult.ok) ok++;
-        else {
-          failed++;
-          if (catResult.deferred) {
-            deferred++;
-            maxRetryMs = Math.max(maxRetryMs, catResult.retry_after_ms || 0);
-          }
-        }
+        if (catResult.ok) { ok++; }
+        else if (catResult.deferred) { deferred++; maxRetryMs = Math.max(maxRetryMs, catResult.retry_after_ms || 0); }
+        else { failed++; }
       }
-      if (failed > 0) {
+      if (failed + deferred > 0) {
         summary = { total, ok, failed, deferred, retry_after_ms: maxRetryMs };
-        label = deferred > 0
-          ? `Partial: ${ok}/${total} rebuilt, ${deferred} deferred`
-          : `Partial: ${ok}/${total} rebuilt, ${failed} failed`;
+        const parts = [];
+        if (deferred > 0) parts.push(`${deferred} deferred`);
+        if (failed > 0) parts.push(`${failed} failed`);
+        label = `Partial: ${ok}/${total} rebuilt, ${parts.join(', ')}`;
       }
     }
     // Store an absolute retry instant so polling can decay the remaining time.
