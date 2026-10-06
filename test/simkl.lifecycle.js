@@ -277,16 +277,55 @@ async function run() {
       pass('browser actual success refreshes original tab and selects correct callback profile');
 
       // One Save at the bottom covers the fillable sections and tracks edits.
-      const bar = card.locator('.save-bar');
+      const bar = card.locator('.tab-panel[data-tab="advanced"] .save-bar');
       await card.locator('[data-email]').fill('target@example.test');
       assert.match(await bar.getAttribute('class'), /dirty/);
       assert.match(await bar.innerText(), /unsaved changes/);
       await bar.getByRole('button', { name: 'Save', exact: true }).click();
-      await page.waitForFunction(() => !document.querySelector('.save-bar').classList.contains('dirty'));
+      await page.waitForFunction(() => !document.querySelector('.tab-panel[data-tab="advanced"] .save-bar').classList.contains('dirty'));
       assert.equal(config.getProfile(uiId).email, 'target@example.test');
       assert.equal(await card.locator('.tab-panel[data-tab="advanced"] button', { hasText: /^Save$/ }).count(), 1, 'exactly one Save on the Advanced tab');
       assert.deepEqual(errors, []);
       pass('browser single bottom Save tracks and clears unsaved changes');
+
+      // Every tab follows the Advanced layout: boxed sections, and each tab with
+      // fields has exactly one Save in its bottom bar that tracks edits.
+      {
+        const tabId = add('TabsLayout');
+        await page.goto(base + '/configure/');
+        await page.locator('#userSelect').selectOption(tabId);
+        const tcard = page.locator('.card[data-id="' + tabId + '"]');
+        // The badge is verified without opening Advanced (stored V1 token).
+        await tcard.locator('.hdr-badge').filter({ hasText: 'Simkl connected' }).waitFor();
+        const edits = {
+          filters: async panel => panel.locator('[data-filter="list_size"]').selectOption('30'),
+          catalogs: async panel => panel.locator('[data-catalog]').first().click(),
+          scrobble: async panel => panel.locator('[data-scrobble="email"]').fill('scrobble@example.test'),
+        };
+        for (const [tab, edit] of Object.entries(edits)) {
+          await tcard.locator('.tab-btn[data-tab="' + tab + '"]').click();
+          const panel = tcard.locator('.tab-panel[data-tab="' + tab + '"]');
+          assert.ok(await panel.locator('.sec-title').count() >= 2, tab + ' has titled sections');
+          assert.equal(await panel.locator('.sec-title').count(), await panel.locator('.sec-box').count(), tab + ': one box per title');
+          assert.equal(await panel.getByRole('button', { name: /^Save/ }).count(), 1, tab + ': exactly one Save');
+          const tbar = panel.locator('.save-bar');
+          await edit(panel);
+          assert.match(await tbar.getAttribute('class'), /dirty/, tab + ' marks unsaved changes');
+          await tbar.getByRole('button', { name: 'Save', exact: true }).click();
+          await page.waitForFunction(t => !document.querySelector('.tab-panel[data-tab="' + t + '"] .save-bar').classList.contains('dirty'), tab);
+        }
+        const saved = config.getProfile(tabId);
+        assert.equal(saved.filters.list_size, 30);
+        assert.equal(saved.scrobble.email, 'scrobble@example.test');
+        assert.ok(Object.keys(saved.catalogs || {}).length > 0, 'catalog toggle saved');
+        for (const tab of ['trainer', 'install']) {
+          assert.equal(await tcard.locator('.tab-panel[data-tab="' + tab + '"] .save-bar').count(), 0, tab + ' has nothing to save');
+          assert.ok(await tcard.locator('.tab-panel[data-tab="' + tab + '"] .sec-box').count() >= 1, tab + ' is boxed');
+        }
+        assert.deepEqual(errors, []);
+        config.removeProfile(tabId);
+        pass('browser every tab: boxed sections + one tracked Save per fillable tab');
+      }
     }
     console.log('All Simkl lifecycle checks passed (' + checks + ').');
   } finally {
