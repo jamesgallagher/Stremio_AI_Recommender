@@ -179,7 +179,27 @@ function publicProfile(p, req) {
     status: (() => {
       const st = rebuild.status(p);
       const job = jobs.snapshot(p.id);
-      return { ...st, job, rebuilding: st.rebuilding || jobs.isBusy(p.id) };
+      // MDBList provider status: show cooldown/deferred state for this profile's key
+      const { key, source } = settings.resolveMdblistKey(p);
+      let mdblist_status = null;
+      if (key) {
+        const crypto = require('crypto');
+        const fp = crypto.createHash('sha256').update(key).digest('hex').slice(0, 16);
+        const govStats = require('./services/governor').stats();
+        const mdbStats = govStats.mdblist?.[fp];
+        if (mdbStats) {
+          mdblist_status = {
+            source,
+            backing_off: mdbStats.backing_off,
+            backoff_ms_left: mdbStats.backoff_ms_left,
+            circuit_open: mdbStats.circuit_open,
+            circuit_ms_left: mdbStats.circuit_ms_left,
+            calls: mdbStats.calls,
+            today: mdbStats.today,
+          };
+        }
+      }
+      return { ...st, job, rebuilding: st.rebuilding || jobs.isBusy(p.id), mdblist_status };
     })(),
   };
 }
