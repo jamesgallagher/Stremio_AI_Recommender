@@ -2,14 +2,66 @@
 // STRICT by design: kids/age-limited profiles only list titles that HAVE a
 // Common Sense rating at or below the limit. No rating -> not listed. We do
 // not fall back to MPAA/TMDB certifications or any other source.
+const crypto = require('crypto');
 const USER_AGENT = 'AI-Recommender/1.0 (+https://github.com/jamesgallagher/Stremio_AI_Recommender)';
 const store = require('../store');
 const governor = require('./governor');
+
+// Server-private cryptographic fingerprint of a resolved key. Equal keys share
+// a bucket; distinct keys have independent rate limits. Never exposed to
+// clients or logs (only the first 16 hex chars are used as a state key).
+function keyFingerprint(apiKey) {
+  return apiKey ? crypto.createHash('sha256').update(apiKey).digest('hex').slice(0, 16) : 'none';
+}
 
 const NOT_RATED = null;
 const CSM_TTL_MS = 30 * 24 * 3600e3; // ratings are near-static; refresh monthly
 const BATCH_SIZE = 50;
 const PER_TITLE_CAP = 25; // ceiling on the per-title fallback (quota guard)
+const MDBLIST_TIMEOUT_MS = 15000; // 15s deadline for fetch + body parse
+
+// Shared MDBList request helper: races the entire fetch+parse operation
+// against an independently rejecting 15s deadline. The deadline starts once
+// the governed slot begins (after pacing wait), so rate-governor waiting is
+// not charged against the actual request deadline. Body parsing is inside the
+// governed operation so transport/body timeouts participate in breaker
+// accounting. Error bodies are NOT parsed — the raw Response (with status/
+// headers) is returned to the governor so a non-JSON 429 still records
+// Retry-After. Preserves HTTP status/headers for 429 (quota backoff) and 5xx
+// (transport failure) handling.
+async function mdblistRequest(url, options = {}, apiKey) {
+  const fp = keyFingerprint(apiKey);
+  const result = await governor.schedule('mdblist', async () => {
+    const controller = new AbortController();
+    let timer;
+    // Independently rejecting deadline: settles even if the transport
+    // ignores the abort signal (never-settling fetch/body).
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        const err = new Error('MDBList request timed out');
+        err.timeout = true;
+        reject(err);
+        controller.abort();
+      }, MDBLIST_TIMEOUT_MS);
+    });
+    const operation = (async () => {
+      const res = await fetch(url, { ...options, signal: controller.signal });
+      // Error status and Retry-After must survive HTML/empty error bodies.
+      // Do NOT parse error bodies — the governor needs the raw Response.
+      if (!res.ok) return { res, body: null };
+      if (controller.signal.aborted) throw new Error('MDBList request timed out');
+      return { res, body: await res.json() };
+    })();
+    try { return await Promise.race([operation, deadline]); }
+    finally { clearTimeout(timer); }
+  }, fp);
+  if (!result.res.ok) {
+    const err = new Error(`MDBList request failed (${result.res.status})`);
+    err.status = result.res.status;
+    throw err;
+  }
+  return result.body;
+}
 
 // The Common Sense age is MDBList's `age_rating` (a number). `commonsense` is
 // a BOOLEAN availability flag — reading IT as the age produced NaN, so every
@@ -38,13 +90,10 @@ function parseCommonSenseAge(data) {
 }
 
 async function fetchJson(url) {
-  const res = await governor.schedule('mdblist', () => fetch(url, { headers: { 'User-Agent': USER_AGENT } }));
-  if (!res.ok) {
-    const err = new Error(`MDBList request failed (${res.status})`);
-    err.status = res.status;
-    throw err;
-  }
-  return res.json();
+  // Extract the apikey from the URL for the governor's per-credential partitioning
+  const match = url.match(/apikey=([^&]+)/);
+  const apiKey = match ? decodeURIComponent(match[1]) : '';
+  return mdblistRequest(url, { headers: { 'User-Agent': USER_AGENT } }, apiKey);
 }
 
 // Returns the Common Sense age (number) or null if CSM has not rated it.
@@ -189,17 +238,11 @@ async function listItemsPage(apiKey, user, slug, type, { limit = 50, offset = 0,
 async function mediaInfoBatch(apiKey, type, imdbIds) {
   if (!imdbIds.length) return new Map();
   const mediaType = type === 'series' ? 'show' : 'movie';
-  const res = await governor.schedule('mdblist', () => fetch(`${API}/imdb/${mediaType}?apikey=${encodeURIComponent(apiKey)}`, {
+  const arr = await mdblistRequest(`${API}/imdb/${mediaType}?apikey=${encodeURIComponent(apiKey)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'User-Agent': USER_AGENT },
     body: JSON.stringify({ ids: imdbIds }),
-  }));
-  if (!res.ok) {
-    const err = new Error(`MDBList batch lookup failed (${res.status})`);
-    err.status = res.status;
-    throw err;
-  }
-  const arr = await res.json();
+  }, apiKey);
   const map = new Map();
   for (const m of Array.isArray(arr) ? arr : []) {
     const id = m?.ids?.imdb || m?.imdbid;

@@ -525,7 +525,7 @@ async function runBench({ profile, engineIds, holdout, type = 'movie', serveOpts
     rs.clearType(profile.id, type);
     const ctx = {
       tmdbKey: settings.keyFor(profile, 'tmdb_api_key'),
-      mdblistKey: settings.keyFor(profile, 'mdblist_api_key'),
+      mdblistKey: settings.resolveMdblistKey(profile).key,
       settings: settings.getSettings(),
       filters: profile.filters || {},
       log,

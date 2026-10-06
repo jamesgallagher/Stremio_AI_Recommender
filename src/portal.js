@@ -49,8 +49,9 @@ router.get('/version', (req, res) => {
 // Rate-governor snapshot: per-service call totals, today's count vs any daily
 // cap, and current throttle/backoff state. Observability for the heavy paths
 // (Simkl 1-POST/s write cap, TMDB build volume, Jikan 60/min) — GET /api/governor.
+// Uses publicStats() which never exposes raw keys or fingerprints.
 router.get('/governor', (req, res) => {
-  res.json({ stats: require('./services/governor').stats() });
+  res.json({ stats: require('./services/governor').publicStats() });
 });
 
 function redactKey(v) {
@@ -129,7 +130,7 @@ function publicProfile(p, req) {
       tmdb_api_key: !!settings.keyFor(p, 'tmdb_api_key'),
       groq_api_key: !!settings.keyFor(p, 'groq_api_key'),
       rpdb_api_key: !!settings.keyFor(p, 'rpdb_api_key'),
-      mdblist_api_key: !!settings.keyFor(p, 'mdblist_api_key'),
+      mdblist_api_key: !!settings.resolveMdblistKey(p).key,
     },
     keys_preview: {
       tmdb_api_key: redactKey(p.keys.tmdb_api_key),
@@ -179,7 +180,53 @@ function publicProfile(p, req) {
     status: (() => {
       const st = rebuild.status(p);
       const job = jobs.snapshot(p.id);
-      return { ...st, job, rebuilding: st.rebuilding || jobs.isBusy(p.id) };
+      // MDBList provider status: show key source, cooldown/deferred state for
+      // this profile's key. Rendered even before the first request (source is
+      // known from key resolution; stats are null until a call occurs).
+      const { key, source } = settings.resolveMdblistKey(p);
+      const mdblist_status = { source };
+      if (key) {
+        const crypto = require('crypto');
+        const fp = crypto.createHash('sha256').update(key).digest('hex').slice(0, 16);
+        const credStats = require('./services/governor').credentialStats(fp);
+        if (credStats) {
+          mdblist_status.backing_off = credStats.backing_off;
+          mdblist_status.backoff_ms_left = credStats.backoff_ms_left;
+          mdblist_status.circuit_open = credStats.circuit_open;
+          mdblist_status.circuit_ms_left = credStats.circuit_ms_left;
+          mdblist_status.calls = credStats.calls;
+          mdblist_status.today = credStats.today;
+        }
+      }
+      // Queue position: named preceding job (the ACTIVE job's profile name,
+      // not this waiting job's own label).
+      if (job && job.state === 'queued') {
+        mdblist_status.queue_position = jobs.queuePosition(p.id);
+        const activeInfo = jobs.activeJobInfo();
+        if (activeInfo) {
+          // Resolve the active job's profile name (safe: only name, no secrets)
+          const activeProfile = config.getProfile(activeInfo.profileId);
+          mdblist_status.queue_blocker = activeProfile ? `${activeProfile.name} (${activeInfo.kind})` : activeInfo.kind;
+        }
+      }
+      // The extras summary is computed at job completion (jobs.js pump) for
+      // extras jobs only. Here we read it without mutating the stored snapshot.
+      // A persisted retry interval decays via the absolute retry_at instant.
+      let jobOut = job;
+      if (job && job.summary) {
+        // Return a copy with the decayed retry time (never mutate the stored snapshot).
+        const summary = { ...job.summary };
+        if (job.retry_at && job.retry_at > Date.now()) {
+          summary.retry_after_ms = job.retry_at - Date.now();
+        } else if (job.retry_at) {
+          summary.retry_after_ms = 0;
+        }
+        jobOut = { ...job, summary };
+      } else if (job && job.deferred && job.retry_at) {
+        // Top-level deferred error: decay retry_after_ms from the absolute retry_at.
+        jobOut = { ...job, retry_after_ms: job.retry_at > Date.now() ? job.retry_at - Date.now() : 0 };
+      }
+      return { ...st, job: jobOut, rebuilding: st.rebuilding || jobs.isBusy(p.id), mdblist_status };
     })(),
   };
 }
@@ -376,10 +423,10 @@ async function testRpdb(profile) {
 }
 
 async function testMdblist(profile) {
-  // Test the EFFECTIVE key (global Server-Config key first, per-profile only as a
-  // legacy fallback) — the same resolution enrichment/serve use via keyFor — so a
-  // passing test reflects what actually runs, not a stray per-profile field.
-  const key = settings.keyFor(profile, 'mdblist_api_key');
+  // Test the EFFECTIVE key (personal first, then global server key) — the same
+  // resolution enrichment/serve use via resolveMdblistKey — so a passing test
+  // reflects what actually runs, not a stray per-profile field.
+  const { key } = settings.resolveMdblistKey(profile);
   if (!key) return { ok: false, error: 'MDBList key not set — required (rating floor, extra catalogs + Common Sense age checks)' };
   try {
     const r = await mdblistService.testKey(key);

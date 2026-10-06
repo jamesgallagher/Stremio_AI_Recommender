@@ -42,6 +42,22 @@ function queuePosition(profileId) {
   return i < 0 ? 0 : i + 1; // 1-based; 0 = not waiting (running or absent)
 }
 
+// Safe active/preceding job metadata: the currently running job's profile ID
+// and kind (for the portal to resolve a profile name and display as the
+// named blocker). Never exposes another profile's secrets or fingerprints.
+function activeJobInfo() {
+  if (!active) return null;
+  return { profileId: active.profileId, kind: active.kind };
+}
+
+// The queue's first (next-to-run) job, for naming the blocker when a job
+// is waiting. Returns null if the queue is empty.
+function nextJobInfo() {
+  if (!queue.length) return null;
+  const j = queue[0];
+  return { profileId: j.profileId, kind: j.kind };
+}
+
 // Enqueue a job. `run(progress)` does the work; call progress(pct, label) to
 // report. Returns a promise that settles when the job finishes. A duplicate
 // (same profile+kind, already queued/running) returns the in-flight promise.
@@ -69,17 +85,55 @@ async function pump() {
   if (active || !queue.length) return;
   const job = queue.shift();
   active = job;
-  setProgress(job.profileId, { kind: job.kind, state: 'running', pct: 0, label: 'Starting…', started_at: Date.now() });
+  // Reset stale deferred/circuit/result/summary flags from a previous job so a
+  // new job starts with a clean state.
+  setProgress(job.profileId, { kind: job.kind, state: 'running', pct: 0, label: 'Starting…', started_at: Date.now(), deferred: null, circuit_open: null, retry_after_ms: null, retry_at: null, result: null, summary: null, provider: null });
   const progress = (pct, label) => setProgress(job.profileId, {
     pct: Math.max(0, Math.min(100, Math.round(pct))),
     ...(label ? { label } : {}),
   });
   try {
     const result = await job.run(progress);
-    setProgress(job.profileId, { state: 'done', pct: 100, label: 'Done', finished_at: Date.now(), result: result || null });
+    // Compute the extras summary at job completion (extras jobs only), from
+    // the actual per-catalog outcomes. Do NOT mutate the stored result.
+    let summary = null;
+    let label = 'Done';
+    if (job.kind === 'extras' && result) {
+      const total = Object.keys(result).length;
+      let ok = 0, failed = 0, deferred = 0;
+      let maxRetryMs = 0;
+      for (const [catId, catResult] of Object.entries(result)) {
+        if (catResult.ok) { ok++; }
+        else if (catResult.deferred) { deferred++; maxRetryMs = Math.max(maxRetryMs, catResult.retry_after_ms || 0); }
+        else { failed++; }
+      }
+      if (failed + deferred > 0) {
+        summary = { total, ok, failed, deferred, retry_after_ms: maxRetryMs };
+        const parts = [];
+        if (deferred > 0) parts.push(`${deferred} deferred`);
+        if (failed > 0) parts.push(`${failed} failed`);
+        label = `Partial: ${ok}/${total} rebuilt, ${parts.join(', ')}`;
+      }
+    }
+    // Store an absolute retry instant so polling can decay the remaining time.
+    const retryAt = summary && summary.retry_after_ms > 0 ? Date.now() + summary.retry_after_ms : null;
+    setProgress(job.profileId, { state: 'done', pct: 100, label, finished_at: Date.now(), result: result || null, summary, retry_at: retryAt });
     job.resolve(result);
   } catch (err) {
-    setProgress(job.profileId, { state: 'error', label: `Failed: ${err.message}`, error: err.message, finished_at: Date.now() });
+    // Preserve structured defer/circuit metadata so the portal can show
+    // actionable retry information (retry_after_ms, provider, deferred flag).
+    const patch = { state: 'error', label: `Failed: ${err.message}`, error: err.message, finished_at: Date.now() };
+    if (err.defer) {
+      patch.deferred = true;
+      patch.retry_after_ms = err.retryAfterMs || 0;
+      patch.retry_at = Date.now() + (err.retryAfterMs || 0);
+      patch.provider = 'mdblist';
+    }
+    if (err.circuitOpen) {
+      patch.circuit_open = true;
+      patch.provider = 'mdblist';
+    }
+    setProgress(job.profileId, patch);
     job.reject(err);
   } finally {
     active = null;
@@ -89,4 +143,4 @@ async function pump() {
 
 function _reset() { queue.length = 0; active = null; state.clear(); }
 
-module.exports = { enqueue, snapshot, isBusy, queuePosition, setProgress, _reset };
+module.exports = { enqueue, snapshot, isBusy, queuePosition, activeJobInfo, nextJobInfo, setProgress, _reset };

@@ -1560,28 +1560,29 @@ ok('governor: reserve paces per-service, 429 backs off, stats reports', () => {
   const g = require('../src/services/governor');
   g._reset();
   // First call runs now (0); concurrent calls are spaced by the interval (tmdb 25ms)
-  assert.strictEqual(g.reserve('tmdb', 0), 0);
-  assert.strictEqual(g.reserve('tmdb', 0), 25);
-  assert.strictEqual(g.reserve('tmdb', 0), 50);
-  assert.strictEqual(g.reserve('tmdb', 1000), 0); // arriving after the window waits nothing
+  assert.strictEqual(g.reserve('tmdb', undefined, 0), 0);
+  assert.strictEqual(g.reserve('tmdb', undefined, 0), 25);
+  assert.strictEqual(g.reserve('tmdb', undefined, 0), 50);
+  assert.strictEqual(g.reserve('tmdb', undefined, 1000), 0); // arriving after the window waits nothing
   // Simkl POST is the hard 1/s write cap
   g._reset();
-  assert.strictEqual(g.reserve('simkl_post', 0), 0);
-  assert.strictEqual(g.reserve('simkl_post', 0), 1100);
+  assert.strictEqual(g.reserve('simkl_post', undefined, 0), 0);
+  assert.strictEqual(g.reserve('simkl_post', undefined, 0), 1100);
   // A 429 with Retry-After pushes the next slot out by that window
   g._reset();
-  g.noteResponse('groq', { status: 429, headers: { get: (k) => (k === 'retry-after' ? '2' : null) } }, 0);
-  assert.strictEqual(g.reserve('groq', 0), 2000); // 2s honoured
+  g.noteResponse('groq', { status: 429, headers: { get: (k) => (k === 'retry-after' ? '2' : null) } }, undefined, 0);
+  assert.strictEqual(g.reserve('groq', undefined, 0), 2000); // 2s honoured
   // A non-429 response is a no-op; an unknown service is not paced
   g._reset();
-  g.noteResponse('tmdb', { status: 200, headers: { get: () => null } }, 0);
-  assert.strictEqual(g.reserve('tmdb', 0), 0);
-  assert.strictEqual(g.reserve('nope', 0), 0);
-  assert.strictEqual(g.reserve('nope', 0), 0);
+  g.noteResponse('tmdb', { status: 200, headers: { get: () => null } }, undefined, 0);
+  assert.strictEqual(g.reserve('tmdb', undefined, 0), 0);
+  assert.strictEqual(g.reserve('nope', undefined, 0), 0);
+  assert.strictEqual(g.reserve('nope', undefined, 0), 0);
   // Stats snapshot shape (MDBList carries a daily cap)
   g._reset();
-  g.reserve('mdblist', 0);
+  g.reserve('mdblist', undefined, 0);
   const st = g.stats(0);
+  // mdblist without a fingerprint is stored under the plain 'mdblist' key
   assert.strictEqual(st.mdblist.calls, 1);
   assert.strictEqual(st.mdblist.today, 1);
   assert.strictEqual(st.mdblist.daily_cap, 1000);

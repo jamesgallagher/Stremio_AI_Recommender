@@ -213,6 +213,18 @@ function keyFor(profile, field) {
   return global || profile?.keys?.[field] || '';
 }
 
+// MDBList key resolution: personal (profile) first, then global (server), then none.
+// Returns { key, source } where source is 'user' | 'server' | 'none'.
+// Fallback is for an absent personal key only — an invalid/rate-limited personal
+// key must NOT silently consume the server's quota.
+function resolveMdblistKey(profile) {
+  const personal = (profile?.keys?.mdblist_api_key || '').trim();
+  if (personal) return { key: personal, source: 'user' };
+  const global = (getSettings()?.keys?.mdblist_api_key || '').trim();
+  if (global) return { key: global, source: 'server' };
+  return { key: '', source: 'none' };
+}
+
 module.exports = {
   blankSettings,
   getSettings,
@@ -223,6 +235,7 @@ module.exports = {
   hasLlm,
   embedConfig,
   keyFor,
+  resolveMdblistKey,
   settingsLocked,
   DEFAULT_RPDB_KEY,
   LLM_SECRET_FIELDS,

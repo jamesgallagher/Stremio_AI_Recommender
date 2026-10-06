@@ -383,6 +383,37 @@ function statusLine(p) {
   return `${catalogLine('🎬 Movies', p.status.movie)} &nbsp;·&nbsp; ${catalogLine('📺 Series', p.status.series)}`;
 }
 
+// Shared MDBList status/result renderer. Used by both the initial render and
+// normal status polling so the fragment stays current without a page reload.
+function renderMdblistStatus(p) {
+  const ms = p.status?.mdblist_status;
+  if (!ms) return '';
+  const sourceLabel = ms.source === 'user' ? 'User key' : ms.source === 'server' ? 'Server fallback' : 'No key';
+  let html = `<div class="muted" style="font-size:11px;margin-top:6px">Key source: <b>${sourceLabel}</b>`;
+  if (ms.backing_off) html += ` — backing off (${Math.ceil((ms.backoff_ms_left || 0) / 1000)}s left)`;
+  if (ms.circuit_open) html += ` — circuit open (${Math.ceil((ms.circuit_ms_left || 0) / 1000)}s left)`;
+  if (ms.queue_position) html += ` — queue position ${ms.queue_position}`;
+  if (ms.queue_blocker) html += ` (blocked by ${esc(ms.queue_blocker)})`;
+  html += '</div>';
+  // Deferred/partial result from the most recent rebuild.
+  const job = p.status?.job;
+  if (job && job.state === 'error' && job.deferred) {
+    const retrySec = Math.ceil((job.retry_after_ms || 0) / 1000);
+    html += `<div class="muted" style="font-size:11px;margin-top:4px">Deferred: MDBList provider cooldown (~${retrySec}s). Old catalogs intact; next queued work starts after.</div>`;
+  } else if (job && job.state === 'error' && job.circuit_open) {
+    html += `<div class="muted" style="font-size:11px;margin-top:4px">Circuit breaker open: MDBList transport failures. Old catalogs intact.</div>`;
+  } else if (job && job.state === 'done' && job.summary) {
+    const s = job.summary;
+    if (s.deferred > 0 || s.failed > 0) {
+      html += `<div class="muted" style="font-size:11px;margin-top:4px">Partial: ${s.ok}/${s.total} catalogs rebuilt`;
+      if (s.deferred > 0) html += `, ${s.deferred} deferred (MDBList cooldown ~${Math.ceil((s.retry_after_ms || 0) / 1000)}s)`;
+      if (s.failed > 0) html += `, ${s.failed} failed`;
+      html += ` — old catalogs intact for deferred/failed.</div>`;
+    }
+  }
+  return html;
+}
+
 function render(profiles) {
   const container = $('#profiles');
   // Preserve the active tab + any open recs list across a FULL re-render (only
@@ -587,9 +618,10 @@ function render(profiles) {
 
         <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
           <b>API Keys</b>
-          <div class="muted" style="margin-top:4px">Per-profile MDBList key. The server key continues to be used for normal operation at this stage.</div>
+          <div class="muted" style="margin-top:4px">Per-profile MDBList key. A personal key takes priority over the server key; without one, the server key is used. Neither set: MDBList lookups are unavailable (kids age rules fail-closed).</div>
           <label style="margin-top:8px">MDBList</label>
           ${mdblistKeyRow(p.id, p.keys.mdblist_api_key)}
+          <div id="mdblist-status-${p.id}">${renderMdblistStatus(p)}</div>
         </div>
 
         <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
@@ -2239,6 +2271,9 @@ async function pollStatus() {
       rb.textContent = !p.status.rebuilding ? 'Rebuild now'
         : (j && j.state === 'queued' ? 'Queued…' : `Rebuilding ${(j && j.pct) || 0}%`);
     }
+    // Update the MDBList status/result fragment in place (shared renderer).
+    const mdblistEl = card.querySelector(`#mdblist-status-${SELECTED}`);
+    if (mdblistEl) mdblistEl.innerHTML = renderMdblistStatus(p);
   }
 }
 

@@ -431,7 +431,7 @@ async function buildWatchlistCatalog(profile, def, log = console) {
   // OVERWRITE it when MDBList yields a real IMDb number, so a populated badge is
   // never blanked. No MDBList key -> skip entirely (RPDB poster overlay is
   // unaffected either way).
-  const mdblistKey = settings.keyFor(profile, 'mdblist_api_key');
+  const { key: mdblistKey } = settings.resolveMdblistKey(profile);
   if (mdblistKey && built.length) {
     try {
       const ratings = await mdblist.cachedImdbRatings(mdblistKey, def.type, built.map((m) => m.id), log);
@@ -502,7 +502,7 @@ async function buildExtraCatalog(profile, def, log = console) {
   if (def.source === 'simkl_plantowatch') {
     return cleanMetas(await applyExtraAgeGate(profile, def, await buildWatchlistCatalog(profile, def, log), log));
   }
-  const key = settings.keyFor(profile, 'mdblist_api_key');
+  const { key } = settings.resolveMdblistKey(profile);
   if (!key) throw new Error('MDBList API key is required for extra catalogs');
   // CB-1: the visible count comes from the profile's list-size setting (one
   // number for every non-Watch-Later catalog). Watch Later keeps its source-sized
@@ -611,7 +611,19 @@ async function rebuildProfile(profile, log = console, opts = {}, onProgress = ()
             }
           }
         } catch (err) {
-          results[def.id] = { ok: false, error: err.message };
+          // Preserve actionable per-catalog deferred/provider/retry-at metadata
+          // so the portal and job queue can show a truthful partial outcome.
+          const entry = { ok: false, error: err.message };
+          if (err.defer) {
+            entry.deferred = true;
+            entry.retry_after_ms = err.retryAfterMs || 0;
+            entry.provider = 'mdblist';
+          }
+          if (err.circuitOpen) {
+            entry.circuit_open = true;
+            entry.provider = 'mdblist';
+          }
+          results[def.id] = entry;
           log.warn(`[extra] ${profile.name}/${def.id} failed: ${err.message} — kept previous list`);
         }
         done++;
