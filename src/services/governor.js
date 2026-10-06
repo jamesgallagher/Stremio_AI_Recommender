@@ -238,7 +238,9 @@ async function mdblistSchedule(fn, keyFingerprint) {
       err.defer = true;
       err.retryAfterMs = 0;
       entry.reject(err);
-      if (s.queue.length > 0) wakeNext(s, keyFingerprint);
+      // Only wake when the removed entry was the head — removing a non-head
+      // does not transfer head ownership.
+      if (idx === 0 && s.queue.length > 0) wakeNext(s, keyFingerprint);
     }
   }, MDBLIST_MAX_ADMISSION_WAIT_MS);
 
@@ -257,6 +259,8 @@ async function mdblistSchedule(fn, keyFingerprint) {
   }
 
   // We're the head: run admission (wait for cooldown + pacing), then fn.
+  // The try/catch covers admission + removal ONLY. Network outcomes stay
+  // exclusively in runMdblistFn and must not shift/wake the admission queue.
   try {
     clearTimeout(entry.timer);
     await mdblistAdmitWait(s, entry.entryTime);
@@ -267,15 +271,17 @@ async function mdblistSchedule(fn, keyFingerprint) {
     // Remove from FIFO and release the next admission BEFORE the network op.
     s.queue.shift();
     wakeNext(s, keyFingerprint);
-
-    // Network operation (tracked as in-flight).
-    return await runMdblistFn(fn, s, keyFingerprint);
   } catch (err) {
-    clearTimeout(entry.timer);
-    s.queue.shift();
-    wakeNext(s, keyFingerprint);
+    // Admission error: remove only this specific entry if still present.
+    const idx = s.queue.indexOf(entry);
+    if (idx >= 0) s.queue.splice(idx, 1);
+    if (s.queue.length > 0) wakeNext(s, keyFingerprint);
     throw err;
   }
+
+  // Network operation (tracked as in-flight). Runs AFTER the admission
+  // try/catch so network outcomes never touch the admission queue.
+  return await runMdblistFn(fn, s, keyFingerprint);
 }
 
 // Wake the next caller in the FIFO queue (if any). Admission only (no fn).
@@ -295,10 +301,11 @@ function wakeNext(s, keyFingerprint) {
       next.resolve(); // Signal: admission complete, caller now runs fn.
       wakeNext(s, keyFingerprint);
     } catch (err) {
-      clearTimeout(next.timer);
-      s.queue.shift();
+      // Admission error: remove only this specific entry if still present.
+      const idx = s.queue.indexOf(next);
+      if (idx >= 0) s.queue.splice(idx, 1);
       next.reject(err);
-      wakeNext(s, keyFingerprint);
+      if (s.queue.length > 0) wakeNext(s, keyFingerprint);
     }
   })();
 }
