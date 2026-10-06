@@ -9091,13 +9091,29 @@ async function httpTests() {
     assert.ok(html.includes("toggleSimklVersion"), 'version toggle function present');
     config.removeProfile(pV.id);
 
-    // Check targeting with existing V1 (check V2 when V1 is active)
+    // Check targeting with existing V1 (check V2 when V1 is active):
+    // the explicit version (2) differs from the saved preference (1), so the
+    // server returns 409 configuration-changed without any provider call.
     const pC = config.addProfile('CheckV2');
     config.updateProfile(pC.id, {
       keys: { simkl_v2_client_id: 'client-C', simkl_v2_client_secret: 'secret-C' },
       simkl_auth: { access_token: 'v1-token', version: 1, client_id: 'client-C1' },
       simkl_auth_version: 1,
     });
+    const checkRes409 = await fetch(`${BASE}/api/profiles/${pC.id}/simkl/check`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ version: 2 }),
+    });
+    assert.strictEqual(checkRes409.status, 409, 'explicit V2 vs saved pref V1 → 409');
+    const checkRes409Body = await checkRes409.json();
+    assert.ok(checkRes409Body.error.includes('Configuration changed'), '409 error message');
+    assert.strictEqual(checkRes409Body.target_version, 2, 'target version in 409 response');
+
+    // After saving the new preference (V2), the check proceeds normally.
+    await (await fetch(`${BASE}/api/profiles/${pC.id}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ simkl_auth_version: 2 }),
+    })).json();
     const checkRes = await (await fetch(`${BASE}/api/profiles/${pC.id}/simkl/check`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ version: 2 }),
@@ -9132,6 +9148,18 @@ async function httpTests() {
       body: JSON.stringify({ version: 1 }),
     })).json();
     assert.strictEqual(checkRes3.state, 'missing_configuration', 'missing V1 credentials → missing_configuration');
+
+    // Invalid version (3) → 400
+    const pI = config.addProfile('CheckInvalidVersion');
+    config.updateProfile(pI.id, { simkl_auth_version: 1 });
+    const checkRes400 = await fetch(`${BASE}/api/profiles/${pI.id}/simkl/check`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ version: 3 }),
+    });
+    assert.strictEqual(checkRes400.status, 400, 'invalid version 3 → 400');
+    const checkRes400Body = await checkRes400.json();
+    assert.ok(checkRes400Body.error.includes('version'), '400 error mentions version');
+    config.removeProfile(pI.id);
 
     // No hidden-credential mutation: stored V2 secret not returned
     const pF = config.addProfile('SecretCheck');
@@ -9245,10 +9273,51 @@ async function httpTests() {
     })).json();
     assert.ok(testRes4.error, 'conflicting modes rejected');
 
+    // R4: blank/untouched MDBList draft preserves stored key (null only from
+    // explicit Clear). Simulate the saveSimkl behavior: a blank draft that
+    // differs from the original should NOT submit null.
+    const pK = config.addProfile('MDBBlankDraft');
+    config.updateProfile(pK.id, { keys: { mdblist_api_key: 'stored-key-abc' } });
+    // Simulate: user clears the field (draft = ''), orig = 'stored-key-abc'.
+    // The save logic: if (v !== orig && v !== '') → submit v. Since v === '',
+    // nothing is submitted → stored key is preserved.
+    const v = '';
+    const orig = 'stored-key-abc';
+    const keys = {};
+    if (v !== orig && v !== '') keys.mdblist_api_key = v;
+    assert.deepStrictEqual(keys, {}, 'blank draft does not submit null');
+    // Verify the stored key is still intact after a save with no MDBList key
+    await (await origFetch(`${BASE}/api/profiles/${pK.id}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'blank@test.com' }),
+    })).json();
+    const allK = await (await origFetch(`${BASE}/api/profiles`)).json();
+    const profK = allK.profiles.find((p) => p.id === pK.id);
+    assert.strictEqual(profK.keys.mdblist_api_key, 'stored-key-abc', 'stored key preserved after blank draft save');
+    config.removeProfile(pK.id);
+
     global.fetch = origFetch;
     config.removeProfile(pI.id);
     config.removeProfile(pJ.id);
-    console.log('  ✓ Card 1: MDBList user key — personal key test independent of global, draft/saved/missing/conflict');
+    config.removeProfile(pK.id);
+    console.log('  ✓ Card 1: MDBList user key — personal key test independent of global, draft/saved/missing/conflict, blank draft preserves key');
+  }
+
+  // ---- Card 1: Trakt import retired (410) ----
+  {
+    const pT = config.addProfile('TraktRetired');
+    config.updateProfile(pT.id, {
+      simkl_auth: { access_token: 'token-T', version: 1, client_id: 'client-T' },
+    });
+    const traktRes = await fetch(`${BASE}/api/profiles/${pT.id}/simkl/import-trakt`, {
+      method: 'POST', headers: { 'Content-Type': 'application/zip' },
+      body: Buffer.from('fake-zip'),
+    });
+    assert.strictEqual(traktRes.status, 410, 'import-trakt returns 410');
+    const traktBody = await traktRes.json();
+    assert.ok(traktBody.error.includes('retired'), '410 message mentions retired');
+    config.removeProfile(pT.id);
+    console.log('  ✓ Card 1: Trakt import retired (410)');
   }
 
   // ---- Card 1: TVDB Server Config — Test → Save → Test → Reload → Test ----

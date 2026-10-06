@@ -494,15 +494,23 @@ function grantFingerprint(p) {
 router.post('/profiles/:id/simkl/check', async (req, res) => {
   const profile = config.getProfile(req.params.id);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
-  // Optional numeric `version` (the SELECTED version from the portal). When
-  // absent, the profile's stored preference is used (legacy callers retain
-  // current active-grant verification behavior).
+  // Validate the explicitly supplied version: must be numeric 1 or 2.
   const rawVersion = req.body?.version;
-  const version = (rawVersion === 1 || rawVersion === 2) ? rawVersion : undefined;
+  if (rawVersion !== undefined && rawVersion !== 1 && rawVersion !== 2) {
+    return res.status(400).json({ error: 'version must be 1 or 2' });
+  }
+  const version = rawVersion; // 1, 2, or undefined (omitted = legacy behavior)
+  // When an explicit valid version is supplied and differs from the profile's
+  // stored preference, return 409 without any provider call (configuration
+  // changed — the user must save the new preference first).
+  const savedPref = profile.simkl_auth_version;
+  if (version !== undefined && version !== savedPref) {
+    return res.status(409).json({ error: 'Configuration changed — save the selected version first', target_version: version });
+  }
   let result = await simkl.manualCheck(profile, { version });
   const current = config.getProfile(profile.id);
   if (!current || result.check_fingerprint !== grantFingerprint(current)) {
-    return res.json({ state: 'credential_mismatch', message: 'Simkl connection changed — check again', connected: false });
+    return res.json({ state: 'credential_mismatch', message: 'Simkl connection changed — check again', connected: false, target_version: version });
   }
   // Keep the SELECTED readiness out of the OLD grant's verification cache/badge
   // when the selected version does not match the active grant's version.
@@ -512,7 +520,7 @@ router.post('/profiles/:id/simkl/check', async (req, res) => {
     const check = { state: result.state, message: result.message, username: result.username || null, account_id: result.account_id || null, checked_at: Date.now() };
     simklChecks.set(grantFingerprint(current), check);
   }
-  res.json({ state: result.state, message: result.message, username: result.username || null, account_id: result.account_id || null, connected: result.state === 'connected' });
+  res.json({ state: result.state, message: result.message, username: result.username || null, account_id: result.account_id || null, connected: result.state === 'connected', target_version: version });
 });
 
 // Passive status poll (mandate M6): LIGHTWEIGHT — no Simkl call. Returns the
@@ -776,51 +784,14 @@ router.post('/profiles/:id/simkl/sync', async (req, res) => {
   }
 });
 
-// ---- One-time Trakt → Simkl import ----
-// The user uploads their Trakt data-export ZIP; we push its watched history into
-// this profile's Simkl account, then resync so the app's watched store reflects
-// it. Runs on the global job queue (fire-and-forget, polled via /job) because a
-// full library is minutes of paced 1-POST/s writes — far past Cloudflare's ~100s
-// origin cap if held open. The ZIP arrives as a raw body (express.raw); the JSON
-// body parser above skips it because the content-type isn't application/json.
+// ---- Trakt → Simkl import (retired) ----
+// The endpoint is retired: it returns 410 before reading ZIPs, queueing jobs,
+// calling providers, or writing history. Historical data and unrelated legacy
+// fields are preserved.
 router.post('/profiles/:id/simkl/import-trakt',
   express.raw({ type: ['application/zip', 'application/x-zip-compressed', 'application/octet-stream'], limit: '250mb' }),
   (req, res) => {
-    const profile = config.getProfile(req.params.id);
-    if (!profile) return res.status(404).json({ error: 'Profile not found' });
-    if (!profile.simkl_auth?.access_token) return res.status(400).json({ error: 'Connect Simkl first' });
-    const zip = req.body;
-    if (!Buffer.isBuffer(zip) || zip.length === 0) {
-      return res.status(400).json({ error: 'No ZIP file received — upload your Trakt data export .zip' });
-    }
-    if (jobs.isBusy(profile.id)) {
-      return res.status(409).json({ error: 'A build or import is already running for this profile — let it finish first' });
-    }
-    jobs.enqueue(profile.id, 'trakt-import', async (progress) => {
-      // Band each phase's own 0–100 into the overall bar so the last phase (the
-      // pool rebuild) is included — the whole point: the rebuild runs HERE, after
-      // the full import + resync, on the complete watched store, not off a
-      // partial mid-import sync the scheduler happened to catch.
-      const band = (lo, hi) => (p, label) => progress(lo + ((hi - lo) * p) / 100, label);
-
-      const imported = await traktImport.importFromZip(profile, zip, console, band(0, 68));
-      // Pull the now-updated Simkl history into the local watched store, then top
-      // up genre/age enrichment — same as the "Sync watched now" path.
-      progress(70, 'Syncing watched history from Simkl');
-      const sync = await watchedStore.syncFromSimkl(profile, console, { force: true });
-      try { await watchedStore.enrichPending(profile.id, console); } catch { /* best-effort */ }
-      // Rebuild the recommendation pool directly (not via jobs.enqueue — we're
-      // already inside a job; enqueuing would deadlock behind ourselves) so it's
-      // deterministic and built from the COMPLETE imported history.
-      progress(76, 'Rebuilding recommendations');
-      const built = await recommendationStore.buildPool(profile, console, band(78, 100));
-      return {
-        ...imported,
-        resync: { total: sync.total, breakdown: sync.breakdown },
-        rebuilt: built && !built.skipped ? { stored: built.stored, seeds: built.seeds } : null,
-      };
-    }).catch((err) => console.error(`[trakt-import] ${profile.name}: ${err.message}`));
-    res.status(202).json({ started: true, job: jobs.snapshot(profile.id) });
+    res.status(410).json({ error: 'Trakt import is retired. Your existing watched history is preserved.' });
   });
 
 // ---- Recommendation builder (v6 F5) ----

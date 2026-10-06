@@ -268,6 +268,44 @@ function keyRow(id, dataKey, value, testService) {
   return `<div class="keyrow">${keyField(dataKey, value)}${test}</div>${result}`;
 }
 
+// Saved-secret row: shows "Saved securely" with a Replace action when the
+// secret is stored. Replace reveals an empty input for entering a new value.
+// The eye toggles only the entered draft. Save persists; Cancel preserves.
+function savedSecretRow(id, dataKey, saved) {
+  if (saved) {
+    return `<div class="keyrow" data-saved-secret="${dataKey}">
+      <span class="muted" style="align-self:center">Saved securely</span>
+      <button class="ghost mini" onclick="replaceSecret('${id}','${dataKey}')">Replace</button>
+    </div>`;
+  }
+  return `<div class="keyrow" data-saved-secret="${dataKey}">
+    <div class="keyfield">
+      <input type="password" data-key="${dataKey}" data-orig="" value="" placeholder="not set" autocomplete="off" spellcheck="false" ${IGNORE_PW_MANAGERS}>
+      <button type="button" class="eye" onclick="toggleKey(this)" title="Show / hide">${EYE_OFF}</button>
+    </div>
+  </div>`;
+}
+
+// Replace: reveal the empty replacement input for a saved secret.
+function replaceSecret(id, dataKey) {
+  const row = document.querySelector(`[data-id="${id}"] [data-saved-secret="${dataKey}"]`);
+  if (!row) return;
+  row.innerHTML = `<div class="keyfield">
+    <input type="password" data-key="${dataKey}" data-orig="" value="" placeholder="Enter new secret" autocomplete="off" spellcheck="false" ${IGNORE_PW_MANAGERS}>
+    <button type="button" class="eye" onclick="toggleKey(this)" title="Show / hide">${EYE_OFF}</button>
+  </div>
+  <button class="ghost mini" onclick="saveSimkl('${id}')">Save</button>
+  <button class="ghost mini" onclick="cancelSecret('${id}','${dataKey}')">Cancel</button>`;
+}
+
+// Cancel: restore the "Saved securely" indicator (preserves the stored secret).
+function cancelSecret(id, dataKey) {
+  const row = document.querySelector(`[data-id="${id}"] [data-saved-secret="${dataKey}"]`);
+  if (!row) return;
+  row.innerHTML = `<span class="muted" style="align-self:center">Saved securely</span>
+    <button class="ghost mini" onclick="replaceSecret('${id}','${dataKey}')">Replace</button>`;
+}
+
 // Per-profile MDBList key row (Advanced → API Keys). Unlike the global Server
 // Config key row, the Test button tests the per-profile key (a draft without
 // saving it, or the stored user key when untouched) — never the global key.
@@ -514,40 +552,42 @@ function render(profiles) {
 
         <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
           <b>Simkl Integration</b>
-          <div class="muted" style="margin-top:4px">Watch tracker. Create a Simkl API app for <b>${esc(p.name)}</b> — AUTH V1 (PIN device flow) and/or AUTH V2 (OAuth + PKCE, requires a public HTTPS <code>EXTERNAL_URL</code>). Paste the Client ID (and Secret), Save, then Connect. The status below is verified <b>live</b> against Simkl.</div>
-          <div style="margin-top:12px"><label>Auth version</label>
-            <select data-auth-version onchange="toggleSimklVersion('${p.id}')">
-              <option value="1" ${p.simkl_auth_version === 1 ? 'selected' : ''}>AUTH V1 (PIN device flow)</option>
-              <option value="2" ${p.simkl_auth_version === 2 ? 'selected' : ''}>AUTH V2 (OAuth + PKCE)</option>
-            </select>
-            <div class="muted" style="font-size:11px;margin-top:3px">V2 requires a public HTTPS <code>EXTERNAL_URL</code> for the callback. The active token's version is independent of this preference (selecting V2 does not change an existing V1 token).</div>
-          </div>
-          <div class="keys-list" style="margin-top:12px">
-            <div data-simkl-v1 ${p.simkl_auth_version === 2 ? 'style="display:none"' : ''}>
-              <div><label>Client ID
-                  <a class="getkey" href="https://simkl.com/settings/developer/new/" target="_blank" rel="noopener">get key ↗</a></label>
-                ${keyRow(p.id, 'simkl_client_id', p.keys.simkl_client_id)}</div>
-              <div><label>Client Secret <span class="muted">(optional for PIN)</span></label>
-                ${keyRow(p.id, 'simkl_client_secret', p.keys.simkl_client_secret)}</div>
+          <div class="muted" style="margin-top:4px">Watch tracker. Create a Simkl API app for <b>${esc(p.name)}</b> — AUTH V1 (PIN device flow) and/or AUTH V2 (OAuth + PKCE, requires a public HTTPS <code>EXTERNAL_URL</code>). Paste the Client ID (and Secret), Save, then Connect. Use <b>Check connection</b> to verify live against Simkl.</div>
+          <div data-simkl-editor ${p.simkl_connected ? 'style="display:none"' : ''}>
+            <div style="margin-top:12px"><label>Auth version</label>
+              <select data-auth-version onchange="toggleSimklVersion('${p.id}')">
+                <option value="1" ${p.simkl_auth_version === 1 ? 'selected' : ''}>AUTH V1 (PIN device flow)</option>
+                <option value="2" ${p.simkl_auth_version === 2 ? 'selected' : ''}>AUTH V2 (OAuth + PKCE)</option>
+              </select>
+              <div class="muted" style="font-size:11px;margin-top:3px">V2 requires a public HTTPS <code>EXTERNAL_URL</code> for the callback. The active token's version is independent of this preference (selecting V2 does not change an existing V1 token).</div>
             </div>
-            <div data-simkl-v2 ${p.simkl_auth_version === 1 ? 'style="display:none"' : ''}>
-              <div><label>Client ID</label>
-                ${keyRow(p.id, 'simkl_v2_client_id', p.keys.simkl_v2_client_id)}</div>
-              <div><label>Client Secret <span class="muted">(${p.keys_set.simkl_v2_client_secret ? 'Saved securely' : 'required for V2'})</span></label>
-                ${keyRow(p.id, 'simkl_v2_client_secret', '')}</div>
+            <div class="keys-list" style="margin-top:12px">
+              <div data-simkl-v1 ${p.simkl_auth_version === 2 ? 'style="display:none"' : ''}>
+                <div><label>Client ID
+                    <a class="getkey" href="https://simkl.com/settings/developer/new/" target="_blank" rel="noopener">get key ↗</a></label>
+                  ${keyRow(p.id, 'simkl_client_id', p.keys.simkl_client_id)}</div>
+                <div><label>Client Secret <span class="muted">(optional for PIN)</span></label>
+                  ${keyRow(p.id, 'simkl_client_secret', p.keys.simkl_client_secret)}</div>
+              </div>
+              <div data-simkl-v2 ${p.simkl_auth_version === 1 ? 'style="display:none"' : ''}>
+                <div><label>Client ID</label>
+                  ${keyRow(p.id, 'simkl_v2_client_id', p.keys.simkl_v2_client_id)}</div>
+                <div><label>Client Secret <span class="muted">(${p.keys_set.simkl_v2_client_secret ? 'Saved securely' : 'required for V2'})</span></label>
+                  ${savedSecretRow(p.id, 'simkl_v2_client_secret', p.keys_set.simkl_v2_client_secret)}</div>
+              </div>
             </div>
+            <div style="margin-top:10px"><button onclick="saveSimkl('${p.id}')">Save</button>
+              <button class="ghost" onclick="checkSimklLive('${p.id}')">Check connection</button>
+              <button class="ghost" onclick="connectSimkl('${p.id}')">Connect</button></div>
           </div>
-          <div style="margin-top:10px"><button onclick="saveSimkl('${p.id}')">Save</button>
-            <button class="ghost" onclick="checkSimklLive('${p.id}')">Check connection</button>
-            <button class="ghost" onclick="connectSimkl('${p.id}')">Connect</button></div>
           <div class="simkl-flow" data-sid="${p.id}" style="margin-top:12px; padding-top:10px; border-top:1px solid var(--border)">
-            <span class="muted">Save the Client ID, then <b>Check connection</b> to verify live against Simkl.</span>
+            <span class="muted">${p.simkl_connected ? 'Connected — see status below.' : 'Save the Client ID, then <b>Check connection</b> to verify live against Simkl.'}</span>
           </div>
         </div>
 
         <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
           <b>API Keys</b>
-          <div class="muted" style="margin-top:4px">Per-profile MDBList key. Saving it does not yet replace the configured server key for normal use (Card 2 changes that).</div>
+          <div class="muted" style="margin-top:4px">Per-profile MDBList key. The server key continues to be used for normal operation at this stage.</div>
           <label style="margin-top:8px">MDBList</label>
           ${mdblistKeyRow(p.id, p.keys.mdblist_api_key)}
         </div>
@@ -935,16 +975,45 @@ function keyRowS(service, dataKey, value) {
 // display mask), so it is NEVER pre-filled into the input — the input is
 // always empty (replace-only). "Saved securely" is shown when the key is set.
 // A Test button tests the saved key ({use_saved:true}) or an unsaved
-// replacement ({key: <draft>}).
+// replacement ({key: <draft>}). Replace reveals an empty input; Cancel
+// preserves the saved key.
 function tvdbKeyRow(value) {
   const set = !!value;
-  return `<div class="keyrow">
+  if (set) {
+    return `<div class="keyrow" data-saved-secret="tvdb_api_key">
+      <span class="muted" style="align-self:center">Saved securely</span>
+      <button class="ghost mini" onclick="replaceTvdbKey()">Replace</button>
+      <button class="ghost mini" onclick="testSettingKey('tvdb','tvdb_api_key',this)">Test</button>
+    </div><span class="tres" data-tres="tvdb_api_key"></span>`;
+  }
+  return `<div class="keyrow" data-saved-secret="tvdb_api_key">
     <div class="keyfield">
-      <input type="password" data-key="tvdb_api_key" data-orig="" value="" placeholder="${set ? 'Saved securely — enter to replace' : 'not set'}" autocomplete="off" spellcheck="false" ${IGNORE_PW_MANAGERS}>
+      <input type="password" data-key="tvdb_api_key" data-orig="" value="" placeholder="not set" autocomplete="off" spellcheck="false" ${IGNORE_PW_MANAGERS}>
       <button type="button" class="eye" onclick="toggleKey(this)" title="Show / hide">${EYE_OFF}</button>
     </div>
     <button class="ghost mini" onclick="testSettingKey('tvdb','tvdb_api_key',this)">Test</button>
   </div><span class="tres" data-tres="tvdb_api_key"></span>`;
+}
+
+// Replace: reveal the empty replacement input for the TVDB key.
+function replaceTvdbKey() {
+  const row = document.querySelector('#serverConfig [data-saved-secret="tvdb_api_key"]');
+  if (!row) return;
+  row.innerHTML = `<div class="keyfield">
+    <input type="password" data-key="tvdb_api_key" data-orig="" value="" placeholder="Enter new key" autocomplete="off" spellcheck="false" ${IGNORE_PW_MANAGERS}>
+    <button type="button" class="eye" onclick="toggleKey(this)" title="Show / hide">${EYE_OFF}</button>
+  </div>
+  <button class="ghost mini" onclick="saveSettings(document.querySelector('#serverConfig .row button'))">Save</button>
+  <button class="ghost mini" onclick="cancelTvdbKey()">Cancel</button>`;
+}
+
+// Cancel: restore the "Saved securely" indicator (preserves the stored key).
+function cancelTvdbKey() {
+  const row = document.querySelector('#serverConfig [data-saved-secret="tvdb_api_key"]');
+  if (!row) return;
+  row.innerHTML = `<span class="muted" style="align-self:center">Saved securely</span>
+    <button class="ghost mini" onclick="replaceTvdbKey()">Replace</button>
+    <button class="ghost mini" onclick="testSettingKey('tvdb','tvdb_api_key',this)">Test</button>`;
 }
 
 function collectSettings() {
@@ -1137,15 +1206,27 @@ async function saveSimkl(id) {
     const v = i.value.trim();
     if (v !== (i.dataset.orig || '')) keys[i.dataset.key] = v;
   });
-  // Per-profile MDBList key: a changed value saves (blank = explicit clear);
-  // an untouched value is never submitted (preserves the stored key).
+  // Per-profile MDBList key: a changed non-blank value saves; a blank or
+  // untouched draft preserves the stored key (null only from explicit Clear).
   const mdb = card.querySelector('[data-key="mdblist_api_key"]');
   if (mdb) {
     const v = mdb.value.trim();
     const orig = mdb.dataset.orig || '';
-    if (v !== orig) keys.mdblist_api_key = v === '' ? null : v;
+    if (v !== orig && v !== '') keys.mdblist_api_key = v;
   }
   await api('/profiles/' + id, { method: 'PUT', body: { email, simkl_auth_version: authVersion, ...(Object.keys(keys).length ? { keys } : {}) } });
+  // Reflect successful persistence: update field originals so subsequent
+  // saves only resubmit genuinely changed values.
+  block.querySelectorAll('[data-key]').forEach(i => { i.dataset.orig = i.value.trim(); });
+  if (mdb) mdb.dataset.orig = mdb.value.trim();
+  // Revert saved-secret rows to "Saved securely" after a successful save.
+  card.querySelectorAll('[data-saved-secret]').forEach(row => {
+    const input = row.querySelector('input[data-key]');
+    if (input && input.value.trim()) {
+      row.innerHTML = `<span class="muted" style="align-self:center">Saved securely</span>
+        <button class="ghost mini" onclick="replaceSecret('${id}','${input.dataset.key}')">Replace</button>`;
+    }
+  });
   dirty = false; toast('Saved'); pollStatus();
 }
 
@@ -1163,10 +1244,11 @@ function toggleSimklVersion(id) {
 
 // "Change connection" (connected summary): reveal the version selector /
 // credential editor so the user can reauthorize or migrate V1→V2 without a
-// Disconnect. The editor is always present in the Simkl Integration section;
-// this just scrolls to it.
+// Disconnect. The editor is hidden when connected; this reveals it.
 function revealSimklEditor(id) {
   const card = document.querySelector(`[data-id="${id}"]`);
+  const editor = card?.querySelector('[data-simkl-editor]');
+  if (editor) editor.style.display = '';
   const sel = card?.querySelector('[data-auth-version]');
   if (sel) sel.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
@@ -1214,6 +1296,15 @@ async function testMdblistUser(id, btn) {
 // never erases the key (handled by saveSimkl's data-orig comparison).
 async function clearMdblistUser(id) {
   await api('/profiles/' + id, { method: 'PUT', body: { keys: { mdblist_api_key: null } } });
+  // Update the specific field's value, original, and saved indicator in place
+  // (no full-card rebuild that would discard drafts in other fields).
+  const card = document.querySelector(`[data-id="${id}"]`);
+  const mdb = card?.querySelector('[data-key="mdblist_api_key"]');
+  if (mdb) {
+    mdb.value = '';
+    mdb.dataset.orig = '';
+    mdb.placeholder = 'not set';
+  }
   dirty = false; toast('MDBList key cleared'); pollStatus();
 }
 
@@ -1350,23 +1441,38 @@ async function checkSimklStatus(id) {
   } catch (e) { /* passive poll failure is silent */ }
 }
 
-// Manual Check connection — POSTs /simkl/check (the provider's one-request
-// live check). Renders the structured state (M6): connected, v1_ready_unconnected,
-// not_authorized, wrong_auth_version, client_id_rejected, credential_mismatch,
-// rate_limited, provider_unavailable, missing_configuration.
-// The check explicitly targets the SELECTED version (numeric `version`), so a
-// check never validates the old grant when the user has switched versions.
+// Manual Check connection — saves the selected configuration (single coherent
+// PUT with the selected version's edited fields), then POSTs /simkl/check.
+// Stops on Save failure. Hidden-version drafts are never submitted.
 async function checkSimklLive(id) {
   const card = document.querySelector(`[data-id="${id}"]`);
   const flowEl = card?.querySelector('.simkl-flow');
   if (!flowEl) return;
-  const version = parseInt(card.querySelector('[data-auth-version]').value, 10);
+  // Capture the request identity: profile id + selected version. If the
+  // profile or selection changes while awaiting, the result is stale.
+  const requestVersion = parseInt(card.querySelector('[data-auth-version]').value, 10);
+  flowEl.innerHTML = '<span class="muted">⟳ Saving & checking Simkl…</span>';
+  try {
+    await saveSimkl(id);
+  } catch (e) {
+    flowEl.innerHTML = `<span style="color:var(--err)">Save failed: ${esc(e.message)}</span>`;
+    return;
+  }
   flowEl.innerHTML = '<span class="muted">⟳ Checking Simkl live…</span>';
   try {
-    const r = await api(`/profiles/${id}/simkl/check`, { method: 'POST', body: { version } });
+    const r = await api(`/profiles/${id}/simkl/check`, { method: 'POST', body: { version: requestVersion } });
+    // Discard stale results: if the profile is gone or the selected version
+    // changed while awaiting, the result no longer applies.
+    const currentCard = document.querySelector(`[data-id="${id}"]`);
+    const currentVersion = parseInt(currentCard?.querySelector('[data-auth-version]')?.value, 10);
+    if (currentVersion !== requestVersion) return;
     renderSimklFlow(id, r);
   } catch (e) {
-    flowEl.innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`;
+    const currentCard = document.querySelector(`[data-id="${id}"]`);
+    const currentVersion = parseInt(currentCard?.querySelector('[data-auth-version]')?.value, 10);
+    if (currentVersion !== requestVersion) return;
+    const flowEl2 = currentCard?.querySelector('.simkl-flow');
+    if (flowEl2) flowEl2.innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`;
   }
 }
 
@@ -1376,23 +1482,29 @@ function renderSimklFlow(id, r) {
   const card = document.querySelector(`[data-id="${id}"]`);
   const flowEl = card?.querySelector('.simkl-flow');
   if (!flowEl) return;
-  // Update the header badge to match the latest live check.
+  const p = PROFILES.find(x => x.id === id);
+  const activeVersion = p?.simkl_active_version || null;
+  // A target check for a version that does NOT match the active grant must not
+  // overwrite the connected summary. The active grant's controls (Sync,
+  // Disconnect, Change connection) remain; the target's readiness is shown
+  // as a supplementary note.
+  const isTargetMismatch = r.target_version !== undefined && activeVersion !== null && r.target_version !== activeVersion;
+  // Update the header badge: the active grant's state is authoritative.
   const badge = card.querySelector('.hdr-badge');
   if (badge) {
-    if (r.connected) badge.innerHTML = '<span class="badge ok">Simkl connected</span>';
+    if (r.connected || isTargetMismatch) badge.innerHTML = '<span class="badge ok">Simkl connected</span>';
     else if (r.state === 'token_stored') badge.innerHTML = '<span class="badge warn">Simkl token stored</span>';
     else badge.innerHTML = '<span class="badge err">Simkl not connected</span>';
   }
-  if (r.connected) {
-    // Identify the ACTIVE version (the grant's version) so it cannot be
-    // confused with the SELECTED preference. The selector/editor is always
-    // visible in the Simkl Integration section; "Change connection" just
-    // reveals it for reauthorization / V1-to-V2 migration without a
-    // Disconnect. No old credentials are shown here.
-    const p = PROFILES.find(x => x.id === id);
-    const activeVersion = p?.simkl_active_version || (r.username ? null : null);
+  if (r.connected || isTargetMismatch) {
+    // Active grant is connected (or a target check for a different version
+    // returned while the active grant is still connected).
     const activeTag = activeVersion ? ` (AUTH V${activeVersion})` : '';
+    const targetNote = isTargetMismatch
+      ? `<div class="muted" style="margin-top:6px;font-size:12px">Target AUTH V${r.target_version}: ${esc(r.message || r.state)}</div>`
+      : '';
     flowEl.innerHTML = `<div class="muted">✓ Connected${r.username ? ` as <b style="color:var(--ok)">${esc(r.username)}</b>` : ''} — verified live${activeTag}. <b>${r.watched_count || 0}</b> watched title(s) in the local store.</div>
+      ${targetNote}
       <div style="margin-top:8px" class="row"><button class="ghost" onclick="syncSimkl('${id}', this)">Sync watched now</button>
       <button class="ghost" onclick="disconnectSimkl('${id}')">Disconnect from Simkl</button>
       <button class="ghost" onclick="revealSimklEditor('${id}')" title="Reveal the version selector / credentials for reauthorization or V1→V2 migration">Change connection</button>

@@ -329,14 +329,15 @@ async function manualCheckImpl(profile, { version: requestedVersion } = {}) {
   // An explicit numeric `version` (the SELECTED version from the portal)
   // targets that version's readiness. When absent, the profile's stored
   // preference (legacy callers) is used — the current active-grant behavior.
-  const version = (requestedVersion === 1 || requestedVersion === 2) ? requestedVersion : (profile.simkl_auth_version || 2);
+  const explicit = requestedVersion === 1 || requestedVersion === 2;
+  const version = explicit ? requestedVersion : (profile.simkl_auth_version || 2);
   const auth = profile.simkl_auth;
   if (auth?.access_token) {
     const activeVersion = auth.version || 1;
-    // When the SELECTED version does not match the active grant's version,
-    // check the selected version's readiness (NOT the old grant). This keeps
-    // the selected readiness out of the old grant's verification cache/badge.
-    if (activeVersion !== version) {
+    // Only an EXPLICITLY selected version that differs from the active grant
+    // changes the readiness branch. An omitted version always verifies the
+    // active grant (legacy behavior).
+    if (explicit && activeVersion !== version) {
       if (version === 2) {
         const v2Id = profile.keys.simkl_v2_client_id;
         const v2Secret = profile.keys.simkl_v2_client_secret;
