@@ -282,10 +282,16 @@ async function run() {
       // and the V2 target note is appended once.
       {
         const regId = add('RegTarget');
+        // Force a full page load (hash-only change doesn't re-trigger load()).
+        await page.goto(base + '/configure/');
         await page.goto(base + '/configure/#simkl?profile=' + regId);
         const regCard = page.locator('[data-id="' + regId + '"]');
-        // Select V1 (active version) and check to verify.
+        // Wait for the editor to render (checkSimklStatus is async via readSimklCallbackError).
+        await regCard.locator('[data-simkl-editor]').waitFor({ state: 'visible' });
+        // Select V1 (active version) before waiting for the Check button.
         await regCard.locator('[data-auth-version]').selectOption('1');
+        // Wait for the Check button to appear (renderSimklFlow is async after checkSimklStatus).
+        await regCard.locator('.simkl-flow').getByRole('button', { name: 'Check connection', exact: true }).waitFor();
         await regCard.locator('.simkl-flow').getByRole('button', { name: 'Check connection', exact: true }).click();
         await regCard.locator('.simkl-flow').filter({ hasText: '✓ Connected' }).waitFor();
         // Record the active details: username and watched count.

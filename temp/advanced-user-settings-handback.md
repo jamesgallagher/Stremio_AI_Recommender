@@ -76,14 +76,19 @@
 
 ### Playwright status
 
-**Playwright is not installed on this machine.** The 21 non-browser lifecycle checks pass. The `--browser` section (including the new active-state regression) requires `npm install playwright` to run. The browser test code is verified correct by inspection against the updated UI. **James must hand back a candidate for Chet's execution** — browser code inspection is not a passing run, and fixture repairs are not red/green proof of a production regression.
+**Playwright is installed.** All 24 `--browser` checks pass, including the 4 browser regressions:
+1. Pending migration (V2 replacement secret saved while pending)
+2. Callback failure (OAuth consent='wrong')
+3. Actual success (OAuth consent='good')
+4. **RegTarget active-state regression** — V1 active + V2 target: active username/watched count/Sync/Disconnect preserved after V2 Check; V2 target note appended exactly once; badge remains "Simkl connected"
 
 ## Tests (all pass on final head `73f576f`)
 
 - **smoke:** 216 unit + 59 async/http + T1-T8 + Card 1 (10 focused checks)
 - **integration:** 271 checks
 - **mobile:** 75 unit + http
-- **simkl.lifecycle:** 21 checks (non-browser; `--browser` requires Playwright)
+- **simkl.lifecycle:** 21 checks (non-browser)
+- **simkl.lifecycle --browser:** 24 checks (Playwright, Chromium; includes 4 browser regressions)
 
 ## Card 1 acceptance coverage
 
@@ -116,10 +121,10 @@
 | Other-version readiness appends target result, preserves active state | `Card 1: Other-version readiness` |
 | TVDB Replace keeps Test button; draft test sends entered key, not saved | `Card 1: TVDB Replace` |
 | Saved-secret draft of non-selected version preserved after save | `saveSimkl` code (block-scoped, committed-fields-only) |
-| Active state (badge/username/watched/Sync/Disconnect) preserved after other-version Check | Browser regression (requires Playwright) |
-| Target note appended exactly once; passive render retains it | Browser regression (requires Playwright) |
+| Active state (badge/username/watched/Sync/Disconnect) preserved after other-version Check | Browser regression (RegTarget, `--browser` passed) |
+| Target note appended exactly once; passive render retains it | Browser regression (RegTarget, `--browser` passed) |
 | Draft edited while Save pending survives (not collapsed to Saved securely) | `saveSimkl` code (captured values + current-DOM check) |
-| Browser harness uses correct URL/version/locator/assertions | `test/simkl.lifecycle.js --browser` (requires Playwright) |
+| Browser harness uses correct URL/version/locator/assertions | `test/simkl.lifecycle.js --browser` (24 checks passed) |
 
 ## Notes for Card 2
 
