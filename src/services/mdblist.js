@@ -25,20 +25,35 @@ const MDBLIST_TIMEOUT_MS = 15000; // 15s deadline for fetch + body parse
 // the governed slot begins (after pacing wait), so rate-governor waiting is
 // not charged against the actual request deadline. Body parsing is inside the
 // governed operation so transport/body timeouts participate in breaker
-// accounting. Preserves HTTP status/headers for 429 (quota backoff) and 5xx
+// accounting. Error bodies are NOT parsed — the raw Response (with status/
+// headers) is returned to the governor so a non-JSON 429 still records
+// Retry-After. Preserves HTTP status/headers for 429 (quota backoff) and 5xx
 // (transport failure) handling.
 async function mdblistRequest(url, options = {}, apiKey) {
   const fp = keyFingerprint(apiKey);
   const result = await governor.schedule('mdblist', async () => {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), MDBLIST_TIMEOUT_MS);
-    try {
+    let timer;
+    // Independently rejecting deadline: settles even if the transport
+    // ignores the abort signal (never-settling fetch/body).
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        const err = new Error('MDBList request timed out');
+        err.timeout = true;
+        reject(err);
+        controller.abort();
+      }, MDBLIST_TIMEOUT_MS);
+    });
+    const operation = (async () => {
       const res = await fetch(url, { ...options, signal: controller.signal });
-      const body = await res.json(); // body parse inside the governed operation
-      return { res, body };
-    } finally {
-      clearTimeout(timer);
-    }
+      // Error status and Retry-After must survive HTML/empty error bodies.
+      // Do NOT parse error bodies — the governor needs the raw Response.
+      if (!res.ok) return { res, body: null };
+      if (controller.signal.aborted) throw new Error('MDBList request timed out');
+      return { res, body: await res.json() };
+    })();
+    try { return await Promise.race([operation, deadline]); }
+    finally { clearTimeout(timer); }
   }, fp);
   if (!result.res.ok) {
     const err = new Error(`MDBList request failed (${result.res.status})`);

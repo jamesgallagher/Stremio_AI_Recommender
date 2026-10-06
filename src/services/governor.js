@@ -103,16 +103,20 @@ function parseRetryAfter(value, nowMs) {
 // Reserve the next slot for a service and return the ms to wait before the call
 // may run. SYNCHRONOUS on purpose: the slot is claimed before any await, so two
 // concurrent callers get distinct, spaced slots. Exported for testing.
-function reserve(service, keyFingerprint, nowMs = Date.now()) {
+// For MDBList, `count` is false: the request is counted only when fn actually
+// starts (not on reserve), so deferred/cancelled work does not inflate counters.
+function reserve(service, keyFingerprint, nowMs = Date.now(), { count = true } = {}) {
   const lim = LIMITS[service] || { minIntervalMs: 0 };
   const s = stateFor(service, keyFingerprint);
   const at = Math.max(nowMs, s.nextAt, s.backoffUntil);
   s.nextAt = at + lim.minIntervalMs;
-  s.calls += 1;
+  if (count) {
+    s.calls += 1;
+    const day = Math.floor(nowMs / DAY_MS);
+    if (s.day !== day) { s.day = day; s.dayCalls = 0; }
+    s.dayCalls += 1;
+  }
   s.lastActivity = nowMs;
-  const day = Math.floor(nowMs / DAY_MS);
-  if (s.day !== day) { s.day = day; s.dayCalls = 0; }
-  s.dayCalls += 1;
   return Math.max(0, at - nowMs);
 }
 
@@ -164,24 +168,68 @@ async function schedule(service, fn, keyFingerprint) {
     err.retryAfterMs = wouldWait;
     throw err;
   }
-  const wait = reserve(service, keyFingerprint);
+  // MDBList: do NOT count the request on reserve (counted when fn starts).
+  const wait = reserve(service, keyFingerprint, undefined, { count: service !== 'mdblist' });
   if (wait > 0) await sleep(wait);
   // Recheck cooldown/breaker immediately before send: during the pacing sleep
-  // another call may have received a 429 with a long Retry-After, moving the
-  // allowed slot beyond the 30s bound. Defer promptly in that case.
+  // another call may have received a 429 (short or long Retry-After), moving
+  // the allowed slot. A new cooldown within the wait budget must be waited out;
+  // beyond it, defer. Do not use the tail of s.nextAt as proof that this
+  // caller's already-reserved slot is invalid: it includes later callers'
+  // reservations. Keep this caller's slot identity/time separate from
+  // provider cooldown.
   if (service === 'mdblist') {
     if (lim.breaker && isOpen(service, keyFingerprint)) {
+      // Un-reserve: the slot was reserved but no request was sent.
+      const s = stateFor(service, keyFingerprint);
+      s.nextAt = Math.max(0, s.nextAt - lim.minIntervalMs);
       const err = new Error(`MDBList circuit open — skipping (cooldown)`);
       err.circuitOpen = true;
       throw err;
     }
-    const reWait = pendingWait(service, keyFingerprint);
-    if (reWait > MDBLIST_MAX_SLOT_WAIT_MS) {
-      const err = new Error(`MDBList slot wait ${reWait}ms exceeds 30s — deferring`);
-      err.defer = true;
-      err.retryAfterMs = reWait;
-      throw err;
+    // Inspect actual credential backoff state: a new cooldown (even short)
+    // must be honored. If backoffUntil is in the future, wait it out (if
+    // within 30s) or defer (if beyond).
+    const s = stateFor(service, keyFingerprint);
+    const nowMs = Date.now();
+    if (s.backoffUntil > nowMs) {
+      const backoffWait = s.backoffUntil - nowMs;
+      if (backoffWait > MDBLIST_MAX_SLOT_WAIT_MS) {
+        // Un-reserve: the slot was reserved but no request was sent.
+        s.nextAt = Math.max(0, s.nextAt - lim.minIntervalMs);
+        const err = new Error(`MDBList backoff ${backoffWait}ms exceeds 30s — deferring`);
+        err.defer = true;
+        err.retryAfterMs = backoffWait;
+        throw err;
+      }
+      // Wait out the short cooldown, then recheck.
+      await sleep(backoffWait);
+      // Recheck after the wait: another 429 may have extended the backoff.
+      const s2 = stateFor(service, keyFingerprint);
+      if (s2.backoffUntil > Date.now()) {
+        const extendedWait = s2.backoffUntil - Date.now();
+        if (extendedWait > MDBLIST_MAX_SLOT_WAIT_MS) {
+          s2.nextAt = Math.max(0, s2.nextAt - lim.minIntervalMs);
+          const err = new Error(`MDBList backoff ${extendedWait}ms exceeds 30s — deferring`);
+          err.defer = true;
+          err.retryAfterMs = extendedWait;
+          throw err;
+        }
+      }
+      if (lim.breaker && isOpen(service, keyFingerprint)) {
+        const s3 = stateFor(service, keyFingerprint);
+        s3.nextAt = Math.max(0, s3.nextAt - lim.minIntervalMs);
+        const err = new Error(`MDBList circuit open — skipping (cooldown)`);
+        err.circuitOpen = true;
+        throw err;
+      }
     }
+    // Count the request now (fn is about to start).
+    const sCount = stateFor(service, keyFingerprint);
+    sCount.calls += 1;
+    const day = Math.floor(Date.now() / DAY_MS);
+    if (sCount.day !== day) { sCount.day = day; sCount.dayCalls = 0; }
+    sCount.dayCalls += 1;
   }
   try {
     const result = await fn();

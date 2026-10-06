@@ -598,14 +598,25 @@ function render(profiles) {
             if (ms.backing_off) html += ` — backing off (${Math.ceil((ms.backoff_ms_left || 0) / 1000)}s left)`;
             if (ms.circuit_open) html += ` — circuit open (${Math.ceil((ms.circuit_ms_left || 0) / 1000)}s left)`;
             if (ms.queue_position) html += ` — queue position ${ms.queue_position}`;
+            if (ms.queue_blocker) html += ` (blocked by ${ms.queue_blocker})`;
             html += '</div>';
-            // Deferred/partial result from the most recent rebuild
+            // Deferred/partial result from the most recent rebuild.
+            // The job can complete (state:done) with per-catalog deferred/partial
+            // results — render those, not just top-level errors.
             const job = p.status?.job;
             if (job && job.state === 'error' && job.deferred) {
               const retrySec = Math.ceil((job.retry_after_ms || 0) / 1000);
               html += `<div class="muted" style="font-size:11px;margin-top:4px">Deferred: MDBList provider cooldown (~${retrySec}s). Old catalogs intact; next queued work starts after.</div>`;
             } else if (job && job.state === 'error' && job.circuit_open) {
               html += `<div class="muted" style="font-size:11px;margin-top:4px">Circuit breaker open: MDBList transport failures. Old catalogs intact.</div>`;
+            } else if (job && job.state === 'done' && job.summary) {
+              const s = job.summary;
+              if (s.deferred > 0 || s.failed > 0) {
+                html += `<div class="muted" style="font-size:11px;margin-top:4px">Partial: ${s.ok}/${s.total} catalogs rebuilt`;
+                if (s.deferred > 0) html += `, ${s.deferred} deferred (MDBList cooldown ~${Math.ceil((s.retry_after_ms || 0) / 1000)}s)`;
+                if (s.failed > 0 && s.deferred === 0) html += `, ${s.failed} failed`;
+                html += ` — old catalogs intact for deferred/failed.</div>`;
+              }
             }
             return html;
           })()}

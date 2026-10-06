@@ -42,6 +42,22 @@ function queuePosition(profileId) {
   return i < 0 ? 0 : i + 1; // 1-based; 0 = not waiting (running or absent)
 }
 
+// Safe active/preceding job metadata: the currently running job's profile ID
+// and kind (for the portal to resolve a profile name and display as the
+// named blocker). Never exposes another profile's secrets or fingerprints.
+function activeJobInfo() {
+  if (!active) return null;
+  return { profileId: active.profileId, kind: active.kind };
+}
+
+// The queue's first (next-to-run) job, for naming the blocker when a job
+// is waiting. Returns null if the queue is empty.
+function nextJobInfo() {
+  if (!queue.length) return null;
+  const j = queue[0];
+  return { profileId: j.profileId, kind: j.kind };
+}
+
 // Enqueue a job. `run(progress)` does the work; call progress(pct, label) to
 // report. Returns a promise that settles when the job finishes. A duplicate
 // (same profile+kind, already queued/running) returns the in-flight promise.
@@ -69,7 +85,9 @@ async function pump() {
   if (active || !queue.length) return;
   const job = queue.shift();
   active = job;
-  setProgress(job.profileId, { kind: job.kind, state: 'running', pct: 0, label: 'Starting…', started_at: Date.now() });
+  // Reset stale deferred/circuit/result flags from a previous job so a new
+  // job starts with a clean state.
+  setProgress(job.profileId, { kind: job.kind, state: 'running', pct: 0, label: 'Starting…', started_at: Date.now(), deferred: null, circuit_open: null, retry_after_ms: null, result: null });
   const progress = (pct, label) => setProgress(job.profileId, {
     pct: Math.max(0, Math.min(100, Math.round(pct))),
     ...(label ? { label } : {}),
@@ -102,4 +120,4 @@ async function pump() {
 
 function _reset() { queue.length = 0; active = null; state.clear(); }
 
-module.exports = { enqueue, snapshot, isBusy, queuePosition, setProgress, _reset };
+module.exports = { enqueue, snapshot, isBusy, queuePosition, activeJobInfo, nextJobInfo, setProgress, _reset };

@@ -198,10 +198,36 @@ function publicProfile(p, req) {
           mdblist_status.today = credStats.today;
         }
       }
-      // Queue position: named preceding job if this profile is waiting
+      // Queue position: named preceding job (the ACTIVE job's profile name,
+      // not this waiting job's own label).
       if (job && job.state === 'queued') {
         mdblist_status.queue_position = jobs.queuePosition(p.id);
-        mdblist_status.queue_blocker = job.label || 'queued';
+        const activeInfo = jobs.activeJobInfo();
+        if (activeInfo) {
+          // Resolve the active job's profile name (safe: only name, no secrets)
+          const activeProfile = config.profiles.find((pr) => pr.id === activeInfo.profileId);
+          mdblist_status.queue_blocker = activeProfile ? `${activeProfile.name} (${activeInfo.kind})` : activeInfo.kind;
+        }
+      }
+      // Derive a truthful extras-job summary from actual per-catalog results.
+      // The job can complete with partial/deferred results; it must not
+      // pretend all catalogs rebuilt.
+      if (job && job.result) {
+        const results = job.result;
+        const total = Object.keys(results).length;
+        let ok = 0, failed = 0, deferred = 0;
+        let maxRetryMs = 0;
+        for (const [catId, catResult] of Object.entries(results)) {
+          if (catResult.ok) ok++;
+          else {
+            failed++;
+            if (catResult.deferred) {
+              deferred++;
+              maxRetryMs = Math.max(maxRetryMs, catResult.retry_after_ms || 0);
+            }
+          }
+        }
+        job.summary = { total, ok, failed, deferred, retry_after_ms: maxRetryMs };
       }
       return { ...st, job, rebuilding: st.rebuilding || jobs.isBusy(p.id), mdblist_status };
     })(),
