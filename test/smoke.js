@@ -5,10 +5,8 @@ process.env.PORT = '7311';
 process.env.SECRET_KEY = process.env.SECRET_KEY || 'test-secret-key-do-not-use-in-prod';
 // Hermetic: src/server requires dotenv, which loads a developer's real .env when
 // present. Pin the vars the tests assume (empty, not deleted — dotenv won't
-// override an already-set var): admin creds OFF (open portal), and no
-// EXTERNAL_URL so install/dnr links use the request host (localhost:7311).
-process.env.ADMIN_USER = '';
-process.env.ADMIN_PASSWORD = '';
+// override an already-set var): no EXTERNAL_URL so install/dnr links use the
+// request host (localhost:7311).
 process.env.EXTERNAL_URL = '';
 
 const assert = require('assert');
@@ -6314,6 +6312,18 @@ async function httpTests() {
 
   console.log('http:');
   require('../src/server');
+  // AUTH-1: provision an admin session so /api requests carry the air_sid cookie.
+  const { provisionAdmin, cookieHeader } = require('./helpers/admin-session');
+  const { token: adminToken } = provisionAdmin();
+  const adminCookie = cookieHeader(adminToken);
+  const rawFetch = global.fetch;
+  global.fetch = (url, opts = {}) => {
+    const u = typeof url === 'string' ? url : url.url || '';
+    if (u.includes('/api/') || u.includes('/configure')) {
+      opts.headers = { ...(opts.headers || {}), Cookie: adminCookie };
+    }
+    return rawFetch(url, opts);
+  };
   // The migrateFromProfiles unit test above seeds the GLOBAL settings with
   // JAMES-* lookup keys. Now that the addon reads GLOBAL keys, clear them so the
   // addon-serve tests start from a known "no keys" baseline (tests that need a
@@ -7066,10 +7076,11 @@ async function httpTests() {
     global.fetch = async () => { throw new Error('Simkl must not be called on cancellation'); };
     try {
       // The cancellation redirects to the portal (fetch follows the 302 to the
-      // /configure/ page). The existing grant is preserved (no overwrite).
+      // /configure/ page, which redirects to /mobile/?next= for sign-in).
+      // The existing grant is preserved (no overwrite).
       const res = await origFetch(`${BASE}/simkl/oauth2/callback?error=access_denied&state=${encodeURIComponent(state)}`);
       assert.strictEqual(res.status, 200, 'cancellation lands on the portal page');
-      assert.ok(res.url.includes('/configure/'), 'redirected to the portal');
+      assert.ok(res.url.includes('/mobile/?next='), 'redirected to sign-in (portal behind admin auth)');
       // The existing grant is preserved (no overwrite).
       assert.strictEqual(config.getProfile(cancelProfile.id).simkl_auth.access_token, 'v2-existing', 'existing grant preserved on cancellation');
     } finally {

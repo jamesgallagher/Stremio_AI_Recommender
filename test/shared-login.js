@@ -199,6 +199,124 @@ function makeLegacy(name, email, createdAt) {
   });
 
   console.log(`\nshared-login unit: all ${passed} checks passed.`);
+
+  // ---- HTTP surface (T12-T22) ----
+  console.log('shared-login http:');
+  require('../src/server');
+  const { provisionAdmin, cookieHeader } = require('./helpers/admin-session');
+  const { token: adminToken } = provisionAdmin();
+  const adminCookie = cookieHeader(adminToken);
+  const BASE = `http://localhost:${process.env.PORT}`;
+
+  // T12: GET /api/me returns is_admin
+  await ok('T12 GET /api/me returns is_admin', async () => {
+    const res = await fetch(`${BASE}/api/me`, { headers: { Cookie: adminCookie } });
+    assert.strictEqual(res.status, 200);
+    const body = await res.json();
+    assert.strictEqual(body.profile.is_admin, true);
+  });
+
+  // T13: requireAdminApi 401 {auth:'signin'} when no session
+  await ok('T13 /api 401 {auth:signin} without session', async () => {
+    const res = await fetch(`${BASE}/api/version`);
+    assert.strictEqual(res.status, 401);
+    const body = await res.json();
+    assert.deepStrictEqual(body, { auth: 'signin' });
+  });
+
+  // T14: requireAdminApi 403 {auth:'forbidden'} when session but not admin
+  await ok('T14 /api 403 {auth:forbidden} for non-admin session', async () => {
+    // Create a non-admin profile + session.
+    const nonAdmin = config.addProfile('NonAdmin');
+    config.updateProfile(nonAdmin.id, { email: 'nonadmin@example.com' });
+    const { token } = auth.createSession(nonAdmin.id);
+    const res = await fetch(`${BASE}/api/version`, { headers: { Cookie: `air_sid=${token}` } });
+    assert.strictEqual(res.status, 403);
+    const body = await res.json();
+    assert.deepStrictEqual(body, { auth: 'forbidden' });
+  });
+
+  // T15: requireAdminApi passes when admin
+  await ok('T15 /api passes for admin session', async () => {
+    const res = await fetch(`${BASE}/api/version`, { headers: { Cookie: adminCookie } });
+    assert.strictEqual(res.status, 200);
+  });
+
+  // T16: requireAdminPage 302 → /mobile/?next=%2Fconfigure%2F when no session
+  await ok('T16 /configure 302 → /mobile/?next= without session', async () => {
+    const res = await fetch(`${BASE}/configure/`, { redirect: 'manual' });
+    assert.strictEqual(res.status, 302);
+    assert.ok(res.headers.get('location').includes('/mobile/?next='));
+  });
+
+  // T17: requireAdminPage 302 → /mobile/?next=%2Fconfigure%2F when session but not admin
+  await ok('T17 /configure 302 → /mobile/?next= for non-admin session', async () => {
+    const nonAdmin = config.addProfile('NonAdmin2');
+    config.updateProfile(nonAdmin.id, { email: 'nonadmin2@example.com' });
+    const { token } = auth.createSession(nonAdmin.id);
+    const res = await fetch(`${BASE}/configure/`, { headers: { Cookie: `air_sid=${token}` }, redirect: 'manual' });
+    assert.strictEqual(res.status, 302);
+    assert.ok(res.headers.get('location').includes('/mobile/?next='));
+  });
+
+  // T18: requireAdminPage passes when admin
+  await ok('T18 /configure passes for admin session', async () => {
+    const res = await fetch(`${BASE}/configure/`, { headers: { Cookie: adminCookie } });
+    assert.strictEqual(res.status, 200);
+  });
+
+  // T19: Legacy cookie upgrade (mobile_sid → air_sid)
+  await ok('T19 legacy mobile_sid cookie upgrades to air_sid', async () => {
+    const res = await fetch(`${BASE}/api/me`, { headers: { Cookie: `mobile_sid=${adminToken}` } });
+    assert.strictEqual(res.status, 200);
+    const setCookies = res.headers.get('set-cookie') || '';
+    assert.ok(setCookies.includes('air_sid='), 'air_sid cookie set');
+    assert.ok(setCookies.includes('mobile_sid=') && setCookies.includes('Max-Age=0'), 'mobile_sid cleared');
+  });
+
+  // T20: clearSessionCookies clears both cookies
+  await ok('T20 logout clears both air_sid and mobile_sid', async () => {
+    const res = await fetch(`${BASE}/mobile/api/auth/logout`, { method: 'POST', headers: { Cookie: adminCookie } });
+    assert.strictEqual(res.status, 200);
+    const setCookies = res.headers.get('set-cookie') || '';
+    assert.ok(setCookies.includes('air_sid='), 'air_sid cleared');
+    assert.ok(setCookies.includes('mobile_sid='), 'mobile_sid cleared');
+  });
+
+  // T20 cleared the admin session — re-provision for T21/T22.
+  const { token: adminToken2 } = provisionAdmin();
+  const adminCookie2 = cookieHeader(adminToken2);
+
+  // T21: PUT /api/profiles/:id with is_admin error codes
+  await ok('T21 PUT is_admin error codes over HTTP', async () => {
+    const a = config.listProfiles().find((p) => p.is_admin === true);
+    // Demote the only admin → LAST_ADMIN (409).
+    const res1 = await fetch(`${BASE}/api/profiles/${a.id}`, {
+      method: 'PUT', headers: { Cookie: adminCookie2, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ is_admin: false }),
+    });
+    assert.strictEqual(res1.status, 409);
+    const body1 = await res1.json();
+    assert.ok(body1.error.includes('at least one admin'));
+    // BAD_ADMIN_FLAG (400).
+    const res2 = await fetch(`${BASE}/api/profiles/${a.id}`, {
+      method: 'PUT', headers: { Cookie: adminCookie2, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ is_admin: 'true' }),
+    });
+    assert.strictEqual(res2.status, 400);
+  });
+
+  // T22: DELETE /api/profiles/:id with LAST_ADMIN
+  await ok('T22 DELETE only admin → 409 LAST_ADMIN', async () => {
+    const a = config.listProfiles().find((p) => p.is_admin === true);
+    const res = await fetch(`${BASE}/api/profiles/${a.id}`, { method: 'DELETE', headers: { Cookie: adminCookie2 } });
+    assert.strictEqual(res.status, 409);
+    const body = await res.json();
+    assert.ok(body.error.includes('at least one admin'));
+  });
+
+  console.log(`\nshared-login http: all ${passed - 7} HTTP checks passed.`);
+  process.exit(0);
 })().catch((err) => {
   console.error('\n✗ SHARED-LOGIN FAILED:', err && err.stack ? err.stack : err);
   process.exit(1);

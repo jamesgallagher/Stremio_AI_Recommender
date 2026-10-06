@@ -46,6 +46,11 @@ router.get('/version', (req, res) => {
   res.json({ version, secrets_locked: config.secretsLocked(), encryption_available: crypto.encryptionAvailable() });
 });
 
+// AUTH-1: current admin's profile (behind requireAdminApi — req.profile is set).
+router.get('/me', (req, res) => {
+  res.json({ profile: publicProfile(req.profile, req) });
+});
+
 // Rate-governor snapshot: per-service call totals, today's count vs any daily
 // cap, and current throttle/backoff state. Observability for the heavy paths
 // (Simkl 1-POST/s write cap, TMDB build volume, Jikan 60/min) — GET /api/governor.
@@ -165,6 +170,7 @@ function publicProfile(p, req) {
     simkl_v2_callback_uri: simklV2CallbackUri(),
     simkl_v2_callback_ready: !!simklV2CallbackUri(),
     email: p.email || '', // user email — Mobile Companion passwordless login (stored only for now)
+    is_admin: p.is_admin === true, // AUTH-1: admin flag for /configure access + Admin checkbox
     // Auto-scrobble config — password is never returned, only whether it's set.
     scrobble: {
       enabled: !!p.scrobble?.enabled,
@@ -288,6 +294,7 @@ router.put('/profiles/:id', (req, res) => {
   const patch = {};
   if (req.body.name !== undefined) patch.name = req.body.name;
   if (req.body.email !== undefined) patch.email = req.body.email;
+  if (req.body.is_admin !== undefined) patch.is_admin = req.body.is_admin;
   if (req.body.filters) patch.filters = req.body.filters;
   if (req.body.catalogs) patch.catalogs = req.body.catalogs;
   if (req.body.keys) {
@@ -342,6 +349,9 @@ router.put('/profiles/:id', (req, res) => {
     if (err.message && err.message.includes('is already used by profile')) {
       return res.status(409).json({ error: err.message });
     }
+    // AUTH-1 error codes → stable HTTP status + body.
+    if (err.code === 'LAST_ADMIN') return res.status(409).json({ error: err.message });
+    if (err.code === 'ADMIN_NEEDS_EMAIL' || err.code === 'BAD_ADMIN_FLAG') return res.status(400).json({ error: err.message });
     throw err;
   }
   const { profile, engineChanged } = result;
@@ -383,7 +393,12 @@ router.put('/profiles/:id', (req, res) => {
 });
 
 router.delete('/profiles/:id', (req, res) => {
-  if (!config.removeProfile(req.params.id)) return res.status(404).json({ error: 'Profile not found' });
+  try {
+    if (!config.removeProfile(req.params.id)) return res.status(404).json({ error: 'Profile not found' });
+  } catch (err) {
+    if (err.code === 'LAST_ADMIN') return res.status(409).json({ error: err.message });
+    throw err;
+  }
   simklFlows.delete(req.params.id);
   try { watchedStore.deleteForProfile(req.params.id); recommendationStore.deleteForProfile(req.params.id); tasteFeedback.deleteForProfile(req.params.id); serveCalibration.deleteForProfile(req.params.id); } catch (err) { console.warn(`[store] cleanup failed for ${req.params.id}: ${err.message}`); }
   res.json({ ok: true });
