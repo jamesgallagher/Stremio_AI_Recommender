@@ -18,6 +18,7 @@ const NOT_RATED = null;
 const CSM_TTL_MS = 30 * 24 * 3600e3; // ratings are near-static; refresh monthly
 const BATCH_SIZE = 50;
 const PER_TITLE_CAP = 25; // ceiling on the per-title fallback (quota guard)
+const MDBLIST_TIMEOUT_MS = 15000; // 15s deadline for fetch + body parse
 
 // The Common Sense age is MDBList's `age_rating` (a number). `commonsense` is
 // a BOOLEAN availability flag — reading IT as the age produced NaN, so every
@@ -49,13 +50,21 @@ async function fetchJson(url) {
   // Extract the apikey from the URL for the governor's per-credential partitioning
   const match = url.match(/apikey=([^&]+)/);
   const fp = keyFingerprint(match ? decodeURIComponent(match[1]) : '');
-  const res = await governor.schedule('mdblist', () => fetch(url, { headers: { 'User-Agent': USER_AGENT } }), fp);
-  if (!res.ok) {
-    const err = new Error(`MDBList request failed (${res.status})`);
-    err.status = res.status;
-    throw err;
+  // 15s deadline covers both the fetch and the body parse. Timer cleanup +
+  // best-effort abort; the timeout settles even if a fake transport ignores abort.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), MDBLIST_TIMEOUT_MS);
+  try {
+    const res = await governor.schedule('mdblist', () => fetch(url, { headers: { 'User-Agent': USER_AGENT }, signal: controller.signal }), fp);
+    if (!res.ok) {
+      const err = new Error(`MDBList request failed (${res.status})`);
+      err.status = res.status;
+      throw err;
+    }
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
   }
-  return res.json();
 }
 
 // Returns the Common Sense age (number) or null if CSM has not rated it.
@@ -201,23 +210,31 @@ async function mediaInfoBatch(apiKey, type, imdbIds) {
   if (!imdbIds.length) return new Map();
   const mediaType = type === 'series' ? 'show' : 'movie';
   const fp = keyFingerprint(apiKey);
-  const res = await governor.schedule('mdblist', () => fetch(`${API}/imdb/${mediaType}?apikey=${encodeURIComponent(apiKey)}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'User-Agent': USER_AGENT },
-    body: JSON.stringify({ ids: imdbIds }),
-  }), fp);
-  if (!res.ok) {
-    const err = new Error(`MDBList batch lookup failed (${res.status})`);
-    err.status = res.status;
-    throw err;
+  // 15s deadline covers both the fetch and the body parse
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), MDBLIST_TIMEOUT_MS);
+  try {
+    const res = await governor.schedule('mdblist', () => fetch(`${API}/imdb/${mediaType}?apikey=${encodeURIComponent(apiKey)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': USER_AGENT },
+      body: JSON.stringify({ ids: imdbIds }),
+      signal: controller.signal,
+    }), fp);
+    if (!res.ok) {
+      const err = new Error(`MDBList batch lookup failed (${res.status})`);
+      err.status = res.status;
+      throw err;
+    }
+    const arr = await res.json();
+    const map = new Map();
+    for (const m of Array.isArray(arr) ? arr : []) {
+      const id = m?.ids?.imdb || m?.imdbid;
+      if (id) map.set(id, m);
+    }
+    return map;
+  } finally {
+    clearTimeout(timer);
   }
-  const arr = await res.json();
-  const map = new Map();
-  for (const m of Array.isArray(arr) ? arr : []) {
-    const id = m?.ids?.imdb || m?.imdbid;
-    if (id) map.set(id, m);
-  }
-  return map;
 }
 
 // IMDb rating from either a list item (append_to_response=ratings) or a
