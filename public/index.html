@@ -26,7 +26,7 @@
   .badge.warn { color: var(--warn); border-color: var(--warn); }
   .badge.err { color: var(--err); border-color: var(--err); }
   label { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 4px; }
-  input[type=text], input[type=password], select {
+  input[type=text], input[type=password], input[type=email], select {
     width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border);
     background: var(--card2); color: var(--text); font-size: 14px; outline: none;
   }
@@ -58,7 +58,7 @@
   .cat-item.locked > label { cursor: default; }
   .cat-item:has(input:checked) > label .cat-title { color: var(--ok); }
   .cat-title { display: flex; align-items: center; gap: 6px; min-width: 0; }
-  .cat-title .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cat-title .name { min-width: 0; overflow-wrap: anywhere; }
   .cat-restrict { font-size: 11px; color: var(--muted); padding-left: 22px; }
   .cat-preview { flex: 0 0 auto; background: transparent; border: 0; padding: 5px; margin: 0;
     color: var(--muted); cursor: pointer; display: flex; align-items: center; border-radius: 6px; }
@@ -118,7 +118,7 @@
   .diag div { margin: 2px 0; }
   .pin { font-size: 28px; letter-spacing: 6px; font-weight: 700; color: var(--accent); }
   .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-  @media (max-width: 640px) { .cols { grid-template-columns: 1fr; } }
+  @media (max-width: 640px) { .cols { grid-template-columns: 1fr; } .genres { grid-template-columns: 1fr 1fr; } }
   details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin: 12px 0 4px; }
   /* Profile tabs — one card, tab bar + panels; switching is pure show/hide (no re-render) */
   .tabs { display: flex; flex-wrap: wrap; gap: 2px; margin-top: 14px; border-bottom: 1px solid var(--border); }
@@ -128,14 +128,22 @@
   .tab-btn.active { color: var(--text); border-bottom-color: var(--accent); }
   .tab-panel { display: none; padding-top: 14px; }
   .tab-panel.active { display: block; }
-  /* Advanced tab — each section is a title followed by one content box (the
-     Filters tab's Title-decay box style); inputs sit one shade darker than the
-     box. A single sticky Save bar covers every fillable section. */
+  /* Profile tabs share one layout (Advanced was the reference): a short intro,
+     then each section is a title followed by one content box; inputs and tiles
+     sit one shade darker than the box. A tab with fields ends in one sticky
+     Save bar that turns amber once anything in it is edited. */
   .sec-title { font-size: 13px; font-weight: 600; color: var(--text); margin: 18px 0 6px; }
-  .adv > .muted + .sec-title { margin-top: 4px; }
+  .tab-panel > .muted + .sec-title, .tab-panel > .warn-line + .sec-title { margin-top: 4px; }
   .sec-box { background: var(--card2); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
   .sec-box > label:first-child, .sec-box .cols:first-child label { margin-top: 0; }
   .sec-box input[type=text], .sec-box input[type=password], .sec-box input[type=email], .sec-box select { background: var(--card); }
+  .sec-box .genres label, .sec-box .cat-item, .sec-box .tr-row, .sec-box .tr-chip, .sec-box .install, .sec-box .diag { background: var(--card); }
+  .sec-box .tr-thumb { background: var(--card2); }
+  .sec-box .cats, .sec-box .genres { margin-top: 0; }
+  .sec-box .tr-chips:first-child { margin-top: 0; }
+  .sec-box .tr-pager { margin-top: 12px; }
+  label.check { margin: 0; display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 13px; cursor: pointer; }
+  .warn-line { color: var(--err); font-size: 12px; margin-top: 6px; }
   .sec-box.danger { border-color: rgba(248,113,113,.45); }
   .hint { font-size: 11px; color: var(--muted); margin-top: 6px; }
   .conn { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13px; }
@@ -147,8 +155,6 @@
     margin: 18px -18px -18px; padding: 12px 18px; background: var(--card); border-top: 1px solid var(--border); border-radius: 0 0 12px 12px; }
   .save-bar.dirty { border-top-color: var(--warn); }
   .save-bar.dirty .save-note { color: var(--warn); }
-  .adv input[type=email] { width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border);
-    color: var(--text); font-size: 14px; outline: none; }
   .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
     background: var(--card2); border: 1px solid var(--accent); border-radius: 10px; padding: 10px 18px; font-size: 13px; display: none; }
   .getkey { color: var(--accent); font-size: 11px; text-decoration: none; margin-left: 6px; }
@@ -192,7 +198,8 @@
   .tr-acts { display: flex; align-items: center; gap: 6px; }
   .tr-banner { background: var(--card2); border: 1px solid var(--border); border-left: 3px solid var(--accent);
     border-radius: 8px; padding: 8px 12px; font-size: 13px; margin: 8px 0; }
-  .tr-notice { color: var(--muted); font-size: 12px; margin: 8px 0; }
+  .tr-notice { color: var(--muted); font-size: 12px; margin: 10px 0; padding: 8px 12px;
+    border: 1px solid var(--border); border-left: 3px solid var(--warn); border-radius: 8px; background: var(--card); }
   .tr-pager { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
   @media (max-width: 640px) {
     .tr-row { display: block; }
@@ -465,132 +472,201 @@ function render(profiles) {
 
       <div class="tab-panel" data-tab="filters">
         <div class="muted" style="margin-bottom:8px;font-size:11px">The <b>engine</b> decides how each list is generated; changing it rebuilds that catalog. Rating floor, excluded genres, recency and list size apply at <b>serve time</b> over the stored pool — change one and it takes effect immediately, no rebuild. The <b>age limit</b> and <b>minimum vote count</b> are baked in at build, so they apply on the next rebuild.</div>
-        <div class="cols">
-          ${engineField(p, 'movie')}
-          ${engineField(p, 'series')}
-        </div>
-        <div class="cols">
-          <div><label>Minimum rating</label>
-            <select data-filter="min_rating">
-              ${[0,5,5.5,6,6.5,7,7.5,8,8.5,9].map(v => `<option value="${v}" ${v === p.filters.min_rating ? 'selected' : ''}>${v === 0 ? 'No minimum' : '≥ ' + v.toFixed(1)}</option>`).join('')}
-            </select>
-            <div class="muted" style="font-size:11px;margin-top:3px">Applied to the <b>IMDb rating</b> (0–10) — the number shown on the poster — at serve time. Needs an MDBList key (falls back to TMDB's rating without one); unrated titles are kept.</div>
-            ${p.filters.min_rating > 0 && !p.keys_set.mdblist_api_key ? '<div style="color:var(--err);font-size:12px;margin-top:4px">⚠ A rating floor is set but no MDBList key — the floor uses the <b>TMDB</b> rating as a fallback, not the IMDb number on the poster, so lower-rated titles can slip through. Add an MDBList key in Server Config.</div>' : ''}</div>
-          <div><label>Minimum vote count</label>
-            <select data-filter="vote_count_floor">
-              ${[[0,'No minimum'],[250,'250+'],[500,'500+'],[1000,'1,000+'],[2500,'2,500+'],[5000,'5,000+']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.vote_count_floor ?? 1000) ? 'selected' : ''}>${l}</option>`).join('')}
-            </select>
-            <div class="muted" style="font-size:11px;margin-top:3px">Titles with fewer TMDB votes than this are <b>never stored</b> in your recommendations (a high rating on a handful of votes is meaningless) — they can return later if they gain votes. Series use ⅕ of this (TV vote counts run far lower). Enforced when the pool is built, so a change applies on the next rebuild.</div></div>
-          <div><label>Released</label>
-            <select data-filter="min_year">
-              ${[[2020,'2020 onwards'],[2010,'2010 onwards'],[2000,'2000 onwards'],[1990,'1990 onwards'],[1980,'1980 onwards'],[0,'No limit']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.min_year || 0) ? 'selected' : ''}>${l}</option>`).join('')}
-            </select>
-            <div class="muted" style="font-size:11px;margin-top:3px">*Applied to movies only — a recency cut-off would wrongly drop long-running series.</div></div>
-          <div><label>List size (per catalog)</label>
-            <select data-filter="list_size">
-              ${[10,15,20,25,30,40].map(v => `<option value="${v}" ${v === p.filters.list_size ? 'selected' : ''}>${v} titles</option>`).join('')}
-            </select></div>
-          <div><label>Age limit</label>
-            <div class="row" style="gap:8px">
-              <label style="margin:0;display:flex;align-items:center;gap:6px;color:var(--text);font-size:13px">
-                <input type="checkbox" data-filter="age_limit_on" ${p.filters.age_limit > 0 ? 'checked' : ''} onchange="const s=this.closest('.row').querySelector('[data-filter=age_limit]'); s.disabled=!this.checked; s.style.display=this.checked?'':'none'"> Limit to age
-              </label>
-              <select data-filter="age_limit" style="width:auto;flex:1;${p.filters.age_limit > 0 ? '' : 'display:none'}" ${p.filters.age_limit > 0 ? '' : 'disabled'}>
-                ${[[10,'10+ (TV-PG / PG)'],[12,'12+ (PG, UK 12)'],[14,'TV-14 (14+, AU M)'],[15,'15+ (MA 15+)']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.age_limit || 10) ? 'selected' : ''}>${l}</option>`).join('')}
-              </select>
-            </div>
-            <div class="muted" style="font-size:11px;margin-top:3px">Each title is checked in order: always-blocked ratings first, then the Common Sense Media age (must be at or under the limit), then the Australian rating, then US, then TVDB/MDBList/other countries; only if nothing has a rating does the AI judge it.</div>
-            ${p.filters.age_limit > 0 && !p.keys_set.groq_api_key ? '<div style="color:var(--err);font-size:12px;margin-top:4px">⚠ Age limit is on but no LLM is configured — set a Custom LLM or Groq key in Server Config, or rebuilds fail.</div>' : ''}
+
+        <div class="sec-title">Engines</div>
+        <div class="sec-box">
+          <div class="cols">
+            ${engineField(p, 'movie')}
+            ${engineField(p, 'series')}
           </div>
         </div>
-        <label>Excluded genres <span class="muted">(ticked = never recommended)</span></label>
-        <div class="genres">
-          ${GENRES.map(g => `<label><input type="checkbox" value="${esc(g)}" ${p.filters.excluded_genres.includes(g) ? 'checked' : ''}>${esc(g)}</label>`).join('')}
+
+        <div class="sec-title">Quality</div>
+        <div class="sec-box">
+          <div class="cols">
+            <div><label>Minimum rating</label>
+              <select data-filter="min_rating">
+                ${[0,5,5.5,6,6.5,7,7.5,8,8.5,9].map(v => `<option value="${v}" ${v === p.filters.min_rating ? 'selected' : ''}>${v === 0 ? 'No minimum' : '≥ ' + v.toFixed(1)}</option>`).join('')}
+              </select>
+              <div class="hint">Applied to the <b>IMDb rating</b> (0–10) — the number shown on the poster — at serve time. Needs an MDBList key (falls back to TMDB's rating without one); unrated titles are kept.</div>
+              ${p.filters.min_rating > 0 && !p.keys_set.mdblist_api_key ? '<div class="warn-line">⚠ A rating floor is set but no MDBList key — the floor uses the <b>TMDB</b> rating as a fallback, not the IMDb number on the poster, so lower-rated titles can slip through. Add an MDBList key in Advanced (or Server Config).</div>' : ''}</div>
+            <div><label>Minimum vote count</label>
+              <select data-filter="vote_count_floor">
+                ${[[0,'No minimum'],[250,'250+'],[500,'500+'],[1000,'1,000+'],[2500,'2,500+'],[5000,'5,000+']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.vote_count_floor ?? 1000) ? 'selected' : ''}>${l}</option>`).join('')}
+              </select>
+              <div class="hint">Titles with fewer TMDB votes than this are <b>never stored</b> in your recommendations (a high rating on a handful of votes is meaningless) — they can return later if they gain votes. Series use ⅕ of this (TV vote counts run far lower). Applies on the next rebuild.</div></div>
+          </div>
         </div>
-        <div data-decay-box style="margin-top:14px; padding:12px; background:var(--card2); border:1px solid var(--border); border-radius:10px">
-          <label style="margin:0;display:flex;align-items:center;gap:8px;color:var(--text);font-size:13px;cursor:pointer">
-            <input type="checkbox" data-filter="title_decay_on" ${p.filters.title_decay_enabled ? 'checked' : ''} onchange="const s=this.closest('[data-decay-box]').querySelector('[data-filter=title_decay_days]'); s.disabled=!this.checked; s.style.display=this.checked?'':'none'">
-            <b>Title decay</b> <span class="muted">— retire stale recommendations automatically</span>
-          </label>
-          <div class="muted" style="font-size:11px;margin-top:6px">A recommendation you keep being shown but never open or add to your watchlist is retired after it has stayed on your list this long — keeping the list fresh. Opening or watchlisting a title resets its clock, so only the ones you consistently ignore drop off, and a retired title can return later. <b>Off by default.</b></div>
-          <div class="row" style="gap:8px;margin-top:8px">
-            <label style="margin:0;color:var(--muted);font-size:12px">Retire after</label>
+
+        <div class="sec-title">Recency &amp; list size</div>
+        <div class="sec-box">
+          <div class="cols">
+            <div><label>Released</label>
+              <select data-filter="min_year">
+                ${[[2020,'2020 onwards'],[2010,'2010 onwards'],[2000,'2000 onwards'],[1990,'1990 onwards'],[1980,'1980 onwards'],[0,'No limit']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.min_year || 0) ? 'selected' : ''}>${l}</option>`).join('')}
+              </select>
+              <div class="hint">Movies only — a recency cut-off would wrongly drop long-running series.</div></div>
+            <div><label>List size (per catalog)</label>
+              <select data-filter="list_size">
+                ${[10,15,20,25,30,40].map(v => `<option value="${v}" ${v === p.filters.list_size ? 'selected' : ''}>${v} titles</option>`).join('')}
+              </select>
+              <div class="hint">How many titles every catalog shows, except Watch Later.</div></div>
+          </div>
+        </div>
+
+        <div class="sec-title">Age limit</div>
+        <div class="sec-box">
+          <div class="row" style="gap:10px">
+            <label class="check">
+              <input type="checkbox" data-filter="age_limit_on" ${p.filters.age_limit > 0 ? 'checked' : ''} onchange="const s=this.closest('.row').querySelector('[data-filter=age_limit]'); s.disabled=!this.checked; s.style.display=this.checked?'':'none'"> Limit to age
+            </label>
+            <select data-filter="age_limit" style="width:auto;flex:1;${p.filters.age_limit > 0 ? '' : 'display:none'}" ${p.filters.age_limit > 0 ? '' : 'disabled'}>
+              ${[[10,'10+ (TV-PG / PG)'],[12,'12+ (PG, UK 12)'],[14,'TV-14 (14+, AU M)'],[15,'15+ (MA 15+)']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.age_limit || 10) ? 'selected' : ''}>${l}</option>`).join('')}
+            </select>
+          </div>
+          <div class="hint">Each title is checked in order: always-blocked ratings first, then the Common Sense Media age (must be at or under the limit), then the Australian rating, then US, then TVDB/MDBList/other countries; only if nothing has a rating does the AI judge it. Applies on the next rebuild.</div>
+          ${p.filters.age_limit > 0 && !p.keys_set.groq_api_key ? '<div class="warn-line">⚠ Age limit is on but no LLM is configured — set a Custom LLM or Groq key in Server Config, or rebuilds fail.</div>' : ''}
+        </div>
+
+        <div class="sec-title">Excluded genres <span class="muted" style="font-weight:400">— ticked = never recommended</span></div>
+        <div class="sec-box">
+          <div class="genres">
+            ${GENRES.map(g => `<label><input type="checkbox" value="${esc(g)}" ${p.filters.excluded_genres.includes(g) ? 'checked' : ''}>${esc(g)}</label>`).join('')}
+          </div>
+        </div>
+
+        <div class="sec-title">Title decay</div>
+        <div class="sec-box" data-decay-box>
+          <div class="row" style="gap:10px">
+            <label class="check">
+              <input type="checkbox" data-filter="title_decay_on" ${p.filters.title_decay_enabled ? 'checked' : ''} onchange="const s=this.closest('[data-decay-box]').querySelector('[data-filter=title_decay_days]'); s.disabled=!this.checked; s.style.display=this.checked?'':'none'"> Retire stale recommendations after
+            </label>
             <select data-filter="title_decay_days" style="width:auto;flex:0 0 auto;${p.filters.title_decay_enabled ? '' : 'display:none'}" ${p.filters.title_decay_enabled ? '' : 'disabled'}>
               ${[[14,'14 days'],[30,'30 days'],[60,'60 days'],[90,'90 days'],[180,'180 days'],[365,'365 days']].map(([v,l]) => `<option value="${v}" ${v === (p.filters.title_decay_days || 60) ? 'selected' : ''}>${l}</option>`).join('')}
             </select>
           </div>
+          <div class="hint">A recommendation you keep being shown but never open or add to your watchlist is retired after it has stayed on your list this long — keeping the list fresh. Opening or watchlisting a title resets its clock, so only the ones you consistently ignore drop off, and a retired title can return later. <b>Off by default.</b></div>
         </div>
-        <div style="margin-top:10px"><button onclick="saveFilters('${p.id}')">Save filters</button>
-        <span class="muted"> — rating, genres, recency &amp; list size apply immediately; the age limit &amp; minimum vote count apply on the next rebuild (or hit Rebuild now)</span></div>
+
+        <div class="save-bar" data-note="— rating, genres, recency &amp; list size apply immediately; age limit &amp; vote count on the next rebuild">
+          <button onclick="saveFilters('${p.id}')">Save</button>
+          <span class="muted save-note">— rating, genres, recency &amp; list size apply immediately; age limit &amp; vote count on the next rebuild</span>
+        </div>
       </div>
 
       <div class="tab-panel" data-tab="catalogs">
-        <div class="muted" style="margin-top:4px">The two AI recommendation catalogs (<b>Recommended for you</b>, movies + series) are always on. <b>Watch Later</b> mirrors this profile's Simkl plan-to-watch list — on by default, refreshed daily, and now <b>keeps titles you've already watched</b> (if you added it, it stays until you remove it from your Simkl list). The curated MDBList lists refresh daily and <b>drop titles you've already watched</b> (except <b>Christmas</b>, a re-watchable, marked "keeps watched"); popular charts are unfiltered, the rest drop titles rated below IMDb 6 (MDBList key required). Every catalog <b>except Watch Later</b> shows the number of titles set by this profile's <b>list size</b> filter (Watch Later shows whatever is on your Simkl list). The <b>Kids</b> and <b>Anime TV-14</b> rows are <b>age-gated to their band always</b> (even on adult profiles), so they need a Groq/LLM key to build. On profiles with an age limit, <b>every</b> extra catalog also passes the anime/NSFW gate and the AI age check — the list is kept unpublished if either can't run. Use the <b>preview</b> button on any row to see the exact titles it serves.</div>
-        <div class="cats">
-          ${catItemHtml({ pid: p.id, id: 'ai-recs-movies', name: 'Recommended for you', type: 'movie', checked: true, locked: true })}
-          ${catItemHtml({ pid: p.id, id: 'ai-recs-series', name: 'Recommended for you', type: 'series', checked: true, locked: true })}
-          ${catsFor(p).map(c => catItemHtml({ pid: p.id, id: c.id, name: c.name, type: c.type, checked: catOn(p, c), locked: false, restrict: catRestrict(c) })).join('')}
+        <div class="muted" style="margin-bottom:8px;font-size:11px">Choose which lists appear in Stremio/Nuvio. Every catalog <b>except Watch Later</b> shows the number of titles set by the <b>list size</b> filter. Use the <b>preview</b> button on any row to see the exact titles it serves.</div>
+
+        <div class="sec-title">Recommended for you</div>
+        <div class="sec-box">
+          <div class="cats">
+            ${catItemHtml({ pid: p.id, id: 'ai-recs-movies', name: 'Recommended for you', type: 'movie', checked: true, locked: true })}
+            ${catItemHtml({ pid: p.id, id: 'ai-recs-series', name: 'Recommended for you', type: 'series', checked: true, locked: true })}
+          </div>
+          <div class="hint">The two AI recommendation catalogs (movies + series) are always on.</div>
         </div>
-        ${catsFor(p).some(c => catOn(p, c) && c.source === 'simkl_plantowatch') && !p.simkl_connected ? '<div style="color:var(--err);font-size:12px;margin-top:6px">⚠ Watch Later is enabled but Simkl is not connected — it cannot build until this profile connects Simkl.</div>' : ''}
-        ${catsFor(p).some(c => catOn(p, c) && c.source === 'mdblist') && !p.keys_set.mdblist_api_key ? '<div style="color:var(--err);font-size:12px;margin-top:6px">⚠ Curated catalogs are enabled but no MDBList key is set — add one in Server Config (they cannot build without it).</div>' : ''}
-        <div style="margin-top:10px" class="row">
-          <button onclick="saveCatalogs('${p.id}')">Save catalogs</button>
-          <span class="muted"> — newly enabled lists build in the background; they appear in Stremio/Nuvio after the app refreshes the addon manifest (or reinstall the addon)</span>
+
+        <div class="sec-title">Watch Later</div>
+        <div class="sec-box">
+          <div class="cats">
+            ${catsFor(p).filter(c => c.source === 'simkl_plantowatch').map(c => catItemHtml({ pid: p.id, id: c.id, name: c.name, type: c.type, checked: catOn(p, c), locked: false, restrict: catRestrict(c) })).join('')}
+          </div>
+          <div class="hint">Mirrors this profile's Simkl plan-to-watch list — on by default, refreshed daily, and <b>keeps titles you've already watched</b> (if you added it, it stays until you remove it from your Simkl list).</div>
+          ${catsFor(p).some(c => catOn(p, c) && c.source === 'simkl_plantowatch') && !p.simkl_connected ? '<div class="warn-line">⚠ Watch Later is enabled but Simkl is not connected — it cannot build until this profile connects Simkl (Advanced).</div>' : ''}
+        </div>
+
+        <div class="sec-title">Curated lists</div>
+        <div class="sec-box">
+          <div class="cats">
+            ${catsFor(p).filter(c => c.source !== 'simkl_plantowatch').map(c => catItemHtml({ pid: p.id, id: c.id, name: c.name, type: c.type, checked: catOn(p, c), locked: false, restrict: catRestrict(c) })).join('')}
+          </div>
+          <div class="hint">MDBList lists refresh daily and <b>drop titles you've already watched</b> (except <b>Christmas</b>, a re-watchable, marked "keeps watched"); popular charts are unfiltered, the rest drop titles rated below IMDb 6 (MDBList key required). The <b>Kids</b> and <b>Anime TV-14</b> rows are <b>age-gated to their band always</b> (even on adult profiles), so they need a Groq/LLM key to build. On profiles with an age limit, <b>every</b> extra catalog also passes the anime/NSFW gate and the AI age check — the list is kept unpublished if either can't run.</div>
+          ${catsFor(p).some(c => catOn(p, c) && c.source === 'mdblist') && !p.keys_set.mdblist_api_key ? '<div class="warn-line">⚠ Curated catalogs are enabled but no MDBList key is set — add one in Advanced (or Server Config); they cannot build without it.</div>' : ''}
+        </div>
+
+        <div class="save-bar" data-note="— new lists build in the background, then appear after the app refreshes the addon (or reinstall it)">
+          <button onclick="saveCatalogs('${p.id}')">Save</button>
+          <span class="muted save-note">— new lists build in the background, then appear after the app refreshes the addon (or reinstall it)</span>
         </div>
       </div>
 
-      <div class="tab-panel" data-tab="trainer"><div class="trainer-panel" data-trainer="${p.id}"></div></div>
+      <div class="tab-panel" data-tab="trainer">
+        <div class="muted" style="margin-bottom:8px;font-size:11px">Rate what <b>${esc(p.name)}</b> has watched. Each rating saves straight to Simkl and teaches the Marquee engines their taste — there's nothing to save here.</div>
+        <div class="sec-title">Watch history</div>
+        <div class="sec-box"><div class="trainer-panel" data-trainer="${p.id}"></div></div>
+      </div>
 
       <div class="tab-panel" data-tab="scrobble">
-        <div class="muted" style="margin-top:4px">Mirror <b>${esc(p.name)}</b>'s <b>Nuvio</b> or <b>Stremio</b> watched history into their Simkl account hourly — so marks made in the app reach Simkl and feed recommendations, even if the app's own tracker session drops. Per account, kept isolated from other profiles.</div>
-        ${p.scrobble.encryption_available ? '' : '<div style="color:var(--err);font-size:12px;margin-top:6px">⚠ SCROBBLE_KEY is not set on the server — you can test credentials but not save a password. Set the SCROBBLE_KEY environment variable (any long random string) on the container, then reload.</div>'}
-        <label style="margin-top:10px;display:flex;align-items:center;gap:8px;color:var(--text);font-size:14px">
-          <input type="checkbox" data-scrobble="enabled" ${p.scrobble.enabled ? 'checked' : ''}> Auto-scrobble watched content to Simkl
-        </label>
-        <div class="cols" style="margin-top:10px">
-          <div><label>Source app</label>
-            <select data-scrobble="provider" onchange="onScrobbleProvider('${p.id}')">
-              <option value="nuvio" ${p.scrobble.provider === 'nuvio' ? 'selected' : ''}>Nuvio</option>
-              <option value="stremio" ${p.scrobble.provider === 'stremio' ? 'selected' : ''}>Stremio</option>
-            </select></div>
-          <div><label>Account email</label>
-            <input type="email" data-scrobble="email" value="${esc(p.scrobble.email)}" placeholder="name@example.com" autocomplete="off" spellcheck="false" ${IGNORE_PW_MANAGERS}></div>
+        <div class="muted" style="margin-bottom:8px;font-size:11px">Mirror <b>${esc(p.name)}</b>'s <b>Nuvio</b> or <b>Stremio</b> watched history into their Simkl account hourly — so marks made in the app reach Simkl and feed recommendations, even if the app's own tracker session drops. Per account, kept isolated from other profiles.</div>
+        ${p.scrobble.encryption_available ? '' : '<div class="warn-line" style="margin-bottom:8px">⚠ SCROBBLE_KEY is not set on the server — you can test credentials but not save a password. Set the SCROBBLE_KEY environment variable (any long random string) on the container, then reload.</div>'}
+
+        <div class="sec-title">Auto-scrobble</div>
+        <div class="sec-box">
+          <label class="check">
+            <input type="checkbox" data-scrobble="enabled" ${p.scrobble.enabled ? 'checked' : ''}> Auto-scrobble watched content to Simkl
+          </label>
+          <div class="hint">Runs hourly once saved on. Needs Simkl connected (Advanced)${p.simkl_connected ? '' : ' — <span style="color:var(--warn)">not connected yet</span>'}.</div>
         </div>
-        <label style="margin-top:10px">Account password</label>
-        <div class="keyrow">
-          <div class="keyfield">
-            <input type="password" data-scrobble="password" value="" placeholder="${p.scrobble.password_set ? '•••••••• saved — blank keeps it' : 'not set'}" autocomplete="off" spellcheck="false" ${IGNORE_PW_MANAGERS}>
-            <button type="button" class="eye" onclick="toggleKey(this)" title="Show / hide">${EYE_OFF}</button>
+
+        <div class="sec-title">App account</div>
+        <div class="sec-box">
+          <div class="cols">
+            <div><label>Source app</label>
+              <select data-scrobble="provider" onchange="onScrobbleProvider('${p.id}')">
+                <option value="nuvio" ${p.scrobble.provider === 'nuvio' ? 'selected' : ''}>Nuvio</option>
+                <option value="stremio" ${p.scrobble.provider === 'stremio' ? 'selected' : ''}>Stremio</option>
+              </select></div>
+            <div><label>Account email</label>
+              <input type="email" data-scrobble="email" value="${esc(p.scrobble.email)}" placeholder="name@example.com" autocomplete="off" spellcheck="false" ${IGNORE_PW_MANAGERS}></div>
           </div>
-          <button class="ghost mini" onclick="testScrobble('${p.id}', this)">Test</button>
+          <label>Account password</label>
+          <div class="keyrow">
+            <div class="keyfield">
+              <input type="password" data-scrobble="password" value="" placeholder="${p.scrobble.password_set ? '•••••••• saved — blank keeps it' : 'not set'}" autocomplete="off" spellcheck="false" ${IGNORE_PW_MANAGERS}>
+              <button type="button" class="eye" onclick="toggleKey(this)" title="Show / hide">${EYE_OFF}</button>
+            </div>
+            <button class="ghost mini" onclick="testScrobble('${p.id}', this)">Test</button>
+          </div>
+          <span class="tres" data-tres="scrobble"></span>
+          <div class="scrobble-unmatched" data-id="${p.id}"></div>
+          <div class="scrobble-profile" style="${p.scrobble.provider === 'nuvio' ? '' : 'display:none'}">
+            <label>Which Nuvio profile</label>
+            <select data-scrobble="nuvio_profile">
+              ${p.scrobble.nuvio_profile_index != null
+                ? `<option value="${p.scrobble.nuvio_profile_index}" selected>${esc(p.scrobble.nuvio_profile_name || ('Profile ' + p.scrobble.nuvio_profile_index))}</option>`
+                : '<option value="">— Test to load profiles —</option>'}
+            </select>
+            <div class="hint">One Nuvio login can hold several people. Pick the one whose history feeds <b>${esc(p.name)}</b>'s recommendations — <b>choosing the wrong profile mixes another person's watch history in</b>.</div>
+          </div>
         </div>
-        <span class="tres" data-tres="scrobble"></span>
-        <div class="scrobble-unmatched" data-id="${p.id}"></div>
-        <div class="scrobble-profile" style="margin-top:10px;${p.scrobble.provider === 'nuvio' ? '' : 'display:none'}">
-          <label>Which Nuvio profile</label>
-          <select data-scrobble="nuvio_profile">
-            ${p.scrobble.nuvio_profile_index != null
-              ? `<option value="${p.scrobble.nuvio_profile_index}" selected>${esc(p.scrobble.nuvio_profile_name || ('Profile ' + p.scrobble.nuvio_profile_index))}</option>`
-              : '<option value="">— Test to load profiles —</option>'}
-          </select>
-          <div class="muted" style="font-size:11px;margin-top:3px">One Nuvio login can hold several people. Pick the one whose history feeds <b>${esc(p.name)}</b>'s recommendations — <b>choosing the wrong profile mixes another person's watch history in</b>.</div>
-        </div>
-        <div style="margin-top:12px" class="row">
+
+        ${p.scrobble.enabled && p.simkl_connected ? `<div class="sec-title">Sync</div>
+        <div class="sec-box">
+          <div class="row">
+            <button class="ghost" onclick="syncScrobble('${p.id}', this, false)">Sync now</button>
+            <button class="ghost" onclick="syncScrobble('${p.id}', this, true)" title="Re-push this account's entire watched history to Simkl, ignoring what's already there (Simkl re-marks them watched — harmless)">Full rebuild</button>
+          </div>
+          <div class="hint"><b>Sync now</b> pushes anything new since the last hourly run. <b>Full rebuild</b> re-pushes the whole history (harmless — Simkl just re-marks titles watched).</div>
+        </div>` : ''}
+
+        <div class="save-bar" data-note="— saves the auto-scrobble switch and app account">
           <button onclick="saveScrobble('${p.id}')">Save</button>
-          ${p.scrobble.enabled && p.simkl_connected ? `<button class="ghost" onclick="syncScrobble('${p.id}', this, false)">Sync now</button>
-          <button class="ghost" onclick="syncScrobble('${p.id}', this, true)" title="Re-push this account's entire watched history to Simkl, ignoring what's already there (Simkl re-marks them watched — harmless)">Full rebuild</button>` : ''}
-          <span class="muted"> — runs hourly; needs Simkl connected above</span>
+          <span class="muted save-note">— saves the auto-scrobble switch and app account</span>
         </div>
       </div>
 
       <div class="tab-panel" data-tab="install">
-        ${p.external_url_set ? '' : `<div style="color:var(--warn);font-size:12px;margin:6px 0">⚠ EXTERNAL_URL is not set — this link uses the address you opened this page from, which Stremio clients outside your network can't reach. Set the EXTERNAL_URL variable to your public hostname (e.g. your Cloudflare Tunnel URL).</div>`}
-        <div class="install">${esc(installUrl)}</div>
-        <div style="margin-top:8px" class="row">
-          <button class="ghost" onclick="copyText('${esc(installUrl)}')">Copy URL</button>
-          <a href="${esc(installUrl.replace(/^https?:\/\//, 'stremio://'))}"><button class="ghost">Open in Stremio</button></a>
+        <div class="muted" style="margin-bottom:8px;font-size:11px">Add <b>${esc(p.name)}</b>'s personal addon to Stremio or Nuvio. This link is their personal list — don't share it outside the family.</div>
+        <div class="sec-title">Install link</div>
+        <div class="sec-box">
+          ${p.external_url_set ? '' : `<div class="warn-line" style="margin:0 0 8px">⚠ EXTERNAL_URL is not set — this link uses the address you opened this page from, which Stremio clients outside your network can't reach. Set the EXTERNAL_URL variable to your public hostname (e.g. your Cloudflare Tunnel URL).</div>`}
+          <div class="install" style="margin-top:0">${esc(installUrl)}</div>
+          <div style="margin-top:10px" class="row">
+            <button onclick="copyText('${esc(installUrl)}')">Copy URL</button>
+            <a href="${esc(installUrl.replace(/^https?:\/\//, 'stremio://'))}"><button class="ghost">Open in Stremio</button></a>
+          </div>
+          <div class="hint">In Stremio, open <b>Addons → Add addon</b> and paste the URL (Nuvio: add it from its addon settings). After enabling new catalogs, refresh or reinstall the addon so the app picks them up.</div>
         </div>
-        <div class="muted" style="margin-top:6px">Paste the URL in Stremio → Addons → Add addon. This link is ${esc(p.name)}'s personal list — don't share it outside the family.</div>
       </div>
 
       <div class="tab-panel adv" data-tab="advanced">
@@ -686,7 +762,7 @@ function render(profiles) {
           </div>
         </div>
 
-        <div class="save-bar">
+        <div class="save-bar" data-note="— saves the email, Simkl credentials &amp; MDBList key">
           <button onclick="saveAdvanced('${p.id}')">Save</button>
           <span class="muted save-note">— saves the email, Simkl credentials &amp; MDBList key</span>
         </div>
@@ -697,8 +773,9 @@ function render(profiles) {
   // card whose Advanced tab is showing (the Simkl Integration section lives there).
   container.querySelectorAll('.card[data-id]').forEach(card => {
     activateTab(card, activeMap[card.dataset.id] || 'filters', { silent: true });
-    // The Simkl row renders a placeholder; fill it when Advanced is showing.
-    if (activeMap[card.dataset.id] === 'advanced') checkSimklStatus(card.dataset.id);
+    // Fill the Simkl row + header badge whichever tab is showing (only the
+    // selected profile renders; the live verify runs once per page load).
+    checkSimklStatus(card.dataset.id);
     if (recsMap[card.dataset.id]) {
       const panel = card.querySelector('.recs-panel');
       panel.innerHTML = recsMap[card.dataset.id];
@@ -1342,22 +1419,24 @@ async function saveAdvanced(id) {
       // subsequent Save will correctly detect the later draft as changed.
     }
   });
-  dirty = false; setAdvDirty(card, false); toast('Saved'); pollStatus();
+  dirty = false; setPanelDirty(savedPanel(id, 'advanced'), false); toast('Saved'); pollStatus();
 }
 
-// Save-bar state: amber "unsaved changes" once any fillable Advanced field is
-// edited, back to neutral after a successful Save.
-function setAdvDirty(card, on) {
-  const bar = card?.querySelector('.save-bar');
+// Save-bar state, shared by every tab with fields: amber "unsaved changes"
+// once anything in the panel is edited, back to the panel's own note
+// (data-note) after a successful Save. Fields marked data-nodirty (searches,
+// draft-only inputs) never count.
+function setPanelDirty(panel, on) {
+  const bar = panel?.querySelector('.save-bar');
   if (!bar) return;
   bar.classList.toggle('dirty', on);
-  bar.querySelector('.save-note').textContent = on
-    ? '— unsaved changes'
-    : '— saves the email, Simkl credentials & MDBList key';
+  bar.querySelector('.save-note').textContent = on ? '— unsaved changes' : (bar.dataset.note || '');
 }
-document.addEventListener('input', e => {
-  if (e.target.closest('.adv') && e.target.matches('[data-email], [data-key], [data-auth-version]')) setAdvDirty(e.target.closest('.card'), true);
-});
+const savedPanel = (id, tab) => document.querySelector(`.card[data-id="${id}"] .tab-panel[data-tab="${tab}"]`);
+['input', 'change'].forEach(type => document.addEventListener(type, e => {
+  const panel = e.target.closest('#profiles .tab-panel');
+  if (panel && e.target.matches('input, select, textarea') && !e.target.closest('[data-nodirty]')) setPanelDirty(panel, true);
+}));
 
 // Toggle the visible Simkl credential block (V1/V2) without saving, clearing
 // drafts, or replacing the card. Stored credentials for the other version
@@ -1449,6 +1528,7 @@ async function saveFilters(id) {
     || filters.engine_series !== (prev.engine_series || 'genesis');
   await api('/profiles/' + id, { method: 'PUT', body: { filters } });
   dirty = false;
+  setPanelDirty(savedPanel(id, 'filters'), false);
   toast('Filters saved — applies at serve time (rating/genre/recency) or next rebuild'
     + (engineChanged ? ' — engine change rebuilds that catalog' : ''));
   pollStatus();
@@ -1460,6 +1540,7 @@ async function saveCatalogs(id) {
   card.querySelectorAll('[data-catalog]').forEach(i => { catalogs[i.dataset.catalog] = i.checked; });
   await api('/profiles/' + id, { method: 'PUT', body: { catalogs } });
   dirty = false;
+  setPanelDirty(savedPanel(id, 'catalogs'), false);
   toast('Catalogs saved — enabled lists build in the background');
   pollStatus();
 }
@@ -1519,6 +1600,7 @@ async function saveScrobble(id) {
   try {
     await api('/profiles/' + id, { method: 'PUT', body: { scrobble } });
     dirty = false;
+    setPanelDirty(savedPanel(id, 'scrobble'), false);
     toast('Auto-scrobble saved');
     pollStatus();
   } catch (err) {
@@ -1948,7 +2030,7 @@ function trainerDraw(id) {
   const typeToggle = `<div class="tr-chips tr-type"><button class="tr-chip" data-type="movie" aria-pressed="${st.type === 'movie'}">Films</button><button class="tr-chip" data-type="series" aria-pressed="${st.type === 'series'}">Shows</button></div>`;
   panel.innerHTML = `${typeToggle}${notice}<div class="tr-banner-slot">${TrainerUI.bannerHtml(d.training, now, { rebuilding: st.rebuilding })}</div>
     <div class="tr-chips tr-views">${TrainerUI.chipsHtml(d.counts, st.view, { hideUnfinished: st.type === 'series' })}</div>
-    <div class="tr-search-row"><input type="text" class="tr-search" placeholder="Search titles…" value="${esc(st.q)}" title="${esc(TrainerUI.TIPS.search)}"></div>
+    <div class="tr-search-row"><input type="text" class="tr-search" data-nodirty placeholder="Search titles…" value="${esc(st.q)}" title="${esc(TrainerUI.TIPS.search)}"></div>
     <div class="tr-table">${rows}</div>
     <div class="tr-pager">
       <button class="ghost mini" data-act="prev" title="${esc(TrainerUI.TIPS.prev)}" ${st.page <= 1 ? 'disabled' : ''}>Prev</button>
