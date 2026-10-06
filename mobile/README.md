@@ -82,7 +82,7 @@ mobile/
    existing `/addon`, `/api`, `/configure` mounts:
    ```js
    const mobile = require('../mobile/server/router');
-   app.use('/mobile', mobile.router); // OTP-guarded; NOT behind admin Basic Auth
+   app.use('/mobile', mobile.router); // session-guarded; NOT behind the admin guard
    ```
 2. **Add one Simkl function** to [src/services/simkl.js](../src/services/simkl.js):
    `addToPlanToWatch(profile, items)` — it belongs with the other Simkl calls
@@ -96,20 +96,24 @@ Simkl write → Step 3).
 
 ## Auth & routing boundary
 
-The existing `/api` is the **admin** portal, behind HTTP Basic Auth
-([src/server.js:121](../src/server.js)). The mobile app must **not** live there —
-family members are not admins. Instead:
+The admin portal (`/api/*`, `/configure/`) is protected by the shared
+email-OTP session (`air_sid` cookie, admin profiles only). The mobile app
+shares the same session cookie but serves **all** profile sessions (not just
+admins):
 
 | Route | Auth | Purpose |
 |---|---|---|
-| `GET /mobile`, `/mobile/*.js/.css` | none | Static SPA shell (public assets, like `/configure`) |
+| `GET /mobile`, `/mobile/*.js/.css` | none | Static SPA shell (public assets) |
 | `POST /mobile/api/auth/request`, `/auth/verify` | none | Issue / verify OTP |
-| `GET/POST /mobile/api/*` (all data) | **mobile session** | Guarded; bound to one profile |
-| `/api/*` | admin Basic Auth | Unchanged |
+| `GET/POST /mobile/api/*` (all data) | **mobile session** (`air_sid`) | Guarded; bound to one profile |
+| `/api/*` | **admin session** (`air_sid`, admin only) | 401/403 for non-admins |
+| `/configure/` | **admin session** (`air_sid`, admin only) | 302 → `/mobile/?next=…` for non-admins |
 | `/addon/:token/*` | install token | Unchanged |
 
-The mobile session guard is a separate mechanism from admin Basic Auth; it never
-grants admin access.
+The session cookie is shared (`air_sid`, `Path=/`), but the admin guard
+(`requireAdminApi` / `requireAdminPage`) only passes profiles with
+`is_admin: true`. A non-admin profile can use `/mobile` normally but cannot
+access `/api/*` or `/configure/`.
 
 ---
 
@@ -126,13 +130,12 @@ none are per-profile.
 | `BREVO_SMTP_PORT` | no | `587` | SMTP port (`465` = implicit TLS). |
 | `MOBILE_MAIL_FROM` | for real email | — | Verified Brevo sender address (e.g. `no-reply@gallagherhome.au`). |
 | `MOBILE_MAIL_FROM_NAME` | no | `AI Recommender` | Sender display name. |
-| `MOBILE_SESSION_DAYS` | no | `30` | Session lifetime (rolling). |
 | `EXTERNAL_URL` | no (exists) | — | Reused to build the app link inside the OTP email. |
 
-`BREVO_SMTP_KEY` is an infrastructure secret handled like `ADMIN_PASSWORD` — it
-stays in ENV (never in `profiles.json`/`settings.json`, never committed;
-`.env` is already git-ignored). The at-rest `SECRET_KEY` sealing applies to
-stored profile/settings secrets, not ENV.
+`BREVO_SMTP_KEY` is an infrastructure secret — it stays in ENV (never in
+`profiles.json`/`settings.json`, never committed; `.env` is already git-ignored).
+The at-rest `SECRET_KEY` sealing applies to stored profile/settings secrets,
+not ENV.
 
 ---
 

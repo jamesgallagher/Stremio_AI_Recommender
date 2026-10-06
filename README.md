@@ -419,8 +419,6 @@ Docker tab → **Add Container** (or point a Compose stack at this repo's
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `EXTERNAL_URL` | Yes (for real use) | — | Public base URL, e.g. `https://recs.yourdomain.com` (your Cloudflare Tunnel hostname). Baked into install URLs and the manifest logo. Without it, links use the LAN address you opened the portal from — Stremio clients outside your network can't reach those |
-| `ADMIN_USER` | Recommended | — | Admin portal username (Basic Auth) |
-| `ADMIN_PASSWORD` | Recommended | — | Admin portal password. If either is unset, `/configure` is unprotected (startup log warns) |
 | `PORT` | No | `7000` | Internal HTTP port — only change if you also change the container port mapping |
 | `DATA_DIR` | No | `/data` | Storage location inside the container — leave as is |
 | `STALE_HOURS` | No | `24` | How old a cached list may get before a background rebuild |
@@ -431,8 +429,11 @@ Docker tab → **Add Container** (or point a Compose stack at this repo's
 No API keys go in the template — Trakt/TMDB/Groq keys are entered per
 profile in the web portal and stored in `/data/profiles.json`.
 
-After starting: open `http://<unraid-ip>:7000/configure/`, log in with the
-admin credentials, add profiles.
+After starting: open `http://<unraid-ip>:7000/mobile/` — the Initial User
+Creation wizard appears (only when zero profiles exist). Enter a name and
+email, verify the code, and the first admin profile is created. From then on,
+sign in at `/mobile/` with the email on your profile; the **Configure**
+button in the topbar opens the admin portal at `/configure/`.
 
 ## Exposure (Cloudflare Tunnel)
 
@@ -442,8 +443,8 @@ manifest point somewhere Stremio clients can actually reach. Then:
 
 - `/addon/*` — must be publicly reachable **without** auth (Stremio can't do
   login prompts). Safe: profile tokens are unguessable 128-bit values.
-- `/configure/` and `/api/*` — protected by HTTP Basic Auth when `ADMIN_USER`
-  and `ADMIN_PASSWORD` are set (do this). Optionally layer **Cloudflare
+- `/configure/` and `/api/*` — protected by the shared email-OTP session
+  (`air_sid` cookie, admin profiles only). Optionally layer **Cloudflare
   Access** on these paths as well.
 
 ## Config (env)
@@ -454,8 +455,6 @@ manifest point somewhere Stremio clients can actually reach. Then:
 | `DATA_DIR` | `./data` | persistent storage |
 | `STALE_HOURS` | 24 | cache staleness threshold |
 | `BACKOFF_MINUTES` | 30 | retry backoff after failed rebuild |
-| `ADMIN_USER` | — | admin portal username (Basic Auth) |
-| `ADMIN_PASSWORD` | — | admin portal password; portal is unprotected if either is unset |
 | `SECRET_KEY` | — | encrypts all stored secrets at rest (API keys, Trakt tokens, scrobble passwords); `SCROBBLE_KEY` accepted as alias |
 
 ## Credits

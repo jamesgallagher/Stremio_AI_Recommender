@@ -3,8 +3,8 @@
 **Status:** ✅ BUILT (2026-08-26). All modules under `mobile/server/`, tests in
 `mobile/test/mobile.smoke.js` (18 unit + HTTP regression), wired into `npm test`.
 Existing suite still green (44 unit + 46 http) — with a small hermeticity fix so
-`test/smoke.js` pins `ADMIN_USER`/`ADMIN_PASSWORD`/`EXTERNAL_URL` off (a populated
-`.env` had been leaking them in via dotenv).
+`test/smoke.js` pins `EXTERNAL_URL` off (a populated `.env` had been leaking it
+in via dotenv).
 
 **Live-verified 2026-08-26:** switched to the **Brevo SMTP relay** (`nodemailer`) —
 the key on hand was an SMTP key, not a REST key. Real OTP emails delivered via
@@ -33,7 +33,7 @@ so from that point on the app can **only** ever read/write that profile's data.
 | Method & path | Auth | Body / query | Response |
 |---|---|---|---|
 | `POST /mobile/api/auth/request` | none | `{ email }` | `200 { ok: true }` **always** (generic — no account enumeration) |
-| `POST /mobile/api/auth/verify` | none | `{ email, code }` | `200 { ok, profile:{ id, name } }` + `Set-Cookie: mobile_sid` / `401 { error }` |
+| `POST /mobile/api/auth/verify` | none | `{ email, code }` | `200 { ok, profile:{ id, name } }` + `Set-Cookie: air_sid` / `401 { error }` |
 | `POST /mobile/api/auth/logout` | session | — | `200 { ok }` (revokes session) |
 | `GET  /mobile/api/me` | session | — | `200 { profile:{ id, name, simkl_connected } }` |
 
@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS mobile_session (
   token_hash  TEXT PRIMARY KEY,     -- sha256(token) — the raw token only lives in the cookie
   profile_id  TEXT NOT NULL,
   created_at  INTEGER NOT NULL,
-  expires_at  INTEGER NOT NULL,     -- created_at + MOBILE_SESSION_DAYS
+  expires_at  INTEGER NOT NULL,     -- created_at + 30 days (fixed)
   last_seen_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_sess_profile ON mobile_session (profile_id);
@@ -102,12 +102,12 @@ secrets (sealed at rest, admin password compared via `crypto.timingSafeEqual`).
 5. Match → set `used_at = now` (**single-use**), create a session:
    - `token = crypto.randomBytes(32).toString('hex')`.
    - Store `sha256(token)` with `profile_id`, `expires_at = now + days`.
-   - `Set-Cookie: mobile_sid=<token>; HttpOnly; Secure; SameSite=Lax; Path=/mobile; Max-Age=<days>`.
+   - `Set-Cookie: air_sid=<token>; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=2592000` (30 days, fixed).
 6. Respond `{ ok:true, profile:{ id, name } }`.
 
 ### Session guard (`auth.requireSession` middleware)
 
-- Read `mobile_sid` cookie (parse without adding a dep — a tiny cookie reader, or
+- Read `air_sid` cookie (parse without adding a dep — a tiny cookie reader, or
   `req.headers.cookie` split; Express 5 has no built-in cookie parser and we're
   avoiding new deps).
 - `row = sessionByHash(sha256(token))`; missing or `expires_at < now` → `401`.
@@ -154,8 +154,8 @@ async function sendOtpEmail({ to, code, ttlMinutes = 60, appUrl = '' }, send = d
 - [x] `mobile/server/mail.js` — `buildOtpMessage` (pure) + `sendOtpEmail` (injectable send) + `verifyTransport` + nodemailer SMTP transporter.
 - [x] `mobile/server/auth.js` — `requestOtp`, `verifyOtp`, `resolveSession`, `logout`; email normalisation; per-email rate limiter; all time via injected `nowMs`.
 - [x] `mobile/server/router.js` — the four routes + `requireSession` guard + cookie helpers.
-- [x] Mount in [src/server.js](../../src/server.js): `app.use('/mobile', require('../mobile/server/router').router)` (before admin auth).
-- [x] Add `BREVO_SMTP_LOGIN`, `BREVO_SMTP_KEY`, `BREVO_SMTP_HOST`, `BREVO_SMTP_PORT`, `MOBILE_MAIL_FROM`, `MOBILE_MAIL_FROM_NAME`, `MOBILE_SESSION_DAYS`, `MOBILE_INSECURE_COOKIE` to `.env.example` + `docker-compose.yml`.
+- [x] Mount in [src/server.js](../../src/server.js): `app.use('/mobile', require('../mobile/server/router').router)` (before the admin guard).
+- [x] Add `BREVO_SMTP_LOGIN`, `BREVO_SMTP_KEY`, `BREVO_SMTP_HOST`, `BREVO_SMTP_PORT`, `MOBILE_MAIL_FROM`, `MOBILE_MAIL_FROM_NAME`, `MOBILE_INSECURE_COOKIE` to `.env.example` + `docker-compose.yml`.
 - [x] Prune expired OTPs/sessions on the existing hourly tick ([src/server.js](../../src/server.js)).
 - [x] `mobile/test/mobile.smoke.js` + `npm test` / `npm run test:mobile` wiring.
 
@@ -212,14 +212,14 @@ Pure/offline. Inject `nowMs` and a fake mail transport. Each is one `ok(...)`.
 
 Guard the existing app — these assert nothing that already works has moved.
 
-1. **`regression: admin /api still requires Basic Auth`** — a request to a
-   portal route without credentials still returns `401` (the mobile mount didn't
-   loosen it).
-2. **`regression: mobile auth routes need NO Basic Auth`** — `POST
-   /mobile/api/auth/request` is reachable without admin credentials (it lives
-   outside the `/api` auth middleware).
+1. **`regression: admin /api still behind session auth`** — a request to a
+   portal route without the `air_sid` cookie still returns `401` (the mobile
+   mount didn't loosen it).
+2. **`regression: mobile auth routes are public`** — `POST
+   /mobile/api/auth/request` is reachable without any session (it lives
+   outside the `/api` admin guard).
 3. **`regression: data routes need a session`** — any `/mobile/api/*` data route
-   without a valid `mobile_sid` returns `401` (no accidental open door).
+   without a valid `air_sid` returns `401` (no accidental open door).
 4. **`regression: new tables don't disturb existing ones`** — after
    `otpStore.init()`, the existing `watchedStore` / `recommendationStore` smoke
    assertions still pass against the same `store.db`.
@@ -235,7 +235,7 @@ Guard the existing app — these assert nothing that already works has moved.
 ## Acceptance criteria
 
 - Entering a valid profile email delivers a 6-digit code within seconds; entering
-  it signs the user in for `MOBILE_SESSION_DAYS`.
+  it signs the user in for a fixed 30-day absolute session.
 - A code works exactly once and dies at 1 hour.
 - No response, log line, or timing difference reveals whether an email is
   registered.
