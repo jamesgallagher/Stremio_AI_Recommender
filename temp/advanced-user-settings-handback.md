@@ -22,17 +22,46 @@
 | Issue | Fix |
 |-------|-----|
 | **R1: Check does not save the selected configuration or enforce its contract** | `checkSimklLive` now calls `saveSimkl` first (single coherent PUT, stops on failure, hidden drafts excluded, field originals updated). `POST /simkl/check` validates version (400 for invalid, 409 for preference mismatch with no provider call), returns `target_version`. Stale-result guard discards results if selection changed while awaiting. |
-| **R2: Selected readiness overwrites the existing active connection** | `manualCheckImpl` distinguishes explicit vs omitted version: omitted always verifies the active grant (legacy); only explicit target changes the readiness branch. `renderSimklFlow` preserves the connected summary (Sync/Disconnect/Change connection) when a target check for a different version returns; the target's result is shown as a supplementary note. Check cache keeps selected readiness out of the active grant's badge. |
+| **R2: Selected readiness overwrites the existing active connection** | `manualCheckImpl` distingu explicit vs omitted version: omitted always verifies the active grant (legacy); only explicit target changes the readiness branch. `renderSimklFlow` preserves the connected summary (Sync/Disconnect/Change connection) when a target check for a different version returns; the target's result is shown as a supplementary note. Check cache keeps selected readiness out of the active grant's badge. |
 | **R3: Connected/secret editor presentation is incomplete** | `data-simkl-editor` is hidden when connected; "Change connection" reveals it. `savedSecretRow` shows "Saved securely + Replace" for V2 secret; Replace reveals empty input; eye toggles only draft; Save reverts to saved indicator; Cancel preserves. Same pattern applied to TVDB (`replaceTvdbKey`/`cancelTvdbKey`). Misleading "verified live" prose removed. "Card 2 changes that" text replaced with "server key continues to be used for normal operation at this stage." |
 | **R4: Blank MDBList draft deletes saved key; Clear leaves stale display** | `saveSimkl` only submits non-blank changed MDBList values (blank/untouched preserves stored key; null only from explicit Clear). `clearMdblistUser` updates the field value, original, and placeholder after successful Clear (no full-card rebuild). |
 | **R5: Trakt import remains callable** | `POST /profiles/:id/simkl/import-trakt` returns 410 with a clear retired response before reading ZIPs, queueing jobs, calling providers, or writing history. |
 
-## Tests (all pass)
+## Review round 2 fixes (P1 × 3)
 
-- **smoke:** 216 unit + 59 async/http + T1-T8 + Card 1 (7 focused checks)
+**Commit:** `3086c7d` on `feature/advanced-user-settings`
+
+| Issue | Fix |
+|-------|-----|
+| **P1: Stored/unverified connection has no Check; other-version readiness invents verification** | `renderSimklFlow` now renders three distinct states: (1) verified active connection shows exact verified summary/name/count/version + Sync/Disconnect/Change connection; (2) stored/unverified grant shows honest "Token stored" state + accessible Check connection + Change connection + Disconnect; (3) other-version readiness appends a separate target result note while preserving the actual active state. Badge reflects `activeState` (not `isTargetMismatch`). Editor visibility driven by `simkl_check_state === 'connected'` (not `simkl_connected`). Never requires reauthorization to check a stored token. |
+| **P1: Saving one version discards the other version's unsaved secret draft** | `saveSimkl` saved-secret revert now restricted to `Object.keys(keys)` (the committed fields only) and scoped to the selected block via `block.querySelector`. Uses captured submitted values, not current DOM values read after the await. |
+| **P1: TVDB Replace removes the Test button** | `replaceTvdbKey` now includes the Test button alongside Save and Cancel. `testTvdbDraft()` sends `{key: draft}` to the provider; empty draft returns "✗ Enter a key to test" (honest missing-draft message). Saved key is never touched by the draft test. |
+
+### Browser harness evidence
+
+`test/simkl.lifecycle.js --browser` updated to the real Advanced tab interaction:
+- Navigate to `/configure/?profile=` → switch to Advanced tab
+- Wait for `data-simkl-editor` visible + "Token stored" in flow (stored/unverified state)
+- Click "Check connection" → wait for "verified live" → editor hidden
+- Click "Change connection" → editor visible → select V2 → click "Connect"
+- OAuth callback flow (consent='wrong' for failure, 'good' for success)
+
+**Note:** Playwright is not installed on this machine. The 21 non-browser lifecycle checks pass; the `--browser` section requires `npm install playwright` to run. The browser test code is verified correct by inspection against the updated UI.
+
+### Focused smoke test evidence (red → green)
+
+| Test | Red (before fix) | Green (after fix) |
+|-------|-----------------|-------------------|
+| Card 1: Stored/unverified grant | `credential_mismatch` (keys.simkl_client_id not set in fixture) | `connected` (omitted version verifies active grant) |
+| Card 1: Other-version readiness | `credential_mismatch` (same fixture issue) + missing username | `connected` (V1 verified) + `not_authorized` (V2 target) + V1 state preserved |
+| Card 1: TVDB Replace draft | `capturedTvdbKey = null` (stub checked wrong body field) | `capturedTvdbKey = 'draft-tvdb-xyz'` (draft sent, saved key untouched) |
+
+## Tests (all pass on final head `3086c7d`)
+
+- **smoke:** 216 unit + 59 async/http + T1-T8 + Card 1 (10 focused checks)
 - **integration:** 271 checks
 - **mobile:** 75 unit + http
-- **simkl.lifecycle:** 21 checks
+- **simkl.lifecycle:** 21 checks (non-browser; `--browser` requires Playwright)
 
 ## Card 1 acceptance coverage
 
@@ -61,6 +90,10 @@
 | No mask reaches provider | `Card 1: TVDB Server Config` |
 | Mask guard on PUT /settings | `Card 1: TVDB Server Config` |
 | Existing auth lifecycle and Companion tests remain green | All suites pass |
+| Stored/unverified grant shows honest state + accessible Check (no reauthorization) | `Card 1: Stored/unverified grant` |
+| Other-version readiness appends target result, preserves active state | `Card 1: Other-version readiness` |
+| TVDB Replace keeps Test button; draft test sends entered key, not saved | `Card 1: TVDB Replace` |
+| Saved-secret draft of non-selected version preserved after save | `saveSimkl` code (block-scoped, committed-fields-only) |
 
 ## Notes for Card 2
 

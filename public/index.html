@@ -1225,9 +1225,14 @@ async function saveSimkl(id) {
   // version's drafts are never submitted.
   const block = card.querySelector(authVersion === 2 ? '[data-simkl-v2]' : '[data-simkl-v1]');
   const keys = {};
+  // Capture submitted values and their field nodes BEFORE the PUT.
+  const captured = {}; // dataKey -> { value, node }
   block.querySelectorAll('[data-key]').forEach(i => {
     const v = i.value.trim();
-    if (v !== (i.dataset.orig || '')) keys[i.dataset.key] = v;
+    if (v !== (i.dataset.orig || '')) {
+      keys[i.dataset.key] = v;
+      captured[i.dataset.key] = { value: v, node: i };
+    }
   });
   // Per-profile MDBList key: a changed non-blank value saves; a blank or
   // untouched draft preserves the stored key (null only from explicit Clear).
@@ -1235,22 +1240,30 @@ async function saveSimkl(id) {
   if (mdb) {
     const v = mdb.value.trim();
     const orig = mdb.dataset.orig || '';
-    if (v !== orig && v !== '') keys.mdblist_api_key = v;
+    if (v !== orig && v !== '') {
+      keys.mdblist_api_key = v;
+      captured.mdblist_api_key = { value: v, node: mdb };
+    }
   }
   await api('/profiles/' + id, { method: 'PUT', body: { email, simkl_auth_version: authVersion, ...(Object.keys(keys).length ? { keys } : {}) } });
-  // Reflect successful persistence: update field originals so subsequent
-  // saves only resubmit genuinely changed values. Restrict to the selected
-  // block only — hidden version drafts are preserved.
-  block.querySelectorAll('[data-key]').forEach(i => { i.dataset.orig = i.value.trim(); });
-  if (mdb) mdb.dataset.orig = mdb.value.trim();
-  // Revert saved-secret rows ONLY for fields actually committed in this save
-  // (in the `keys` object), restricted to the selected block. Hidden version
-  // drafts are never touched.
-  Object.keys(keys).forEach(dataKey => {
+  // After success, update originals to the ACKNOWLEDGED submitted values (not
+  // current DOM values, which may have changed while awaiting). Only touch
+  // fields acknowledged by this request.
+  Object.keys(captured).forEach(dataKey => {
+    const { value, node } = captured[dataKey];
+    node.dataset.orig = value;
+    // Collapse a secret replacement into "Saved securely" ONLY if its current
+    // draft still equals the acknowledged value. If changed meanwhile, leave
+    // it visible and dirty (original set to the acknowledged stored value so
+    // a subsequent Save submits the later draft correctly).
     const row = block.querySelector(`[data-saved-secret="${dataKey}"]`);
-    if (row) {
+    if (row && node.value.trim() === value) {
       row.innerHTML = `<span class="muted" style="align-self:center">Saved securely</span>
         <button class="ghost mini" onclick="replaceSecret('${id}','${dataKey}')">Replace</button>`;
+    } else if (row) {
+      // Changed while awaiting: keep the input visible and dirty.
+      // The original is already set to the acknowledged value above, so a
+      // subsequent Save will correctly detect the later draft as changed.
     }
   });
   dirty = false; toast('Saved'); pollStatus();
@@ -1498,7 +1511,29 @@ async function checkSimklLive(id) {
     const currentCard = document.querySelector(`[data-id="${id}"]`);
     const currentVersion = parseInt(currentCard?.querySelector('[data-auth-version]')?.value, 10);
     if (currentVersion !== requestVersion) return;
-    renderSimklFlow(id, r);
+    // Preserve the request/profile guard after the await.
+    const p = PROFILES.find(x => x.id === id);
+    const activeVersion = p?.simkl_active_version || null;
+    const isTargetMismatch = r.target_version !== undefined && activeVersion !== null && r.target_version !== activeVersion;
+    if (isTargetMismatch) {
+      // Store the target result separately; render the passive active state.
+      let ui = SIMKL_UI.get(id);
+      if (!ui) { ui = { instructions: '', message: '', busy: false }; SIMKL_UI.set(id, ui); }
+      ui.targetResult = r;
+      // Fetch the passive status for the active grant.
+      const passive = await api(`/profiles/${id}/simkl/status`);
+      // Re-check the guard after the second await.
+      const guardCard = document.querySelector(`[data-id="${id}"]`);
+      const guardVersion = parseInt(guardCard?.querySelector('[data-auth-version]')?.value, 10);
+      if (guardVersion !== requestVersion) return;
+      renderSimklFlow(id, passive);
+    } else {
+      // Matching version: the check result IS the active verification.
+      // Clear any prior target note.
+      const ui = SIMKL_UI.get(id);
+      if (ui) ui.targetResult = null;
+      renderSimklFlow(id, r);
+    }
   } catch (e) {
     const currentCard = document.querySelector(`[data-id="${id}"]`);
     const currentVersion = parseInt(currentCard?.querySelector('[data-auth-version]')?.value, 10);
@@ -1508,19 +1543,19 @@ async function checkSimklLive(id) {
   }
 }
 
-// Shared renderer for the Simkl flow area. Keeps the header badge consistent
-// with the latest check state. The active grant's state is authoritative; a
-// target check for a different version appends a supplementary note without
-// implying verification of the active grant.
+// Shared renderer for the Simkl flow area. The active grant's state (from
+// passive status or a matching-version check) is authoritative for the badge
+// and controls. A stored targetResult (from an explicit other-version check)
+// is appended as a separate labelled note — never reinterpreted as the
+// active state.
 function renderSimklFlow(id, r) {
   const card = document.querySelector(`[data-id="${id}"]`);
   const flowEl = card?.querySelector('.simkl-flow');
   if (!flowEl) return;
   const p = PROFILES.find(x => x.id === id);
   const activeVersion = p?.simkl_active_version || null;
-  const isTargetMismatch = r.target_version !== undefined && activeVersion !== null && r.target_version !== activeVersion;
-  // The active grant's state is authoritative for the badge. A target mismatch
-  // does NOT imply the active grant is verified.
+  const ui = SIMKL_UI.get(id);
+  // The active grant's state is authoritative for the badge.
   const activeState = r.state;
   const badge = card.querySelector('.hdr-badge');
   if (badge) {
@@ -1528,7 +1563,7 @@ function renderSimklFlow(id, r) {
     else if (activeState === 'token_stored') badge.innerHTML = '<span class="badge warn">Simkl token stored</span>';
     else badge.innerHTML = '<span class="badge err">Simkl not connected</span>';
   }
-  // Determine the active grant's rendering (independent of target mismatch).
+  // Determine the active grant's rendering.
   let activeHtml;
   if (r.state === 'connected') {
     const activeTag = activeVersion ? ` (AUTH V${activeVersion})` : '';
@@ -1553,23 +1588,22 @@ function renderSimklFlow(id, r) {
   } else {
     activeHtml = `<div><button onclick="connectSimkl('${id}')">Connect Simkl</button>${r.message ? ` <span class="muted">— ${esc(r.message)}</span>` : ''}</div>`;
   }
-  // Append the target's readiness as a separate supplementary note.
-  const targetNote = isTargetMismatch
-    ? `<div class="muted" style="margin-top:6px;font-size:12px">Target AUTH V${r.target_version}: ${esc(r.message || r.state)}</div>`
+  // Append the stored targetResult as a separate labelled note.
+  const targetResult = ui?.targetResult || null;
+  const targetNote = targetResult
+    ? `<div class="muted" style="margin-top:6px;font-size:12px">Target AUTH V${targetResult.target_version}: ${esc(targetResult.message || targetResult.state)}</div>`
     : '';
   flowEl.innerHTML = activeHtml + targetNote + '<div class="flow-status" style="margin-top:10px"></div>';
   // Editor visibility: hide when verified (connected); keep visible for
   // stored/unverified/failed states. Respect a user's explicit edit-open state.
   const editor = card.querySelector('[data-simkl-editor]');
   if (editor) {
-    const ui = SIMKL_UI.get(id);
     if (r.state === 'connected' && !ui?.editorOpen) {
       editor.style.display = 'none';
     } else {
       editor.style.display = '';
     }
   }
-  const ui = SIMKL_UI.get(id);
   if (ui?.instructions) flowEl.querySelector('.flow-status').innerHTML = ui.instructions;
   if (ui?.message) flowEl.insertAdjacentHTML('beforeend', '<div class="simkl-attempt-error" style="color:var(--err)">' + esc(ui.message) + '</div>');
 }
