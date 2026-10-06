@@ -93,10 +93,10 @@ function enabledExtras(profile) {
 }
 
 // The prerequisite for a catalog's data source. Simkl is per-profile; the
-// MDBList key is global (Server Config), with a per-profile fallback.
+// MDBList key resolves personal-first, then global (Server Config).
 function requirementMet(profile, def) {
   if (def.source === 'simkl_plantowatch') return !!profile.simkl_auth?.access_token;
-  return !!require('./settings').keyFor(profile, 'mdblist_api_key');
+  return !!require('./settings').resolveMdblistKey(profile).key;
 }
 
 module.exports = { EXTRA_CATALOGS, getExtra, isEnabled, enabledExtras, ageAppropriate, requirementMet };

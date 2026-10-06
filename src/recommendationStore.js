@@ -690,7 +690,7 @@ async function stagedBuildPool(profile, log = console, onProgress = () => {}, { 
   const filters = profile.filters || {};
   const ctx = {
     tmdbKey,
-    mdblistKey: settings.keyFor(profile, 'mdblist_api_key'),
+    mdblistKey: settings.resolveMdblistKey(profile).key,
     settings: s,
     filters,
     log,
@@ -835,7 +835,7 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
   const filters = profile.filters || {};
   const ctx = {
     tmdbKey,
-    mdblistKey: settings.keyFor(profile, 'mdblist_api_key'),
+    mdblistKey: settings.resolveMdblistKey(profile).key,
     settings: s,
     filters,
     log,

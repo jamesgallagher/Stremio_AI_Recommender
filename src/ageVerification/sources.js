@@ -161,7 +161,7 @@ async function llmGate(type, tier, titles, log = console) {
 // connection (for simklCerts, when a real source lands). The chain's `decide`
 // takes this object as its `sources` argument.
 function buildSources(profile, log = console) {
-  const mdbKey = () => (settings.getSettings()?.keys?.mdblist_api_key || '').trim();
+  const mdbKey = () => settings.resolveMdblistKey(profile).key;
   return {
     tmdbRatings: (type, titles) => tmdbRatings(profile, type, titles, log),
     csmAges: (type, imdbIds) => {

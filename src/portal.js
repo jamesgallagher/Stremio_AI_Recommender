@@ -129,7 +129,7 @@ function publicProfile(p, req) {
       tmdb_api_key: !!settings.keyFor(p, 'tmdb_api_key'),
       groq_api_key: !!settings.keyFor(p, 'groq_api_key'),
       rpdb_api_key: !!settings.keyFor(p, 'rpdb_api_key'),
-      mdblist_api_key: !!settings.keyFor(p, 'mdblist_api_key'),
+      mdblist_api_key: !!settings.resolveMdblistKey(p).key,
     },
     keys_preview: {
       tmdb_api_key: redactKey(p.keys.tmdb_api_key),
@@ -376,10 +376,10 @@ async function testRpdb(profile) {
 }
 
 async function testMdblist(profile) {
-  // Test the EFFECTIVE key (global Server-Config key first, per-profile only as a
-  // legacy fallback) — the same resolution enrichment/serve use via keyFor — so a
-  // passing test reflects what actually runs, not a stray per-profile field.
-  const key = settings.keyFor(profile, 'mdblist_api_key');
+  // Test the EFFECTIVE key (personal first, then global server key) — the same
+  // resolution enrichment/serve use via resolveMdblistKey — so a passing test
+  // reflects what actually runs, not a stray per-profile field.
+  const { key } = settings.resolveMdblistKey(profile);
   if (!key) return { ok: false, error: 'MDBList key not set — required (rating floor, extra catalogs + Common Sense age checks)' };
   try {
     const r = await mdblistService.testKey(key);
