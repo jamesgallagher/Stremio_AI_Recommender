@@ -3,7 +3,7 @@
 **Branch:** `feature/mdblist-user-keys`
 **Base:** latest `v7`
 **Version:** 7.41.0-beta
-**Tested SHA:** `55e5d66` (fifth review fixes: FIFO ownership, T5/T17/T19/T23 strengthened)
+**Tested SHA:** `7c9df26` (sixth review: T17 real store cache, T23 real URL structure + Chromium, T26 held-admission-wake, T26b controlled-timer non-head expiry)
 
 ## Scope
 
