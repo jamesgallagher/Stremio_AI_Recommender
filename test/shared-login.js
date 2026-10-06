@@ -198,6 +198,22 @@ function makeLegacy(name, email, createdAt) {
     assert.strictEqual(d4, null, 'resolve at t0+30d+1ms is null');
   });
 
+  // ---- T8: ui.js viewForState with setupNeeded ----
+  await ok('T8 viewForState: setupNeeded → setup; authed → route; login', () => {
+    const ui = require('../mobile/public/ui');
+    // setupNeeded → always 'setup'.
+    assert.strictEqual(ui.viewForState({ setupNeeded: true, authed: false, route: 'recs' }), 'setup');
+    assert.strictEqual(ui.viewForState({ setupNeeded: true, authed: true, route: 'recs' }), 'setup');
+    // Not authed → 'login'.
+    assert.strictEqual(ui.viewForState({ authed: false, route: 'recs' }), 'login');
+    // Authed → the route.
+    assert.strictEqual(ui.viewForState({ authed: true, route: 'search' }), 'search');
+    // Authed + 'login' route → default.
+    assert.strictEqual(ui.viewForState({ authed: true, route: 'login' }), 'recs');
+    // Authed + 'setup' route → default (setup is only shown via setupNeeded).
+    assert.strictEqual(ui.viewForState({ authed: true, route: 'setup' }), 'recs');
+  });
+
   console.log(`\nshared-login unit: all ${passed} checks passed.`);
 
   // ---- HTTP surface (T12-T22) ----

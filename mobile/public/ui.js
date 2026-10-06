@@ -9,24 +9,26 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  const ROUTES = ['login', 'recs', 'search', 'settings', 'trainer'];
+  const ROUTES = ['login', 'setup', 'recs', 'search', 'settings', 'trainer'];
   const DEFAULT_VIEW = 'recs'; // authed landing
 
   // '#/search' -> { view:'search' }; '', '#/' -> default; unknown -> default.
   function parseRoute(hash) {
     const raw = String(hash == null ? '' : hash).replace(/^#/, '').replace(/^\//, '');
-    const seg = raw.split(/[/?]/)[0].trim().toLowerCase();
+    const seg = raw.split(/[?/]/)[0].trim().toLowerCase();
     return { view: ROUTES.indexOf(seg) !== -1 ? seg : DEFAULT_VIEW, params: {} };
   }
 
-  // The view to actually render given auth + the requested route. Not signed in
-  // -> always 'login'. Signed in -> the route, but 'login'/unknown fall back to
-  // the default (an authed user never sits on the login screen).
+  // The view to actually render given auth + the requested route.
+  // setupNeeded -> always 'setup' (zero profiles, Initial User Creation).
+  // Not signed in -> always 'login'. Signed in -> the route, but
+  // 'login'/'setup'/unknown fall back to the default.
   function viewForState(state) {
     const s = state || {};
+    if (s.setupNeeded) return 'setup';
     if (!s.authed) return 'login';
     const r = s.route;
-    if (!r || r === 'login' || ROUTES.indexOf(r) === -1) return DEFAULT_VIEW;
+    if (!r || r === 'login' || r === 'setup' || ROUTES.indexOf(r) === -1) return DEFAULT_VIEW;
     return r;
   }
 

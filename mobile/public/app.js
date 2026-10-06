@@ -13,6 +13,13 @@
     send: $('send-code'), verify: $('verify-code'), back: $('back-to-email'),
     logout: $('logout'), openSettings: $('open-settings'), profileName: $('profile-name'), msg: $('login-msg'),
     content: $('content'),
+    // Setup (Initial User Creation)
+    setup: $('view-setup'),
+    setupNameStep: $('setup-name-step'), setupCodeStep: $('setup-code-step'),
+    setupName: $('setup-name'), setupEmail: $('setup-email'),
+    setupSend: $('setup-send-code'), setupVerify: $('setup-verify'), setupBack: $('setup-back-to-name'),
+    setupMsg: $('setup-msg'),
+    openConfigure: $('open-configure'),
   };
 
   async function apiFetch(path, opts = {}) {
@@ -41,11 +48,14 @@
   // ---- render ----
   function render() {
     const route = window.ui.parseRoute(location.hash).view;
-    const view = window.ui.viewForState({ authed: state.authed, route });
+    const view = window.ui.viewForState({ authed: state.authed, route, setupNeeded: state.setupNeeded });
     els.login.hidden = view !== 'login';
-    els.shell.hidden = view === 'login';
-    if (view === 'login') return;
+    els.setup.hidden = view !== 'setup';
+    els.shell.hidden = (view === 'login' || view === 'setup');
+    if (view === 'login' || view === 'setup') return;
     els.profileName.textContent = state.profile ? state.profile.name : '';
+    // Configure button visible only for admins.
+    els.openConfigure.hidden = !state.profile?.is_admin;
     els.content.querySelectorAll('.view').forEach((v) => { v.hidden = v.id !== 'view-' + view; });
     document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.route === view));
     if (view === 'recs') loadRecs();
@@ -802,12 +812,81 @@
   els.openSettings.addEventListener('click', () => { location.hash = '#/settings'; });
 
   // ---- boot ---- (declaration so the verify flow can reuse it)
+  // Configure button → /configure/ (admin-only).
+  els.openConfigure.addEventListener('click', () => { window.location.href = '/configure/'; });
+
+  // ---- setup flow (Initial User Creation) ----
+  function showSetupNameStep() { els.setupNameStep.hidden = false; els.setupCodeStep.hidden = true; setSetupMsg(''); }
+  function showSetupCodeStep() { els.setupNameStep.hidden = true; els.setupCodeStep.hidden = false; $('setup-code').value = ''; $('setup-code').focus(); }
+  const setSetupMsg = (text, kind) => { els.setupMsg.textContent = text || ''; els.setupMsg.className = 'msg' + (kind ? ' ' + kind : ''); };
+
+  els.setupSend.addEventListener('click', async () => {
+    const name = els.setupName.value.trim();
+    const email = els.setupEmail.value.trim();
+    if (!name) return setSetupMsg('Enter a name.', 'err');
+    if (!email) return setSetupMsg('Enter your email.', 'err');
+    els.setupSend.disabled = true; setSetupMsg('Sending…');
+    try {
+      const res = await apiFetch('/setup/request', { method: 'POST', body: JSON.stringify({ name, email }) });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setSetupMsg(data.error === 'SETUP_DONE' ? 'Setup already done — sign in instead.' : (data.error || 'Something went wrong.'), 'err');
+        return;
+      }
+      state.setupEmail = email; state.setupName = name;
+      showSetupCodeStep();
+      setSetupMsg('A 6-digit code is on its way. It expires in 1 hour.', 'ok');
+    } catch { setSetupMsg('Something went wrong — try again.', 'err'); }
+    finally { els.setupSend.disabled = false; }
+  });
+
+  els.setupVerify.addEventListener('click', async () => {
+    const code = $('setup-code').value.trim();
+    if (!code) return setSetupMsg('Enter the code from your email.', 'err');
+    els.setupVerify.disabled = true; setSetupMsg('Verifying…');
+    try {
+      const res = await apiFetch('/setup/verify', { method: 'POST', body: JSON.stringify({ email: state.setupEmail, code }) });
+      if (!res.ok) { setSetupMsg('That code is invalid or expired.', 'err'); return; }
+      setSetupMsg('Profile created — signing in…', 'ok');
+      location.hash = '#/recs';
+      await boot();
+    } catch { setSetupMsg('Something went wrong — try again.', 'err'); }
+    finally { els.setupVerify.disabled = false; }
+  });
+
+  els.setupBack.addEventListener('click', () => { state.setupEmail = ''; state.setupName = ''; showSetupNameStep(); els.setupName.focus(); });
+  $('setup-code').addEventListener('keydown', (e) => { if (e.key === 'Enter') els.setupVerify.click(); });
+
   async function boot() {
+    // Check if setup is needed (zero profiles).
+    let setupNeeded = false;
+    try {
+      const res = await apiFetch('/setup');
+      if (res.ok) setupNeeded = (await res.json()).needs_setup;
+    } catch { /* ignore */ }
+    state.setupNeeded = setupNeeded;
+
+    if (setupNeeded) {
+      // Show the setup view.
+      showSetupNameStep();
+      location.hash = '#/setup';
+      render();
+      return;
+    }
+
     try {
       const res = await apiFetch('/me');
       if (res.ok) { state.authed = true; state.profile = (await res.json()).profile; }
       else { state.authed = false; state.profile = null; }
     } catch { state.authed = false; state.profile = null; }
+
+    // Handle ?next= parameter (redirect back after sign-in).
+    const next = new URLSearchParams(location.search).get('next');
+    if (next && state.authed) {
+      window.location.href = next;
+      return;
+    }
+
     render();
   }
   boot();
