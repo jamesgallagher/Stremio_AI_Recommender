@@ -553,7 +553,7 @@ function render(profiles) {
         <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
           <b>Simkl Integration</b>
           <div class="muted" style="margin-top:4px">Watch tracker. Create a Simkl API app for <b>${esc(p.name)}</b> — AUTH V1 (PIN device flow) and/or AUTH V2 (OAuth + PKCE, requires a public HTTPS <code>EXTERNAL_URL</code>). Paste the Client ID (and Secret), Save, then Connect. Use <b>Check connection</b> to verify live against Simkl.</div>
-          <div data-simkl-editor ${p.simkl_connected ? 'style="display:none"' : ''}>
+          <div data-simkl-editor ${p.simkl_check_state === 'connected' ? 'style="display:none"' : ''}>
             <div style="margin-top:12px"><label>Auth version</label>
               <select data-auth-version onchange="toggleSimklVersion('${p.id}')">
                 <option value="1" ${p.simkl_auth_version === 1 ? 'selected' : ''}>AUTH V1 (PIN device flow)</option>
@@ -995,7 +995,9 @@ function tvdbKeyRow(value) {
   </div><span class="tres" data-tres="tvdb_api_key"></span>`;
 }
 
-// Replace: reveal the empty replacement input for the TVDB key.
+// Replace: reveal the empty replacement input for the TVDB key. The Test
+// button in replacement mode sends the entered draft ({key: draft}) — it
+// never touches the saved key. Empty draft returns a missing-draft error.
 function replaceTvdbKey() {
   const row = document.querySelector('#serverConfig [data-saved-secret="tvdb_api_key"]');
   if (!row) return;
@@ -1003,8 +1005,29 @@ function replaceTvdbKey() {
     <input type="password" data-key="tvdb_api_key" data-orig="" value="" placeholder="Enter new key" autocomplete="off" spellcheck="false" ${IGNORE_PW_MANAGERS}>
     <button type="button" class="eye" onclick="toggleKey(this)" title="Show / hide">${EYE_OFF}</button>
   </div>
+  <button class="ghost mini" onclick="testTvdbDraft()">Test</button>
   <button class="ghost mini" onclick="saveSettings(document.querySelector('#serverConfig .row button'))">Save</button>
   <button class="ghost mini" onclick="cancelTvdbKey()">Cancel</button>`;
+}
+
+// Test the entered TVDB draft (replacement mode). Sends {key: draft}; an
+// empty draft returns a missing-draft error rather than claiming the old
+// saved key passed.
+async function testTvdbDraft() {
+  const el = $('#serverConfig');
+  const out = el.querySelector('[data-tres="tvdb_api_key"]');
+  const key = el.querySelector('[data-key="tvdb_api_key"]')?.value.trim();
+  out.textContent = 'testing…'; out.className = 'tres';
+  try {
+    if (!key) {
+      out.textContent = '✗ Enter a key to test';
+      out.className = 'tres err';
+      return;
+    }
+    const r = await api('/settings/test/tvdb', { method: 'POST', body: { key } });
+    out.textContent = r.ok ? ('✓ ' + (r.detail || 'valid')) : ('✗ ' + (r.error || 'failed'));
+    out.className = 'tres ' + (r.ok ? 'ok' : 'err');
+  } catch (e) { out.textContent = '✗ ' + e.message; out.className = 'tres err'; }
 }
 
 // Cancel: restore the "Saved securely" indicator (preserves the stored key).
@@ -1216,15 +1239,18 @@ async function saveSimkl(id) {
   }
   await api('/profiles/' + id, { method: 'PUT', body: { email, simkl_auth_version: authVersion, ...(Object.keys(keys).length ? { keys } : {}) } });
   // Reflect successful persistence: update field originals so subsequent
-  // saves only resubmit genuinely changed values.
+  // saves only resubmit genuinely changed values. Restrict to the selected
+  // block only — hidden version drafts are preserved.
   block.querySelectorAll('[data-key]').forEach(i => { i.dataset.orig = i.value.trim(); });
   if (mdb) mdb.dataset.orig = mdb.value.trim();
-  // Revert saved-secret rows to "Saved securely" after a successful save.
-  card.querySelectorAll('[data-saved-secret]').forEach(row => {
-    const input = row.querySelector('input[data-key]');
-    if (input && input.value.trim()) {
+  // Revert saved-secret rows ONLY for fields actually committed in this save
+  // (in the `keys` object), restricted to the selected block. Hidden version
+  // drafts are never touched.
+  Object.keys(keys).forEach(dataKey => {
+    const row = block.querySelector(`[data-saved-secret="${dataKey}"]`);
+    if (row) {
       row.innerHTML = `<span class="muted" style="align-self:center">Saved securely</span>
-        <button class="ghost mini" onclick="replaceSecret('${id}','${input.dataset.key}')">Replace</button>`;
+        <button class="ghost mini" onclick="replaceSecret('${id}','${dataKey}')">Replace</button>`;
     }
   });
   dirty = false; toast('Saved'); pollStatus();
@@ -1244,11 +1270,17 @@ function toggleSimklVersion(id) {
 
 // "Change connection" (connected summary): reveal the version selector /
 // credential editor so the user can reauthorize or migrate V1→V2 without a
-// Disconnect. The editor is hidden when connected; this reveals it.
+// Disconnect. The editor is hidden when verified; this reveals it and marks
+// the user's explicit edit-open state so passive renders respect it.
 function revealSimklEditor(id) {
   const card = document.querySelector(`[data-id="${id}"]`);
   const editor = card?.querySelector('[data-simkl-editor]');
   if (editor) editor.style.display = '';
+  // Mark the user's explicit edit-open state so later passive renders
+  // do not hide the editor again.
+  let ui = SIMKL_UI.get(id);
+  if (!ui) { ui = { instructions: '', message: '', busy: false }; SIMKL_UI.set(id, ui); }
+  ui.editorOpen = true;
   const sel = card?.querySelector('[data-auth-version]');
   if (sel) sel.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
@@ -1477,50 +1509,65 @@ async function checkSimklLive(id) {
 }
 
 // Shared renderer for the Simkl flow area. Keeps the header badge consistent
-// with the latest check state.
+// with the latest check state. The active grant's state is authoritative; a
+// target check for a different version appends a supplementary note without
+// implying verification of the active grant.
 function renderSimklFlow(id, r) {
   const card = document.querySelector(`[data-id="${id}"]`);
   const flowEl = card?.querySelector('.simkl-flow');
   if (!flowEl) return;
   const p = PROFILES.find(x => x.id === id);
   const activeVersion = p?.simkl_active_version || null;
-  // A target check for a version that does NOT match the active grant must not
-  // overwrite the connected summary. The active grant's controls (Sync,
-  // Disconnect, Change connection) remain; the target's readiness is shown
-  // as a supplementary note.
   const isTargetMismatch = r.target_version !== undefined && activeVersion !== null && r.target_version !== activeVersion;
-  // Update the header badge: the active grant's state is authoritative.
+  // The active grant's state is authoritative for the badge. A target mismatch
+  // does NOT imply the active grant is verified.
+  const activeState = r.state;
   const badge = card.querySelector('.hdr-badge');
   if (badge) {
-    if (r.connected || isTargetMismatch) badge.innerHTML = '<span class="badge ok">Simkl connected</span>';
-    else if (r.state === 'token_stored') badge.innerHTML = '<span class="badge warn">Simkl token stored</span>';
+    if (activeState === 'connected') badge.innerHTML = '<span class="badge ok">Simkl connected</span>';
+    else if (activeState === 'token_stored') badge.innerHTML = '<span class="badge warn">Simkl token stored</span>';
     else badge.innerHTML = '<span class="badge err">Simkl not connected</span>';
   }
-  if (r.connected || isTargetMismatch) {
-    // Active grant is connected (or a target check for a different version
-    // returned while the active grant is still connected).
+  // Determine the active grant's rendering (independent of target mismatch).
+  let activeHtml;
+  if (r.state === 'connected') {
     const activeTag = activeVersion ? ` (AUTH V${activeVersion})` : '';
-    const targetNote = isTargetMismatch
-      ? `<div class="muted" style="margin-top:6px;font-size:12px">Target AUTH V${r.target_version}: ${esc(r.message || r.state)}</div>`
-      : '';
-    flowEl.innerHTML = `<div class="muted">✓ Connected${r.username ? ` as <b style="color:var(--ok)">${esc(r.username)}</b>` : ''} — verified live${activeTag}. <b>${r.watched_count || 0}</b> watched title(s) in the local store.</div>
-      ${targetNote}
+    activeHtml = `<div class="muted">✓ Connected${r.username ? ` as <b style="color:var(--ok)">${esc(r.username)}</b>` : ''} — verified live${activeTag}. <b>${r.watched_count || 0}</b> watched title(s) in the local store.</div>
       <div style="margin-top:8px" class="row"><button class="ghost" onclick="syncSimkl('${id}', this)">Sync watched now</button>
       <button class="ghost" onclick="disconnectSimkl('${id}')">Disconnect from Simkl</button>
       <button class="ghost" onclick="revealSimklEditor('${id}')" title="Reveal the version selector / credentials for reauthorization or V1→V2 migration">Change connection</button>
-      <span class="tres" data-tres="simkl-sync"></span></div>
-      <div class="flow-status" style="margin-top:10px"></div>`;
+      <span class="tres" data-tres="simkl-sync"></span></div>`;
+  } else if (r.state === 'token_stored') {
+    // Stored but unverified: honest state + accessible Check + Change connection.
+    activeHtml = `<div class="muted">⚠ Token stored — not yet verified live. Run <b>Check connection</b> to verify.</div>
+      <div style="margin-top:8px" class="row"><button class="ghost" onclick="checkSimklLive('${id}')">Check connection</button>
+      <button class="ghost" onclick="revealSimklEditor('${id}')">Change connection</button>
+      <button class="ghost" onclick="disconnectSimkl('${id}')">Disconnect</button></div>`;
   } else if (r.state === 'wrong_auth_version') {
-    flowEl.innerHTML = `<div style="color:var(--err)">⚠ ${esc(r.message)}</div>
-      <div style="margin-top:8px"><button onclick="connectSimklV2('${id}')">Start V2 connection</button></div>
-      <div class="flow-status" style="margin-top:10px"></div>`;
+    activeHtml = `<div style="color:var(--err)">⚠ ${esc(r.message)}</div>
+      <div style="margin-top:8px"><button onclick="connectSimklV2('${id}')">Start V2 connection</button></div>`;
   } else if (r.state === 'client_id_rejected' || r.state === 'credential_mismatch' || r.state === 'provider_unavailable') {
-    flowEl.innerHTML = `<div style="color:var(--err)">✗ ${esc(r.message)}</div>
-      <div style="margin-top:8px"><button onclick="connectSimkl('${id}')">Connect Simkl</button></div>
-      <div class="flow-status" style="margin-top:10px"></div>`;
+    activeHtml = `<div style="color:var(--err)">✗ ${esc(r.message)}</div>
+      <div style="margin-top:8px"><button onclick="connectSimkl('${id}')">Connect Simkl</button>
+      <button class="ghost" onclick="revealSimklEditor('${id}')">Change connection</button></div>`;
   } else {
-    flowEl.innerHTML = `<div><button onclick="connectSimkl('${id}')">Connect Simkl</button>${r.message ? ` <span class="muted">— ${esc(r.message)}</span>` : ''}</div>
-      <div class="flow-status" style="margin-top:10px"></div>`;
+    activeHtml = `<div><button onclick="connectSimkl('${id}')">Connect Simkl</button>${r.message ? ` <span class="muted">— ${esc(r.message)}</span>` : ''}</div>`;
+  }
+  // Append the target's readiness as a separate supplementary note.
+  const targetNote = isTargetMismatch
+    ? `<div class="muted" style="margin-top:6px;font-size:12px">Target AUTH V${r.target_version}: ${esc(r.message || r.state)}</div>`
+    : '';
+  flowEl.innerHTML = activeHtml + targetNote + '<div class="flow-status" style="margin-top:10px"></div>';
+  // Editor visibility: hide when verified (connected); keep visible for
+  // stored/unverified/failed states. Respect a user's explicit edit-open state.
+  const editor = card.querySelector('[data-simkl-editor]');
+  if (editor) {
+    const ui = SIMKL_UI.get(id);
+    if (r.state === 'connected' && !ui?.editorOpen) {
+      editor.style.display = 'none';
+    } else {
+      editor.style.display = '';
+    }
   }
   const ui = SIMKL_UI.get(id);
   if (ui?.instructions) flowEl.querySelector('.flow-status').innerHTML = ui.instructions;

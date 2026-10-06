@@ -211,10 +211,29 @@ async function run() {
       context.on('page', p => p.on('pageerror', e => errors.push(e.message)));
       page.on('pageerror', e => errors.push(e.message));
       const uiId = add('BrowserTarget');
-      await page.goto(base + '/configure/#simkl?profile=' + uiId);
+      // Navigate to the Advanced tab (Simkl Integration section lives there).
+      await page.goto(base + '/configure/?profile=' + uiId);
       const card = page.locator('[data-id="' + uiId + '"]');
+      // Switch to the Advanced tab.
+      await card.getByRole('button', { name: 'Advanced', exact: true }).click();
+      // The profile has a stored V1 token but no check cache entry (fresh
+      // restart-equivalent state). The editor is visible; the flow shows
+      // "Token stored" with an accessible Check connection button.
+      await card.locator('[data-simkl-editor]').waitFor({ state: 'visible' });
+      await card.locator('.simkl-flow').filter({ hasText: 'Token stored' }).waitFor();
+      // Click "Check connection" to verify the stored token.
       await card.getByRole('button', { name: 'Check connection', exact: true }).click();
-      await card.getByRole('button', { name: 'Reauthorize with V2 (OAuth)', exact: true }).click();
+      // After verification, the connected summary shows with Change connection.
+      await card.locator('.simkl-flow').filter({ hasText: 'verified live' }).waitFor();
+      // The editor is hidden after verification (connected state).
+      await card.locator('[data-simkl-editor]').waitFor({ state: 'hidden' });
+      // Click "Change connection" to reveal the editor.
+      await card.getByRole('button', { name: 'Change connection', exact: true }).click();
+      await card.locator('[data-simkl-editor]').waitFor({ state: 'visible' });
+      // Select V2 in the version selector.
+      await card.locator('[data-auth-version]').selectOption('2');
+      // Click "Connect" to start the V2 OAuth flow.
+      await card.getByRole('button', { name: 'Connect', exact: true }).click();
       await page.waitForTimeout(6500);
       const link = card.getByRole('link', { name: 'Authorize with Simkl', exact: true });
       assert.equal(await link.count(), 1);
@@ -230,7 +249,10 @@ async function run() {
       await failureTab.close();
       pass('browser real callback failure retained after status render');
       consent = 'good';
-      await card.getByRole('button', { name: 'Reauthorize with V2 (OAuth)', exact: true }).click();
+      // Reveal the editor again and click Connect for V2.
+      await card.getByRole('button', { name: 'Change connection', exact: true }).click();
+      await card.locator('[data-simkl-editor]').waitFor({ state: 'visible' });
+      await card.getByRole('button', { name: 'Connect', exact: true }).click();
       let failedReload = false;
       await card.getByRole('link', { name: 'Authorize with Simkl', exact: true }).waitFor();
       await page.route('**/api/profiles', r => {
@@ -242,7 +264,9 @@ async function run() {
       await page.waitForFunction(id => PROFILES.find(p => p.id === id)?.simkl_active_version === 2, uiId);
       assert.equal(config.getProfile(uiId).simkl_auth.version, 2);
       assert.equal(failedReload, true, 'completion retries a failed profile reload');
-      assert.equal(await card.getByRole('button', { name: 'Reauthorize with V2 (OAuth)', exact: true }).count(), 0);
+      // After successful V2 connection, the connected summary shows.
+      await card.locator('.simkl-flow').filter({ hasText: 'verified live' }).waitFor();
+      assert.equal(await card.getByRole('button', { name: 'Change connection', exact: true }).count(), 1);
       await successTab.waitForSelector('[data-id="' + uiId + '"]');
       assert.equal(await successTab.locator('#userSelect').inputValue(), uiId);
       assert.deepEqual(errors, []);

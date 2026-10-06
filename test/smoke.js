@@ -9401,6 +9401,138 @@ async function httpTests() {
     console.log('  ✓ Card 1: TVDB Server Config — Test/Save/Reload/Test, draft vs saved, mask guard');
   }
 
+  // ---- Card 1: Stored/unverified grant — passive status + Check accessibility ----
+  {
+    // Restart-equivalent: a stored token with no check cache entry.
+    const pS = config.addProfile('StoredUnverified');
+    config.updateProfile(pS.id, {
+      keys: { simkl_client_id: 'client-S' },
+      simkl_auth: { access_token: 'stored-token', version: 1, client_id: 'client-S' },
+      simkl_auth_version: 1,
+    });
+    // The passive status returns token_stored (not connected).
+    const statusRes = await (await fetch(`${BASE}/api/profiles/${pS.id}/simkl/status`)).json();
+    assert.strictEqual(statusRes.state, 'token_stored', 'stored token → token_stored');
+    assert.ok(statusRes.message.includes('Token stored'), 'message mentions Token stored');
+    // The profile data has simkl_connected=true but simkl_check_state=null.
+    const allS = await (await fetch(`${BASE}/api/profiles`)).json();
+    const profS = allS.profiles.find((p) => p.id === pS.id);
+    assert.strictEqual(profS.simkl_connected, true, 'simkl_connected true (token exists)');
+    assert.strictEqual(profS.simkl_check_state, null, 'no check cache entry');
+    // A check with omitted version (legacy) verifies the active grant.
+    // Stub the provider call so /sync/activities succeeds.
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes('api.simkl.com')) {
+        return { ok: true, status: 200, json: async () => ({}) };
+      }
+      return origFetch(url, opts);
+    };
+    const checkRes = await (await origFetch(`${BASE}/api/profiles/${pS.id}/simkl/check`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    })).json();
+    global.fetch = origFetch;
+    assert.strictEqual(checkRes.state, 'connected', 'omitted version verifies active grant');
+    config.removeProfile(pS.id);
+    console.log('  ✓ Card 1: Stored/unverified grant — passive status + Check accessibility');
+  }
+
+  // ---- Card 1: Other-version readiness preserves active state ----
+  {
+    // A verified V1 grant with a V2 target check.
+    const pO = config.addProfile('OtherVersion');
+    config.updateProfile(pO.id, {
+      keys: { simkl_client_id: 'client-O1', simkl_v2_client_id: 'client-O', simkl_v2_client_secret: 'secret-O' },
+      simkl_auth: { access_token: 'v1-token-O', version: 1, client_id: 'client-O1', account_id: 99 },
+      simkl_auth_version: 1,
+    });
+    // Stub the provider call so /sync/activities and /users/settings succeed.
+    const origFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes('api.simkl.com')) {
+        if (u.includes('/users/settings')) return { ok: true, status: 200, json: async () => ({ user: { name: 'Test User', id: 99 } }) };
+        return { ok: true, status: 200, json: async () => ({}) };
+      }
+      return origFetch(url, opts);
+    };
+    // First, verify the V1 grant (omitted version = legacy behavior).
+    const verifyRes = await (await origFetch(`${BASE}/api/profiles/${pO.id}/simkl/check`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    })).json();
+    assert.strictEqual(verifyRes.state, 'connected', 'V1 verified');
+    assert.ok(verifyRes.username, 'username present');
+    // Now, check V2 (explicit version 2, matches saved preference after save).
+    await (await origFetch(`${BASE}/api/profiles/${pO.id}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ simkl_auth_version: 2 }),
+    })).json();
+    const v2Res = await (await origFetch(`${BASE}/api/profiles/${pO.id}/simkl/check`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ version: 2 }),
+    })).json();
+    // The V2 readiness result does NOT overwrite the V1 active state.
+    // The response has target_version=2 and the V1 active state is preserved
+    // in the check cache (the V1 check result is still cached).
+    assert.strictEqual(v2Res.target_version, 2, 'target_version is 2');
+    assert.strictEqual(v2Res.state, 'not_authorized', 'V2 not authorized');
+    // The passive status still reflects the V1 verified state (cached).
+    const statusAfter = await (await origFetch(`${BASE}/api/profiles/${pO.id}/simkl/status`)).json();
+    assert.strictEqual(statusAfter.state, 'connected', 'V1 still connected in passive status');
+    assert.ok(statusAfter.username, 'V1 username preserved');
+    global.fetch = origFetch;
+    config.removeProfile(pO.id);
+    console.log('  ✓ Card 1: Other-version readiness preserves active state');
+  }
+
+  // ---- Card 1: TVDB Replace — draft test sends entered key, not saved ----
+  {
+    const settings = require('../src/settings');
+    settings.updateSettings({ keys: { tvdb_api_key: 'saved-tvdb-key-abc' } });
+    const origFetch = global.fetch;
+    let capturedTvdbKey = null;
+    global.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes('thetvdb.com')) {
+        const body = opts?.body ? JSON.parse(opts.body) : {};
+        capturedTvdbKey = body.apikey || null;
+        return { ok: true, status: 200, json: async () => ({ data: { token: 'fake-token' } }) };
+      }
+      return origFetch(url, opts);
+    };
+    // Saved Test (use_saved) → server resolves the saved key and sends it to the provider.
+    await (await origFetch(`${BASE}/api/settings/test/tvdb`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ use_saved: true }),
+    })).json();
+    assert.strictEqual(capturedTvdbKey, 'saved-tvdb-key-abc', 'use_saved sends the saved key to the provider');
+    // Replace/draft Test → sends the entered draft (not the saved key).
+    await (await origFetch(`${BASE}/api/settings/test/tvdb`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'draft-tvdb-xyz' }),
+    })).json();
+    assert.strictEqual(capturedTvdbKey, 'draft-tvdb-xyz', 'draft key sent, saved key untouched');
+    // Cancel → back to saved mode (use_saved).
+    await (await origFetch(`${BASE}/api/settings/test/tvdb`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ use_saved: true }),
+    })).json();
+    assert.strictEqual(capturedTvdbKey, 'saved-tvdb-key-abc', 'use_saved after cancel sends saved key');
+    // Empty draft → honest missing-draft error (no provider call).
+    const beforeEmpty = capturedTvdbKey;
+    const emptyRes = await (await origFetch(`${BASE}/api/settings/test/tvdb`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: '' }),
+    })).json();
+    assert.ok(emptyRes.error, 'empty draft returns error');
+    assert.strictEqual(capturedTvdbKey, beforeEmpty, 'empty draft does not call the provider');
+    global.fetch = origFetch;
+    console.log('  ✓ Card 1: TVDB Replace — draft test sends entered key, not saved');
+  }
+
   console.log(`\nAll checks passed (${passed} unit + 59 async/http + T1-T8 + Card 1).`);
   process.exit(0);
 }
