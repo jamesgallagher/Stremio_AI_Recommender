@@ -2,9 +2,17 @@
 // STRICT by design: kids/age-limited profiles only list titles that HAVE a
 // Common Sense rating at or below the limit. No rating -> not listed. We do
 // not fall back to MPAA/TMDB certifications or any other source.
+const crypto = require('crypto');
 const USER_AGENT = 'AI-Recommender/1.0 (+https://github.com/jamesgallagher/Stremio_AI_Recommender)';
 const store = require('../store');
 const governor = require('./governor');
+
+// Server-private cryptographic fingerprint of a resolved key. Equal keys share
+// a bucket; distinct keys have independent rate limits. Never exposed to
+// clients or logs (only the first 16 hex chars are used as a state key).
+function keyFingerprint(apiKey) {
+  return apiKey ? crypto.createHash('sha256').update(apiKey).digest('hex').slice(0, 16) : 'none';
+}
 
 const NOT_RATED = null;
 const CSM_TTL_MS = 30 * 24 * 3600e3; // ratings are near-static; refresh monthly
@@ -38,7 +46,10 @@ function parseCommonSenseAge(data) {
 }
 
 async function fetchJson(url) {
-  const res = await governor.schedule('mdblist', () => fetch(url, { headers: { 'User-Agent': USER_AGENT } }));
+  // Extract the apikey from the URL for the governor's per-credential partitioning
+  const match = url.match(/apikey=([^&]+)/);
+  const fp = keyFingerprint(match ? decodeURIComponent(match[1]) : '');
+  const res = await governor.schedule('mdblist', () => fetch(url, { headers: { 'User-Agent': USER_AGENT } }), fp);
   if (!res.ok) {
     const err = new Error(`MDBList request failed (${res.status})`);
     err.status = res.status;
@@ -189,11 +200,12 @@ async function listItemsPage(apiKey, user, slug, type, { limit = 50, offset = 0,
 async function mediaInfoBatch(apiKey, type, imdbIds) {
   if (!imdbIds.length) return new Map();
   const mediaType = type === 'series' ? 'show' : 'movie';
+  const fp = keyFingerprint(apiKey);
   const res = await governor.schedule('mdblist', () => fetch(`${API}/imdb/${mediaType}?apikey=${encodeURIComponent(apiKey)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'User-Agent': USER_AGENT },
     body: JSON.stringify({ ids: imdbIds }),
-  }));
+  }), fp);
   if (!res.ok) {
     const err = new Error(`MDBList batch lookup failed (${res.status})`);
     err.status = res.status;

@@ -33,7 +33,7 @@ const LIMITS = {
   // authed api.simkl.com (its own lane so a CDN refresh never spends a profile's
   // 10-GET/s Simkl budget). One server-wide fetch/day, so pace it gently.
   simkl_cdn: { minIntervalMs: 1000 },
-  mdblist: { minIntervalMs: 250, dailyCap: 1000 },
+  mdblist: { minIntervalMs: 250, dailyCap: 1000, breaker: { threshold: 5, cooldownMs: 60000 } },
   // TVDB v4 (AGE-1): country certifications for the TV-14 chain. Free tier is
   // ~5 req/s — pace just under it.
   tvdb: { minIntervalMs: 200 },
@@ -46,11 +46,20 @@ const DEFAULT_BACKOFF_MS = 5000; // when a 429 carries no usable Retry-After
 const DAY_MS = 86400e3;
 
 const states = new Map();
-function stateFor(service) {
-  let s = states.get(service);
+// For MDBList, states are partitioned by key fingerprint so equal keys share
+// a bucket and distinct keys have independent pacing/backoff/breaker state.
+// The state key is `mdblist:<fingerprint>` for mdblist, plain `service` for others.
+function stateKey(service, keyFingerprint) {
+  if (service === 'mdblist' && keyFingerprint) return 'mdblist:' + keyFingerprint;
+  return service;
+}
+
+function stateFor(service, keyFingerprint) {
+  const k = stateKey(service, keyFingerprint);
+  let s = states.get(k);
   if (!s) {
-    s = { nextAt: 0, backoffUntil: 0, calls: 0, throttled: 0, lastThrottledAt: 0, day: 0, dayCalls: 0, fails: 0, openUntil: 0, tripped: 0 };
-    states.set(service, s);
+    s = { nextAt: 0, backoffUntil: 0, calls: 0, throttled: 0, lastThrottledAt: 0, day: 0, dayCalls: 0, fails: 0, openUntil: 0, tripped: 0, lastActivity: 0 };
+    states.set(k, s);
   }
   return s;
 }
@@ -63,15 +72,15 @@ function stateFor(service) {
 // retries, which keeps both it and us down) and makes the run fall straight
 // through to the fallback. After the cooldown the next call is a half-open
 // probe: success closes the breaker, failure re-opens it.
-function isOpen(service, nowMs = Date.now()) {
-  const s = states.get(service);
+function isOpen(service, keyFingerprint, nowMs = Date.now()) {
+  const s = states.get(stateKey(service, keyFingerprint));
   return !!s && s.openUntil > nowMs;
 }
 
-function noteOutcome(service, ok, nowMs = Date.now()) {
+function noteOutcome(service, ok, keyFingerprint, nowMs = Date.now()) {
   const lim = LIMITS[service];
   if (!lim || !lim.breaker) return;
-  const s = stateFor(service);
+  const s = stateFor(service, keyFingerprint);
   if (ok) { s.fails = 0; s.openUntil = 0; return; }
   s.fails += 1;
   if (s.fails >= lim.breaker.threshold && s.openUntil <= nowMs) {
@@ -94,12 +103,13 @@ function parseRetryAfter(value, nowMs) {
 // Reserve the next slot for a service and return the ms to wait before the call
 // may run. SYNCHRONOUS on purpose: the slot is claimed before any await, so two
 // concurrent callers get distinct, spaced slots. Exported for testing.
-function reserve(service, nowMs = Date.now()) {
+function reserve(service, keyFingerprint, nowMs = Date.now()) {
   const lim = LIMITS[service] || { minIntervalMs: 0 };
-  const s = stateFor(service);
+  const s = stateFor(service, keyFingerprint);
   const at = Math.max(nowMs, s.nextAt, s.backoffUntil);
   s.nextAt = at + lim.minIntervalMs;
   s.calls += 1;
+  s.lastActivity = nowMs;
   const day = Math.floor(nowMs / DAY_MS);
   if (s.day !== day) { s.day = day; s.dayCalls = 0; }
   s.dayCalls += 1;
@@ -108,47 +118,70 @@ function reserve(service, nowMs = Date.now()) {
 
 // Record a response so a 429 backs off subsequent calls. No-op for non-429 or
 // non-Response values. Exported for testing.
-function noteResponse(service, res, nowMs = Date.now()) {
+function noteResponse(service, res, keyFingerprint, nowMs = Date.now()) {
   if (!res || typeof res.status !== 'number' || res.status !== 429) return;
-  const s = stateFor(service);
+  const s = stateFor(service, keyFingerprint);
   const retryAfter = res.headers && typeof res.headers.get === 'function'
     ? parseRetryAfter(res.headers.get('retry-after'), nowMs) : 0;
   s.backoffUntil = nowMs + (retryAfter || DEFAULT_BACKOFF_MS);
   s.throttled += 1;
   s.lastThrottledAt = nowMs;
+  s.lastActivity = nowMs;
 }
 
 // The one entry point: pace, run fn (which returns a fetch Response), note 429.
 // Also drives the circuit breaker for services that opt in: an open breaker
 // fails fast (no slot, no network); otherwise the outcome (2xx-4xx reachable
 // vs 5xx/thrown down) is recorded. 429 is rate, not down — never a breaker fail.
-async function schedule(service, fn) {
+// `keyFingerprint` partitions MDBList pacing per credential (equal keys share
+// a bucket; distinct keys have independent rate limits).
+const MDBLIST_MAX_SLOT_WAIT_MS = 30000;
+
+async function schedule(service, fn, keyFingerprint) {
   const lim = LIMITS[service] || {};
-  if (lim.breaker && isOpen(service)) {
+  if (lim.breaker && isOpen(service, keyFingerprint)) {
     const err = new Error(`${service} circuit open — skipping (cooldown)`);
     err.circuitOpen = true;
     throw err;
   }
-  const wait = reserve(service);
+  const wait = reserve(service, keyFingerprint);
+  // MDBList: if the reserved slot would require waiting > 30s (e.g. a long
+  // 429 backoff from another credential's key), fail/defer promptly rather
+  // than holding the job queue. The caller defers and the next profile starts.
+  if (service === 'mdblist' && wait > MDBLIST_MAX_SLOT_WAIT_MS) {
+    const err = new Error(`MDBList slot wait ${wait}ms exceeds 30s — deferring`);
+    err.defer = true;
+    err.retryAfterMs = wait;
+    throw err;
+  }
   if (wait > 0) await sleep(wait);
   try {
     const res = await fn();
-    noteResponse(service, res);
-    noteOutcome(service, !(res && typeof res.status === 'number' && res.status >= 500));
+    noteResponse(service, res, keyFingerprint);
+    noteOutcome(service, !(res && typeof res.status === 'number' && res.status >= 500), keyFingerprint);
     return res;
   } catch (err) {
-    noteOutcome(service, false); // connection-level failure = the service is down
+    noteOutcome(service, false, keyFingerprint); // connection-level failure = the service is down
     throw err;
   }
 }
 
 // Diagnostics snapshot (for the Advanced tab, later): per-service call totals,
 // today's count vs any daily cap, and current throttle/backoff state.
+// For MDBList, per-fingerprint entries are grouped under `mdblist` with a
+// `key_source` label (never the raw key or full fingerprint).
+const IDLE_BUCKET_MS = 86400e3; // 24h — idle MDBList buckets are GC'd
+
 function stats(nowMs = Date.now()) {
   const out = {};
   for (const [service, s] of states) {
-    const lim = LIMITS[service] || {};
-    out[service] = {
+    // GC idle MDBList buckets (prevents unbounded state growth from many profiles)
+    if (service.startsWith('mdblist:') && s.lastActivity && nowMs - s.lastActivity > IDLE_BUCKET_MS) {
+      states.delete(service);
+      continue;
+    }
+    const lim = service.startsWith('mdblist:') ? LIMITS.mdblist : (LIMITS[service] || {});
+    const entry = {
       calls: s.calls,
       today: s.day === Math.floor(nowMs / DAY_MS) ? s.dayCalls : 0,
       daily_cap: lim.dailyCap || null,
@@ -159,6 +192,14 @@ function stats(nowMs = Date.now()) {
       circuit_ms_left: Math.max(0, s.openUntil - nowMs),
       tripped: s.tripped,
     };
+    if (service.startsWith('mdblist:')) {
+      // Group under the mdblist lane with a fingerprint suffix
+      const fp = service.slice(7); // strip 'mdblist:' prefix
+      if (!out.mdblist) out.mdblist = {};
+      out.mdblist[fp] = entry;
+    } else {
+      out[service] = entry;
+    }
   }
   return out;
 }
