@@ -70,25 +70,27 @@
 
 - **URL:** `/configure/#simkl?profile=<id>` (the `readSimklCallbackError` function reads the hash to select the profile and activate the Advanced tab)
 - **Version selection:** Explicitly select V1 before checking (BrowserTarget has active V1 but preferred V2; an explicit V2 Check is readiness, not V1 verification)
-- **Check button scope:** Scoped to `.simkl-flow` to avoid ambiguity with any editor check button
+- **Check button scope:** Initial stored-state Check scoped to `.simkl-flow`; target V2 Check scoped to `[data-simkl-editor]` (after Change connection the button is in the editor, not the flow summary)
+- **Target check wait:** Wait for "Target AUTH V2" in `.simkl-flow` before asserting badge/controls (badge already says "connected" before the request completes)
 - **Assertions:** Use "✓ Connected" and "Simkl connected" badge (not substring "verified live" which also matches "not yet verified live")
 - **New regression:** Verify V1 → record username/watched count/Sync/Disconnect → select V2 → Check → assert all active details/controls remain + V2 note appended once → passive render retains truthful state + one note
 
 ### Playwright status
 
-**Playwright is installed.** All 24 `--browser` checks pass, including the 4 browser regressions:
+**Playwright is installed.** All 25 `--browser` checks pass (21 non-browser + 4 browser regressions), tested at SHA `1e68416`:
 1. Pending migration (V2 replacement secret saved while pending)
 2. Callback failure (OAuth consent='wrong')
 3. Actual success (OAuth consent='good')
 4. **RegTarget active-state regression** — V1 active + V2 target: active username/watched count/Sync/Disconnect preserved after V2 Check; V2 target note appended exactly once; badge remains "Simkl connected"
 
-## Tests (all pass on final head `73f576f`)
+**Note:** The unmodified `adca6da` harness (with the initial `.simkl-flow`-scoped target Check) failed the RegTarget regression at line 309 — the Check button is inside `[data-simkl-editor]` after Change connection, not in `.simkl-flow`. Corrected in `1e68416`.
+
+## Tests (all pass on final head `1e68416`)
 
 - **smoke:** 216 unit + 59 async/http + T1-T8 + Card 1 (10 focused checks)
 - **integration:** 271 checks
 - **mobile:** 75 unit + http
-- **simkl.lifecycle:** 21 checks (non-browser)
-- **simkl.lifecycle --browser:** 24 checks (Playwright, Chromium; includes 4 browser regressions)
+- **simkl.lifecycle:** 25 checks (21 non-browser + 4 browser; Playwright/Chromium)
 
 ## Card 1 acceptance coverage
 
@@ -121,10 +123,10 @@
 | Other-version readiness appends target result, preserves active state | `Card 1: Other-version readiness` |
 | TVDB Replace keeps Test button; draft test sends entered key, not saved | `Card 1: TVDB Replace` |
 | Saved-secret draft of non-selected version preserved after save | `saveSimkl` code (block-scoped, committed-fields-only) |
-| Active state (badge/username/watched/Sync/Disconnect) preserved after other-version Check | Browser regression (RegTarget, `--browser` passed) |
-| Target note appended exactly once; passive render retains it | Browser regression (RegTarget, `--browser` passed) |
+| Active state (badge/username/watched/Sync/Disconnect) preserved after other-version Check | Browser regression (RegTarget, `1e68416` `--browser` passed) |
+| Target note appended exactly once; passive render retains it | Browser regression (RegTarget, `1e68416` `--browser` passed) |
 | Draft edited while Save pending survives (not collapsed to Saved securely) | `saveSimkl` code (captured values + current-DOM check) |
-| Browser harness uses correct URL/version/locator/assertions | `test/simkl.lifecycle.js --browser` (24 checks passed) |
+| Browser harness uses correct URL/version/locator/assertions | `test/simkl.lifecycle.js --browser` (25 checks passed at `1e68416`) |
 
 ## Notes for Card 2
 
