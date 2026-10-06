@@ -128,6 +128,27 @@
   .tab-btn.active { color: var(--text); border-bottom-color: var(--accent); }
   .tab-panel { display: none; padding-top: 14px; }
   .tab-panel.active { display: block; }
+  /* Advanced tab — each section is a title followed by one content box (the
+     Filters tab's Title-decay box style); inputs sit one shade darker than the
+     box. A single sticky Save bar covers every fillable section. */
+  .sec-title { font-size: 13px; font-weight: 600; color: var(--text); margin: 18px 0 6px; }
+  .adv > .muted + .sec-title { margin-top: 4px; }
+  .sec-box { background: var(--card2); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+  .sec-box > label:first-child, .sec-box .cols:first-child label { margin-top: 0; }
+  .sec-box input[type=text], .sec-box input[type=password], .sec-box input[type=email], .sec-box select { background: var(--card); }
+  .sec-box.danger { border-color: rgba(248,113,113,.45); }
+  .hint { font-size: 11px; color: var(--muted); margin-top: 6px; }
+  .conn { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; background: var(--muted); }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 0 3px rgba(52,211,153,.18); }
+  .dot.warn { background: var(--warn); }
+  .dot.err { background: var(--err); }
+  .save-bar { position: sticky; bottom: 0; z-index: 5; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    margin: 18px -18px -18px; padding: 12px 18px; background: var(--card); border-top: 1px solid var(--border); border-radius: 0 0 12px 12px; }
+  .save-bar.dirty { border-top-color: var(--warn); }
+  .save-bar.dirty .save-note { color: var(--warn); }
+  .adv input[type=email] { width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border);
+    color: var(--text); font-size: 14px; outline: none; }
   .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
     background: var(--card2); border: 1px solid var(--accent); border-radius: 10px; padding: 10px 18px; font-size: 13px; display: none; }
   .getkey { color: var(--accent); font-size: 11px; text-decoration: none; margin-left: 6px; }
@@ -294,7 +315,6 @@ function replaceSecret(id, dataKey) {
     <input type="password" data-key="${dataKey}" data-orig="" value="" placeholder="Enter new secret" autocomplete="off" spellcheck="false" ${IGNORE_PW_MANAGERS}>
     <button type="button" class="eye" onclick="toggleKey(this)" title="Show / hide">${EYE_OFF}</button>
   </div>
-  <button class="ghost mini" onclick="saveSimkl('${id}')">Save</button>
   <button class="ghost mini" onclick="cancelSecret('${id}','${dataKey}')">Cancel</button>`;
 }
 
@@ -573,80 +593,102 @@ function render(profiles) {
         <div class="muted" style="margin-top:6px">Paste the URL in Stremio → Addons → Add addon. This link is ${esc(p.name)}'s personal list — don't share it outside the family.</div>
       </div>
 
-      <div class="tab-panel" data-tab="advanced">
-        <div style="margin-top:4px">
-          <b>User Settings</b>
-          <label style="margin-top:8px">User email <span class="muted">— for the Mobile Companion</span></label>
+      <div class="tab-panel adv" data-tab="advanced">
+        <div class="muted" style="margin-bottom:8px;font-size:11px">Account details, the <b>Simkl</b> link and this profile's <b>MDBList</b> key are saved together with the <b>Save</b> button at the bottom. Maintenance actions (rebuild, pool, watch history) run straight away.</div>
+
+        <div class="sec-title">Account</div>
+        <div class="sec-box">
+          <label>Email <span class="muted">— for the Mobile Companion</span></label>
           <input type="email" data-email value="${esc(p.email || '')}" placeholder="name@example.com" autocomplete="off" spellcheck="false" ${IGNORE_PW_MANAGERS}>
-          <div class="muted" style="font-size:11px;margin-top:3px">Email is used to receive one-time passwords (OTPs) and is required for the Mobile Companion. It must be unique.</div>
+          <div class="hint">Receives one-time passwords (OTPs) for the Mobile Companion. Must be unique across profiles.</div>
         </div>
 
-        <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
-          <b>Simkl Integration</b>
-          <div class="muted" style="margin-top:4px">Watch tracker. Create a Simkl API app for <b>${esc(p.name)}</b> — AUTH V1 (PIN device flow) and/or AUTH V2 (OAuth + PKCE, requires a public HTTPS <code>EXTERNAL_URL</code>). Paste the Client ID (and Secret), Save, then Connect. Use <b>Check connection</b> to verify live against Simkl.</div>
-          <div data-simkl-editor ${p.simkl_check_state === 'connected' ? 'style="display:none"' : ''}>
-            <div style="margin-top:12px"><label>Auth version</label>
-              <select data-auth-version onchange="toggleSimklVersion('${p.id}')">
-                <option value="1" ${p.simkl_auth_version === 1 ? 'selected' : ''}>AUTH V1 (PIN device flow)</option>
-                <option value="2" ${p.simkl_auth_version === 2 ? 'selected' : ''}>AUTH V2 (OAuth + PKCE)</option>
-              </select>
-              <div class="muted" style="font-size:11px;margin-top:3px">V2 requires a public HTTPS <code>EXTERNAL_URL</code> for the callback. The active token's version is independent of this preference (selecting V2 does not change an existing V1 token).</div>
+        <div class="sec-title">Simkl</div>
+        <div class="sec-box">
+          <div class="simkl-flow" data-sid="${p.id}">
+            ${p.simkl_connected
+              ? `<div class="conn"><span class="dot warn"></span><span class="grow muted">Checking the stored connection…</span></div>`
+              : `<div class="conn"><span class="dot err"></span><span class="grow muted">Not connected — enter the Simkl app credentials below, then <b>Connect Simkl</b>.</span></div>`}
+          </div>
+          <div data-simkl-editor ${p.simkl_connected ? 'style="display:none"' : ''}>
+            <div class="hint" style="margin:10px 0 0">Create a Simkl API app for <b>${esc(p.name)}</b>. <b>AUTH V1</b> uses a PIN code; <b>AUTH V2</b> uses OAuth + PKCE and needs a public HTTPS <code>EXTERNAL_URL</code> for the callback.</div>
+            <div class="cols">
+              <div><label>Auth version</label>
+                <select data-auth-version onchange="toggleSimklVersion('${p.id}')">
+                  <option value="1" ${p.simkl_auth_version === 1 ? 'selected' : ''}>AUTH V1 (PIN device flow)</option>
+                  <option value="2" ${p.simkl_auth_version === 2 ? 'selected' : ''}>AUTH V2 (OAuth + PKCE)</option>
+                </select></div>
+              <div></div>
             </div>
-            <div class="keys-list" style="margin-top:12px">
-              <div data-simkl-v1 ${p.simkl_auth_version === 2 ? 'style="display:none"' : ''}>
-                <div><label>Client ID
-                    <a class="getkey" href="https://simkl.com/settings/developer/new/" target="_blank" rel="noopener">get key ↗</a></label>
+            <div data-simkl-v1 ${p.simkl_auth_version === 2 ? 'style="display:none"' : ''}>
+              <div class="cols">
+                <div><label>Client ID <a class="getkey" href="https://simkl.com/settings/developer/new/" target="_blank" rel="noopener">get key ↗</a></label>
                   ${keyRow(p.id, 'simkl_client_id', p.keys.simkl_client_id)}</div>
                 <div><label>Client Secret <span class="muted">(optional for PIN)</span></label>
                   ${keyRow(p.id, 'simkl_client_secret', p.keys.simkl_client_secret)}</div>
               </div>
-              <div data-simkl-v2 ${p.simkl_auth_version === 1 ? 'style="display:none"' : ''}>
-                <div><label>Client ID</label>
+            </div>
+            <div data-simkl-v2 ${p.simkl_auth_version === 1 ? 'style="display:none"' : ''}>
+              <div class="cols">
+                <div><label>Client ID <a class="getkey" href="https://simkl.com/settings/developer/new/" target="_blank" rel="noopener">get key ↗</a></label>
                   ${keyRow(p.id, 'simkl_v2_client_id', p.keys.simkl_v2_client_id)}</div>
-                <div><label>Client Secret <span class="muted">(${p.keys_set.simkl_v2_client_secret ? 'Saved securely' : 'required for V2'})</span></label>
+                <div><label>Client Secret <span class="muted">(${p.keys_set.simkl_v2_client_secret ? 'saved securely' : 'required for V2'})</span></label>
                   ${savedSecretRow(p.id, 'simkl_v2_client_secret', p.keys_set.simkl_v2_client_secret)}</div>
               </div>
             </div>
-            <div style="margin-top:10px"><button onclick="saveSimkl('${p.id}')">Save</button>
-              <button class="ghost" onclick="checkSimklLive('${p.id}')">Check connection</button>
-              <button class="ghost" onclick="connectSimkl('${p.id}')">Connect</button></div>
-          </div>
-          <div class="simkl-flow" data-sid="${p.id}" style="margin-top:12px; padding-top:10px; border-top:1px solid var(--border)">
-            <span class="muted">${p.simkl_connected ? 'Connected — see status below.' : 'Save the Client ID, then <b>Check connection</b> to verify live against Simkl.'}</span>
+            <div class="row" style="margin-top:12px">
+              <button onclick="connectSimkl('${p.id}')">Connect Simkl</button>
+              <span class="muted" style="font-size:11px">Saves the credentials above, then hands you to Simkl to authorise.</span>
+            </div>
           </div>
         </div>
 
-        <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
-          <b>API Keys</b>
-          <div class="muted" style="margin-top:4px">Per-profile MDBList key. A personal key takes priority over the server key; without one, the server key is used. Neither set: MDBList lookups are unavailable (kids age rules fail-closed).</div>
-          <label style="margin-top:8px">MDBList</label>
+        <div class="sec-title">MDBList</div>
+        <div class="sec-box">
+          <label>Personal API key <a class="getkey" href="https://mdblist.com/preferences/" target="_blank" rel="noopener">get key ↗</a></label>
           ${mdblistKeyRow(p.id, p.keys.mdblist_api_key)}
           <div id="mdblist-status-${p.id}">${renderMdblistStatus(p)}</div>
+          <div class="hint">Takes priority over the server key; leave blank to use the server key. With neither set, MDBList lookups are unavailable (kids age rules fail closed).</div>
         </div>
 
-        <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
-          <div style="margin-top:4px" class="row">
+        <div class="sec-title">Recommendations</div>
+        <div class="sec-box">
+          <div class="row">
             <button class="ghost btn-rebuild" onclick="rebuildNow('${p.id}', this)" ${p.simkl_connected && !p.status.rebuilding ? '' : 'disabled'}>${p.status.rebuilding ? 'Rebuilding…' : 'Rebuild now'}</button>
-            <button class="danger" onclick="delProfile('${p.id}')">Delete profile</button>
+            <span class="muted" style="font-size:11px">Re-runs the extra catalogs (and the pool if watched history moved).</span>
           </div>
-          <div class="muted" style="font-size:11px;margin-top:4px">Rebuild re-runs the extra catalogs (and the pool if watched history moved). Delete removes this profile and stops its install link immediately.</div>
-
-          <div style="margin-top:16px"><b>Recommendation pool</b> <span class="muted" style="font-size:11px">— built from Simkl watched history (TMDB recommendations, recency-weighted)</span></div>
-          <div style="margin-top:8px" class="row">
+          <label style="margin-top:14px">Recommendation pool <span class="muted">— built from Simkl watched history (TMDB recommendations, recency-weighted)</span></label>
+          <div class="row">
             <button class="ghost" onclick="buildRecs('${p.id}', this)" title="Build the recommendation pool from watched history">Build</button>
             <button class="ghost" onclick="viewRecs('${p.id}', this)">View</button>
             <button class="ghost" onclick="resetRecs('${p.id}', this)" title="Wipe the pool and your 'don't recommend' flags">Reset</button>
           </div>
           <span class="tres" data-tres="recs"></span>
-          ${p.simkl_connected ? '' : '<div class="muted" style="margin-top:6px">Connect Simkl (Simkl Integration) first — the pool builds from watched history.</div>'}
+          ${p.simkl_connected ? '' : '<div class="hint">Connect Simkl first — the pool builds from watched history.</div>'}
           <div class="recs-panel diag" style="display:none;margin-top:10px"></div>
+        </div>
 
-          <div style="margin-top:20px;padding-top:14px;border-top:1px solid var(--border)"><b>Recently watched</b> <span class="muted" style="font-size:11px">— last 50 movies + 50 series, newest first, read <b>live from Simkl</b> (the authority, not the local store)</span></div>
-          <div style="margin-top:8px" class="row">
+        <div class="sec-title">Watch history</div>
+        <div class="sec-box">
+          <div class="row">
             <button class="ghost" onclick="viewWatched('${p.id}', this)" ${p.simkl_connected ? '' : 'disabled'} title="Fetch recent watched history straight from Simkl">View watched</button>
+            <span class="muted" style="font-size:11px">Last 50 movies + 50 series, newest first, read <b>live from Simkl</b> (the authority, not the local store).</span>
           </div>
-          ${p.simkl_connected ? '' : '<div class="muted" style="margin-top:6px">Connect Simkl (Simkl Integration) first.</div>'}
+          ${p.simkl_connected ? '' : '<div class="hint">Connect Simkl first.</div>'}
           <div class="watched-panel diag" style="display:none;margin-top:10px"></div>
+        </div>
+
+        <div class="sec-title" style="color:var(--err)">Danger zone</div>
+        <div class="sec-box danger">
+          <div class="row">
+            <span class="grow muted" style="font-size:12px">Delete removes <b>${esc(p.name)}</b> and stops their install link immediately. This cannot be undone.</span>
+            <button class="danger" onclick="delProfile('${p.id}')">Delete profile</button>
+          </div>
+        </div>
+
+        <div class="save-bar">
+          <button onclick="saveAdvanced('${p.id}')">Save</button>
+          <span class="muted save-note">— saves the email, Simkl credentials &amp; MDBList key</span>
         </div>
       </div>
     </div>`;
@@ -655,6 +697,8 @@ function render(profiles) {
   // card whose Advanced tab is showing (the Simkl Integration section lives there).
   container.querySelectorAll('.card[data-id]').forEach(card => {
     activateTab(card, activeMap[card.dataset.id] || 'filters', { silent: true });
+    // The Simkl row renders a placeholder; fill it when Advanced is showing.
+    if (activeMap[card.dataset.id] === 'advanced') checkSimklStatus(card.dataset.id);
     if (recsMap[card.dataset.id]) {
       const panel = card.querySelector('.recs-panel');
       panel.innerHTML = recsMap[card.dataset.id];
@@ -1244,12 +1288,12 @@ async function saveKeys(id, silent = false) {
   if (!silent) { dirty = false; toast('Keys saved'); pollStatus(); }
 }
 
-// Advanced tab Save: the user email + the selected Simkl version's genuinely
-// edited credential fields + the auth version preference + the per-profile
-// MDBList key, all in one profile PUT. The hidden (non-selected) version's
-// drafts are never submitted. A failed save throws so dependent actions
-// (Connect) stop.
-async function saveSimkl(id) {
+// Advanced tab Save (the sticky bar at the bottom): the user email + the
+// selected Simkl version's genuinely edited credential fields + the auth
+// version preference + the per-profile MDBList key, all in one profile PUT.
+// The hidden (non-selected) version's drafts are never submitted. A failed
+// save throws so dependent actions (Connect) stop.
+async function saveAdvanced(id) {
   const card = document.querySelector(`[data-id="${id}"]`);
   const email = (card.querySelector('[data-email]')?.value || '').trim();
   const authVersion = parseInt(card.querySelector('[data-auth-version]').value, 10);
@@ -1298,8 +1342,22 @@ async function saveSimkl(id) {
       // subsequent Save will correctly detect the later draft as changed.
     }
   });
-  dirty = false; toast('Saved'); pollStatus();
+  dirty = false; setAdvDirty(card, false); toast('Saved'); pollStatus();
 }
+
+// Save-bar state: amber "unsaved changes" once any fillable Advanced field is
+// edited, back to neutral after a successful Save.
+function setAdvDirty(card, on) {
+  const bar = card?.querySelector('.save-bar');
+  if (!bar) return;
+  bar.classList.toggle('dirty', on);
+  bar.querySelector('.save-note').textContent = on
+    ? '— unsaved changes'
+    : '— saves the email, Simkl credentials & MDBList key';
+}
+document.addEventListener('input', e => {
+  if (e.target.closest('.adv') && e.target.matches('[data-email], [data-key], [data-auth-version]')) setAdvDirty(e.target.closest('.card'), true);
+});
 
 // Toggle the visible Simkl credential block (V1/V2) without saving, clearing
 // drafts, or replacing the card. Stored credentials for the other version
@@ -1311,23 +1369,6 @@ function toggleSimklVersion(id) {
   const v2 = card.querySelector('[data-simkl-v2]');
   if (v1) v1.style.display = version === 1 ? '' : 'none';
   if (v2) v2.style.display = version === 2 ? '' : 'none';
-}
-
-// "Change connection" (connected summary): reveal the version selector /
-// credential editor so the user can reauthorize or migrate V1→V2 without a
-// Disconnect. The editor is hidden when verified; this reveals it and marks
-// the user's explicit edit-open state so passive renders respect it.
-function revealSimklEditor(id) {
-  const card = document.querySelector(`[data-id="${id}"]`);
-  const editor = card?.querySelector('[data-simkl-editor]');
-  if (editor) editor.style.display = '';
-  // Mark the user's explicit edit-open state so later passive renders
-  // do not hide the editor again.
-  let ui = SIMKL_UI.get(id);
-  if (!ui) { ui = { instructions: '', message: '', busy: false }; SIMKL_UI.set(id, ui); }
-  ui.editorOpen = true;
-  const sel = card?.querySelector('[data-auth-version]');
-  if (sel) sel.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
 async function testKey(id, service, btn) {
@@ -1370,7 +1411,7 @@ async function testMdblistUser(id, btn) {
 }
 
 // Clear the per-profile MDBList key (explicit null). An unchanged/blank draft
-// never erases the key (handled by saveSimkl's data-orig comparison).
+// never erases the key (handled by saveAdvanced's data-orig comparison).
 async function clearMdblistUser(id) {
   await api('/profiles/' + id, { method: 'PUT', body: { keys: { mdblist_api_key: null } } });
   // Update the specific field's value, original, and saved indicator in place
@@ -1504,140 +1545,75 @@ async function syncScrobble(id, btn, full) {
   btn.textContent = orig;
 }
 
-// Passive status poll — lightweight, no Simkl call. Renders the last manual
-// check's state (or the stored-token state). Used on the Simkl tab open.
+// Simkl section. A stored token counts as connected for the controls: the
+// credential editor is hidden and Disconnect is the only action (switching
+// auth version = Disconnect, then Connect). The passive status poll never
+// calls Simkl; when it reports a stored-but-unverified token (the check cache
+// is in-memory, so every token reads "stored" after a restart), the page runs
+// ONE live check of the active grant per profile per page load — no version,
+// so it verifies the active grant and edits no settings — instead of asking
+// the user to press "Check connection".
 const SIMKL_UI = new Map();
+const SIMKL_AUTOCHECKED = new Set();
+const SIMKL_HAS_TOKEN = new Set(['connected', 'token_stored', 'verifying', 'provider_unavailable']);
 
 async function checkSimklStatus(id) {
   const card = document.querySelector(`[data-id="${id}"]`);
-  const flowEl = card?.querySelector('.simkl-flow');
-  if (!flowEl) return;
+  if (!card?.querySelector('.simkl-flow')) return;
   try {
-    const r = await api(`/profiles/${id}/simkl/status`);
+    let r = await api(`/profiles/${id}/simkl/status`);
+    if (r.state === 'token_stored' && !SIMKL_AUTOCHECKED.has(id)) {
+      SIMKL_AUTOCHECKED.add(id);
+      renderSimklFlow(id, { ...r, state: 'verifying' });
+      try {
+        r = { ...r, ...(await api(`/profiles/${id}/simkl/check`, { method: 'POST' })) };
+      } catch (e) {
+        r = { ...r, state: 'provider_unavailable', message: e.message };
+      }
+    }
     renderSimklFlow(id, r);
   } catch (e) { /* passive poll failure is silent */ }
 }
 
-// Manual Check connection — saves the selected configuration (single coherent
-// PUT with the selected version's edited fields), then POSTs /simkl/check.
-// Stops on Save failure. Hidden-version drafts are never submitted.
-async function checkSimklLive(id) {
-  const card = document.querySelector(`[data-id="${id}"]`);
-  const flowEl = card?.querySelector('.simkl-flow');
-  if (!flowEl) return;
-  // Capture the request identity: profile id + selected version. If the
-  // profile or selection changes while awaiting, the result is stale.
-  const requestVersion = parseInt(card.querySelector('[data-auth-version]').value, 10);
-  flowEl.innerHTML = '<span class="muted">⟳ Saving & checking Simkl…</span>';
-  try {
-    await saveSimkl(id);
-  } catch (e) {
-    flowEl.innerHTML = `<span style="color:var(--err)">Save failed: ${esc(e.message)}</span>`;
-    return;
-  }
-  flowEl.innerHTML = '<span class="muted">⟳ Checking Simkl live…</span>';
-  try {
-    const r = await api(`/profiles/${id}/simkl/check`, { method: 'POST', body: { version: requestVersion } });
-    // Discard stale results: if the profile is gone or the selected version
-    // changed while awaiting, the result no longer applies.
-    const currentCard = document.querySelector(`[data-id="${id}"]`);
-    const currentVersion = parseInt(currentCard?.querySelector('[data-auth-version]')?.value, 10);
-    if (currentVersion !== requestVersion) return;
-    // Preserve the request/profile guard after the await.
-    const p = PROFILES.find(x => x.id === id);
-    const activeVersion = p?.simkl_active_version || null;
-    const isTargetMismatch = r.target_version !== undefined && activeVersion !== null && r.target_version !== activeVersion;
-    if (isTargetMismatch) {
-      // Store the target result separately; render the passive active state.
-      let ui = SIMKL_UI.get(id);
-      if (!ui) { ui = { instructions: '', message: '', busy: false }; SIMKL_UI.set(id, ui); }
-      ui.targetResult = r;
-      // Fetch the passive status for the active grant.
-      const passive = await api(`/profiles/${id}/simkl/status`);
-      // Re-check the guard after the second await.
-      const guardCard = document.querySelector(`[data-id="${id}"]`);
-      const guardVersion = parseInt(guardCard?.querySelector('[data-auth-version]')?.value, 10);
-      if (guardVersion !== requestVersion) return;
-      renderSimklFlow(id, passive);
-    } else {
-      // Matching version: the check result IS the active verification.
-      // Clear any prior target note.
-      const ui = SIMKL_UI.get(id);
-      if (ui) ui.targetResult = null;
-      renderSimklFlow(id, r);
-    }
-  } catch (e) {
-    const currentCard = document.querySelector(`[data-id="${id}"]`);
-    const currentVersion = parseInt(currentCard?.querySelector('[data-auth-version]')?.value, 10);
-    if (currentVersion !== requestVersion) return;
-    const flowEl2 = currentCard?.querySelector('.simkl-flow');
-    if (flowEl2) flowEl2.innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`;
-  }
-}
-
-// Shared renderer for the Simkl flow area. The active grant's state (from
-// passive status or a matching-version check) is authoritative for the badge
-// and controls. A stored targetResult (from an explicit other-version check)
-// is appended as a separate labelled note — never reinterpreted as the
-// active state.
+// Render the Simkl status row + header badge for one state, and show the
+// credential editor only while there is no usable token.
 function renderSimklFlow(id, r) {
   const card = document.querySelector(`[data-id="${id}"]`);
   const flowEl = card?.querySelector('.simkl-flow');
   if (!flowEl) return;
   const p = PROFILES.find(x => x.id === id);
-  const activeVersion = p?.simkl_active_version || null;
   const ui = SIMKL_UI.get(id);
-  // The active grant's state is authoritative for the badge.
-  const activeState = r.state;
+  const hasToken = SIMKL_HAS_TOKEN.has(r.state) && (r.state !== 'provider_unavailable' || !!p?.simkl_connected);
   const badge = card.querySelector('.hdr-badge');
   if (badge) {
-    if (activeState === 'connected') badge.innerHTML = '<span class="badge ok">Simkl connected</span>';
-    else if (activeState === 'token_stored') badge.innerHTML = '<span class="badge warn">Simkl token stored</span>';
+    if (r.state === 'connected') badge.innerHTML = '<span class="badge ok">Simkl connected</span>';
+    else if (hasToken) badge.innerHTML = '<span class="badge warn">Simkl token stored</span>';
     else badge.innerHTML = '<span class="badge err">Simkl not connected</span>';
   }
-  // Determine the active grant's rendering.
-  let activeHtml;
+  const disconnect = `<button class="ghost" onclick="disconnectSimkl('${id}')">Disconnect</button>`;
+  const version = p?.simkl_active_version ? ` · AUTH V${p.simkl_active_version}` : '';
+  const watched = `<span class="muted">${r.watched_count || 0} watched title(s) in the local store</span>`;
+  let line;
   if (r.state === 'connected') {
-    const activeTag = activeVersion ? ` (AUTH V${activeVersion})` : '';
-    activeHtml = `<div class="muted">✓ Connected${r.username ? ` as <b style="color:var(--ok)">${esc(r.username)}</b>` : ''} — verified live${activeTag}. <b>${r.watched_count || 0}</b> watched title(s) in the local store.</div>
-      <div style="margin-top:8px" class="row"><button class="ghost" onclick="syncSimkl('${id}', this)">Sync watched now</button>
-      <button class="ghost" onclick="disconnectSimkl('${id}')">Disconnect from Simkl</button>
-      <button class="ghost" onclick="revealSimklEditor('${id}')" title="Reveal the version selector / credentials for reauthorization or V1→V2 migration">Change connection</button>
-      <span class="tres" data-tres="simkl-sync"></span></div>`;
-  } else if (r.state === 'token_stored') {
-    // Stored but unverified: honest state + accessible Check + Change connection.
-    activeHtml = `<div class="muted">⚠ Token stored — not yet verified live. Run <b>Check connection</b> to verify.</div>
-      <div style="margin-top:8px" class="row"><button class="ghost" onclick="checkSimklLive('${id}')">Check connection</button>
-      <button class="ghost" onclick="revealSimklEditor('${id}')">Change connection</button>
-      <button class="ghost" onclick="disconnectSimkl('${id}')">Disconnect</button></div>`;
+    line = `<span class="dot ok"></span><span class="grow">Connected${r.username ? ` as <b style="color:var(--ok)">${esc(r.username)}</b>` : ''}${version} · ${watched}</span>${disconnect}`;
+  } else if (r.state === 'verifying') {
+    line = `<span class="dot warn"></span><span class="grow muted">⟳ Verifying the stored connection with Simkl…</span>${disconnect}`;
+  } else if (hasToken) {
+    const why = r.state === 'provider_unavailable' ? `couldn't reach Simkl to verify it${r.message ? ` (${esc(r.message)})` : ''}` : 'not verified yet';
+    line = `<span class="dot warn"></span><span class="grow">Token stored${version} — <span class="muted">${why}</span></span>${disconnect}`;
   } else if (r.state === 'wrong_auth_version') {
-    activeHtml = `<div style="color:var(--err)">⚠ ${esc(r.message)}</div>
-      <div style="margin-top:8px"><button onclick="connectSimklV2('${id}')">Start V2 connection</button></div>`;
-  } else if (r.state === 'client_id_rejected' || r.state === 'credential_mismatch' || r.state === 'provider_unavailable') {
-    activeHtml = `<div style="color:var(--err)">✗ ${esc(r.message)}</div>
-      <div style="margin-top:8px"><button onclick="connectSimkl('${id}')">Connect Simkl</button>
-      <button class="ghost" onclick="revealSimklEditor('${id}')">Change connection</button></div>`;
+    line = `<span class="dot err"></span><span class="grow" style="color:var(--err)">${esc(r.message)}</span><button onclick="connectSimklV2('${id}')">Start V2 connection</button>`;
+  } else if (r.state === 'not_authorized' || !r.state) {
+    line = `<span class="dot err"></span><span class="grow muted">Not connected — enter the Simkl app credentials below, then <b>Connect Simkl</b>.</span>`;
   } else {
-    activeHtml = `<div><button onclick="connectSimkl('${id}')">Connect Simkl</button>${r.message ? ` <span class="muted">— ${esc(r.message)}</span>` : ''}</div>`;
+    // Rejected / mismatched / unconfigured: the token (if any) is unusable.
+    line = `<span class="dot err"></span><span class="grow" style="color:var(--err)">✗ ${esc(r.message || r.state)}</span>${p?.simkl_connected ? disconnect : ''}`;
   }
-  // Append the stored targetResult as a separate labelled note.
-  const targetResult = ui?.targetResult || null;
-  const targetNote = targetResult
-    ? `<div class="muted" style="margin-top:6px;font-size:12px">Target AUTH V${targetResult.target_version}: ${esc(targetResult.message || targetResult.state)}</div>`
-    : '';
-  flowEl.innerHTML = activeHtml + targetNote + '<div class="flow-status" style="margin-top:10px"></div>';
-  // Editor visibility: hide when verified (connected); keep visible for
-  // stored/unverified/failed states. Respect a user's explicit edit-open state.
+  flowEl.innerHTML = `<div class="conn">${line}</div><div class="flow-status"></div>`;
   const editor = card.querySelector('[data-simkl-editor]');
-  if (editor) {
-    if (r.state === 'connected' && !ui?.editorOpen) {
-      editor.style.display = 'none';
-    } else {
-      editor.style.display = '';
-    }
-  }
-  if (ui?.instructions) flowEl.querySelector('.flow-status').innerHTML = ui.instructions;
-  if (ui?.message) flowEl.insertAdjacentHTML('beforeend', '<div class="simkl-attempt-error" style="color:var(--err)">' + esc(ui.message) + '</div>');
+  if (editor) editor.style.display = hasToken ? 'none' : '';
+  if (ui?.instructions) flowEl.querySelector('.flow-status').innerHTML = `<div style="margin-top:10px">${ui.instructions}</div>`;
+  if (ui?.message) flowEl.insertAdjacentHTML('beforeend', '<div class="simkl-attempt-error" style="color:var(--err);margin-top:8px;font-size:12px">' + esc(ui.message) + '</div>');
 }
 
 async function connectSimkl(id) {
@@ -1646,7 +1622,7 @@ async function connectSimkl(id) {
   const ui = { instructions: '', message: '', busy: false };
   SIMKL_UI.set(id, ui);
   try {
-    await saveSimkl(id);
+    await saveAdvanced(id);
     const r = await api('/profiles/' + id + '/simkl/connect', { method: 'POST' });
     if (SIMKL_UI.get(id) !== ui) return;
     if (r.authorize_url) {
@@ -1674,9 +1650,10 @@ async function connectSimkl(id) {
           const profiles = (await api('/profiles')).profiles;
           if (SIMKL_UI.get(id) !== ui) return;
           PROFILES = profiles;
+          SIMKL_AUTOCHECKED.delete(id);
           ui.instructions = '';
           if (SELECTED === id) renderSelected();
-          toast(attempt.result === 'connected' ? 'Simkl connected 🎉' : 'Simkl token stored — run Check connection');
+          toast(attempt.result === 'connected' ? 'Simkl connected 🎉' : 'Simkl token stored');
         } else ui.message = attempt.message;
         clearInterval(ui.timer);
         ui.instructions = '';
@@ -1703,10 +1680,14 @@ async function connectSimklV2(id) {
 }
 
 async function disconnectSimkl(id) {
+  const name = PROFILES.find(x => x.id === id)?.name || 'this profile';
+  if (!confirm(`Disconnect Simkl from ${name}? Recommendations stop following their watch history until Simkl is connected again.`)) return;
   const ui = SIMKL_UI.get(id);
   if (ui?.timer) clearInterval(ui.timer);
   SIMKL_UI.delete(id);
+  SIMKL_AUTOCHECKED.delete(id);
   await api(`/profiles/${id}/simkl/disconnect`, { method: 'POST' });
+  await pollStatus();
   checkSimklStatus(id);
 }
 
@@ -1819,19 +1800,6 @@ async function suppressRec(id, type, tmdbId, btn) {
     if (rowEl) { rowEl.style.opacity = '0.35'; }
     btn.textContent = 'removed';
   } catch (e) { btn.textContent = '✗'; btn.title = e.message; }
-}
-
-async function syncSimkl(id, btn) {
-  const out = document.querySelector(`[data-id="${id}"] [data-tres="simkl-sync"]`);
-  btn.disabled = true; out.textContent = ' ⟳ syncing…'; out.className = 'tres';
-  try {
-    const r = await api(`/profiles/${id}/simkl/sync`, { method: 'POST', body: { force: true } });
-    if (r.skipped) out.textContent = ' — ' + (r.reason === 'unchanged' ? `up to date (${r.count} titles)` : r.reason);
-    else out.textContent = ` ✓ ${r.total} watched title(s) (movies ${r.breakdown.movies}, shows ${r.breakdown.shows}, anime ${r.breakdown.anime})`;
-    out.className = 'tres ok';
-    checkSimklStatus(id);
-  } catch (e) { out.textContent = ' ✗ ' + e.message; out.className = 'tres err'; }
-  finally { btn.disabled = false; }
 }
 
 async function rebuildNow(id, btn) {
