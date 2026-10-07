@@ -76,7 +76,7 @@ router.post('/api/auth/verify', (req, res) => {
 
 // ---- setup (public, only when zero profiles) ----
 router.get('/api/setup', (req, res) => {
-  res.json({ needs_setup: config.listProfiles().length === 0 });
+  res.json({ needed: config.listProfiles().length === 0 });
 });
 
 router.post('/api/setup/request', async (req, res) => {
@@ -85,7 +85,13 @@ router.post('/api/setup/request', async (req, res) => {
     const r = await auth.requestSetupOtp({ name, email }, { appUrl: appUrl() });
     if (!r.ok) {
       const statusMap = { BAD_NAME: 400, BAD_EMAIL: 400, SETUP_DONE: 409, RATE_LIMITED: 429 };
-      res.status(statusMap[r.code] || 400).json({ error: r.code });
+      const msgMap = {
+        BAD_NAME: 'Enter a name (up to 40 characters).',
+        BAD_EMAIL: 'Enter a valid email address.',
+        SETUP_DONE: 'Setup is already complete — sign in instead.',
+        RATE_LIMITED: 'Too many codes requested — wait 15 minutes.',
+      };
+      res.status(statusMap[r.code] || 400).json({ error: msgMap[r.code] || r.code });
       return;
     }
     res.json({ ok: true });
@@ -107,6 +113,10 @@ router.post('/api/setup/verify', (req, res) => {
   }
   if (!result.ok) {
     console.warn(`[setup] verify DENIED for ${email} — reason=${result.reason}`);
+    if (result.reason === 'SETUP_DONE') {
+      res.status(409).json({ error: 'Setup is already complete — sign in instead.' });
+      return;
+    }
     res.status(401).json({ error: 'Invalid or expired code' });
     return;
   }

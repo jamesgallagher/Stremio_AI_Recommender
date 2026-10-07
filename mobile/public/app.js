@@ -15,9 +15,9 @@
     content: $('content'),
     // Setup (Initial User Creation)
     setup: $('view-setup'),
-    setupNameStep: $('setup-name-step'), setupCodeStep: $('setup-code-step'),
+    setupNameStep: $('setup-details-step'), setupCodeStep: $('setup-code-step'),
     setupName: $('setup-name'), setupEmail: $('setup-email'),
-    setupSend: $('setup-send-code'), setupVerify: $('setup-verify'), setupBack: $('setup-back-to-name'),
+    setupSend: $('setup-send'), setupVerify: $('setup-verify'), setupBack: $('setup-back'),
     setupMsg: $('setup-msg'),
     openConfigure: $('open-configure'),
   };
@@ -823,19 +823,19 @@
   els.setupSend.addEventListener('click', async () => {
     const name = els.setupName.value.trim();
     const email = els.setupEmail.value.trim();
-    if (!name) return setSetupMsg('Enter a name.', 'err');
+    if (!name) return setSetupMsg('Enter your name.', 'err');
     if (!email) return setSetupMsg('Enter your email.', 'err');
     els.setupSend.disabled = true; setSetupMsg('Sending…');
     try {
       const res = await apiFetch('/setup/request', { method: 'POST', body: JSON.stringify({ name, email }) });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        setSetupMsg(data.error === 'SETUP_DONE' ? 'Setup already done — sign in instead.' : (data.error || 'Something went wrong.'), 'err');
+        setSetupMsg(data.error || 'Something went wrong — try again.', 'err');
         return;
       }
       state.setupEmail = email; state.setupName = name;
       showSetupCodeStep();
-      setSetupMsg('A 6-digit code is on its way. It expires in 1 hour.', 'ok');
+      setSetupMsg('A 6-digit code is on its way to ' + email + '. It expires in 1 hour.', 'ok');
     } catch { setSetupMsg('Something went wrong — try again.', 'err'); }
     finally { els.setupSend.disabled = false; }
   });
@@ -846,30 +846,35 @@
     els.setupVerify.disabled = true; setSetupMsg('Verifying…');
     try {
       const res = await apiFetch('/setup/verify', { method: 'POST', body: JSON.stringify({ email: state.setupEmail, code }) });
+      if (res.status === 409) {
+        const data = await res.json().catch(() => ({}));
+        setSetupMsg(data.error || 'Setup already complete.', 'err');
+        setTimeout(() => location.reload(), 1500);
+        return;
+      }
       if (!res.ok) { setSetupMsg('That code is invalid or expired.', 'err'); return; }
-      setSetupMsg('Profile created — signing in…', 'ok');
-      location.hash = '#/recs';
-      await boot();
+      setSetupMsg('Account created — opening Configure…', 'ok');
+      location.replace('/configure/');
     } catch { setSetupMsg('Something went wrong — try again.', 'err'); }
     finally { els.setupVerify.disabled = false; }
   });
 
-  els.setupBack.addEventListener('click', () => { state.setupEmail = ''; state.setupName = ''; showSetupNameStep(); els.setupName.focus(); });
+  els.setupBack.addEventListener('click', () => { showSetupNameStep(); els.setupName.focus(); });
   $('setup-code').addEventListener('keydown', (e) => { if (e.key === 'Enter') els.setupVerify.click(); });
+  els.setupEmail.addEventListener('keydown', (e) => { if (e.key === 'Enter') els.setupSend.click(); });
 
   async function boot() {
     // Check if setup is needed (zero profiles).
     let setupNeeded = false;
     try {
       const res = await apiFetch('/setup');
-      if (res.ok) setupNeeded = (await res.json()).needs_setup;
+      if (res.ok) setupNeeded = (await res.json()).needed === true;
     } catch { /* ignore */ }
     state.setupNeeded = setupNeeded;
 
     if (setupNeeded) {
       // Show the setup view.
       showSetupNameStep();
-      location.hash = '#/setup';
       render();
       return;
     }

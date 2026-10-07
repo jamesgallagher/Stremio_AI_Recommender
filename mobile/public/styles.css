@@ -59,8 +59,8 @@ h1 { font-size: 22px; margin: 4px 0; }
 .stack > * + * { margin-top: 10px; }
 
 /* ---- Login ---- */
-#view-login { min-height: 100dvh; display: grid; place-items: center; padding: 20px; }
-#view-login .card { width: 100%; max-width: 380px; }
+#view-login, #view-setup { min-height: 100dvh; display: grid; place-items: center; padding: 20px; }
+#view-login .card, #view-setup .card { width: 100%; max-width: 380px; }
 .brandmark { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
 .brandmark img { width: 32px; height: 32px; }
 
@@ -77,6 +77,8 @@ h1 { font-size: 22px; margin: 4px 0; }
 .topbar .profile { color: var(--muted); font-size: 13px; max-width: 45vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Settings cog sits between the profile name and Log out. */
 .icon-btn { min-height: 40px; min-width: 40px; padding: 6px 8px; font-size: 18px; line-height: 1; }
+/* AUTH-1: admins' Configure button — no room for it in the phone top bar. */
+@media (max-width: 479px) { #open-configure { display: none; } }
 
 #content {
   /* leave room for the fixed bottom tab bar + the phone's home indicator */
