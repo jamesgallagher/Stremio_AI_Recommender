@@ -19,16 +19,28 @@
     return { view: ROUTES.indexOf(seg) !== -1 ? seg : DEFAULT_VIEW, params: {} };
   }
 
-  // The view to actually render given auth + the requested route. Not signed in
-  // -> always 'login'. Signed in -> the route, but 'login'/unknown fall back to
-  // the default (an authed user never sits on the login screen).
+  // The view to actually render given auth + the requested route.
+  // setupNeeded -> always 'setup' (zero profiles, Initial User Creation).
+  // Not signed in -> always 'login'. Signed in -> the route, but
+  // 'login'/'setup'/unknown fall back to the default.
   function viewForState(state) {
     const s = state || {};
+    if (s.setupNeeded) return 'setup';
     if (!s.authed) return 'login';
     const r = s.route;
-    if (!r || r === 'login' || ROUTES.indexOf(r) === -1) return DEFAULT_VIEW;
+    if (!r || r === 'login' || r === 'setup' || ROUTES.indexOf(r) === -1) return DEFAULT_VIEW;
     return r;
   }
 
-  return { ROUTES, DEFAULT_VIEW, parseRoute, viewForState };
+  // Card §6.4: the only `next` value honoured after sign-in is '/configure/'.
+  // Returns '/configure/' (admin, next=/configure/), 'deny' (non-admin,
+  // next=/configure/), or null (any other value — external URLs, paths, etc.).
+  function nextAfterSignIn(next, profile) {
+    if (next === '/configure/') {
+      return profile && profile.is_admin === true ? '/configure/' : 'deny';
+    }
+    return null;
+  }
+
+  return { ROUTES, DEFAULT_VIEW, parseRoute, viewForState, nextAfterSignIn };
 });

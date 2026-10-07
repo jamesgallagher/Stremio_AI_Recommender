@@ -22,8 +22,6 @@
 process.env.DATA_DIR = require('os').tmpdir() + '/ai-rec-integration-' + Date.now();
 process.env.PORT = '7313'; // distinct from smoke.js (7311) + mobile (7312)
 process.env.SECRET_KEY = process.env.SECRET_KEY || 'test-secret-key-do-not-use-in-prod';
-process.env.ADMIN_USER = '';
-process.env.ADMIN_PASSWORD = '';
 process.env.EXTERNAL_URL = '';
 
 const assert = require('assert');

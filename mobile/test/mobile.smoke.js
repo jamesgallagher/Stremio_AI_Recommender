@@ -7,9 +7,6 @@
 process.env.DATA_DIR = require('os').tmpdir() + '/ai-rec-mobile-test-' + Date.now();
 process.env.PORT = '7312'; // distinct from test/smoke.js (7311)
 process.env.SECRET_KEY = process.env.SECRET_KEY || 'test-secret-key-do-not-use-in-prod';
-// Enable admin Basic Auth so the HTTP phase can prove /mobile sits OUTSIDE it.
-process.env.ADMIN_USER = 'admin';
-process.env.ADMIN_PASSWORD = 'test-admin-pw';
 // Mail intentionally NOT configured — sendOtpEmail would log; tests inject fakes.
 delete process.env.BREVO_API_KEY;
 delete process.env.BREVO_SMTP_KEY;
@@ -1263,13 +1260,15 @@ async function httpTests() {
   require('../../src/server'); // calls app.listen on process.env.PORT
   const BASE = `http://localhost:${process.env.PORT}`;
   await new Promise((r) => setTimeout(r, 500)); // let it bind
-  const adminHeader = 'Basic ' + Buffer.from(`${process.env.ADMIN_USER}:${process.env.ADMIN_PASSWORD}`).toString('base64');
+  const { provisionAdmin, cookieHeader } = require('../../test/helpers/admin-session');
+  const { token: adminToken } = provisionAdmin();
+  const adminCookie = cookieHeader(adminToken);
 
-  // Admin /api still enforces Basic Auth — mounting /mobile didn't loosen it.
+  // Admin /api requires the shared session cookie — mounting /mobile didn't loosen it.
   {
     assert.strictEqual((await fetch(`${BASE}/api/version`)).status, 401);
-    assert.strictEqual((await fetch(`${BASE}/api/version`, { headers: { Authorization: adminHeader } })).status, 200);
-    console.log('  ✓ regression: admin /api still behind Basic Auth');
+    assert.strictEqual((await fetch(`${BASE}/api/version`, { headers: { Cookie: adminCookie } })).status, 200);
+    console.log('  ✓ regression: admin /api still behind session auth');
   }
 
   // Mobile auth routes are public (no Basic Auth) and answer the generic 200.
@@ -1304,9 +1303,9 @@ async function httpTests() {
     });
     assert.strictEqual(vres.status, 200);
     const setCookie = vres.headers.get('set-cookie') || '';
-    assert.ok(setCookie.includes('mobile_sid='), 'session cookie is set');
+    assert.ok(setCookie.includes('air_sid='), 'session cookie is set');
     assert.ok(/HttpOnly/i.test(setCookie), 'cookie is HttpOnly');
-    const cookie = setCookie.split(';')[0]; // mobile_sid=<token>
+    const cookie = setCookie.split(';')[0]; // air_sid=<token>
     assert.strictEqual((await vres.json()).profile.id, p.id);
 
     const me = await fetch(`${BASE}/mobile/api/me`, { headers: { Cookie: cookie } });
@@ -1315,7 +1314,7 @@ async function httpTests() {
     assert.strictEqual(meBody.profile.id, p.id);
     assert.strictEqual(meBody.profile.simkl_connected, false);
 
-    assert.strictEqual((await fetch(`${BASE}/mobile/api/me`, { headers: { Cookie: 'mobile_sid=deadbeef' } })).status, 401);
+    assert.strictEqual((await fetch(`${BASE}/mobile/api/me`, { headers: { Cookie: 'air_sid=deadbeef' } })).status, 401);
 
     const lo = await fetch(`${BASE}/mobile/api/auth/logout`, { method: 'POST', headers: { Cookie: cookie } });
     assert.strictEqual(lo.status, 200);
@@ -1340,9 +1339,9 @@ async function httpTests() {
   // Existing routes coexist with /mobile.
   {
     assert.strictEqual((await fetch(`${BASE}/health`)).status, 200);
-    const conf = await fetch(`${BASE}/configure/`, { headers: { Authorization: adminHeader } });
+    const conf = await fetch(`${BASE}/configure/`, { headers: { Cookie: adminCookie } });
     assert.strictEqual(conf.status, 200);
-    const rootRedirect = await fetch(`${BASE}/`, { headers: { Authorization: adminHeader }, redirect: 'manual' });
+    const rootRedirect = await fetch(`${BASE}/`, { headers: { Cookie: adminCookie }, redirect: 'manual' });
     assert.ok(rootRedirect.status === 301 || rootRedirect.status === 302, '/ still redirects to /configure');
     console.log('  ✓ regression: / , /health , /configure coexist with /mobile');
   }

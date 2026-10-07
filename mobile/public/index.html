@@ -50,12 +50,48 @@
     </div>
   </section>
 
+  <!-- ===== Initial User Creation (AUTH-1: only when no profiles exist) ===== -->
+  <section id="view-setup" class="view" hidden>
+    <div class="card stack">
+      <div class="brandmark">
+        <img src="/logo.svg" alt="" onerror="this.style.display='none'">
+        <h1>AI Recommender</h1>
+      </div>
+      <p class="sub"><strong>Initial User Creation.</strong> No users exist yet. Create the first account. It will be the administrator and can open Configure.</p>
+
+      <!-- Step A: name + email -->
+      <div id="setup-details-step">
+        <label for="setup-name">Name</label>
+        <input id="setup-name" type="text" autocomplete="name" maxlength="40" placeholder="Your name">
+        <label for="setup-email">Email</label>
+        <input id="setup-email" type="email" inputmode="email" autocomplete="email" placeholder="you@example.com">
+        <div style="margin-top:12px">
+          <button id="setup-send" class="block">Send code</button>
+        </div>
+      </div>
+
+      <!-- Step B: code -->
+      <div id="setup-code-step" hidden>
+        <label for="setup-code">6-digit code</label>
+        <input id="setup-code" type="tel" inputmode="numeric" autocomplete="one-time-code"
+               maxlength="6" pattern="[0-9]*" placeholder="••••••">
+        <div class="stack" style="margin-top:12px">
+          <button id="setup-verify" class="block">Verify &amp; create account</button>
+          <button id="setup-back" class="ghost block">Change name or email</button>
+        </div>
+      </div>
+
+      <p id="setup-msg" class="msg" role="status" aria-live="polite"></p>
+    </div>
+  </section>
+
   <!-- ===== App shell (authed) ===== -->
   <div id="shell" hidden>
     <header class="topbar">
       <span class="brand">AI Recommender</span>
       <span class="spacer"></span>
       <span id="profile-name" class="profile"></span>
+      <button id="open-configure" class="ghost" type="button" hidden>Configure</button>
       <button id="open-settings" class="ghost icon-btn" aria-label="Settings" title="Settings">⚙</button>
       <button id="logout" class="ghost">Log out</button>
     </header>

@@ -5,10 +5,8 @@ process.env.PORT = '7311';
 process.env.SECRET_KEY = process.env.SECRET_KEY || 'test-secret-key-do-not-use-in-prod';
 // Hermetic: src/server requires dotenv, which loads a developer's real .env when
 // present. Pin the vars the tests assume (empty, not deleted — dotenv won't
-// override an already-set var): admin creds OFF (open portal), and no
-// EXTERNAL_URL so install/dnr links use the request host (localhost:7311).
-process.env.ADMIN_USER = '';
-process.env.ADMIN_PASSWORD = '';
+// override an already-set var): no EXTERNAL_URL so install/dnr links use the
+// request host (localhost:7311).
 process.env.EXTERNAL_URL = '';
 
 const assert = require('assert');
@@ -6314,6 +6312,11 @@ async function httpTests() {
 
   console.log('http:');
   require('../src/server');
+  // AUTH-1: provision an admin session so /api requests carry the air_sid cookie.
+  const { provisionAdmin, cookieHeader, attachCookie } = require('./helpers/admin-session');
+  const { token: adminToken } = provisionAdmin();
+  const adminCookie = cookieHeader(adminToken);
+  attachCookie(BASE, adminCookie);
   // The migrateFromProfiles unit test above seeds the GLOBAL settings with
   // JAMES-* lookup keys. Now that the addon reads GLOBAL keys, clear them so the
   // addon-serve tests start from a known "no keys" baseline (tests that need a

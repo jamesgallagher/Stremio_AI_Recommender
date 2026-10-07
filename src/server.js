@@ -67,72 +67,25 @@ app.use('/addon/:token', addon.router);
 const mobile = require('../mobile/server/router');
 app.use('/mobile', mobile.router);
 
-// Admin auth: HTTP Basic, enabled when ADMIN_USER + ADMIN_PASSWORD are set.
-// Protects the portal and its API only.
-const crypto = require('crypto');
-const ADMIN_USER = process.env.ADMIN_USER || '';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
-const authEnabled = !!(ADMIN_USER && ADMIN_PASSWORD);
+// AUTH-1: shared email-OTP sign-in for /mobile and /configure (no Basic Auth).
+// requireAdminApi guards /api (401 {auth:'signin'} / 403 {auth:'forbidden'});
+// requireAdminPage guards /configure (302 → /mobile/?next=%2Fconfigure%2F).
+const sessionAuth = require('./sessionAuth');
 
-function safeEqual(a, b) {
-  const ha = crypto.createHash('sha256').update(a).digest();
-  const hb = crypto.createHash('sha256').update(b).digest();
-  return crypto.timingSafeEqual(ha, hb);
+// Boot migration: ensure at least one admin exists (promote the oldest
+// profile with an email if none is admin).
+try {
+  const r = config.promoteFirstAdminIfMissing();
+  if (r.reason === 'promoted') console.log(`[auth] "${r.promoted}" is now the admin (first boot with shared sign-in)`);
+  else if (r.reason === 'no-email') console.warn('[auth] no admin exists and no profile has an email — run scripts/set-admin.js inside the container to choose one');
+} catch (err) {
+  console.warn(`[auth] admin migration skipped: ${err.message}`);
 }
 
-// Brute-force protection: per-IP failed-attempt window. In-memory (resets on
-// restart) — fine for a self-hosted admin portal. A successful login clears
-// the counter so a shared/NATed IP isn't locked out by one bad client.
-const AUTH_WINDOW_MS = 15 * 60e3;
-const AUTH_MAX_FAILURES = 20;
-const authFailures = new Map(); // ip -> { count, resetAt }
-
-function authBlocked(ip) {
-  const entry = authFailures.get(ip);
-  if (!entry) return false;
-  if (Date.now() > entry.resetAt) { authFailures.delete(ip); return false; }
-  return entry.count >= AUTH_MAX_FAILURES;
-}
-
-function recordAuthFailure(ip) {
-  const now = Date.now();
-  if (authFailures.size > 10000) { // scanner flood guard: drop expired entries
-    for (const [k, v] of authFailures) if (now > v.resetAt) authFailures.delete(k);
-  }
-  const entry = authFailures.get(ip);
-  if (!entry || now > entry.resetAt) {
-    authFailures.set(ip, { count: 1, resetAt: now + AUTH_WINDOW_MS });
-  } else {
-    entry.count++;
-    if (entry.count === AUTH_MAX_FAILURES) {
-      console.warn(`[auth] ${ip}: blocked for ${AUTH_WINDOW_MS / 60e3} min after ${entry.count} failed login attempts`);
-    }
-  }
-}
-
-function adminAuth(req, res, next) {
-  if (!authEnabled) return next();
-  if (authBlocked(req.ip)) {
-    return res.status(429).send('Too many failed login attempts — try again later');
-  }
-  const header = req.headers.authorization || '';
-  if (header.startsWith('Basic ')) {
-    const [user, ...rest] = Buffer.from(header.slice(6), 'base64').toString().split(':');
-    const pass = rest.join(':');
-    if (safeEqual(user, ADMIN_USER) && safeEqual(pass, ADMIN_PASSWORD)) {
-      authFailures.delete(req.ip);
-      return next();
-    }
-    recordAuthFailure(req.ip); // only count actual wrong credentials, not the initial challenge
-  }
-  res.setHeader('WWW-Authenticate', 'Basic realm="AI Recommender admin"');
-  res.status(401).send('Authentication required');
-}
-
-// Configure portal (Basic Auth via ADMIN_USER/ADMIN_PASSWORD; optionally also
-// put Cloudflare Access in front of /configure and /api)
-app.use('/api', adminAuth, portal.router);
-app.use('/configure', adminAuth, express.static(path.join(__dirname, '..', 'public')));
+// Configure portal (session auth via air_sid cookie; optionally also put
+// Cloudflare Access in front of /configure and /api)
+app.use('/api', sessionAuth.requireAdminApi, portal.router);
+app.use('/configure', sessionAuth.requireAdminPage, express.static(path.join(__dirname, '..', 'public')));
 app.get('/', (req, res) => res.redirect('/configure/'));
 
 app.get('/health', (req, res) => res.json({ ok: true }));
@@ -325,9 +278,9 @@ const PORT = parseInt(process.env.PORT || '7000', 10);
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`AI Recommender listening on :${PORT}`);
   console.log(`Configure portal: http://localhost:${PORT}/configure/`);
-  console.log(authEnabled
-    ? '[auth] Admin portal protected by Basic Auth (ADMIN_USER set)'
-    : '[auth] WARNING: admin portal is UNPROTECTED — set ADMIN_USER and ADMIN_PASSWORD');
+  if (process.env.ADMIN_USER || process.env.ADMIN_PASSWORD) {
+    console.log('[auth] ADMIN_USER/ADMIN_PASSWORD are no longer used — /configure uses the shared sign-in (admin profiles). You can remove them.');
+  }
 });
 
 // Scheduler: keep lists warm and pruned so nobody ever waits on a cold open.

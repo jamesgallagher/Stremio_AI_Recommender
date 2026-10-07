@@ -164,7 +164,6 @@
   .tres:empty { display: none; }
   .tres.ok { color: var(--ok); }
   .tres.err { color: var(--err); }
-  .brand { width: 34px; height: 34px; vertical-align: middle; margin-right: 8px; border-radius: 8px; }
   /* Trainer tab (T3) — per-profile watch-history rating screen */
   .trainer-panel { margin-top: 4px; }
   .tr-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 8px; }
@@ -211,11 +210,29 @@
     .tr-star-wrap { width: 36px; height: 36px; }
     .tr-glyph, .tr-fill { font-size: 34px; line-height: 34px; }
   }
+  /* AUTH-1 app bar — the /mobile top bar (mobile/public/styles.css .topbar,
+     .icon-btn, button.ghost) copied value-for-value so both surfaces match.
+     Scoped to .topbar so the portal's own buttons are untouched. */
+  .topbar { position: sticky; top: 0; z-index: 6; display: flex; align-items: center; gap: 10px;
+    height: 52px; padding: 0 14px; padding-top: env(safe-area-inset-top);
+    background: var(--card); border-bottom: 1px solid var(--border); }
+  .topbar .brand { font-weight: 700; }
+  .topbar .spacer { flex: 1; }
+  .topbar .profile { color: var(--muted); font-size: 13px; max-width: 45vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .topbar button { font-family: inherit; font-size: 16px; font-weight: 600; border-radius: 10px; }
+  .topbar button.ghost { min-height: 40px; padding: 8px 12px; }
+  .topbar .icon-btn { min-height: 40px; min-width: 40px; padding: 6px 8px; font-size: 18px; line-height: 1; }
 </style>
 </head>
 <body>
+<header class="topbar" id="appbar">
+  <span class="brand">AI Recommender</span>
+  <span class="spacer"></span>
+  <span id="me-name" class="profile"></span>
+  <button id="open-settings" class="ghost icon-btn" type="button" aria-label="Settings" title="Settings" onclick="openMySettings()">⚙</button>
+  <button id="logout" class="ghost" type="button" onclick="logOut()">Log out</button>
+</header>
 <div class="wrap">
-  <h1><img src="logo.svg" alt="" class="brand">AI Recommender</h1>
   <div class="sub">Admin portal — pick a family member above to manage their addon (Simkl link, filters, catalogs, install URL). Shared keys live in Server Config. <span id="ver"></span></div>
 
   <div id="lockBanner" style="display:none;background:var(--err);color:#fff;padding:12px 14px;border-radius:8px;margin:10px 0;font-size:14px">
@@ -362,6 +379,11 @@ async function api(path, opts = {}) {
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
+  // AUTH-1: signed out / no longer an admin → back to the shared sign-in.
+  if ((res.status === 401 || res.status === 403) && data.auth) {
+    location.href = '/mobile/?next=%2Fconfigure%2F';
+    throw new Error('Signed out');
+  }
   if (!res.ok) throw new Error(data.error || res.statusText);
   return data;
 }
@@ -440,6 +462,9 @@ function renderMdblistStatus(p) {
   }
   return html;
 }
+
+// AUTH-1: the only admin's box is locked on (server enforces this too — LAST_ADMIN).
+const adminLocked = (p) => p.is_admin && PROFILES.filter(x => x.is_admin).length === 1;
 
 function render(profiles) {
   const container = $('#profiles');
@@ -670,13 +695,19 @@ function render(profiles) {
       </div>
 
       <div class="tab-panel adv" data-tab="advanced">
-        <div class="muted" style="margin-bottom:8px;font-size:11px">Account details, the <b>Simkl</b> link and this profile's <b>MDBList</b> key are saved together with the <b>Save</b> button at the bottom. Maintenance actions (rebuild, pool, watch history) run straight away.</div>
+        <div class="muted" style="margin-bottom:8px;font-size:11px">Account details (email and admin), the <b>Simkl</b> link and this profile's <b>MDBList</b> key are saved together with the <b>Save</b> button at the bottom. Maintenance actions (rebuild, pool, watch history) run straight away.</div>
 
         <div class="sec-title">Account</div>
         <div class="sec-box">
-          <label>Email <span class="muted">— for the Mobile Companion</span></label>
+          <label>Email <span class="muted">— used to sign in</span></label>
           <input type="email" data-email value="${esc(p.email || '')}" placeholder="name@example.com" autocomplete="off" spellcheck="false" ${IGNORE_PW_MANAGERS}>
-          <div class="hint">Receives one-time passwords (OTPs) for the Mobile Companion. Must be unique across profiles.</div>
+          <div class="hint">Receives one-time sign-in codes (OTPs) for the Mobile Companion and, for admins, Configure. Must be unique across profiles.</div>
+          <label class="check" style="margin-top:12px">
+            <input type="checkbox" data-admin ${p.is_admin ? 'checked' : ''} ${adminLocked(p) ? 'disabled' : ''}> Admin
+          </label>
+          <div class="hint">${adminLocked(p)
+            ? 'Only admins can open Configure. This is the only admin — make another profile an admin before removing it here.'
+            : 'Only admins can open Configure. There must always be at least one admin.'}</div>
         </div>
 
         <div class="sec-title">Simkl</div>
@@ -762,9 +793,9 @@ function render(profiles) {
           </div>
         </div>
 
-        <div class="save-bar" data-note="— saves the email, Simkl credentials &amp; MDBList key">
-          <button onclick="saveAdvanced('${p.id}')">Save</button>
-          <span class="muted save-note">— saves the email, Simkl credentials &amp; MDBList key</span>
+        <div class="save-bar" data-note="— saves the email, admin, Simkl credentials &amp; MDBList key">
+          <button onclick="saveAdvanced('${p.id}').catch(e => toast('Save failed: ' + e.message))">Save</button>
+          <span class="muted save-note">— saves the email, admin, Simkl credentials &amp; MDBList key</span>
         </div>
       </div>
     </div>`;
@@ -1290,6 +1321,7 @@ async function testLlm(btn) {
 
 // ---- profile selection + server-config visibility ----
 let PROFILES = [];
+let ME = null;
 let SELECTED = null;
 let cfgComplete = false;   // Server Config is fully set up
 let cfgForced = false;     // user clicked "Server Config" to reveal it anyway
@@ -1316,7 +1348,20 @@ function applyServerConfigVisibility() {
 }
 function toggleServerConfig() { cfgForced = !cfgForced; applyServerConfigVisibility(); }
 
+// AUTH-1 ⚙: the signed-in user's own profile, Advanced tab (same meaning as the /mobile cog).
+function openMySettings() {
+  if (!ME || !PROFILES.find(p => p.id === ME.id)) return;
+  SELECTED = ME.id; renderTopBar(); renderSelected();
+  const card = document.querySelector(`.card[data-id="${ME.id}"]`);
+  if (card) { activateTab(card, 'advanced'); card.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+}
+async function logOut() {
+  try { await fetch('/mobile/api/auth/logout', { method: 'POST', credentials: 'same-origin' }); } catch { /* ignore */ }
+  location.href = '/mobile/';
+}
+
 async function load() {
+  if (!ME) { ME = (await api('/me')).profile; $('#me-name').textContent = ME.name; }
   if (!GENRES.length) GENRES = (await api('/genres')).genres;
   if (!ENGINES.length) ENGINES = (await api('/engines')).engines || [];
   if (!CATALOG_DEFS.length) CATALOG_DEFS = (await api('/catalogs')).catalogs;
@@ -1347,7 +1392,7 @@ async function delProfile(id) {
   // keeps profile names out of inline JS entirely.
   const name = document.querySelector(`[data-id="${id}"] h2`)?.textContent || 'this profile';
   if (!confirm(`Delete profile "${name}"? Their install link stops working immediately.`)) return;
-  await api('/profiles/' + id, { method: 'DELETE' });
+  try { await api('/profiles/' + id, { method: 'DELETE' }); } catch (e) { return toast('Delete failed: ' + e.message); }
   load();
 }
 
@@ -1373,6 +1418,8 @@ async function saveKeys(id, silent = false) {
 async function saveAdvanced(id) {
   const card = document.querySelector(`[data-id="${id}"]`);
   const email = (card.querySelector('[data-email]')?.value || '').trim();
+  const adminBox = card.querySelector('[data-admin]');
+  const wasAdmin = !!PROFILES.find(x => x.id === id)?.is_admin;
   const authVersion = parseInt(card.querySelector('[data-auth-version]').value, 10);
   // Only the selected version's credential block is in scope — the hidden
   // version's drafts are never submitted.
@@ -1398,7 +1445,7 @@ async function saveAdvanced(id) {
       captured.mdblist_api_key = { value: v, node: mdb };
     }
   }
-  await api('/profiles/' + id, { method: 'PUT', body: { email, simkl_auth_version: authVersion, ...(Object.keys(keys).length ? { keys } : {}) } });
+  await api('/profiles/' + id, { method: 'PUT', body: { email, is_admin: !!adminBox?.checked, simkl_auth_version: authVersion, ...(Object.keys(keys).length ? { keys } : {}) } });
   // After success, update originals to the ACKNOWLEDGED submitted values (not
   // current DOM values, which may have changed while awaiting). Only touch
   // fields acknowledged by this request.
@@ -1420,6 +1467,10 @@ async function saveAdvanced(id) {
     }
   });
   dirty = false; setPanelDirty(savedPanel(id, 'advanced'), false); toast('Saved'); pollStatus();
+  if (adminBox && adminBox.checked !== wasAdmin) {
+    if (id === ME?.id && !adminBox.checked) { location.href = '/mobile/'; return; }
+    await load();
+  }
 }
 
 // Save-bar state, shared by every tab with fields: amber "unsaved changes"

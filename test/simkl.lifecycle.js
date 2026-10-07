@@ -11,7 +11,7 @@ if (!process.env.AIR_SIMKL_TEST_CHILD) {
     const result = require('child_process').spawnSync(process.execPath,
       ['--experimental-sqlite', __filename, ...process.argv.slice(2)], {
         stdio: 'inherit', env: { ...process.env, AIR_SIMKL_TEST_CHILD: '1', DATA_DIR: data,
-          PORT: '0', ADMIN_USER: 'review', ADMIN_PASSWORD: 'review', SECRET_KEY: 'fake-test-key',
+          PORT: '0', SECRET_KEY: 'fake-test-key',
           EXTERNAL_URL: 'https://example.test' },
       });
     process.exitCode = result.status ?? 1;
@@ -65,7 +65,10 @@ async function run() {
   http.Server.prototype.listen = listen;
   await new Promise(resolve => server.listening ? resolve() : server.once('listening', resolve));
   const base = 'http://127.0.0.1:' + server.address().port;
-  const auth = { Authorization: 'Basic ' + Buffer.from('review:review').toString('base64'), 'Content-Type': 'application/json' };
+  // AUTH-1: provision an admin session and use the air_sid cookie (replaces Basic Auth).
+  const { provisionAdmin, cookieHeader } = require('./helpers/admin-session');
+  const { token: adminToken } = provisionAdmin();
+  const auth = { Cookie: cookieHeader(adminToken), 'Content-Type': 'application/json' };
   const route = (url, opts = {}) => nativeFetch(base + url, { ...opts, headers: auth, signal: AbortSignal.timeout(25000) });
   const api = async (id, suffix, method = 'GET', body) => {
     const r = await route('/api/profiles/' + id + suffix, { method, ...(body ? { body: JSON.stringify(body) } : {}) });
