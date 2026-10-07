@@ -183,8 +183,8 @@ ok('config: profile CRUD + filter clamping', () => {
   assert.strictEqual(p.keys.rpdb_api_key, 't0-free-rpdb'); // free RPDB key pre-set
   assert.strictEqual(p.filters.age_limit, 0); // age gate off by default
   assert.strictEqual(p.filters.list_size, 20); // fill-to-quota default
-  assert.strictEqual(p.filters.engine_movie, 'genesis');  // v7: per-type engine, defaults to the original engine
-  assert.strictEqual(p.filters.engine_series, 'genesis'); // Movies + Series each default to Genesis
+  assert.strictEqual(p.filters.engine_movie, 'marquee');  // v7: per-type engine, defaults to Marquee Cinema
+  assert.strictEqual(p.filters.engine_series, 'marquee-tv'); // Movies + Series each default to their Marquee engine
   assert.ok(!('engine' in p.filters));                    // v5 single-engine field retired
   assert.strictEqual(p.filters.title_decay_enabled, false); // v6.37: title decay is opt-in, off by default
   assert.strictEqual(p.filters.title_decay_days, 60); // default sustained-visibility window when enabled
@@ -193,15 +193,15 @@ ok('config: profile CRUD + filter clamping', () => {
   assert.strictEqual(p2.filters.min_rating, 0); // clamped
 
   // v7: per-type engine choice validated against the registry. A known id
-  // persists per type; an unknown id (or the retired 'trakt'/'ai') falls back to
-  // Genesis — never a disabled type. (Age-gating of unrestricted engines has its
-  // own test below.)
-  config.updateProfile(p.id, { filters: { engine_movie: 'genesis', engine_series: 'genesis' } });
-  assert.strictEqual(config.getProfile(p.id).filters.engine_movie, 'genesis');
-  assert.strictEqual(config.getProfile(p.id).filters.engine_series, 'genesis');
+  // persists per type; an unknown id (or the retired 'trakt'/'ai'/'genesis'/'glass')
+  // falls back to the type's default — never a disabled type. (Age-gating of
+  // unrestricted engines has its own test below.)
+  config.updateProfile(p.id, { filters: { engine_movie: 'marquee', engine_series: 'marquee-tv' } });
+  assert.strictEqual(config.getProfile(p.id).filters.engine_movie, 'marquee');
+  assert.strictEqual(config.getProfile(p.id).filters.engine_series, 'marquee-tv');
   config.updateProfile(p.id, { filters: { engine_movie: 'skynet', engine_series: 'trakt' } });
-  assert.strictEqual(config.getProfile(p.id).filters.engine_movie, 'genesis');  // unknown id → Genesis
-  assert.strictEqual(config.getProfile(p.id).filters.engine_series, 'genesis'); // retired id → Genesis
+  assert.strictEqual(config.getProfile(p.id).filters.engine_movie, 'marquee');  // unknown id → type's default
+  assert.strictEqual(config.getProfile(p.id).filters.engine_series, 'marquee-tv'); // retired id → type's default
 
   // Title decay (v6.37): enabled coerces to a bool; the window clamps to 14–365
   // (a sub-8-day window could never fire against the 8-distinct-day floor).
@@ -231,7 +231,7 @@ ok('config: legacy `engine` → per-type engine_movie/engine_series migration + 
 
   // ---- Migration. A pre-v7 profile carries the retired single `engine` field
   //      and NO per-type fields. On load it upgrades: `engine` dropped, both
-  //      types default to Genesis. Seed the raw file (filters aren't sealed).
+  //      types default to their Marquee engine. Seed the raw file (filters aren't sealed).
   const legacy = config.addProfile('Legacy');
   {
     const data = store.loadProfiles();
@@ -242,8 +242,8 @@ ok('config: legacy `engine` → per-type engine_movie/engine_series migration + 
     store.saveProfiles(data);
   }
   const migrated = config.getProfile(legacy.id).filters;
-  assert.strictEqual(migrated.engine_movie, 'genesis');
-  assert.strictEqual(migrated.engine_series, 'genesis');
+  assert.strictEqual(migrated.engine_movie, 'marquee');
+  assert.strictEqual(migrated.engine_series, 'marquee-tv');
   assert.ok(!('engine' in migrated)); // legacy field gone on read…
   config.updateProfile(legacy.id, { name: 'Legacy' }); // …and not re-persisted after the next write
   assert.ok(!('engine' in store.loadProfiles().profiles.find((x) => x.id === legacy.id).filters));
@@ -258,14 +258,14 @@ ok('config: legacy `engine` → per-type engine_movie/engine_series migration + 
     // Adult profile (age_limit 0): the open stub is a legal selection and persists.
     config.updateProfile(legacy.id, { filters: { engine_movie: 'open-stub' } });
     assert.strictEqual(config.getProfile(legacy.id).filters.engine_movie, 'open-stub');
-    // Selecting it on an age-limited profile coerces to Genesis (never open content on a kid).
+    // Selecting it on an age-limited profile coerces to the type's default (never open content on a kid).
     const kid = config.addProfile('Kid');
     config.updateProfile(kid.id, { filters: { age_limit: 12, engine_series: 'open-stub' } });
-    assert.strictEqual(config.getProfile(kid.id).filters.engine_series, 'genesis');
-    // RAISING age_limit on a profile already holding the stub REVOKES it → Genesis,
+    assert.strictEqual(config.getProfile(kid.id).filters.engine_series, 'marquee-tv');
+    // RAISING age_limit on a profile already holding the stub REVOKES it → the type's default,
     // even though engine_movie isn't in this patch (§5.5 point 3).
     config.updateProfile(legacy.id, { filters: { age_limit: 5 } });
-    assert.strictEqual(config.getProfile(legacy.id).filters.engine_movie, 'genesis');
+    assert.strictEqual(config.getProfile(legacy.id).filters.engine_movie, 'marquee');
     config.removeProfile(kid.id);
   } finally { dispose(); }
   config.removeProfile(legacy.id);
@@ -594,7 +594,6 @@ ok('settings: roundtrip, migration seeds from "James", isComplete, llmChain', ()
   let s = settings.getSettings();
   assert.strictEqual(s.keys.tmdb_api_key, 'JAMES-TMDB'); // unsealed back to plaintext
   assert.strictEqual(s.llm.groq_api_key, 'JAMES-GROQ');
-  assert.deepStrictEqual(s.engines, {}); // SC-07: engine-enablement map seeds empty (Genesis is on in code)
   assert.strictEqual(settings.isComplete(s), true); // TMDB + a groq key
 
   // Migration is one-time — a second call is a no-op
@@ -612,16 +611,6 @@ ok('settings: roundtrip, migration seeds from "James", isComplete, llmChain', ()
   assert.ok(!raw.includes('JAMES-GROQ')); // groq key sealed, not plaintext on disk
   assert.ok(!raw.includes('JAMES-TMDB'));
 
-  // GE-07: Glass Tier-2 config roundtrips as PLAINTEXT (not a secret), seeds {} on
-  // older files, REPLACES-whole (unmentioned sections revert to Tier-1 default via
-  // resolveConfig), and `{}` is a true reset.
-  assert.deepStrictEqual(s.glass, {});
-  settings.updateSettings({ glass: { weights: { taste_match: 0.6 } } });
-  assert.deepStrictEqual(settings.getSettings().glass, { weights: { taste_match: 0.6 } });
-  const raw2 = require('fs').readFileSync(require('path').join(process.env.DATA_DIR, 'settings.json'), 'utf8');
-  assert.ok(raw2.includes('taste_match')); // plaintext on disk (config metadata, not a secret)
-  settings.updateSettings({ glass: {} }); // true reset for other tests
-  assert.deepStrictEqual(settings.getSettings().glass, {});
 });
 
 ok('shared/tasteConfig: resolveConfig returns the Tier-1 defaults (Tier-2 retired, ENG-R), clones', () => {
@@ -701,51 +690,6 @@ ok('watchedStore: upsert dedupes by simkl_id, exclusion sets, delete (SQLite)', 
   assert.strictEqual(ws.countWatched(pid), 0);
 });
 
-ok('recommendationStore: recency-weighted affinity (the Pirates behaviour)', () => {
-  const rs = require('../src/recommendationStore');
-  const now = Date.parse('2026-08-18T00:00:00Z');
-  const day = 24 * 3600e3;
-  const seeds = [
-    { type: 'movie', tmdb_id: 'S1', title: 'Terminator 2', watched_at: '2026-08-18T00:00:00Z' },        // today -> weight 1.0
-    { type: 'movie', tmdb_id: 'S2', title: 'Predator', watched_at: new Date(now - 90 * day).toISOString() }, // 90d -> weight 0.5
-  ];
-  const recsBySeed = new Map([
-    ['movie:S1', [{ type: 'movie', tmdb_id: 'A', title: 'A' }, { type: 'movie', tmdb_id: 'B', title: 'B' }]],
-    ['movie:S2', [{ type: 'movie', tmdb_id: 'A', title: 'A' }, { type: 'movie', tmdb_id: 'C', title: 'C' }]],
-  ]);
-  const out = rs.computeAffinity(seeds, recsBySeed, { halfLifeDays: 90, nowMs: now });
-  // A recommended by both (recent 1.0 + old 0.5 = 1.5); B by recent only (1.0); C by old only (0.5)
-  assert.ok(Math.abs(out.get('movie:A').affinity - 1.5) < 1e-9);
-  assert.strictEqual(out.get('movie:A').rec_count, 2);
-  assert.ok(Math.abs(out.get('movie:B').affinity - 1.0) < 1e-9);
-  assert.ok(Math.abs(out.get('movie:C').affinity - 0.5) < 1e-9);
-  // A (intersection of taste) outranks B, which outranks C
-  assert.ok(out.get('movie:A').affinity > out.get('movie:B').affinity);
-  assert.ok(out.get('movie:B').affinity > out.get('movie:C').affinity);
-  // "because you watched": strongest contributor wins — A came from both, but the
-  // recent seed (weight 1.0) beats the old one (0.5), so it credits Terminator 2.
-  assert.strictEqual(out.get('movie:A').because_title, 'Terminator 2');
-  assert.strictEqual(out.get('movie:C').because_title, 'Predator'); // C only came from the old seed
-});
-
-ok('recommendationStore: selectStrong gates on the supplied vote floor (NOT rating), caps at 5, keeps TMDB order', () => {
-  const rs = require('../src/recommendationStore');
-  const mk = (id, va, vc, adult = false, type = 'movie') => ({ type, tmdb_id: id, vote_average: va, vote_count: vc, adult });
-  const recs = [
-    mk('A', 8, 1000), mk('low-rating', 5, 1000), mk('B', 7, 1000), mk('low-votes', 9, 10),
-    mk('adult', 8, 1000, true), mk('C', 6, 200), mk('D', 8, 1000), mk('E', 7, 1000),
-  ];
-  // Rating floor is NOT applied here (moved to serve time) — low-rating stays; the
-  // caller-supplied vote floor (here 150) drops low-votes; porn is dropped. Top-5 in ORDER.
-  assert.deepStrictEqual(rs.selectStrong(recs, 150).map((r) => r.tmdb_id), ['A', 'low-rating', 'B', 'C', 'D']);
-  // low-votes and adult are excluded regardless of position
-  assert.ok(!rs.selectStrong(recs, 150).some((r) => r.tmdb_id === 'low-votes' || r.tmdb_id === 'adult'));
-  // A higher floor rejects more — C (200 votes) now drops under a 500 floor
-  assert.deepStrictEqual(rs.selectStrong(recs, 500).map((r) => r.tmdb_id), ['A', 'low-rating', 'B', 'D', 'E']);
-  // Floor 0 = "No minimum": no vote gate (porn still dropped)
-  assert.ok(rs.selectStrong(recs, 0).some((r) => r.tmdb_id === 'low-votes'));
-  assert.ok(!rs.selectStrong(recs, 0).some((r) => r.tmdb_id === 'adult'));
-});
 
 ok('recommendationStore: SH-01 passesAgeBand — stored verdict re-check (AGE-2)', () => {
   const rs = require('../src/recommendationStore');
@@ -804,27 +748,24 @@ ok('recommendationStore: T12 passesAgeBand fallback — no stored verdict, judge
   }
 });
 
-ok('engines: registry lists Genesis, resolveFor/availableFor honour age gating (I7) + global enablement (SC-07)', () => {
+ok('engines: registry lists Marquee only, resolveFor/availableFor honour age gating (I7)', () => {
   const engines = require('../src/engines');
-  const settings = require('../src/settings');
-  // The registry lists Genesis + Glass for both types, Marquee (movie-only) for
-  // movie, and Marquee TV (series-only) for series. All ship globally DISABLED,
-  // so each is in listForType yet absent from availableFor until an admin enables
-  // it (SC-07).
-  assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['genesis', 'glass', 'marquee']);
-  assert.deepStrictEqual(engines.listForType('series').map((e) => e.id), ['genesis', 'glass', 'marquee-tv']);
-  // Genesis is the permanent default + safe floor — always enabled (SC-07).
-  assert.strictEqual(engines.isEnabled('genesis'), true);
-  // resolveFor falls back to Genesis for any profile, incl. a vestigial old id.
-  assert.strictEqual(engines.resolveFor({ filters: { engine_movie: 'trakt' } }, 'movie').id, 'genesis');
-  assert.strictEqual(engines.resolveFor({ filters: {} }, 'series').id, 'genesis');
-  assert.strictEqual(engines.resolveFor({}, 'movie').id, 'genesis');
-  // Genesis (unrestricted:false) is available to adult AND age-limited profiles.
-  assert.deepStrictEqual(engines.availableFor({ filters: {} }, 'movie').map((e) => e.id), ['genesis']);
-  assert.deepStrictEqual(engines.availableFor({ filters: { age_limit: 12 } }, 'movie').map((e) => e.id), ['genesis']);
+  // The registry lists Marquee Cinema for movies and Marquee TV for series.
+  // Both are always available (no global on/off gate — SC-07 retired with ENG-R).
+  assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['marquee']);
+  assert.deepStrictEqual(engines.listForType('series').map((e) => e.id), ['marquee-tv']);
+  // resolveFor falls back to the type's default for any profile, incl. a
+  // vestigial old id ('genesis', 'glass', 'trakt').
+  assert.strictEqual(engines.resolveFor({ filters: { engine_movie: 'trakt' } }, 'movie').id, 'marquee');
+  assert.strictEqual(engines.resolveFor({ filters: { engine_movie: 'genesis' } }, 'movie').id, 'marquee');
+  assert.strictEqual(engines.resolveFor({ filters: { engine_movie: 'glass' } }, 'movie').id, 'marquee');
+  assert.strictEqual(engines.resolveFor({ filters: {} }, 'series').id, 'marquee-tv');
+  assert.strictEqual(engines.resolveFor({}, 'movie').id, 'marquee');
+  // Marquee (unrestricted:false) is available to adult AND age-limited profiles.
+  assert.deepStrictEqual(engines.availableFor({ filters: {} }, 'movie').map((e) => e.id), ['marquee']);
+  assert.deepStrictEqual(engines.availableFor({ filters: { age_limit: 12 } }, 'movie').map((e) => e.id), ['marquee']);
 
-  // Register an unrestricted ("all ages") stub and prove BOTH gates: global
-  // enablement (SC-07) and the age-selection gate (I7) compose.
+  // Register an unrestricted ("all ages") stub and prove the age-selection gate (I7).
   const dispose = engines._register({
     id: 'open-stub', name: 'Open', description: 't', supportedTypes: ['movie', 'series'],
     capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: true },
@@ -833,36 +774,16 @@ ok('engines: registry lists Genesis, resolveFor/availableFor honour age gating (
   try {
     const adult = { filters: {} };
     const kid = { filters: { age_limit: 12, engine_movie: 'open-stub' } };
-    // SC-07: a freshly registered engine ships DISABLED — absent from dropdowns and
-    // never resolved, even on an adult profile, until an admin enables it.
-    assert.strictEqual(engines.isEnabled('open-stub'), false);
-    assert.ok(!engines.availableFor(adult, 'movie').some((e) => e.id === 'open-stub'));
-    assert.strictEqual(engines.resolveFor({ filters: { engine_movie: 'open-stub' } }, 'movie').id, 'genesis');
-    // Enable it (admin Server Config toggle). Now the age gate is the only filter.
-    settings.updateSettings({ engines: { 'open-stub': true } });
-    assert.strictEqual(engines.isEnabled('open-stub'), true);
-    // Adult profile: the open stub is offered and resolvable.
+    // A freshly registered engine is immediately available (no SC-07 gate).
     assert.ok(engines.availableFor(adult, 'movie').some((e) => e.id === 'open-stub'));
     assert.strictEqual(engines.resolveFor({ filters: { engine_movie: 'open-stub' } }, 'movie').id, 'open-stub');
     // Age-limited profile: the open stub is hidden from the dropdown…
     assert.ok(!engines.availableFor(kid, 'movie').some((e) => e.id === 'open-stub'));
-    // …and never resolved even if hand-stored — Genesis is the safe floor (I7).
-    assert.strictEqual(engines.resolveFor(kid, 'movie').id, 'genesis');
-  } finally { dispose(); settings.updateSettings({ engines: { 'open-stub': false } }); }
+    // …and never resolved even if hand-stored — the type's default is the safe floor (I7).
+    assert.strictEqual(engines.resolveFor(kid, 'movie').id, 'marquee');
+  } finally { dispose(); }
   // Registry restored to the built-in engines after the stub is disposed.
-  assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['genesis', 'glass', 'marquee']);
-
-  // GE-07 conformance: Glass ships DISABLED (absent from dropdowns), and once
-  // enabled it is a GATED engine (unrestricted:false) — offered to an age-limited
-  // profile too (the shared age gate makes it safe), unlike an open engine.
-  assert.strictEqual(engines.isEnabled('glass'), false);
-  assert.ok(!engines.availableFor({ filters: {} }, 'movie').some((e) => e.id === 'glass'));
-  try {
-    settings.updateSettings({ engines: { glass: true } });
-    assert.ok(engines.availableFor({ filters: {} }, 'movie').some((e) => e.id === 'glass'));         // adult
-    assert.ok(engines.availableFor({ filters: { age_limit: 8 } }, 'series').some((e) => e.id === 'glass')); // kid: gated engine IS offered
-    assert.strictEqual(engines.resolveFor({ filters: { age_limit: 8, engine_series: 'glass' } }, 'series').id, 'glass');
-  } finally { settings.updateSettings({ engines: { glass: false } }); }
+  assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['marquee']);
 });
 
 ok('recommendationStore: purgeBelowVoteFloor drops stored rows under the profile vote floor (movies vs series ⅕)', () => {
@@ -1124,21 +1045,6 @@ ok('embeddings: GE-09 cosine (identical/orthogonal/opposite/zero/mismatch) + set
   assert.strictEqual(settings.embedConfig({ llm: { embed_model: 'nomic', embed_uri: 'http://e', custom_uri: 'http://c' } }).uri, 'http://e');
 });
 
-ok('glass/embedStore + semantic.contentString: GE-09 Float32 BLOB round-trip, cross-model guard, content text', () => {
-  const embedStore = require('../src/engines/glass/embedStore');
-  const { contentString } = require('../src/engines/glass/semantic');
-  embedStore._clear();
-  embedStore.put('movie', 1, 'nomic', [0.5, -0.25, 1]);
-  const v = embedStore.get('movie', 1, 'nomic');
-  assert.strictEqual(v.length, 3);
-  assert.ok(Math.abs(v[0] - 0.5) < 1e-6 && Math.abs(v[1] + 0.25) < 1e-6);   // Float32 round-trip
-  assert.strictEqual(embedStore.get('movie', 1, 'other-model'), null);       // cross-model → miss (re-embed)
-  const many = embedStore.getMany('movie', [1, 2], 'nomic');
-  assert.strictEqual(many.size, 1);
-  embedStore._clear();
-  const text = contentString({ title: 'Dune', year: 2021, genres: ['Sci-Fi'], overview: 'A boy on a desert planet.', director: ['Villeneuve'], cast: ['Chalamet'], keywords: ['spice'] });
-  assert.ok(text.includes('Dune (2021)') && text.includes('desert planet') && text.includes('Directed by Villeneuve') && text.includes('Themes: spice'));
-});
 
 ok('glass/events: GE-10 weighted event list — watched positive, dont_recommend negative by reason', () => {
   const watchedStore = require('../src/watchedStore');
@@ -1191,20 +1097,6 @@ ok('glass/tasteModel+scoring: GE-10 a rejected dim goes negative and PENALIZES s
   metaStore._clear();
 });
 
-ok('glass/rerank: GE-08 taste summary (names only), match hint, prompt shape', () => {
-  const rr = require('../src/engines/glass/rerank');
-  const taste = { dims: { genres: { Drama: 1, Action: 0.4 }, directors: { Nolan: 1 }, franchises: { 'c:9': 1, 'n:HBO': 0.8 }, keywords: { heist: 1 }, decades: { 2010: 1 } } };
-  const s = rr.tasteSummary(taste);
-  assert.deepStrictEqual(s.genres, ['Drama', 'Action']);
-  assert.deepStrictEqual(s.directors, ['Nolan']);
-  assert.deepStrictEqual(s.franchises, ['HBO']);   // collection-id key `c:9` excluded (not human-readable)
-  // match hint from stored intersects.
-  const hint = rr.matchHint({ score_components: { matched: { director: ['Nolan'], franchise: ['Pirates'] } }, sources: ['exploration'] });
-  assert.ok(hint.includes('director Nolan') && hint.includes('franchise Pirates') && hint.includes('fresh direction'));
-  // prompt carries the ids + is JSON-only instruction.
-  const prompt = rr.buildUserPrompt('movie', s, [{ id: '1', title: 'Heat', year: 1995, genres: ['Crime'], why: 'director Mann' }]);
-  assert.ok(prompt.includes('1: "Heat" (1995)') && /JSON array/i.test(prompt) && /each exactly once/i.test(prompt));
-});
 
 ok('recommendationStore: selectServe applies rating/genre/recency at serve time', () => {
   const rs = require('../src/recommendationStore');
@@ -6498,7 +6390,7 @@ async function httpTests() {
         config.updateProfile(prof.id, { filters: { engine_movie: 'sc03-open' } }); // legal on an adult profile
         assert.strictEqual(load().filters.engine_movie, 'sc03-open');
         const c3 = config.updateProfile(prof.id, { filters: { age_limit: 12 } });   // raise the limit
-        assert.strictEqual(load().filters.engine_movie, 'genesis');                 // unrestricted engine revoked
+        assert.strictEqual(load().filters.engine_movie, 'marquee');                 // unrestricted engine revoked → type's default
         assert.deepStrictEqual(c3.engineChanged, ['movie']);                        // revocation reported → clear+rebuild
       } finally { disposeOpen(); }
       console.log('  ✓ engines: SC-03 per-type dispatch, requirement-skip keeps rows, clearType + engineChanged (incl. age revocation)');
@@ -6532,16 +6424,16 @@ async function httpTests() {
     settings.updateSettings({ keys: { tmdb_api_key: 'sc06-tmdb' }, engines: { fake: true } });
     const prof = config.addProfile('SC06-ISO');
     try {
-      config.updateProfile(prof.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'fake', engine_series: 'genesis' } });
+      config.updateProfile(prof.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'fake', engine_series: 'marquee-tv' } });
       const res = await rs.buildRecommendations(config.getProfile(prof.id), q);
-      assert.deepStrictEqual(res.engines, { movie: 'fake', series: 'genesis' });   // dispatch routed each type
+      assert.deepStrictEqual(res.engines, { movie: 'fake', series: 'marquee-tv' });   // dispatch routed each type
       // Movie slice = the fixture's three candidates, strongest-first (rankScore→affinity, I6).
       assert.deepStrictEqual(
         rs.getRecommended(prof.id, { type: 'movie', limit: 100 }).map((r) => r.tmdb_id),
         ['fake-movie-1', 'fake-movie-2', 'fake-movie-3']);
-      assert.ok(!res.series.skipped && res.series.engine === 'genesis');            // Genesis RAN for series…
+      assert.ok(!res.series.skipped && res.series.engine === 'marquee-tv');            // Marquee TV RAN for series…
       assert.strictEqual(rs.getRecommended(prof.id, { type: 'series', limit: 100 }).length, 0); // …and produced nothing (no leak)
-      console.log('  ✓ engines: SC-06 fake fixture → per-type isolation (fake Movies + Genesis Series), no Genesis internals');
+      console.log('  ✓ engines: SC-06 fake fixture → per-type isolation (fake Movies + Marquee TV Series), no Marquee internals');
     } finally {
       config.removeProfile(prof.id);
       rs.deleteForProfile(prof.id);
@@ -6616,18 +6508,18 @@ async function httpTests() {
       assert.ok(engines.availableFor(adult, 'movie').some((e) => e.id === 'fake-open'));
       assert.ok(!engines.availableFor(kid, 'movie').some((e) => e.id === 'fake-open'));
       assert.ok(engines.availableFor(kid, 'movie').some((e) => e.id === 'fake'));
-      // resolveFor: never the open engine for a kid even if hand-stored (Genesis
-      // is the safe floor); an adult resolves to it normally.
-      assert.strictEqual(engines.resolveFor(kid, 'movie').id, 'genesis');
+      // resolveFor: never the open engine for a kid even if hand-stored (the
+      // type's default is the safe floor); an adult resolves to it normally.
+      assert.strictEqual(engines.resolveFor(kid, 'movie').id, 'marquee');
       assert.strictEqual(engines.resolveFor({ filters: { engine_movie: 'fake-open' } }, 'movie').id, 'fake-open');
-      // updateProfile: open persists on an adult; coerces to Genesis on an
+      // updateProfile: open persists on an adult; coerces to the type's default on an
       // age-limited profile; and RAISING the limit later revokes it (§5.5 pt3).
       config.updateProfile(adultP.id, { filters: { engine_movie: 'fake-open' } });
       assert.strictEqual(config.getProfile(adultP.id).filters.engine_movie, 'fake-open');
       config.updateProfile(kidP.id, { filters: { age_limit: 12, engine_series: 'fake-open' } });
-      assert.strictEqual(config.getProfile(kidP.id).filters.engine_series, 'genesis'); // coerced
+      assert.strictEqual(config.getProfile(kidP.id).filters.engine_series, 'marquee-tv'); // coerced
       config.updateProfile(adultP.id, { filters: { age_limit: 7 } });
-      assert.strictEqual(config.getProfile(adultP.id).filters.engine_movie, 'genesis'); // revoked
+      assert.strictEqual(config.getProfile(adultP.id).filters.engine_movie, 'marquee'); // revoked
       console.log('  ✓ engines: SC-06 fake-open (unrestricted) gated off age-limited profiles (I7: availableFor/resolveFor/updateProfile)');
     } finally {
       config.removeProfile(adultP.id);
@@ -6942,17 +6834,13 @@ async function httpTests() {
   assert.ok(genres.genres.includes('Horror') && genres.genres.includes('Kids'));
   console.log('  ✓ /api/genres');
 
-  // /api/engines — the static registry for the portal's per-type dropdowns (SC-02).
-  // It advertises Genesis + Glass (both types) + Marquee (movie-only) + Marquee TV
-  // (series-only); Glass, Marquee and Marquee TV registered but globally disabled.
+  // /api/engines — the static registry (two Marquee engines).
   const eng = await (await fetch(`${BASE}/api/engines`)).json();
-  assert.strictEqual(eng.default, 'genesis');
-  assert.deepStrictEqual(eng.engines.map((e) => e.id), ['genesis', 'glass', 'marquee', 'marquee-tv']);
-  assert.deepStrictEqual(eng.engines[0].supported_types, ['movie', 'series']);
-  assert.ok(eng.engines[0].description && eng.engines[0].capabilities.unrestricted === false);
-  const glassAd = eng.engines.find((e) => e.id === 'glass');
-  assert.ok(glassAd && glassAd.enabled === false && glassAd.capabilities.unrestricted === false);
-  console.log('  ✓ /api/engines advertises the registry (Genesis + Glass both types, Marquee movie-only)');
+  assert.deepStrictEqual(eng.engines.map((e) => e.id), ['marquee', 'marquee-tv']);
+  assert.deepStrictEqual(eng.engines[0].supported_types, ['movie']);
+  assert.deepStrictEqual(eng.engines[1].supported_types, ['series']);
+  assert.ok(eng.engines[0].description);
+  console.log('  ✓ /api/engines advertises the registry (Marquee Cinema + Marquee TV)');
 
   // Create a profile through the API
   let res = await fetch(`${BASE}/api/profiles`, {
@@ -7000,13 +6888,13 @@ async function httpTests() {
   assert.ok('tmdb_api_key' in listed.keys && 'mdblist_api_key' in listed.keys);
   console.log('  ✓ profile API exposes full keys for portal pre-fill');
 
-  // publicProfile carries the per-type engine block (SC-02): selection (default
-  // Genesis), the age-filtered availability list, and the effective engine's
-  // requirement check. engine_movie/engine_series also arrive inside `filters`.
-  assert.strictEqual(listed.engines.movie, 'genesis');
-  assert.strictEqual(listed.engines.series, 'genesis');
-  assert.strictEqual(listed.filters.engine_movie, 'genesis');
-  assert.deepStrictEqual(listed.engines.available.movie, ['genesis']); // Genesis offered to every profile
+  // publicProfile carries the per-type engine block (SC-02): the effective
+  // engine id per type and the requirement check. engine_movie/engine_series
+  // also arrive inside `filters`.
+  assert.strictEqual(listed.engines.movie, 'marquee');
+  assert.strictEqual(listed.engines.series, 'marquee-tv');
+  assert.strictEqual(listed.filters.engine_movie, 'marquee');
+  assert.strictEqual(listed.filters.engine_series, 'marquee-tv');
   assert.strictEqual(typeof listed.engines.requirements.movie.ok, 'boolean'); // needs TMDB+Simkl → false here (no keys)
   console.log('  ✓ profile API carries the per-type engine selection + availability + requirements');
 
@@ -7187,10 +7075,10 @@ async function httpTests() {
   // (global) but no Simkl connection, so both types requirement-skip with a clear
   // "missing Simkl connection" reason (was the generic seed-less skip pre-SC-03).
   assert.match(job.result.reason, /Simkl/);
-  assert.deepStrictEqual(job.result.engines, { movie: 'genesis', series: 'genesis' });
+  assert.deepStrictEqual(job.result.engines, { movie: 'marquee', series: 'marquee-tv' });
   const recView = await (await fetch(`${BASE}/api/profiles/${profile.id}/recommend`)).json();
   assert.strictEqual(recView.total, 0);
-  assert.deepStrictEqual(recView.engines, { movie: 'genesis', series: 'genesis' }); // /recommend surfaces per-type engine
+  assert.deepStrictEqual(recView.engines, { movie: 'marquee', series: 'marquee-tv' }); // /recommend surfaces per-type engine
   // The View panel shows what the catalogs SERVE: the profile's filters + list
   // size (was: the raw pool's top 40, ignoring both).
   {
@@ -7865,66 +7753,16 @@ async function httpTests() {
   console.log('  ✓ /configure/ portal served');
 
   // SC-07: global engine enablement over HTTP — GET /api/engines enabled/locked,
-  // PUT /api/settings toggle (Genesis-lock coercion + unknown-id drop), and the
-  // disable→revert fan-out (a disabled engine's profiles fall back to Genesis, its
-  // slice is cleared, dont_recommend preserved, the other type untouched).
+  // /api/engines: both Marquee engines always available (SC-07 removed).
   {
     const engines = require('../src/engines');
-    const rs = require('../src/recommendationStore');
-    // Genesis: enabled + locked in the API payload.
     const eng0 = await (await fetch(`${BASE}/api/engines`)).json();
-    const gen = eng0.engines.find((e) => e.id === 'genesis');
-    assert.deepStrictEqual([gen.enabled, gen.locked], [true, true]);
-
-    // A second (preResolved) engine ships DISABLED — registered ≠ available.
-    const dispose = engines._register({
-      id: 'sc07-fake', name: 'SC07 Fake', description: 'stub', supportedTypes: ['movie', 'series'],
-      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
-      requirements: () => ({ ok: true, missing: [] }),
-      generate: async (p, type) => [{ type, tmdb_id: `sc07-${type}`, rankScore: 5, imdb_id: `ttsc07${type}`, title: 'x', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, popularity: 1, poster: null }],
-    });
-    try {
-      const eng1 = await (await fetch(`${BASE}/api/engines`)).json();
-      assert.strictEqual(eng1.engines.find((e) => e.id === 'sc07-fake').enabled, false);
-
-      const prof = (await (await fetch(`${BASE}/api/profiles`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'SC07' }) })).json()).profile;
-      const listP = async () => (await (await fetch(`${BASE}/api/profiles`)).json()).profiles.find((x) => x.id === prof.id);
-      assert.ok(!(await listP()).engines.available.movie.includes('sc07-fake')); // disabled → absent from dropdowns
-
-      // Enable it. Genesis:false is coerced back on; an unknown id is dropped.
-      const put = await (await fetch(`${BASE}/api/settings`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ engines: { 'sc07-fake': true, genesis: false, 'ghost-id': true } }) })).json();
-      assert.strictEqual(put.settings.engines.genesis, true); // Genesis-lock coercion
-      assert.ok(!('ghost-id' in put.settings.engines));       // unknown id dropped
-      assert.strictEqual(engines.isEnabled('sc07-fake'), true);
-      // PATCH semantics: a PUT that does NOT name sc07-fake must leave it enabled —
-      // a partial toggle never silently disables engines it omitted.
-      await fetch(`${BASE}/api/settings`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ engines: { genesis: true } }) });
-      assert.strictEqual(engines.isEnabled('sc07-fake'), true);
-      const enabledP = await listP();
-      assert.ok(enabledP.engines.available.movie.includes('sc07-fake')); // now selectable
-
-      // Select it on Series; seed a pool row per type + a Series rejection.
-      await fetch(`${BASE}/api/profiles/${prof.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filters: { ...enabledP.filters, engine_series: 'sc07-fake' } }) });
-      assert.strictEqual((await listP()).engines.series, 'sc07-fake');
-      rs.upsertCandidates(prof.id, [
-        { type: 'movie', tmdb_id: 'm-keep', imdb_id: 'ttmkeep', title: 'M', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, affinity: 9, rec_count: 1, popularity: 1, poster: null },
-        { type: 'series', tmdb_id: 's-gone', imdb_id: 'ttsgone', title: 'S', year: 2024, primary_genre: 'Drama', genres: 'Drama', vote_average: 8, vote_count: 5000, affinity: 9, rec_count: 1, popularity: 1, poster: null },
-      ]);
-      rs.addDontRecommend(prof.id, 'series', 'rejected-1', 'user');
-
-      // Disable it → the Series slice reverts to Genesis + clears; Movies untouched;
-      // the rejection survives; the engine leaves the dropdowns.
-      await fetch(`${BASE}/api/settings`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ engines: { 'sc07-fake': false } }) });
-      const afterP = await listP();
-      assert.strictEqual(afterP.engines.series, 'genesis');                 // persisted revert
-      assert.strictEqual(rs.getRecommended(prof.id, { type: 'series', limit: 10 }).length, 0); // stale slice cleared
-      assert.ok(rs.getRecommended(prof.id, { type: 'movie', limit: 10 }).some((r) => r.tmdb_id === 'm-keep')); // Movies untouched
-      assert.ok(rs.dontRecommendKeys(prof.id).has('series:rejected-1')); // rejection preserved (engine-independent)
-      assert.ok(!afterP.engines.available.series.includes('sc07-fake'));  // gone from dropdowns
-
-      await fetch(`${BASE}/api/profiles/${prof.id}`, { method: 'DELETE' });
-    } finally { dispose(); require('../src/settings').updateSettings({ engines: { 'sc07-fake': false } }); }
-    console.log('  ✓ /api/settings SC-07: enable/disable toggle, Genesis-lock + unknown-drop, disable→revert fan-out');
+    assert.deepStrictEqual(eng0.engines.map((e) => e.id).sort(), ['marquee', 'marquee-tv']);
+    for (const e of eng0.engines) {
+      assert.ok(e.id === 'marquee' || e.id === 'marquee-tv');
+      assert.ok(e.supported_types.length > 0);
+    }
+    console.log('  ✓ /api/engines: both Marquee engines listed');
   }
 
   // ---- Trainer T1: portal routes over HTTP (F11.5) ----

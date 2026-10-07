@@ -1,80 +1,45 @@
-// Engine registry (SC-01). Register engines here; the per-type helpers power the
-// UI dropdowns (cards 04/05) and the build/serve resolution (card 03). With a
-// single engine, listForType(type) returns [genesis] for both types → a single,
-// locked option, and everyone keeps today's results (a user-visible no-op until
-// a second engine is registered).
-const genesis = require('./genesis');
-// Glass (Phase A) — the first real second engine. Registered here so it appears
-// in the per-type dropdowns, but it ships GLOBALLY DISABLED (isEnabled below:
-// non-Genesis defaults OFF) until an admin enables it in Server Config (SC-07) —
-// a user-visible no-op until then. Source sign-off + conformance are cleared
-// (docs/engine-glass/, GE-07).
-const glass = require('./glass');
-// Marquee (ME-09) — movie-only. Registered here so it appears in the movie
-// dropdown, but it ships GLOBALLY DISABLED (isEnabled below: non-Genesis
-// defaults OFF) until an admin enables it in Server Config (SC-07) — a
-// user-visible no-op until then.
+// Engine registry (SC-01). Two engines remain after ENG-R (7.44):
+// Marquee Cinema (movies) and Marquee TV (series). Genesis and Glass were
+// retired — their shared modules live in engines/shared/ and Marquee runs on them.
 const marquee = require('./marquee');
-// Marquee TV (TV-2) — series-only. Registered here so it appears in the series
-// dropdown, but it ships GLOBALLY DISABLED (isEnabled below: non-Genesis
-// defaults OFF) until an admin enables it in Server Config (SC-07) — a
-// user-visible no-op until then (M1).
 const marqueeTv = require('./marqueeTv');
 
-const REGISTRY = new Map([[genesis.id, genesis], [glass.id, glass], [marquee.id, marquee], [marqueeTv.id, marqueeTv]]);
-const DEFAULT_ID = 'genesis';
+const REGISTRY = new Map([[marquee.id, marquee], [marqueeTv.id, marqueeTv]]);
+const DEFAULT_IDS = { movie: 'marquee', series: 'marquee-tv' };
 
 function get(id) { return REGISTRY.get(id) || null; }
 function list() { return [...REGISTRY.values()]; }
 function listForType(t) { return list().filter((e) => e.supportedTypes.includes(t)); }
 function has(id) { return REGISTRY.has(id); }
+function defaultFor(type) { return get(DEFAULT_IDS[type]); }
 
-// Test-only hook (used by card 06's conformance/second-engine fixtures) to
-// register a stub engine and get a disposer. NOT part of the runtime surface.
+// Test-only hook (used by conformance/second-engine fixtures) to register a
+// stub engine and get a disposer. NOT part of the runtime surface.
 function _register(engine) {
   REGISTRY.set(engine.id, engine);
   return () => REGISTRY.delete(engine.id);
 }
 
-// isEnabled (SC-07): the global admin on/off gate, read from Server Config
-// (`settings.engines`). Genesis is the permanent default + safe floor and is
-// ALWAYS enabled (its stored value, if any, is ignored); every other engine is
-// OFF until an admin turns it on — so a code-registered engine ships dark and
-// only appears once it is BOTH registered AND enabled. The settings read is lazy
-// (settings.js has no dependency on this module, so no require cycle) and
-// tolerant of settings being absent/uninitialised → non-Genesis engines read off.
-function isEnabled(id) {
-  if (id === DEFAULT_ID) return true;                 // Genesis: permanently on
-  if (!has(id)) return false;
-  const cfg = require('../settings').getSettings()?.engines || {};
-  return cfg[id] === true;                            // non-Genesis default OFF
-}
-function listEnabled() { return list().filter((e) => isEnabled(e.id)); }
-function listEnabledFor(type) { return listForType(type).filter((e) => isEnabled(e.id)); }
-
 // availableFor: the engines this profile may CHOOSE for `type` — listForType
-// minus any engine that is globally DISABLED (SC-07) or is `unrestricted` ("all
-// ages"/fully open) while the profile has an age limit (I7 / overview §5.5).
-// Powers the dropdowns (portal + companion) so a disabled or open engine is never
-// offered. Genesis (always enabled, unrestricted:false) always survives, so a
-// dropdown is never empty.
+// minus any engine that is `unrestricted` ("all ages"/fully open) while the
+// profile has an age limit (I7 / overview §5.5). Both Marquee engines are
+// always available (no global on/off gate — SC-07 retired with ENG-R).
 function availableFor(profile, type) {
   const limited = (profile?.filters?.age_limit || 0) > 0;
-  return listForType(type).filter((e) => isEnabled(e.id) && !(limited && e.capabilities.unrestricted));
+  return listForType(type).filter((e) => !(limited && e.capabilities.unrestricted));
 }
 
-// resolveFor: the effective engine for (profile, type). Falls back to Genesis
-// (the guaranteed safe floor) when the stored id is unknown, doesn't support the
-// type, is globally DISABLED (SC-07), OR is an unrestricted engine on an
-// age-limited profile — so even a hand-edited profiles.json can never build/serve
-// from a switched-off engine or serve open content to a kids profile (I7).
+// resolveFor: the effective engine for (profile, type). Falls back to the
+// type's default (DEFAULT_IDS) when the stored id is unknown, doesn't support
+// the type, OR is an unrestricted engine on an age-limited profile — so even
+// a hand-edited profiles.json can never build/serve from a switched-off engine
+// or serve open content to a kids profile (I7).
 function resolveFor(profile, type) {
   const id = profile?.filters?.[`engine_${type}`];
   const e = get(id);
-  if (!e || !e.supportedTypes.includes(type)) return genesis;
-  if (!isEnabled(e.id)) return genesis;               // SC-07: disabled → safe floor
-  if (e.capabilities.unrestricted && (profile?.filters?.age_limit || 0) > 0) return genesis;
+  if (!e || !e.supportedTypes.includes(type)) return defaultFor(type);
+  if (e.capabilities.unrestricted && (profile?.filters?.age_limit || 0) > 0) return defaultFor(type);
   return e;
 }
 
-module.exports = { get, list, listForType, has, isEnabled, listEnabled, listEnabledFor, availableFor, resolveFor, DEFAULT_ID, _register };
+module.exports = { get, list, listForType, has, defaultFor, availableFor, resolveFor, DEFAULT_IDS, _register };

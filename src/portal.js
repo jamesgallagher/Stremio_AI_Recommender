@@ -90,20 +90,14 @@ function publicProfile(p, req) {
     external_url_set: !!normalizeExternal(process.env.EXTERNAL_URL),
     filters: p.filters,
     catalogs: p.catalogs || {},
-    // Per-type engine selection (v7 — see docs/engine-abstraction). The chosen id
-    // per type, the ids this profile may OFFER per type (age-filtered, I7 — an
-    // unrestricted "all ages" engine is absent here when the profile has an age
-    // limit, so the dropdown never shows it), and the effective engine's
+    // Per-type engine selection (v7 — see docs/engine-abstraction). The effective
+    // engine id per type (resolved against the registry + age limit) and the
     // requirement check per type (so the UI can warn "needs Simkl"/"needs a key").
     // engine_movie/engine_series also arrive verbatim inside `filters`; this block
-    // is the convenience shape + the availability/requirement data cards 04/05 need.
+    // is the convenience shape cards 04/05 need.
     engines: {
-      movie: p.filters.engine_movie || 'genesis',
-      series: p.filters.engine_series || 'genesis',
-      available: {
-        movie: engines.availableFor(p, 'movie').map((e) => e.id),
-        series: engines.availableFor(p, 'series').map((e) => e.id),
-      },
+      movie: engines.resolveFor(p, 'movie').id,
+      series: engines.resolveFor(p, 'series').id,
       requirements: {
         movie: engines.resolveFor(p, 'movie').requirements(p),
         series: engines.resolveFor(p, 'series').requirements(p),
@@ -244,19 +238,14 @@ router.get('/genres', (req, res) => {
 // The engine registry (static) for the portal's per-type engine dropdowns +
 // descriptions (card 04). Mirrors GET /genres. Per-profile availability + the
 // requirement check are profile-specific, so they live in publicProfile's
-// `engines` block, not here. With one engine this returns just Genesis → a
-// single, locked option per type.
+// `engines` block, not here. Returns the two Marquee engines (Marquee Cinema
+// for movies, Marquee TV for series).
 router.get('/engines', (req, res) => {
   res.json({
     engines: engines.list().map((e) => ({
       id: e.id, name: e.name, description: e.description,
-      supported_types: e.supportedTypes, capabilities: e.capabilities,
-      // SC-07: global admin enablement. `enabled` drives the Server Config
-      // toggles; `locked` marks Genesis as non-disableable (permanent default).
-      enabled: engines.isEnabled(e.id),
-      locked: e.id === engines.DEFAULT_ID,
+      supported_types: e.supportedTypes,
     })),
-    default: engines.DEFAULT_ID,
   });
 });
 
@@ -1227,46 +1216,6 @@ router.get('/settings', (req, res) => {
   });
 });
 
-// SC-07: when an engine is disabled globally, every profile that had it selected
-// for a type reverts to Genesis (a PERSISTED revert) and that slice is cleared +
-// rebuilt — the SC-03 per-profile engine-change path, fanned out across all
-// profiles by a single admin toggle. Kept here in the portal layer, which owns
-// the config↔recommendationStore wiring (config/settings never depend on the
-// store). dont_recommend is engine-independent and is left intact by clearType.
-function revertDisabledEngines(disabledIds) {
-  const disabled = new Set(disabledIds);
-  for (const p of config.listProfiles()) {
-    const filtersPatch = {};
-    for (const t of ['movie', 'series']) {
-      if (disabled.has(p.filters?.[`engine_${t}`])) filtersPatch[`engine_${t}`] = 'genesis';
-    }
-    if (!Object.keys(filtersPatch).length) continue;
-    const { profile, engineChanged } = config.updateProfile(p.id, { filters: filtersPatch });
-    if (!profile || !engineChanged.length) continue;
-    for (const t of engineChanged) recommendationStore.clearType(profile.id, t);
-    recommendationStore.rebuildAfterChange(profile.id)
-      .catch((err) => console.warn(`[engines] ${profile.name}: disable-revert rebuild failed — ${err.message}`));
-  }
-}
-
-// GE-07 (GD-6): a Tier-2 Glass config change (settings.glass) is BUILD-AFFECTING —
-// it alters the stored rankScore ordering for every Glass profile, exactly like
-// changing the selected engine. So each type currently PRODUCED by Glass has its
-// slice cleared + rebuilt (the same SC-03 clearType path a disable-revert uses).
-// Deliberately heavyweight: it's an algorithm change, not a serve-time preference.
-// dont_recommend is engine-independent and left intact by clearType. Resolves the
-// EFFECTIVE engine per type (so an age-revoked/disabled selection that already
-// floors to Genesis is correctly skipped).
-function rebuildGlassProfiles() {
-  for (const p of config.listProfiles()) {
-    const types = ['movie', 'series'].filter((t) => recommendationStore && require('./engines').resolveFor(p, t).id === 'glass');
-    if (!types.length) continue;
-    for (const t of types) recommendationStore.clearType(p.id, t);
-    recommendationStore.rebuildAfterChange(p.id)
-      .catch((err) => console.warn(`[glass] ${p.name}: Tier-2 config rebuild failed — ${err.message}`));
-  }
-}
-
 // ME-09: a Tier-2 Marquee config change (settings.marquee) is BUILD-AFFECTING —
 // the same GD-6 pattern as Glass, but MOVIE ONLY (Marquee is a movie engine).
 // Deliberately a parallel function, not a refactor of Glass's: the two engines'
@@ -1294,40 +1243,8 @@ router.put('/settings', (req, res) => {
         delete patch.keys.tvdb_api_key;
       }
     }
-    // SC-07: admin engine enable/disable map. Validate against the registry —
-    // keep only known ids, coerce to bool, and FORCE Genesis on (it can never be
-    // disabled; a body asking to is silently corrected). Unknown ids are dropped
-    // by iterating the registry rather than the request body. Compute the disable
-    // transition BEFORE the write (isEnabled still reports the old state here).
-    let disabledIds = [];
-    if (req.body.engines && typeof req.body.engines === 'object') {
-      const body = req.body.engines;
-      // PATCH semantics: only engines NAMED in the body change; every other engine
-      // keeps its stored state. (A partial toggle must never silently disable — and
-      // revert to Genesis — an engine it didn't mention; the portal always sends the
-      // full map, but an API caller might send one key.) Genesis is always forced
-      // on. Unknown ids are ignored by iterating the registry, not the body.
-      const validated = { ...(settings.getSettings()?.engines || {}) };
-      for (const e of engines.list()) {
-        if (e.id === engines.DEFAULT_ID) { validated[e.id] = true; continue; }
-        if (e.id in body) validated[e.id] = body[e.id] === true;
-      }
-      disabledIds = engines.list()
-        .filter((e) => e.id !== engines.DEFAULT_ID && e.id in body && engines.isEnabled(e.id) && body[e.id] !== true)
-        .map((e) => e.id);
-      patch.engines = validated;
-    }
-    // GE-07: Glass Tier-2 admin config. Stored as-is (glass-schema-agnostic here;
-    // engines/glass/config validates on read). Detect a real change so an
-    // unrelated settings save doesn't needlessly rebuild every Glass profile.
-    let glassChanged = false;
-    if (req.body.glass && typeof req.body.glass === 'object') {
-      const before = JSON.stringify(settings.getSettings()?.glass || {});
-      patch.glass = req.body.glass;                    // replace-whole (settings.js)
-      glassChanged = JSON.stringify(req.body.glass) !== before;
-    }
-    // ME-09: Marquee Tier-2 admin config — exactly Glass's pattern (stored as-is,
-    // real change detected by JSON compare so an unrelated save doesn't rebuild).
+    // ME-09: Marquee Tier-2 admin config (stored as-is, real change detected by
+    // JSON compare so an unrelated save doesn't rebuild).
     let marqueeChanged = false;
     if (req.body.marquee && typeof req.body.marquee === 'object') {
       const before = JSON.stringify(settings.getSettings()?.marquee || {});
@@ -1335,12 +1252,6 @@ router.put('/settings', (req, res) => {
       marqueeChanged = JSON.stringify(req.body.marquee) !== before;
     }
     const updated = settings.updateSettings(patch);
-    // Fan out AFTER the write is persisted, so isEnabled already reports the new
-    // (disabled) state while the revert runs. resolveFor's disabled→Genesis
-    // fallback is the belt-and-suspenders for the window before this finishes.
-    if (disabledIds.length) revertDisabledEngines(disabledIds);
-    // Build-affecting Tier-2 change → clear + rebuild every Glass slice (GD-6).
-    if (glassChanged) rebuildGlassProfiles();
     // ME-09: build-affecting Tier-2 change → clear + rebuild every Marquee movie slice.
     if (marqueeChanged) rebuildMarqueeProfiles();
     res.json({ settings: updated, complete: settings.isComplete(updated) });

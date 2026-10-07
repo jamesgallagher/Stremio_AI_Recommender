@@ -26,12 +26,9 @@ const animeMap = require('./services/animeMap');
 const watchedStore = require('./watchedStore');
 // Trainer T2 (N8): the taste-feedback store's rebuild trigger (Marquee-only).
 const tasteFeedback = require('./tasteFeedback');
-// The candidate-generation half of the build now lives in the Genesis Engine
-// (SC-01). recommendationStore keeps the pool table, serve path, decay, age gate
-// and the IMDb-rating heal — all engine-agnostic — and re-exports Genesis's pure
-// candidate logic (computeAffinity / selectStrong) + parameters (HALF_LIFE_DAYS /
-// PER_TITLE_CAP) so existing imports and tests resolve them from their old home.
-const genesis = require('./engines/genesis');
+// recommendationStore keeps the pool table, serve path, decay, age gate, and the
+// IMDb-rating heal — all engine-agnostic. The candidate-generation half of the
+// build lives in the engine (Marquee Cinema for movies, Marquee TV for series).
 // Calibrated serving (spec §16): the pure helpers + the per-profile taste target store.
 const serveCalibration = require('./serveCalibration');
 
@@ -1385,10 +1382,6 @@ function pruneOtherEngines(profileId, type, engineId) {
 
 module.exports = {
   init,
-  // Re-exported from the Genesis Engine (their new home) so existing imports and
-  // the smoke tests keep resolving them from recommendationStore.
-  computeAffinity: genesis.computeAffinity,
-  selectStrong: genesis.selectStrong,
   buildRecommendations,
   ageGatePool,
   buildPool,
@@ -1435,8 +1428,6 @@ module.exports = {
   recordImpressions,
   applyDecay,
   noteMetaOpen,
-  HALF_LIFE_DAYS: genesis.HALF_LIFE_DAYS,
-  PER_TITLE_CAP: genesis.PER_TITLE_CAP,
   SERVE_LIMIT,
   DECAY_WINDOW_MS,
   FALLOFF_GAP_MS,
