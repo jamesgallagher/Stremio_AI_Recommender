@@ -825,30 +825,6 @@ async function main() {
     }
   });
 
-  await it('R2. Glass Tier-2 config is build-affecting: a settings.glass reweight rebuilds a different pool ordering', async () => {
-    settings.updateSettings({ engines: { glass: true }, glass: {} });
-    stubTmdb();
-    const p = config.addProfile('INT-R2');
-    try {
-      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'glass', engine_series: 'glass' } });
-      seedGlassFixtures(p.id);
-      await rs.buildPool(config.getProfile(p.id), quiet);
-      const before = rs.getRecommended(p.id, { type: 'movie', limit: 100 }).map((x) => `${x.tmdb_id}:${x.affinity.toFixed(4)}`);
-      // Tier-2 reweight: crank exploration + momentum to the exclusion of taste, then
-      // rebuild the slice (the SC-03 clearType path a real admin change fans out).
-      settings.updateSettings({ glass: { weights: { taste_match: 0, quality: 0, trending_momentum: 0.5, popularity: 0, release_recency: 0, novelty: 0.2, exploration: 0.3 } } });
-      rs.clearType(p.id, 'movie');
-      await rs.buildPool(config.getProfile(p.id), quiet);
-      const after = rs.getRecommended(p.id, { type: 'movie', limit: 100 }).map((x) => `${x.tmdb_id}:${x.affinity.toFixed(4)}`);
-      assert.notDeepStrictEqual(after, before, 'a Tier-2 reweight changes the stored rankScore ordering/values');
-    } finally {
-      restoreTmdb();
-      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id); metaStore._clear();
-      settings.updateSettings({ engines: { glass: false }, glass: {} });
-      simklTrending.upsertList('movies', [], 0); simklTrending.upsertList('tv', [], 0); simklTrending.upsertList('anime', [], 0);
-    }
-  });
-
   await it('S. Glass conformance safety (I1): the shared age gate drops an over-band Glass title before serve (kids)', async () => {
     settings.updateSettings({ engines: { glass: true } });
     stubTmdb();
@@ -907,9 +883,6 @@ async function main() {
     assert.deepStrictEqual(same(await rerank.rerankCandidates('movie', scored, taste, cfg, { chain, chat: async () => { throw new Error('timeout'); }, log: quiet })), ['1', '2', '3', '4']);
     assert.deepStrictEqual(same(await rerank.rerankCandidates('movie', scored, taste, cfg, { chain, chat: async () => [], log: quiet })), ['1', '2', '3', '4']); // empty reply
     assert.deepStrictEqual(same(await rerank.rerankCandidates('movie', scored, taste, cfg, { chain, chat: async () => [{ id: 'nope' }], log: quiet })), ['1', '2', '3', '4']); // all-unknown
-    // enabled:false disables it even with a local endpoint.
-    const offCfg = require('../src/engines/shared/tasteConfig').resolveConfig({ glass: { rerank: { enabled: false } } });
-    assert.deepStrictEqual(same(await rerank.rerankCandidates('movie', scored, taste, offCfg, { chain, chat, log: quiet })), ['1', '2', '3', '4']);
   });
 
   // ── U. Glass GE-08 through the engine: local-only chain, reasons reach the pool ─
@@ -982,91 +955,7 @@ async function main() {
     }
   });
 
-  // ── W. Glass GE-09: embed() transport parse + semantic layer (off/measure/weighted) ─
-  await it('W. GE-09 embed() parses OpenAI shape; semantic layer stores the feature, weight 0 = measure-only, weighted reorders', async () => {
-    const emb = require('../src/services/embeddings');
-    const semantic = require('../src/engines/glass/semantic');
-    const embedStore = require('../src/engines/glass/embedStore');
-    const metaStore = require('../src/engines/shared/metaStore');
-    const { resolveConfig } = require('../src/engines/shared/tasteConfig');
 
-    // embed() transport: parses {data:[{index,embedding}]} and re-orders by index.
-    const origFetch = global.fetch;
-    global.fetch = async () => ({ ok: true, text: async () => '', json: async () => ({ data: [{ index: 1, embedding: [0, 1] }, { index: 0, embedding: [1, 0] }] }) });
-    try {
-      const vecs = await emb.embed({ uri: 'http://x', model: 'm' }, ['a', 'b']);
-      assert.deepStrictEqual(vecs, [[1, 0], [0, 1]]);   // sorted by index → input order
-    } finally { global.fetch = origFetch; }
-
-    // Semantic layer end to end with an injected embedder (content token → vector).
-    const embedFn = async (texts) => texts.map((t) => (t.includes('CLOSE') ? [1, 0] : [0, 1]));
-    const p = config.addProfile('INT-W');
-    try {
-      metaStore._clear(); embedStore._clear();
-      watchedStore.upsertMany(p.id, [{ type: 'movie', simkl_id: 1, imdb_id: 'ttw', tmdb_id: '1', title: 'W', year: 2024, watched_at: '2026-09-08T00:00:00Z' }]);
-      metaStore.put('movie', 1, { tmdb_id: '1', type: 'movie', title: 'Watched', overview: 'a CLOSE story', genres: ['Drama'] });      // taste vec → [1,0]
-      metaStore.put('movie', 10, { tmdb_id: '10', type: 'movie', title: 'A', overview: 'a CLOSE tale', genres: ['Drama'] });           // cosine 1
-      metaStore.put('movie', 11, { tmdb_id: '11', type: 'movie', title: 'B', overview: 'a FAR tale', genres: ['Drama'] });             // cosine 0
-      const mkScored = () => ([
-        { tmdb_id: '11', title: 'B', rankScore: 0.6, score_components: { features: { taste_match: 0.6 } } },
-        { tmdb_id: '10', title: 'A', rankScore: 0.5, score_components: { features: { taste_match: 0.5 } } },
-      ]);
-      // Disabled (default) → untouched.
-      const offCfg = resolveConfig(null);
-      assert.deepStrictEqual((await semantic.applySemantic(p, 'movie', mkScored(), {}, offCfg, { model: 'm', embedFn, log: quiet })).map((c) => c.tmdb_id), ['11', '10']);
-
-      // Enabled, weight 0 → feature STORED but order unchanged (measure-only).
-      const measCfg = resolveConfig({ glass: { embeddings: { enabled: true } } });
-      const meas = await semantic.applySemantic(p, 'movie', mkScored(), {}, measCfg, { model: 'm', embedFn, log: quiet });
-      assert.deepStrictEqual(meas.map((c) => c.tmdb_id), ['11', '10']);                       // unchanged
-      const byId = Object.fromEntries(meas.map((c) => [c.tmdb_id, c.score_components.features.semantic_similarity]));
-      assert.ok(Math.abs(byId['10'] - 1) < 1e-9 && Math.abs(byId['11'] - 0) < 1e-9);           // A close, B far
-      assert.ok(embedStore.count() > 0, 'vectors are cached');
-
-      // Enabled + weighted → the semantically-close A overtakes B.
-      const wCfg = resolveConfig({ glass: { embeddings: { enabled: true }, weights: { semantic_similarity: 1.0 } } });
-      const weighted = await semantic.applySemantic(p, 'movie', mkScored(), {}, wCfg, { model: 'm', embedFn, log: quiet });
-      assert.deepStrictEqual(weighted.map((c) => c.tmdb_id), ['10', '11']);                    // reordered by semantic weight
-    } finally {
-      config.removeProfile(p.id); watchedStore.deleteForProfile(p.id); metaStore._clear(); embedStore._clear();
-    }
-  });
-
-  // ── X. Glass engine wires GE-09: enabled → semantic_similarity persists to the pool ─
-  await it('X. Glass engine folds semantic_similarity into score_components when embeddings are enabled', async () => {
-    const metaStore = require('../src/engines/shared/metaStore');
-    const embedStore = require('../src/engines/glass/embedStore');
-    const glass = require('../src/engines/glass');
-    const pipeline = require('../src/engines/pipeline');
-    settings.updateSettings({ engines: { glass: true } });
-    stubTmdb();
-    const p = config.addProfile('INT-X');
-    try {
-      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'glass', engine_series: 'glass' } });
-      seedGlassFixtures(p.id); embedStore._clear();
-      let embedCalls = 0;
-      const ctx = {
-        tmdbKey: 'itest-tmdb', mdblistKey: '', log: quiet, filters: config.getProfile(p.id).filters,
-        settings: { llm: {}, glass: { embeddings: { enabled: true } } },   // Tier-2 turns it on
-        glassEmbed: async (texts) => { embedCalls++; return texts.map(() => [1, 0, 0]); },
-        glassRecsFetcher: async (_k, type) => (type === 'movie'
-          ? [{ type, tmdb_id: '301', title: 'Rec A', year: 2024, genre_ids: [18], vote_average: 8, vote_count: 5000, popularity: 30, adult: false, poster: null }] : []),
-      };
-      await pipeline.runEngineBuild(config.getProfile(p.id), 'movie', glass, ctx, () => {});
-      assert.ok(embedCalls > 0, 'the engine invoked the local embedder');
-      const rows = rs.getRecommended(p.id, { type: 'movie', limit: 100 });
-      assert.ok(rows.length >= 1);
-      for (const r of rows) {
-        const f = JSON.parse(r.score_components).features;
-        assert.ok(typeof f.semantic_similarity === 'number', 'semantic_similarity is stored for measurement');
-      }
-    } finally {
-      restoreTmdb();
-      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id); metaStore._clear(); embedStore._clear();
-      settings.updateSettings({ engines: { glass: false } });
-      simklTrending.upsertList('movies', [], 0); simklTrending.upsertList('tv', [], 0); simklTrending.upsertList('anime', [], 0);
-    }
-  });
 
   // ── Marquee ME-02: TMDB list endpoints + trending cache (stubbed fetch / injected fetcher) ─
   await it('marquee trendingMovies: rank continuous across pages + failure/short-page handling', async () => {

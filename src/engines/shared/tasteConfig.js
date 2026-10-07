@@ -1,11 +1,10 @@
-// Glass tunable configuration (GD-6 — tiered; v1 = Tier-1 defaults + Tier-2
-// global admin). Every knob here is EXTERNALISED, VERSIONED config, not a code
-// constant baked into the algorithm (design §7). A change to any of it alters the
-// stored rankScore ordering, so it is BUILD-AFFECTING: a Tier-2 edit clears the
-// Glass type slices and rebuilds (wired in the portal, GE-07).
+// Shared tunable configuration (GD-6 — tiered; v1 = Tier-1 defaults). Every
+// knob here is EXTERNALISED, VERSIONED config, not a code constant baked into
+// the algorithm (design §7). A change to any of it alters the stored rankScore
+// ordering, so it is BUILD-AFFECTING.
 //
 //   Tier 1 — these versioned defaults ("the algorithm").
-//   Tier 2 — a global admin override merged from settings.glass (GE-07).
+//   Tier 2 (settings.glass) was retired with the Glass engine (ENG-R, 7.44): these Tier-1 defaults are the config.
 //   Tier 3 — 1–2 friendly per-profile sliders — DEFERRED (design §7).
 //
 // ⚠ Starting weights are v1 DEFAULTS, chosen to be sensible and explicitly
@@ -51,9 +50,6 @@ const DEFAULTS = {
     release_recency: 0.08,      // newer titles nudged up (movies-scoped semantics)
     novelty: 0.08,              // away from the profile's over-represented genres
     exploration: 0.07,          // the reserved exploration candidates
-    semantic_similarity: 0.00,  // GE-09: EVIDENCE-GATED — computed+stored when embeddings.enabled,
-                                //   but weight 0 (measure-only) until the components data proves lift;
-                                //   raise it via Tier-2 once justified (design §8-C, "measure lift vs A/B").
   },
 
   // ── taste_match sub-weights: how each enriched dim contributes to taste_match.
@@ -72,19 +68,6 @@ const DEFAULTS = {
   },
   keyword_min_shared: 1,        // floor: keyword intersect needs ≥ this many shared to count
 
-  // ── Vector embeddings (Phase C / GE-09, design §5.2) ──
-  // EVIDENCE-GATED + OPTIONAL. When enabled, Glass embeds candidate + watched
-  // content on the LOCAL /embeddings endpoint (settings.llm.embed_*), builds a
-  // recency-weighted taste vector, and folds cosine similarity in as the
-  // semantic_similarity feature (stored in score_components). Off by default:
-  // the capability exists, but nothing computes/weights it until the data
-  // justifies turning it on and raising weights.semantic_similarity.
-  embeddings: {
-    enabled: false,             // master switch (Tier-2). false → no embed calls, feature omitted.
-    candidate_cap: 150,         // embed at most the top-N scored candidates (cost bound)
-    taste_cap: 150,             // embed at most the N most-recent watched titles for the taste vector
-  },
-
   // ── Output (§4.7, GI-1) ──
   resolve_cap: 300,             // ≤ this many candidates are enriched + returned (≈ STORE_CAP; the resolve budget)
 
@@ -99,39 +82,14 @@ const DEFAULTS = {
     dont_recommend_user: -1.5,      // an explicit "not interested" — strong negative
     dont_recommend_decayed: -0.5,   // shown repeatedly, never engaged — mild negative
   },
-
-  // ── LLM semantic rerank (Phase B / GE-08, design §4.4) ──
-  // The free LOCAL LLM reorders the strongest slice + writes "because…" reasons.
-  // Optional + degrades to the deterministic order (prefer-local; never spills to
-  // Groq). `enabled:false` turns it off even when a local endpoint exists.
-  rerank: {
-    enabled: true,
-    candidate_cap: 120,         // top-N sent to the LLM (design says ≈100–300, never thousands).
-                                //   A local model must emit this many {id,reason} objects, so lower
-                                //   it (e.g. 40–60) if your box is slow — Tier-2 tunable.
-    timeout_ms: 120000,         // the rerank is a BACKGROUND build call, so it gets its own generous
-                                //   timeout — NOT the tight request-path Custom-LLM default (25s) the
-                                //   age gate shares. Env override: GLASS_RERANK_TIMEOUT_MS.
-  },
 };
 
-// Resolve the EFFECTIVE Glass config for a build: Tier-1 defaults with a Tier-2
-// global admin override (settings.glass) shallow-merged per section. Unknown keys
-// in settings.glass are ignored (only sections that exist in DEFAULTS are merged),
-// so a malformed admin blob can never break a build — it just doesn't apply.
+// Resolve the EFFECTIVE config for a build: the Tier-1 defaults. The Tier-2
+// global admin override (settings.glass) was retired with the Glass engine
+// (ENG-R, 7.44) — these Tier-1 defaults are the config. The `settings` argument
+// is kept for call-site compatibility but is ignored.
 function resolveConfig(settings) {
-  const cfg = clone(DEFAULTS);
-  const over = settings && typeof settings.glass === 'object' ? settings.glass : null;
-  if (over) {
-    for (const section of Object.keys(DEFAULTS)) {
-      if (over[section] && typeof over[section] === 'object' && typeof DEFAULTS[section] === 'object') {
-        Object.assign(cfg[section], over[section]);
-      } else if (over[section] !== undefined && typeof DEFAULTS[section] !== 'object') {
-        cfg[section] = over[section];
-      }
-    }
-  }
-  return cfg;
+  return clone(DEFAULTS);
 }
 
 function halfLivesFor(cfg, type) {

@@ -624,17 +624,17 @@ ok('settings: roundtrip, migration seeds from "James", isComplete, llmChain', ()
   assert.deepStrictEqual(settings.getSettings().glass, {});
 });
 
-ok('glass/config: GE-07 resolveConfig merges Tier-2 over Tier-1 by section, ignores unknown keys, clones', () => {
+ok('shared/tasteConfig: resolveConfig returns the Tier-1 defaults (Tier-2 retired, ENG-R), clones', () => {
   const { resolveConfig, DEFAULTS, ALGORITHM_VERSION } = require('../src/engines/shared/tasteConfig');
   const base = resolveConfig(null);
   assert.strictEqual(base.weights.taste_match, DEFAULTS.weights.taste_match);
   assert.strictEqual(ALGORITHM_VERSION, 'glass-a1');
-  // Tier-2 overrides only the named section keys; other sections stay default.
+  // Tier-2 (settings.glass) was retired with the Glass engine (ENG-R, 7.44):
+  // resolveConfig ignores its argument and returns the Tier-1 defaults.
   const over = resolveConfig({ glass: { weights: { taste_match: 0.6 }, resolve_cap: 150, bogus: 1 } });
-  assert.strictEqual(over.weights.taste_match, 0.6);
-  assert.strictEqual(over.weights.quality, DEFAULTS.weights.quality); // sibling key preserved
-  assert.strictEqual(over.resolve_cap, 150);
-  assert.ok(!('bogus' in over)); // unknown top-level key ignored
+  assert.strictEqual(over.weights.taste_match, DEFAULTS.weights.taste_match); // arg ignored
+  assert.strictEqual(over.resolve_cap, DEFAULTS.resolve_cap);
+  assert.ok(!('bogus' in over)); // no settings keys leak in
   // Returned config is an independent clone (mutating it can't corrupt DEFAULTS).
   over.weights.taste_match = 0.99;
   assert.strictEqual(resolveConfig(null).weights.taste_match, DEFAULTS.weights.taste_match);
