@@ -1101,31 +1101,33 @@ async function unitTests() {
     assert.ok(!('engine_movie' in res.body.filters), 'engine not echoed back');
   });
 
-  await ok('settings: companionSettings ships per-type engine lists, age-gated server-side, no age leak', () => {
+  await ok('settings: companionSettings ships per-type engine summary + requirements, no age leak', () => {
     const engines = require('../../src/engines');
 
-    // Both Marquee engines: movie list carries marquee, series list carries marquee-tv;
+    // Both Marquee engines: movie carries marquee, series carries marquee-tv;
     // the DTO is phone-safe (no capabilities / supported_types).
     const p = config.addProfile('EngList');
     const s0 = handlers.companionSettings(config.getProfile(p.id));
-    assert.deepStrictEqual(s0.engines.available.movie.map((e) => e.id), ['marquee']);
-    assert.deepStrictEqual(s0.engines.available.series.map((e) => e.id), ['marquee-tv']);
-    assert.deepStrictEqual(Object.keys(s0.engines.available.movie[0]).sort(), ['description', 'id', 'name']); // no internal-flag leak
+    assert.strictEqual(s0.engines.movie.id, 'marquee');
+    assert.strictEqual(s0.engines.series.id, 'marquee-tv');
+    assert.deepStrictEqual(Object.keys(s0.engines.movie).sort(), ['description', 'id', 'name']); // no internal-flag leak
+    assert.strictEqual(typeof s0.engines.requirements.movie.ok, 'boolean');
+    assert.strictEqual(typeof s0.engines.requirements.series.ok, 'boolean');
 
     // I7: register the canonical unrestricted fixture `fake-open`
-    // (test/fixtures/fake-engine.js, SC-06). It is then offered to an adult profile
-    // and OMITTED from an age-limited one, with no age value sent either way.
+    // (test/fixtures/fake-engine.js, SC-06). resolveFor falls back to the
+    // type's default for an age-limited profile (I7 gate).
     const dispose = engines._register(fakeOpen);
     try {
       const adult = config.addProfile('EngAdult');
+      config.updateProfile(adult.id, { filters: { engine_movie: 'fake-open' } });
       const sA = handlers.companionSettings(config.getProfile(adult.id));
-      assert.ok(sA.engines.available.movie.some((e) => e.id === 'fake-open')); // offered to an adult
+      assert.strictEqual(sA.engines.movie.id, 'fake-open'); // resolved for an adult
 
       const kid = config.addProfile('EngKid');
-      config.updateProfile(kid.id, { filters: { age_limit: 12 } });
+      config.updateProfile(kid.id, { filters: { age_limit: 12, engine_movie: 'fake-open' } });
       const sK = handlers.companionSettings(config.getProfile(kid.id));
-      assert.ok(!sK.engines.available.movie.some((e) => e.id === 'fake-open')); // hidden from a kid
-      assert.ok(!sK.engines.available.series.some((e) => e.id === 'fake-open'));
+      assert.strictEqual(sK.engines.movie.id, 'marquee'); // I7: unrestricted engine falls back for a kid
       assert.ok(!('age_limit' in sK.filters), 'no age gate in the filters payload');
       assert.ok(!JSON.stringify(sK).includes('age_limit'), 'no age_limit anywhere in the settings response');
       config.removeProfile(adult.id); config.removeProfile(kid.id);

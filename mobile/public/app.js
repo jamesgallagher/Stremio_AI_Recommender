@@ -446,6 +446,7 @@
   const setEls = {
     tabs: document.querySelectorAll('#settings-tabs .seg'),
     msg: $('settings-msg'),
+    engines: $('set-engines'),
     minRating: $('set-min-rating'), recency: $('set-recency'), listSize: $('set-list-size'),
     voteFloor: $('set-vote-floor'), genres: $('set-genres'), catalogOnly: $('set-catalog-only'),
     titleDecay: $('set-title-decay'), titleDecayDays: $('set-title-decay-days'), titleDecayDaysField: $('set-title-decay-days-field'),
@@ -453,6 +454,23 @@
     catalogs: $('set-catalogs'), catalogsWarn: $('set-catalogs-warn'), catalogsSave: $('catalogs-save'),
   };
   const setSettingsMsg = (t, kind) => { setEls.msg.textContent = t || ''; setEls.msg.className = 'msg' + (kind ? ' ' + kind : ''); };
+
+  // Per-type engine summary line + requirement warnings (card §7.1/§7.2).
+  function fillEngines(data) {
+    const eng = data.engines || {};
+    const movieName = (eng.movie && eng.movie.name) || 'marquee';
+    const seriesName = (eng.series && eng.series.name) || 'marquee-tv';
+    const reqs = eng.requirements || {};
+    let html = `${movieName} (movies) · ${seriesName} (shows)`;
+    for (const type of ['movie', 'series']) {
+      const req = reqs[type];
+      if (req && !req.ok && Array.isArray(req.missing) && req.missing.length) {
+        const engName = type === 'movie' ? movieName : seriesName;
+        html += `<div class="warn-line">⚠ ${engName} needs ${req.missing.join(', ')}.</div>`;
+      }
+    }
+    setEls.engines.innerHTML = html;
+  }
 
   function switchSettingsTab(tab) {
     setEls.tabs.forEach((s) => s.classList.toggle('active', s.dataset.settab === tab));
@@ -708,6 +726,7 @@
       const data = await res.json().catch(() => ({}));
       if (!res.ok) { setSettingsMsg(data.error || 'Could not load settings.', 'err'); return; }
       const f = data.filters || {};
+      fillEngines(data);
       setSelect(setEls.minRating, f.min_rating != null ? f.min_rating : 0);
       setSelect(setEls.recency, f.min_year != null ? f.min_year : 0);
       setSelect(setEls.listSize, f.list_size != null ? f.list_size : 20);

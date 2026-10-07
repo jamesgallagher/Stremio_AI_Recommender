@@ -499,11 +499,11 @@ function render(profiles) {
       </div>
 
       <div class="tab-panel" data-tab="filters">
-        <div class="muted" style="margin-bottom:8px;font-size:11px">The <b>engine</b> decides how each list is generated; changing it rebuilds that catalog. Rating floor, excluded genres, recency and list size apply at <b>serve time</b> over the stored pool — change one and it takes effect immediately, no rebuild. The <b>age limit</b> and <b>minimum vote count</b> are baked in at build, so they apply on the next rebuild.</div>
+        <div class="muted" style="margin-bottom:8px;font-size:11px">Movies are built by <b>Marquee Cinema</b> and shows by <b>Marquee TV</b>. Rating floor, excluded genres, recency and list size apply at <b>serve time</b> over the stored pool — change one and it takes effect immediately, no rebuild. The <b>age limit</b> and <b>minimum vote count</b> are baked in at build, so they apply on the next rebuild.</div>
 
         <div class="sec-title">Engines</div>
         <div class="sec-box">
-          <div class="muted" style="font-size:12px">Marquee Cinema (movies) · Marquee TV (shows)</div>
+          ${engineSummary(p)}
         </div>
 
         <div class="sec-title">Quality</div>
@@ -830,6 +830,24 @@ function switchTab(btn, name) {
 }
 
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+// Per-type engine summary line + requirement warnings (card §6.1). Reads names
+// from ENGINES (GET /api/engines); renders a warn-line per unmet requirement.
+function engineSummary(p) {
+  const movieEng = ENGINES.find(e => e.id === p.engines?.movie);
+  const seriesEng = ENGINES.find(e => e.id === p.engines?.series);
+  const line = `${movieEng ? movieEng.name : p.engines?.movie || 'marquee'} (movies) · ${seriesEng ? seriesEng.name : p.engines?.series || 'marquee-tv'} (shows)`;
+  const reqs = p.engines?.requirements || {};
+  const warns = [];
+  for (const type of ['movie', 'series']) {
+    const req = reqs[type];
+    if (req && !req.ok && Array.isArray(req.missing) && req.missing.length) {
+      const engName = (type === 'movie' ? movieEng : seriesEng)?.name || '';
+      warns.push(`<div class="warn-line">⚠ ${esc(engName)} needs ${esc(req.missing.join(', '))}.</div>`);
+    }
+  }
+  return `<div class="muted" style="font-size:12px">${esc(line)}</div>${warns.join('')}`;
+}
 
 // Effective catalog toggle: explicit profile setting wins, else the
 // definition's default (Watch Later ships ON, curated lists ship OFF).
@@ -1498,8 +1516,6 @@ async function saveFilters(id) {
     excluded_genres: [...card.querySelectorAll('.genres input:checked')].map(i => i.value),
     title_decay_enabled: decayOn,
     title_decay_days: parseInt(card.querySelector('[data-filter=title_decay_days]').value, 10),
-    engine_movie: 'marquee',
-    engine_series: 'marquee-tv',
   };
   await api('/profiles/' + id, { method: 'PUT', body: { filters } });
   dirty = false;
@@ -1987,22 +2003,13 @@ function trainerDraw(id) {
   const d = st.data;
   const canRate = !!(p && p.simkl_connected);
   const now = Date.now();
-  const engine = p && ENGINES.find(e => e.id === p.filters.engine_movie);
-  const engineSeries = p && ENGINES.find(e => e.id === p.filters.engine_series);
-  // TV-R §5: the notice is per type — films unchanged; shows only when the
-  // Series engine is not Marquee TV.
-  const notice = (p && st.type === 'series' && p.filters.engine_series !== 'marquee-tv')
-    ? `<div class="tr-notice">Ratings still save to Simkl, but this profile's shows come from ${esc(engineSeries ? engineSeries.name : (p.filters.engine_series || 'another engine'))}, so your ratings won't change its recommendations. Switch the Series engine to Marquee TV in Filters.</div>`
-    : (p && p.filters.engine_movie !== 'marquee')
-      ? `<div class="tr-notice">Ratings still save to Simkl, but this profile's movies come from ${esc(engine ? engine.name : (p.filters.engine_movie || 'another engine'))}, so your ratings won't change its recommendations. Switch the Movies engine to Marquee Cinema in Filters.</div>`
-      : '';
   const rows = d.items.length
     ? d.items.map(item => TrainerUI.rowHtml(item, { canRate, now })).join('')
     : `<div class="muted">${st.type === 'series' ? 'No shows in this view yet.' : 'No films in this view yet.'}</div>`;
   const pages = Math.max(1, Math.ceil(d.total / d.pageSize));
   // TV-R §5: the Films | Shows toggle (per-profile state st.type, default movie).
   const typeToggle = `<div class="tr-chips tr-type"><button class="tr-chip" data-type="movie" aria-pressed="${st.type === 'movie'}">Films</button><button class="tr-chip" data-type="series" aria-pressed="${st.type === 'series'}">Shows</button></div>`;
-  panel.innerHTML = `${typeToggle}${notice}<div class="tr-banner-slot">${TrainerUI.bannerHtml(d.training, now, { rebuilding: st.rebuilding })}</div>
+  panel.innerHTML = `${typeToggle}<div class="tr-banner-slot">${TrainerUI.bannerHtml(d.training, now, { rebuilding: st.rebuilding })}</div>
     <div class="tr-chips tr-views">${TrainerUI.chipsHtml(d.counts, st.view, { hideUnfinished: st.type === 'series' })}</div>
     <div class="tr-search-row"><input type="text" class="tr-search" data-nodirty placeholder="Search titles…" value="${esc(st.q)}" title="${esc(TrainerUI.TIPS.search)}"></div>
     <div class="tr-table">${rows}</div>

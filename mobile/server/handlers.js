@@ -305,7 +305,7 @@ function catalogPreviewHandler(req, res) {
 const engDTO = (e) => ({ id: e.id, name: e.name, description: e.description });
 
 // The full Companion settings payload — Filters tab (editable filters + view
-// pref + genre options + per-type engine choices) and Catalogs tab
+// pref + genre options + per-type engine summary) and Catalogs tab
 // (age-appropriate extra catalogs). Never includes the age gate. Exported for tests.
 function companionSettings(profile) {
   const filters = toCompanionFilters(profile.filters || {});
@@ -318,10 +318,14 @@ function companionSettings(profile) {
     catalog_only: catalogOnlyOf(profile),
     genres: Object.keys(tmdb.GENRE_ALIASES).sort(),
     catalogs: companionCatalogs(profile),
+    // Per-type engine summary (card §7.3): the resolved engine per type + the
+    // requirement check so the UI can warn "needs Simkl" / "needs a key".
     engines: {
-      available: {
-        movie: engines.availableFor(profile, 'movie').map(engDTO),
-        series: engines.availableFor(profile, 'series').map(engDTO),
+      movie: engDTO(engines.resolveFor(profile, 'movie')),
+      series: engDTO(engines.resolveFor(profile, 'series')),
+      requirements: {
+        movie: engines.resolveFor(profile, 'movie').requirements(profile),
+        series: engines.resolveFor(profile, 'series').requirements(profile),
       },
     },
   };

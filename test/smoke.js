@@ -7872,8 +7872,8 @@ async function httpTests() {
     assert.ok(body.includes('body: { type: st.type, tmdb_id: key, ignored: false }'), 'unignore sends type');
     assert.ok(body.includes('body: { type: st.type, tmdb_id: key, imdb_id: item.imdb_id }'), 'unwatched/finished send type');
     assert.ok(!body.includes("body: { type: 'movie'"), 'no hard-coded movie type left in trainer calls');
-    // The show notice text, exactly (TV-R §5).
-    assert.ok(body.includes("Ratings still save to Simkl, but this profile's shows come from ${esc(engineSeries ? engineSeries.name : (p.filters.engine_series || 'another engine'))}, so your ratings won't change its recommendations. Switch the Series engine to Marquee TV in Filters."), 'show notice text exact');
+    // The engine-switch notice is gone (ENG-R: both engines are fixed).
+    assert.ok(!body.includes('Switch the Series engine to Marquee TV'), 'no engine-switch notice');
     // The Unfinished chip is hidden for shows: the flag is passed to chipsHtml,
     // and chipsHtml honours it (the film chips are unchanged without it).
     assert.ok((body.match(/hideUnfinished: st\.type === 'series'/g) || []).length >= 2, 'hideUnfinished passed in draw + refreshMeta');
@@ -7881,7 +7881,7 @@ async function httpTests() {
     assert.ok(TrainerUI.chipsHtml(counts, 'all').includes('data-view="unfinished"'), 'film chips keep Unfinished');
     assert.ok(!TrainerUI.chipsHtml(counts, 'all', { hideUnfinished: true }).includes('data-view="unfinished"'), 'show chips hide Unfinished');
     assert.ok(TrainerUI.chipsHtml(counts, 'all', { hideUnfinished: true }).includes('data-view="loved"'), 'other chips untouched');
-    console.log('  ✓ TV-R T8: portal Films | Shows toggle, type on every call, show notice, Unfinished chip hidden');
+    console.log('  ✓ TV-R T8: portal Films | Shows toggle, type on every call, no engine-switch notice, Unfinished chip hidden');
   }
 
   // TV-R r1 B1: the view-chips refresh must not overwrite the Films | Shows
