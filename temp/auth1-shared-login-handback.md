@@ -1,87 +1,173 @@
-# AUTH-1 Hand-back Report
+# AUTH-1 Hand-back
 
-**Branch:** `feature/auth1-shared-login` → `v7`
-**Version:** 7.43.0-beta
-**Date:** 2026-10-07
+PR: https://github.com/jamesgallagher/Stremio_AI_Recommender/pull/41
+Branch: `feature/auth1-shared-login`
+Final SHA: `411513b`
 
-## Summary
+## §0.1 Mandates — implementation locations
 
-One shared email-OTP sign-in for both `/mobile` and `/configure` (cookie `air_sid`, `Path=/`), HTTP Basic Auth removed entirely, "users" are profiles in `profiles.json` with a new `is_admin` boolean field, Initial User Creation wizard (only when zero profiles exist), "at least one admin" invariants enforced, fixed 30-day absolute session lifetime, `/configure` app bar matching `/mobile`, Admin checkbox in Configure→Advanced→Account, Configure button in the `/mobile` topbar for admins, break-glass `scripts/set-admin.js`, and a new test suite (`test/shared-login.js`).
+| # | Mandate | Where |
+|---|---------|-------|
+| 1 | One login for both surfaces | `src/sessionAuth.js` (shared cookie `air_sid`, Path=/); `src/server.js:57-59` (guards mounted on /api + /configure) |
+| 2 | Basic Auth removed entirely | `src/server.js` (no `adminAuth`, no `safeEqual`, no `WWW-Authenticate`); boot notice at `src/server.js:281-283` |
+| 3 | Users are profiles | `src/config.js` (`is_admin` field on profiles); `mobile/server/auth.js` (session bound to profile) |
+| 4 | `is_admin` boolean field | `src/config.js:28` (newProfile), `src/config.js:33` (applyMigrations); `src/portal.js:118` (publicProfile) |
+| 5 | Initial User Creation wizard | `mobile/server/router.js:78-118` (setup routes); `mobile/public/index.html` (setup view); `mobile/public/app.js` (setup flow) |
+| 6 | Never a state with profiles but no admin | `src/config.js` (`updateProfile` LAST_ADMIN invariant, `removeProfile` LAST_ADMIN invariant); `src/server.js:50-55` (boot migration) |
+| 7 | Non-admin can never make themselves admin | `src/sessionAuth.js:63-68` (requireAdminApi 403); `mobile/server/router.js` (settings POST ignores is_admin) |
+| 8 | Session lifetime fixed 30 days | `mobile/server/auth.js:14` (`SESSION_DAYS = 30`); `mobile/server/auth.js:57` (`createSession` absolute expiry) |
+| 9 | Admin checkbox in Configure → Advanced → Account | `public/index.html:706` (checkbox markup); `public/index.html:709-711` (hint strings) |
+| 10 | /configure gets the /mobile top bar | `public/index.html:217-226` (CSS block); `public/index.html:228-234` (header markup) |
+| 11 | ⚙ cog opens signed-in user's own profile | `public/index.html:1440-1446` (`openMySettings()`) |
+| 12 | "Configure" button in /mobile top bar | `mobile/public/index.html` (`#open-configure`); `mobile/public/app.js` (hidden for non-admins + <480px) |
+| 13 | Boot migration for existing installs | `src/config.js` (`promoteFirstAdminIfMissing`); `src/server.js:50-55` (boot call + logging) |
+| 14 | Break-glass is a shell script | `scripts/set-admin.js` (new) |
 
-## Build order (8 steps, one conventional commit each)
+## Tests — pass lines
 
-| Step | Commit | What |
-|------|--------|------|
-| 1 | `feat(auth): is_admin field, admin invariants, createInitialAdmin (AUTH-1 step 1)` | `src/config.js` — `is_admin` on profiles, `accountError()`, `promoteFirstAdminIfMissing()`, `createInitialAdmin()`, LAST_ADMIN/ADMIN_NEEDS_EMAIL/BAD_ADMIN_FLAG invariants in `updateProfile`/`removeProfile` |
-| 2 | `feat(auth): 30-day absolute sessions + setup wizard OTP (AUTH-1 step 2)` | `mobile/server/auth.js` — `SESSION_DAYS=30` (fixed), `createSession()`, `resolveSessionDetail()`, setup wizard (`requestSetupOtp`/`verifySetupOtp`/`pendingSetup`) |
-| 3 | `feat(auth): shared session cookie air_sid + admin guards (AUTH-1 step 3)` | `src/sessionAuth.js` (new) — `air_sid` cookie (`Path=/`), legacy `mobile_sid` upgrade, `requireAdminApi` (401/403), `requireAdminPage` (302→`/mobile/?next=`); `mobile/server/router.js` updated to use the shared cookie |
-| 4 | `feat(auth): remove Basic Auth, wire admin guards, /api/me (AUTH-1 step 4)` | `src/server.js` — all Basic Auth removed, `requireAdminApi` on `/api`, `requireAdminPage` on `/configure`; `src/portal.js` — `is_admin` in `publicProfile`, PUT/DELETE error codes, GET `/api/me`; `test/helpers/admin-session.js` (new); `test/smoke.js` + `test/integration.js` + `test/simkl.lifecycle.js` updated |
-| 5 | `feat(auth): /configure Admin checkbox + logout + 401/403 handling (AUTH-1 step 5)` | `public/index.html` — Admin checkbox in Advanced→Account, logout button, `api()` handles 401/403, save bar text updated |
-| 6 | `feat(auth): /mobile setup view, Configure button, next= handling (AUTH-1 step 6)` | `mobile/public/index.html` — setup view (name/email/code); `mobile/public/app.js` — setup flow, Configure button (admin only), `?next=` handling; `mobile/public/ui.js` — `setup` route + `setupNeeded` in `viewForState`; `test/shared-login.js` T8 |
-| 7 | `feat(auth): break-glass set-admin script, docs, version bump to 7.43.0-beta (AUTH-1 step 7)` | `scripts/set-admin.js` (new); `.env.example` + `docker-compose.yml` (removed ADMIN_USER/ADMIN_PASSWORD/MOBILE_SESSION_DAYS); `README.md` + `mobile/README.md` + `mobile/docs/step-1-auth-otp.md` updated; `package.json` + `package-lock.json` → 7.43.0-beta |
-| 8 | *(this report)* | Browser checks B1–B11 below |
+### Unit (T1–T8)
+```
+✓ T1 createInitialAdmin: empty store -> admin, trims/lower-cases email; second call SETUP_DONE; bad inputs write nothing
+✓ T2 promoteFirstAdminIfMissing: promotes the oldest profile WITH an email; idempotent; no-email and no-profiles cases
+✓ T3 LAST_ADMIN: demoting the only admin throws (file unchanged); with 2 admins one demotes, then the remaining one throws
+✓ T4 removeProfile: the only admin cannot be deleted (file unchanged); with 2 admins it succeeds
+✓ T5 ADMIN_NEEDS_EMAIL: setting is_admin on an emailless profile throws; clearing an admin's email throws; file unchanged
+✓ T6 BAD_ADMIN_FLAG: non-boolean is_admin (string/number/null) throws
+✓ T7 30-day absolute session: createSession, resolve at t0+10d, touch doesn't change expiry, t0+30d-1ms works, t0+30d+1ms null
+✓ T8 viewForState: setupNeeded → setup; authed → route; login
+```
 
-## Test results
+### HTTP (T12–T22)
+```
+✓ T12 setup: needed:true; bad email → 400; empty name → 400
+✓ T13 setup verify: wrong code → 401; right code → 200 + Set-Cookie; admin; needed:false
+✓ T14 setup request again → 409
+✓ T15 /configure: 302 no cookie; 302 non-admin; 200 admin (appbar + Cache-Control)
+✓ T16 /api/version: 401 no cookie; 403 non-admin; 200 admin; Basic → 401
+✓ T17 non-admin cannot elevate
+✓ T18 admin flows: demote self 409; promote B 200; demote self 200; same cookie → 403; DELETE → 409
+✓ T19 legacy mobile_sid → air_sid (GET /mobile/api/me, Max-Age window)
+✓ T20 logout: clears both cookies; token revoked
+✓ T21 /mobile/api/me is_admin; /api/me → {profile:{id,name,is_admin:true}}
+✓ T22 set-admin.js: --email promotes; unknown email → exit 1; --profile + --email
+```
 
-`npm test` green (all 6 suites):
-- `test/smoke.js` — 216 unit + 59 async/http + T1–T8 + Card 1
-- `test/integration.js` — 5 integration checks
-- `mobile/test/mobile.smoke.js` — 75 unit + http
-- `test/shared-login.js` — 8 unit (T1–T8) + 12 HTTP (T12–T22)
-- `test/simkl.lifecycle.js` — 21 lifecycle checks
-- `test/mdblist-user-keys.js` — 26 user-key checks
+### T23 (pure logic)
+```
+✓ T23 nextAfterSignIn: /configure/ admin → redirect; non-admin → deny; other values → null
+```
 
-## Browser checks (B1–B11) for reviewer
+### Browser (B1–B13)
+```
+✓ B1 /mobile/ shows login view
+✓ B2 style parity: /configure vs /mobile topbar
+✓ B3 setup wizard: login view when profiles exist
+✓ B4 Configure button visible for admin
+✓ B5 Configure button hidden for non-admin
+✓ B6 /configure/ loads for admin
+✓ B7 /configure/ redirects non-admin to /mobile/
+✓ B8 /api/* returns 403 for non-admin
+✓ B9 legacy mobile_sid upgrades to air_sid
+✓ B10 Admin checkbox in /configure Advanced
+✓ B11 Logout button in /mobile topbar
+✓ B12 non-admin /configure/ makes <=3 navs, ends on /mobile/
+✓ B13 logout on /configure/ revokes session
+```
 
-These require a real browser (phone-sized recommended per the review-round convention). The server must be running with `DATA_DIR` pointing to a temp dir (zero profiles for B2).
+## Red/green evidence (T15–T17)
 
-| # | Check | How |
-|---|-------|-----|
-| B1 | `/mobile/` with profiles → login view (email field + "Send code" button) | Open `/mobile/` in a browser with at least one profile |
-| B2 | `/mobile/` with zero profiles → setup view (name + email fields + "Send code") | Fresh `DATA_DIR` (no `profiles.json`); open `/mobile/` |
-| B3 | Setup wizard flow: name → email → code → verify → app shell | Complete the setup wizard in B2; verify the app shell appears with the profile name in the topbar |
-| B4 | Configure button visible in `/mobile` topbar for admins | After B3, the "Configure" button should be visible (admin profile) |
-| B5 | Configure button NOT visible for non-admin profiles | Create a non-admin profile (via `scripts/set-admin.js list` + the portal), sign in as that profile, verify the Configure button is hidden |
-| B6 | `/configure/` for admin → portal loads (200) | Click Configure (or navigate to `/configure/` directly) with an admin session |
-| B7 | `/configure/` for non-admin → 302 to `/mobile/?next=%2Fconfigure%2F` | Navigate to `/configure/` with a non-admin session; verify the redirect |
-| B8 | `/api/*` for non-admin → 403 `{auth:'forbidden'}` | With a non-admin session, `fetch('/api/version')` → 403 |
-| B9 | Legacy `mobile_sid` cookie upgrades to `air_sid` | Set a `mobile_sid` cookie manually (or use an old session); navigate to `/mobile/api/me`; verify the response sets `air_sid` and clears `mobile_sid` |
-| B10 | Admin checkbox in Configure→Advanced→Account | Open `/configure/` as admin, go to Advanced → Account; verify the "Admin" checkbox is present and reflects the profile's `is_admin` state |
-| B11 | Logout button in `/mobile` topbar | Click "Log out" in the `/mobile` topbar; verify it calls `/mobile/api/auth/logout` and redirects to `/mobile/?next=` |
+On `origin/v7` (before AUTH-1), `/configure/` and `/api/*` are served without any session guard:
+- T15 (GET /configure/ with no cookie → 302) **fails** on v7: the page returns 200 (no redirect).
+- T16 (GET /api/version with no cookie → 401) **fails** on v7: the endpoint returns 200 (no auth).
+- T17 (non-admin PUT /api/profiles/<own> {is_admin:true} → 403) **fails** on v7: the endpoint returns 200 (no auth).
 
-## Notes
+On the branch, all three pass (see pass lines above).
 
-- **No new npm dependencies** — all changes use existing modules (Express 5, node:sqlite, nodemailer).
-- **No live server/deploy** — all tests use temp `DATA_DIR`, injected `nowMs`, and injected capturing mailer.
-- **`MOBILE_SESSION_DAYS` env var removed** — session lifetime is now a fixed 30-day absolute value (`SESSION_DAYS = 30` in `auth.js`).
-- **`ADMIN_USER`/`ADMIN_PASSWORD` env vars removed** — Basic Auth is gone; the shared `air_sid` session cookie is the sole auth mechanism.
-- **Break-glass:** `node scripts/set-admin.js list|set|unset <name-or-id>` for when the web UI is unreachable.
-- **Legacy cookie migration:** existing `mobile_sid` cookies (Path=/mobile) are upgraded in place to `air_sid` (Path=/) on the first request after the upgrade; `mobile_sid` is cleared.
+## B2 style-parity table
 
-## Files changed (by step)
+| Property | /mobile (light) | /configure (dark) |
+|----------|-----------------|-------------------|
+| `.topbar` background | `rgb(255, 255, 255)` | `rgb(23, 26, 35)` |
+| `.topbar` color | `rgb(26, 29, 38)` | `rgb(230, 232, 238)` |
+| `.topbar` padding | `0px 14px` | `0px 14px` |
+| `.topbar` height | `52px` | `52px` |
+| `.topbar` display | `flex` | `flex` |
+| `.topbar` position | `sticky` | `sticky` |
 
-- `src/config.js` (steps 1)
-- `mobile/server/auth.js` (step 2)
-- `src/sessionAuth.js` (new, step 3)
-- `mobile/server/router.js` (step 3)
-- `src/server.js` (step 4)
-- `src/portal.js` (step 4)
-- `test/helpers/admin-session.js` (new, step 4)
-- `test/helpers/provision-admin-cli.js` (new, step 4)
-- `test/smoke.js` (step 4)
-- `test/integration.js` (step 4)
-- `test/simkl.lifecycle.js` (step 4)
-- `test/shared-login.js` (new, steps 1–6)
-- `public/index.html` (step 5)
-- `mobile/public/index.html` (step 6)
-- `mobile/public/app.js` (step 6)
-- `mobile/public/ui.js` (step 6)
-- `mobile/test/mobile.smoke.js` (steps 4, 6)
-- `scripts/set-admin.js` (new, step 7)
-- `.env.example` (step 7)
-- `docker-compose.yml` (step 7)
-- `README.md` (step 7)
-- `mobile/README.md` (step 7)
-- `mobile/docs/step-1-auth-otp.md` (step 7)
-- `package.json` (step 7)
-- `package-lock.json` (step 7)
+The background and text colour differ because `/mobile` uses a light theme and `/configure` is dark-only. All structural properties (padding, height, display, position) match exactly. The test context uses `colorScheme: 'dark'` per the review correction.
+
+## §11 Self-audit output
+
+```
+$ git fetch origin && git diff --stat origin/v7...HEAD
+ .env.example                        |   5 -
+ README.md                           |  15 +-
+ docker-compose.yml                  |   3 -
+ mobile/README.md                    |  31 +-
+ mobile/docs/step-1-auth-otp.md      |  32 +-
+ mobile/public/app.js                |  99 ++++-
+ mobile/public/index.html            |  36 ++
+ mobile/public/styles.css            |   6 +-
+ mobile/public/ui.js                 |  22 +-
+ mobile/server/auth.js               |  80 ++++-
+ mobile/server/router.js             |  96 +++--
+ mobile/test/mobile.smoke.js         |  23 +-
+ package-lock.json                   |   4 +-
+ package.json                        |   4 +-
+ public/index.html                   |  71 +++-
+ scripts/set-admin.js                |  63 ++++
+ src/config.js                       |  60 ++++
+ src/portal.js                       |  17 +-
+ src/server.js                       |  85 +----
+ src/sessionAuth.js                  |  93 +++++
+ temp/auth1-shared-login-handback.md |  87 +++++
+ test/helpers/admin-session.js       |  54 +++
+ test/helpers/provision-admin-cli.js |  19 +
+ test/integration.js                 |   2 -
+ test/shared-login.js                | 697 ++++++++++++++++++++++++++++++++++++
+ test/simkl.lifecycle.js             |   7 +-
+ test/smoke.js                       |  11 +-
+ 27 files changed, 1519 insertions(+), 203 deletions(-)
+
+$ git diff origin/v7...HEAD -- mobile/server/otpStore.js mobile/server/mail.js mobile/server/handlers.js mobile/public/trainer.js mobile/public/swipe.js public/trainer-ui.js src/engines src/catalogs.js src/settings.js src/rebuild.js src/recommendationStore.js Dockerfile .github
+(empty)
+
+$ grep -rn "ADMIN_PASSWORD\|adminAuth\|WWW-Authenticate\|safeEqual" src mobile/server
+src/portal.js:114:    // behind adminAuth; the public /addon surface never sees these.
+src/server.js:281:  if (process.env.ADMIN_USER || process.env.ADMIN_PASSWORD) {
+src/server.js:282:    console.log('[auth] ADMIN_USER/ADMIN_PASSWORD are no longer used — /configure uses the shared sign-in (admin profiles). You can remove them.');
+mobile/server/mail.js:4:// Credentials are infrastructure secrets in ENV, handled like ADMIN_PASSWORD —
+
+$ grep -rn "MOBILE_SESSION_DAYS" src mobile .env.example docker-compose.yml README.md
+(empty)
+
+$ grep -rn "is_admin" mobile/server/otpStore.js public/trainer-ui.js
+(empty)
+
+$ grep -n "localStorage\|sessionStorage" public/index.html mobile/public/app.js
+(empty)
+
+$ git diff origin/v7...HEAD -- package.json | grep '^[+-]' | grep -v version
+-    "test": "node --experimental-sqlite test/smoke.js && node --experimental-sqlite test/integration.js && node --experimental-sqlite mobile/test/mobile.smoke.js && node --experimental-sqlite test/simkl.lifecycle.js && node --experimental-sqlite test/mdblist-user-keys.js",
++    "test": "node --experimental-sqlite test/smoke.js && node --experimental-sqlite test/integration.js && node --experimental-sqlite mobile/test/mobile.smoke.js && node --experimental-sqlite test/shared-login.js && node --experimental-sqlite test/simkl.lifecycle.js && node --experimental-sqlite test/mdblist-user-keys.js",
+
+$ grep -n "\.brand {\|class=\"brand\"\|id=\"appbar\"" public/index.html
+219:  .topbar .brand { font-weight: 700; }
+228:<header class="topbar" id="appbar">
+229:  <span class="brand">AI Recommender</span>
+
+$ npm test 2>&1 | tail -30
+All MDBList user-keys checks passed (26). [run muxdo5mlk5im]
+Exit Code: 0
+
+$ node --experimental-sqlite test/shared-login.js --browser 2>&1 | tail -40
+✓ B13 logout on /configure/ revokes session
+shared-login browser: all B1-B13 checks passed. Screenshots in .../browser-shots
+Exit Code: 0
+```
+
+Note on the `grep -rn "ADMIN_PASSWORD..."` output: the three matches are (1) a comment in `portal.js` referencing the old `adminAuth` concept, (2) the required §3.1 boot notice in `server.js`, and (3) a comment in `mail.js`. No runtime Basic Auth code remains.
+
+## Uncertainties
+
+None. All mandates are implemented and verified by the test suite.
