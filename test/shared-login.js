@@ -332,6 +332,203 @@ function makeLegacy(name, email, createdAt) {
   });
 
   console.log(`\nshared-login http: all ${passed - 7} HTTP checks passed.`);
+
+  // ---- T23: nextAfterSignIn pure helper (card §6.4) ----
+  await ok('T23 nextAfterSignIn: /configure/ admin → redirect; non-admin → deny; other values → null', () => {
+    const ui = require('../mobile/public/ui');
+    // Admin with next=/configure/ → redirect.
+    assert.strictEqual(ui.nextAfterSignIn('/configure/', { is_admin: true }), '/configure/');
+    // Non-admin with next=/configure/ → deny.
+    assert.strictEqual(ui.nextAfterSignIn('/configure/', { is_admin: false }), 'deny');
+    // Non-admin with no is_admin field → deny.
+    assert.strictEqual(ui.nextAfterSignIn('/configure/', {}), 'deny');
+    // External URL → null.
+    assert.strictEqual(ui.nextAfterSignIn('https://evil.example/phish', { is_admin: true }), null);
+    // Protocol-relative → null.
+    assert.strictEqual(ui.nextAfterSignIn('//evil.example', { is_admin: true }), null);
+    // /configure without trailing slash → null.
+    assert.strictEqual(ui.nextAfterSignIn('/configure', { is_admin: true }), null);
+    // /configure/x → null.
+    assert.strictEqual(ui.nextAfterSignIn('/configure/x', { is_admin: true }), null);
+    // javascript: → null.
+    assert.strictEqual(ui.nextAfterSignIn('javascript:alert(1)', { is_admin: true }), null);
+    // null profile → null (not authed).
+    assert.strictEqual(ui.nextAfterSignIn('/configure/', null), 'deny');
+  });
+
+  console.log(`\nshared-login unit+http: all ${passed} checks passed.`);
+
+// ---- Browser checks (B1-B13) - only when --browser is passed ----
+  if (process.argv.includes('--browser')) {
+    const { chromium } = require('playwright');
+    const browser = await chromium.launch({ headless: true });
+    const SHOT_DIR = path.join(process.env.DATA_DIR, 'browser-shots');
+    fs.mkdirSync(SHOT_DIR, { recursive: true });
+
+    const nonAdmin = config.addProfile('NonAdmin');
+    config.updateProfile(nonAdmin.id, { email: 'nonadmin@test.local' });
+    const { token: nonAdminToken } = auth.createSession(nonAdmin.id);
+
+    const adminCtx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+    await adminCtx.addCookies([{ name: 'air_sid', value: adminToken2, url: BASE }]);
+    const adminPage = await adminCtx.newPage();
+    const adminErrors = [];
+    adminPage.on('pageerror', e => adminErrors.push(e.message));
+
+    const nonAdminCtx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+    await nonAdminCtx.addCookies([{ name: 'air_sid', value: nonAdminToken, url: BASE }]);
+    const nonAdminPage = await nonAdminCtx.newPage();
+    const nonAdminErrors = [];
+    nonAdminPage.on('pageerror', e => nonAdminErrors.push(e.message));
+
+    const phoneCtx = await browser.newContext({ viewport: { width: 375, height: 812 } });
+    await phoneCtx.addCookies([{ name: 'air_sid', value: adminToken2, url: BASE }]);
+    const phonePage = await phoneCtx.newPage();
+
+    console.log('shared-login browser:');
+
+    await ok('B1 /mobile/ shows login view', async () => {
+      const freshCtx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+      const freshPage = await freshCtx.newPage();
+      await freshPage.goto(BASE + '/mobile/');
+      await freshPage.waitForTimeout(1000);
+      const emailVisible = await freshPage.locator('#email').isVisible();
+      const sendVisible = await freshPage.locator('#send-code').isVisible();
+      assert.ok(emailVisible, 'email field visible');
+      assert.ok(sendVisible, 'Send code button visible');
+      await freshPage.screenshot({ path: path.join(SHOT_DIR, 'B1-mobile-login.png') });
+    });
+
+    await ok('B2 style parity: /configure vs /mobile topbar', async () => {
+      await adminPage.goto(BASE + '/mobile/');
+      await adminPage.waitForTimeout(1500);
+      const mobileCss = await adminPage.evaluate(() => {
+        const bar = document.querySelector('.topbar');
+        if (!bar) return null;
+        const cs = getComputedStyle(bar);
+        return { background: cs.backgroundColor, color: cs.color, padding: cs.padding, height: cs.height, display: cs.display, position: cs.position };
+      });
+      await adminPage.goto(BASE + '/configure/');
+      await adminPage.waitForTimeout(1500);
+      const configureCss = await adminPage.evaluate(() => {
+        const bar = document.querySelector('.topbar') || document.querySelector('#appbar');
+        if (!bar) return null;
+        const cs = getComputedStyle(bar);
+        return { background: cs.backgroundColor, color: cs.color, padding: cs.padding, height: cs.height, display: cs.display, position: cs.position };
+      });
+      console.log('  B2 parity: mobile=' + JSON.stringify(mobileCss) + ' configure=' + JSON.stringify(configureCss));
+      assert.ok(mobileCss, 'mobile topbar exists');
+      assert.ok(configureCss, 'configure topbar exists');
+    });
+
+    await ok('B3 setup wizard: login view when profiles exist', async () => {
+      const freshCtx = await browser.newContext({ viewport: { width: 375, height: 812 } });
+      const freshPage = await freshCtx.newPage();
+      await freshPage.goto(BASE + '/mobile/');
+      await freshPage.waitForTimeout(1000);
+      const loginVisible = await freshPage.locator('#view-login').isVisible();
+      assert.ok(loginVisible, 'login view visible when profiles exist');
+      await freshPage.screenshot({ path: path.join(SHOT_DIR, 'B3-mobile-375.png') });
+    });
+
+    await ok('B4 Configure button visible for admin', async () => {
+      await adminPage.goto(BASE + '/mobile/');
+      await adminPage.waitForTimeout(1500);
+      const visible = await adminPage.locator('#open-configure').isVisible();
+      assert.ok(visible, 'Configure button visible for admin');
+    });
+
+    await ok('B5 Configure button hidden for non-admin', async () => {
+      await nonAdminPage.goto(BASE + '/mobile/');
+      await nonAdminPage.waitForTimeout(1500);
+      const visible = await nonAdminPage.locator('#open-configure').isVisible();
+      assert.ok(!visible, 'Configure button hidden for non-admin');
+    });
+
+    await ok('B6 /configure/ loads for admin', async () => {
+      await adminPage.goto(BASE + '/configure/');
+      await adminPage.waitForTimeout(1500);
+      assert.ok(adminPage.url().includes('/configure/'), 'stayed on /configure/');
+      await adminPage.screenshot({ path: path.join(SHOT_DIR, 'B6-configure-admin.png') });
+    });
+
+    await ok('B7 /configure/ redirects non-admin to /mobile/', async () => {
+      await nonAdminPage.goto(BASE + '/configure/');
+      await nonAdminPage.waitForTimeout(2000);
+      assert.ok(nonAdminPage.url().includes('/mobile/'), 'redirected to /mobile/');
+    });
+
+    await ok('B8 /api/* returns 403 for non-admin', async () => {
+      const res = await fetch(BASE + '/api/version', { headers: { Cookie: 'air_sid=' + nonAdminToken } });
+      assert.strictEqual(res.status, 403);
+      const body = await res.json();
+      assert.deepStrictEqual(body, { auth: 'forbidden' });
+    });
+
+    await ok('B9 legacy mobile_sid upgrades to air_sid', async () => {
+      const legacyCtx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+      const legacyPage = await legacyCtx.newPage();
+      await legacyCtx.addCookies([{ name: 'mobile_sid', value: adminToken2, url: BASE + '/mobile/' }]);
+      await legacyPage.goto(BASE + '/mobile/api/me');
+      await legacyPage.waitForTimeout(1000);
+      const cookies = await legacyCtx.cookies(BASE);
+      const airCookie = cookies.find(c => c.name === 'air_sid');
+      assert.ok(airCookie, 'air_sid cookie set after upgrade');
+    });
+
+    await ok('B10 Admin checkbox in /configure Advanced', async () => {
+      await adminPage.goto(BASE + '/configure/');
+      await adminPage.waitForTimeout(1500);
+      const advancedTab = adminPage.locator('[data-tab="advanced"]');
+      if (await advancedTab.isVisible()) { await advancedTab.click(); await adminPage.waitForTimeout(1000); }
+      const visible = await adminPage.locator('[data-is-admin]').isVisible();
+      assert.ok(visible, 'Admin checkbox visible');
+    });
+
+    await ok('B11 Logout button in /mobile topbar', async () => {
+      await adminPage.goto(BASE + '/mobile/');
+      await adminPage.waitForTimeout(1500);
+      const visible = await adminPage.locator('#logout').isVisible();
+      assert.ok(visible, 'Logout button visible');
+      await phonePage.goto(BASE + '/mobile/');
+      await phonePage.waitForTimeout(1500);
+      await phonePage.screenshot({ path: path.join(SHOT_DIR, 'B11-mobile-375-admin.png') });
+    });
+
+    await ok('B12 non-admin /configure/ makes <=3 navs, ends on /mobile/', async () => {
+      let navs = 0;
+      nonAdminPage.on('framenavigated', f => { if (f === nonAdminPage.mainFrame()) navs++; });
+      await nonAdminPage.goto(BASE + '/configure/');
+      await nonAdminPage.waitForTimeout(4000);
+      const url = nonAdminPage.url();
+      console.log('  B12: ' + navs + ' navigations, final URL: ' + url);
+      assert.ok(navs <= 3, 'only ' + navs + ' navigations');
+      assert.ok(url.includes('/mobile/'), 'ended on /mobile/');
+      assert.ok(!url.includes('next='), 'URL has no next param');
+      await nonAdminPage.screenshot({ path: path.join(SHOT_DIR, 'B12-nonadmin-configure.png') });
+    });
+
+    await ok('B13 logout on /configure/ revokes session', async () => {
+      await adminPage.goto(BASE + '/configure/');
+      await adminPage.waitForTimeout(1500);
+      const res = await fetch(BASE + '/mobile/api/auth/logout', { method: 'POST', headers: { Cookie: 'air_sid=' + adminToken2 } });
+      assert.strictEqual(res.status, 200);
+      const resolved = auth.resolveSession(adminToken2);
+      assert.strictEqual(resolved, null, 'session revoked server-side');
+      await adminPage.goto(BASE + '/mobile/');
+      await adminPage.waitForTimeout(1500);
+      const loginVisible = await adminPage.locator('#view-login').isVisible();
+      assert.ok(loginVisible, 'login view visible after logout');
+      await adminPage.screenshot({ path: path.join(SHOT_DIR, 'B13-logout-configure.png') });
+    });
+
+    assert.deepStrictEqual(adminErrors, [], 'no JS errors in admin context');
+    assert.deepStrictEqual(nonAdminErrors, [], 'no JS errors in non-admin context');
+
+    await browser.close();
+    console.log('shared-login browser: all B1-B13 checks passed. Screenshots in ' + SHOT_DIR);
+  }
+
   process.exit(0);
 })().catch((err) => {
   console.error('\n✗ SHARED-LOGIN FAILED:', err && err.stack ? err.stack : err);

@@ -880,11 +880,20 @@
       else { state.authed = false; state.profile = null; }
     } catch { state.authed = false; state.profile = null; }
 
-    // Handle ?next= parameter (redirect back after sign-in).
+    // Handle ?next= parameter (card §6.4: only '/configure/' is honoured,
+    // and only for admins).
     const next = new URLSearchParams(location.search).get('next');
     if (next && state.authed) {
-      window.location.href = next;
-      return;
+      const result = window.ui.nextAfterSignIn(next, state.profile);
+      if (result === '/configure/') {
+        window.location.href = '/configure/';
+        return;
+      } else if (result === 'deny') {
+        history.replaceState(null, '', '/mobile/');
+        showSnack('Configure is only available to admins.', null);
+      } else {
+        history.replaceState(null, '', '/mobile/');
+      }
     }
 
     render();
