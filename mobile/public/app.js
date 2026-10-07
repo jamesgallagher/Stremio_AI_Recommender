@@ -446,8 +446,7 @@
   const setEls = {
     tabs: document.querySelectorAll('#settings-tabs .seg'),
     msg: $('settings-msg'),
-    engineMovie: $('set-engine-movie'), engineMovieDesc: $('set-engine-movie-desc'),
-    engineSeries: $('set-engine-series'), engineSeriesDesc: $('set-engine-series-desc'),
+    engines: $('set-engines'),
     minRating: $('set-min-rating'), recency: $('set-recency'), listSize: $('set-list-size'),
     voteFloor: $('set-vote-floor'), genres: $('set-genres'), catalogOnly: $('set-catalog-only'),
     titleDecay: $('set-title-decay'), titleDecayDays: $('set-title-decay-days'), titleDecayDaysField: $('set-title-decay-days-field'),
@@ -455,6 +454,23 @@
     catalogs: $('set-catalogs'), catalogsWarn: $('set-catalogs-warn'), catalogsSave: $('catalogs-save'),
   };
   const setSettingsMsg = (t, kind) => { setEls.msg.textContent = t || ''; setEls.msg.className = 'msg' + (kind ? ' ' + kind : ''); };
+
+  // Per-type engine summary line + requirement warnings (card §7.1/§7.2).
+  function fillEngines(data) {
+    const eng = data.engines || {};
+    const movieName = (eng.movie && eng.movie.name) || 'marquee';
+    const seriesName = (eng.series && eng.series.name) || 'marquee-tv';
+    const reqs = eng.requirements || {};
+    let html = `${movieName} (movies) · ${seriesName} (shows)`;
+    for (const type of ['movie', 'series']) {
+      const req = reqs[type];
+      if (req && !req.ok && Array.isArray(req.missing) && req.missing.length) {
+        const engName = type === 'movie' ? movieName : seriesName;
+        html += `<div class="warn-line">⚠ ${engName} needs ${req.missing.join(', ')}.</div>`;
+      }
+    }
+    setEls.engines.innerHTML = html;
+  }
 
   function switchSettingsTab(tab) {
     setEls.tabs.forEach((s) => s.classList.toggle('active', s.dataset.settab === tab));
@@ -467,40 +483,6 @@
   function setSelect(sel, value) {
     const v = String(value);
     sel.value = [...sel.options].some((o) => o.value === v) ? v : (sel.options[0] ? sel.options[0].value : '');
-  }
-
-  // Per-type engine dropdowns (SC-05). The option list is already type-scoped,
-  // age-filtered (I7) AND enablement-filtered (SC-07) SERVER-SIDE — the phone
-  // just renders what it's given. One option → a single, locked select "(only
-  // engine)"; it lights up on its own once a second engine is registered AND
-  // enabled. The chosen id defaults to 'genesis' (a null means unset). The
-  // effective engine's requirement (e.g. "needs Simkl connected") is appended to
-  // the description; its wording never mentions the age gate.
-  function fillEngine(sel, descEl, opts, chosen, req) {
-    const only = opts.length <= 1;
-    sel.innerHTML = '';
-    opts.forEach((e) => {
-      const o = document.createElement('option');
-      o.value = e.id;
-      o.textContent = e.name + (only ? ' (only engine)' : '');
-      sel.appendChild(o);
-    });
-    setSelect(sel, chosen || 'genesis');
-    sel.disabled = only;
-    const reqNote = (req && !req.ok && Array.isArray(req.missing) && req.missing.length) ? ' — needs ' + req.missing.join(', ') : '';
-    const descFor = (id) => { const c = opts.find((e) => e.id === id) || opts[0]; return (c && c.description) || ''; };
-    const paint = () => { descEl.textContent = descFor(sel.value) + reqNote; };
-    paint();
-    sel.onchange = paint;
-  }
-  function fillEngines(data) {
-    const eng = data.engines || { available: {}, requirements: {} };
-    const avail = eng.available || {};
-    const reqs = eng.requirements || {};
-    const f = data.filters || {};
-    fillEngine(setEls.engineMovie, setEls.engineMovieDesc, avail.movie || [], f.engine_movie, reqs.movie);
-    fillEngine(setEls.engineSeries, setEls.engineSeriesDesc, avail.series || [], f.engine_series, reqs.series);
-    settingsState.engine = { movie: setEls.engineMovie.value, series: setEls.engineSeries.value };
   }
 
   function renderGenres(genres, excluded) {
@@ -762,8 +744,6 @@
   async function saveSettings() {
     setEls.save.disabled = true; setSettingsMsg('Saving…');
     const payload = {
-      engine_movie: setEls.engineMovie.value,
-      engine_series: setEls.engineSeries.value,
       min_rating: parseFloat(setEls.minRating.value),
       min_year: parseInt(setEls.recency.value, 10),
       list_size: parseInt(setEls.listSize.value, 10),
@@ -773,18 +753,11 @@
       title_decay_days: parseInt(setEls.titleDecayDays.value, 10),
       catalog_only: setEls.catalogOnly.checked,
     };
-    // An engine swap replaces that catalog's producer, so it rebuilds the slice
-    // (SC-03) — say so, since that list takes a moment to refill.
-    const engineChanged = payload.engine_movie !== settingsState.engine?.movie
-      || payload.engine_series !== settingsState.engine?.series;
     try {
       const res = await apiFetch('/settings', { method: 'POST', body: JSON.stringify(payload) });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) { setSettingsMsg(data.error || 'Could not save — try again.', 'err'); return; }
-      setSettingsMsg(engineChanged
-        ? 'Saved. Changing the engine rebuilds that list — it may take a minute.'
-        : 'Saved. Your list updates the next time it loads.', 'ok');
-      settingsState.engine = { movie: payload.engine_movie, series: payload.engine_series }; // new baseline
+      setSettingsMsg('Saved. Your list updates the next time it loads.', 'ok');
       recs.loaded = false; // filters/view changed — the Recommendations tab refetches on next visit
     } catch { setSettingsMsg('Could not save — try again.', 'err'); }
     finally { setEls.save.disabled = false; }

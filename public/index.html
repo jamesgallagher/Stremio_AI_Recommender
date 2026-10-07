@@ -499,14 +499,11 @@ function render(profiles) {
       </div>
 
       <div class="tab-panel" data-tab="filters">
-        <div class="muted" style="margin-bottom:8px;font-size:11px">The <b>engine</b> decides how each list is generated; changing it rebuilds that catalog. Rating floor, excluded genres, recency and list size apply at <b>serve time</b> over the stored pool — change one and it takes effect immediately, no rebuild. The <b>age limit</b> and <b>minimum vote count</b> are baked in at build, so they apply on the next rebuild.</div>
+        <div class="muted" style="margin-bottom:8px;font-size:11px">Movies are built by <b>Marquee Cinema</b> and shows by <b>Marquee TV</b>. Rating floor, excluded genres, recency and list size apply at <b>serve time</b> over the stored pool — change one and it takes effect immediately, no rebuild. The <b>age limit</b> and <b>minimum vote count</b> are baked in at build, so they apply on the next rebuild.</div>
 
         <div class="sec-title">Engines</div>
         <div class="sec-box">
-          <div class="cols">
-            ${engineField(p, 'movie')}
-            ${engineField(p, 'series')}
-          </div>
+          ${engineSummary(p)}
         </div>
 
         <div class="sec-title">Quality</div>
@@ -834,36 +831,22 @@ function switchTab(btn, name) {
 
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
-// Per-type engine selector (card 04). Genesis-only today → one locked option; a
-// second engine (once registered AND enabled) lights the dropdown up on its own.
-function engineField(p, type) {
-  // Only engines this profile may CHOOSE for this type — the age-filtered list the
-  // API computed (p.engines.available[type], from availableFor / I7). An
-  // unrestricted engine is simply absent for an age-limited profile, so it is
-  // never offered. Intersect the global catalog (for name/description) with it.
-  const allow = new Set((p.engines && p.engines.available && p.engines.available[type]) || ['genesis']);
-  const opts  = enginesForType(type).filter(e => allow.has(e.id));
-  const sel   = (p.filters[`engine_${type}`]) || 'genesis';
-  const cur   = opts.find(e => e.id === sel) || opts[0];
-  const only  = opts.length <= 1;
-  const req   = p.engines && p.engines.requirements && p.engines.requirements[type];
-  const warn  = req && !req.ok
-    ? `<div style="color:var(--err);font-size:12px;margin-top:4px">⚠ ${esc(cur ? cur.name : 'This engine')} needs ${esc((req.missing || []).join(', '))}.</div>`
-    : '';
-  return `<div><label>${type === 'movie' ? 'Movies' : 'Series'} engine</label>
-    <select data-filter="engine_${type}" ${only ? 'disabled' : ''} onchange="updateEngineDesc(this,'${type}')">
-      ${opts.map(e => `<option value="${esc(e.id)}" ${e.id === (cur ? cur.id : sel) ? 'selected' : ''}>${esc(e.name)}${only ? ' (only engine)' : ''}</option>`).join('')}
-    </select>
-    <div class="muted" data-engine-desc="${type}" style="font-size:11px;margin-top:3px">${esc(cur ? cur.description : '')}</div>
-    ${warn}</div>`;
-}
-
-// Swap the description under an engine select to the newly chosen engine's.
-// Pure client-side (the catalog is already cached in ENGINES); scoped to this card.
-function updateEngineDesc(sel, type) {
-  const e = ENGINES.find(x => x.id === sel.value);
-  const desc = sel.parentElement.querySelector(`[data-engine-desc="${type}"]`);
-  if (desc) desc.textContent = e ? e.description : '';
+// Per-type engine summary line + requirement warnings (card §6.1). Reads names
+// from ENGINES (GET /api/engines); renders a warn-line per unmet requirement.
+function engineSummary(p) {
+  const movieEng = ENGINES.find(e => e.id === p.engines?.movie);
+  const seriesEng = ENGINES.find(e => e.id === p.engines?.series);
+  const line = `${movieEng ? movieEng.name : p.engines?.movie || 'marquee'} (movies) · ${seriesEng ? seriesEng.name : p.engines?.series || 'marquee-tv'} (shows)`;
+  const reqs = p.engines?.requirements || {};
+  const warns = [];
+  for (const type of ['movie', 'series']) {
+    const req = reqs[type];
+    if (req && !req.ok && Array.isArray(req.missing) && req.missing.length) {
+      const engName = (type === 'movie' ? movieEng : seriesEng)?.name || '';
+      warns.push(`<div class="warn-line">⚠ ${esc(engName)} needs ${esc(req.missing.join(', '))}.</div>`);
+    }
+  }
+  return `<div class="muted" style="font-size:12px">${esc(line)}</div>${warns.join('')}`;
 }
 
 // Effective catalog toggle: explicit profile setting wins, else the
@@ -1116,40 +1099,7 @@ function renderServerConfig(data) {
       </div>
     </details>
 
-    <details open><summary>Engines — which recommendation engines are available install-wide</summary>
-      <div class="muted" style="font-size:11px;margin:6px 0 8px">Turn an engine on to make it selectable per profile (Movies / Series). A disabled engine disappears from every dropdown and any profile using it reverts to Genesis, which rebuilds that catalog. Genesis is the default and can't be turned off.</div>
-      ${enginesSection()}
-    </details>
   </div>`;
-}
-
-// SC-07: the admin engine enable/disable list. Reads the module-global ENGINES
-// (from GET /api/engines, which now carries enabled + locked). Genesis renders
-// locked-on; every other engine is a live checkbox. With only Genesis registered
-// this is a single locked row — it lights up on its own once a second engine is
-// registered in code.
-const SUPPORTED_LABEL = (types) => {
-  const s = new Set(types || []);
-  if (s.has('movie') && s.has('series')) return 'Movies + Shows';
-  if (s.has('movie')) return 'Only Movies';
-  if (s.has('series')) return 'Only Shows';
-  return '—';
-};
-function enginesSection() {
-  if (!ENGINES.length) return '<div class="muted" style="font-size:12px">No engines registered.</div>';
-  return `<div class="stack" style="gap:8px">${ENGINES.map((e) => {
-    const locked = !!e.locked;
-    const on = locked || !!e.enabled;
-    return `<label class="engine-row" style="display:flex;align-items:flex-start;gap:8px;padding:8px;border:1px solid var(--border);border-radius:6px">
-      <input type="checkbox" data-engine="${esc(e.id)}" ${on ? 'checked' : ''} ${locked ? 'disabled' : ''} style="margin-top:2px">
-      <span style="flex:1">
-        <span style="font-weight:600">${esc(e.name)}</span>
-        <span class="badge" style="margin-left:6px">${esc(SUPPORTED_LABEL(e.supported_types))}</span>
-        ${locked ? '<span class="muted" style="font-size:11px;margin-left:6px">Default engine — always on</span>' : ''}
-        <span class="muted" style="display:block;font-size:11px;margin-top:3px">${esc(e.description || '')}</span>
-      </span>
-    </label>`;
-  }).join('')}</div>`;
 }
 
 // key row with a Test button that hits /settings/test/:service with the field's
@@ -1229,8 +1179,6 @@ function cancelTvdbKey() {
 function collectSettings() {
   const el = $('#serverConfig');
   const val = (k) => (el.querySelector(`[data-key="${k}"]`)?.value ?? '').trim();
-  const engines = {};
-  el.querySelectorAll('[data-engine]').forEach((cb) => { engines[cb.dataset.engine] = cb.checked; }); // genesis stays checked+locked; the server forces it on
   const keys = { tmdb_api_key: val('tmdb_api_key'), mdblist_api_key: val('mdblist_api_key'), rpdb_api_key: val('rpdb_api_key') };
   // TVDB: the saved key is redacted in the GET (a display mask), so the input
   // is always empty (replace-only). An empty input means "unchanged" — omit it
@@ -1244,7 +1192,6 @@ function collectSettings() {
       groq_api_key: val('groq_api_key'), groq_api_key_backup: val('groq_api_key_backup'),
     },
     keys,
-    engines,
   };
 }
 
@@ -1254,13 +1201,10 @@ async function saveSettings(btn) {
     await api('/settings', { method: 'PUT', body: collectSettings() });
     dirty = false;
     toast('Server config saved');
-    ENGINES = (await api('/engines')).engines || []; // enabled/locked may have changed
     const s = await api('/settings');
     cfgComplete = !!s.complete;
-    renderServerConfig(s); // re-render only the server-config block (reads the fresh ENGINES)
+    renderServerConfig(s);
     applyServerConfigVisibility();
-    // A disable reverts affected profiles to Genesis and changes per-type
-    // availability, so refresh the profile list + engine dropdowns too.
     const { profiles } = await api('/profiles');
     PROFILES = profiles;
     renderTopBar();
@@ -1572,19 +1516,11 @@ async function saveFilters(id) {
     excluded_genres: [...card.querySelectorAll('.genres input:checked')].map(i => i.value),
     title_decay_enabled: decayOn,
     title_decay_days: parseInt(card.querySelector('[data-filter=title_decay_days]').value, 10),
-    engine_movie: card.querySelector('[data-filter=engine_movie]').value,
-    engine_series: card.querySelector('[data-filter=engine_series]').value,
   };
-  // An engine change replaces that catalog's producer, so it rebuilds the slice
-  // (backend card 03) — hint at that rather than claiming it applies immediately.
-  const prev = (PROFILES.find(p => p.id === id) || {}).filters || {};
-  const engineChanged = filters.engine_movie !== (prev.engine_movie || 'genesis')
-    || filters.engine_series !== (prev.engine_series || 'genesis');
   await api('/profiles/' + id, { method: 'PUT', body: { filters } });
   dirty = false;
   setPanelDirty(savedPanel(id, 'filters'), false);
-  toast('Filters saved — applies at serve time (rating/genre/recency) or next rebuild'
-    + (engineChanged ? ' — engine change rebuilds that catalog' : ''));
+  toast('Filters saved — applies at serve time (rating/genre/recency) or next rebuild');
   pollStatus();
 }
 
@@ -2067,22 +2003,13 @@ function trainerDraw(id) {
   const d = st.data;
   const canRate = !!(p && p.simkl_connected);
   const now = Date.now();
-  const engine = p && ENGINES.find(e => e.id === p.filters.engine_movie);
-  const engineSeries = p && ENGINES.find(e => e.id === p.filters.engine_series);
-  // TV-R §5: the notice is per type — films unchanged; shows only when the
-  // Series engine is not Marquee TV.
-  const notice = (p && st.type === 'series' && p.filters.engine_series !== 'marquee-tv')
-    ? `<div class="tr-notice">Ratings still save to Simkl, but this profile's shows come from ${esc(engineSeries ? engineSeries.name : (p.filters.engine_series || 'another engine'))}, so your ratings won't change its recommendations. Switch the Series engine to Marquee TV in Filters.</div>`
-    : (p && p.filters.engine_movie !== 'marquee')
-      ? `<div class="tr-notice">Ratings still save to Simkl, but this profile's movies come from ${esc(engine ? engine.name : (p.filters.engine_movie || 'another engine'))}, so your ratings won't change its recommendations. Switch the Movies engine to Marquee Cinema in Filters.</div>`
-      : '';
   const rows = d.items.length
     ? d.items.map(item => TrainerUI.rowHtml(item, { canRate, now })).join('')
     : `<div class="muted">${st.type === 'series' ? 'No shows in this view yet.' : 'No films in this view yet.'}</div>`;
   const pages = Math.max(1, Math.ceil(d.total / d.pageSize));
   // TV-R §5: the Films | Shows toggle (per-profile state st.type, default movie).
   const typeToggle = `<div class="tr-chips tr-type"><button class="tr-chip" data-type="movie" aria-pressed="${st.type === 'movie'}">Films</button><button class="tr-chip" data-type="series" aria-pressed="${st.type === 'series'}">Shows</button></div>`;
-  panel.innerHTML = `${typeToggle}${notice}<div class="tr-banner-slot">${TrainerUI.bannerHtml(d.training, now, { rebuilding: st.rebuilding })}</div>
+  panel.innerHTML = `${typeToggle}<div class="tr-banner-slot">${TrainerUI.bannerHtml(d.training, now, { rebuilding: st.rebuilding })}</div>
     <div class="tr-chips tr-views">${TrainerUI.chipsHtml(d.counts, st.view, { hideUnfinished: st.type === 'series' })}</div>
     <div class="tr-search-row"><input type="text" class="tr-search" data-nodirty placeholder="Search titles…" value="${esc(st.q)}" title="${esc(TrainerUI.TIPS.search)}"></div>
     <div class="tr-table">${rows}</div>

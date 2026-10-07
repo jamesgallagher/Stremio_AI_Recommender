@@ -19,9 +19,9 @@ const simklCache = require('./simklCache');
 const trendingCache = require('./trendingCache');
 const simklTrending = require('../../services/simklTrending');
 const llmCache = require('./llmCache');
-const glassCandidates = require('../glass/candidates');
-const glassTasteModel = require('../glass/tasteModel');
-const metaStore = require('../glass/metaStore');
+const sharedCandidates = require('../shared/candidates');
+const sharedTaste = require('../shared/tasteModel');
+const metaStore = require('../shared/metaStore');
 const features = require('./features');
 
 // The fixed TMDB movie-genre id set (spec §3.1): getGenreMap merges the tv
@@ -512,10 +512,10 @@ async function gatherCandidates(profile, ctx, {
 
   // S7 — exploration reserve: high-quality trending OUTSIDE the top-6 genres.
   const reserve = Math.round(cfg.lookup_cap * cfg.exploration_pct);
-  const topSet = new Set(glassTasteModel.topGenres(taste, 6));
+  const topSet = new Set(sharedTaste.topGenres(taste, 6));
   const explore = merged
     .filter((c) => c.sources.has('trending') && !c.sources.has('exploration'))
-    .filter((c) => glassCandidates.outsideTopGenres(c, topSet))
+    .filter((c) => sharedCandidates.outsideTopGenres(c, topSet))
     .filter((c) => (c.vote_average || 0) >= 6.5)
     .sort((a, b) => features.trendingRaw(b.trending, { weekN, dayN }) - features.trendingRaw(a.trending, { weekN, dayN }))
     .slice(0, reserve);

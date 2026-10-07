@@ -9,7 +9,7 @@
 // details change with new seasons but rarely).
 const db = require('../../db');
 const tmdb = require('../../services/tmdb');
-const metaStore = require('../glass/metaStore');
+const metaStore = require('../shared/metaStore');
 
 const TTL_MS = 14 * 24 * 3600e3; // 14 days
 

@@ -230,8 +230,8 @@ async function main() {
       // reports the change, and the caller clears + rebuilds the slice.
       const { engineChanged } = config.updateProfile(p.id, { filters: { age_limit: 10 } });
       assert.deepStrictEqual(engineChanged, ['movie']);
-      assert.strictEqual(config.getProfile(p.id).filters.engine_movie, 'genesis'); // persisted revert
-      assert.strictEqual(engines.resolveFor(config.getProfile(p.id), 'movie').id, 'genesis'); // and resolved
+      assert.strictEqual(config.getProfile(p.id).filters.engine_movie, 'marquee'); // persisted revert
+      assert.strictEqual(engines.resolveFor(config.getProfile(p.id), 'movie').id, 'marquee'); // and resolved
       for (const t of engineChanged) rs.clearType(p.id, t);
       await rs.buildPool(config.getProfile(p.id), quiet); // Genesis has no history/Simkl → empty slice
       // The open engine's title is gone from BOTH the pool and the served list.
@@ -686,7 +686,7 @@ async function main() {
 
   // ── P. Glass GE-03: the deep-metadata store enriches once, then serves cache ──
   await it('P. GE-03 metaStore.enrich fetches once, caches permanently, does not cache a failed fetch', async () => {
-    const metaStore = require('../src/engines/glass/metaStore');
+    const metaStore = require('../src/engines/shared/metaStore');
     metaStore._clear();
     let calls = 0;
     const fetcher = async (_k, type, tmdbId) => { calls++; return { tmdb_id: String(tmdbId), imdb_id: 'tt' + tmdbId, type, director: ['D'], keywords: ['k'] }; };
@@ -707,8 +707,8 @@ async function main() {
 
   // ── Q. Glass GE-04: watched-history enrichment — paced, capped, cached once ──
   await it('Q. GE-04 enrichWatchedBatch fills the Glass meta store, honours the cap, and is idempotent', async () => {
-    const metaStore = require('../src/engines/glass/metaStore');
-    const we = require('../src/engines/glass/watchedEnrichment');
+    const metaStore = require('../src/engines/shared/metaStore');
+    const we = require('../src/engines/shared/watchedEnrichment');
     metaStore._clear();
     const p = config.addProfile('INT-Q');
     try {
@@ -746,7 +746,7 @@ async function main() {
   // hop is a cache hit, and stub tmdb.getRecommendations + getGenreMap. This runs
   // the actual glass engine through buildRecommendations → shared pipeline (upsert,
   // preResolved skip) → pool, then buildPool's shared age gate, then serve.
-  const metaStore = require('../src/engines/glass/metaStore');
+  const metaStore = require('../src/engines/shared/metaStore');
   const GENRE_MAP = { 18: 'Drama', 27: 'Horror', 28: 'Action' };
   // Full deep-metas for every candidate the fixtures below produce.
   function seedGlassFixtures(pid) {
@@ -785,288 +785,8 @@ async function main() {
   }
   function restoreTmdb() { tmdb.getRecommendations = origRecs; tmdb.getGenreMap = origGenreMap; }
 
-  await it('R. Glass builds a preResolved, rankScore-ordered pool with score_components + engine_id (adult, end to end)', async () => {
-    settings.updateSettings({ engines: { glass: true } });
-    stubTmdb();
-    const p = config.addProfile('INT-R');
-    try {
-      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'glass', engine_series: 'glass' } });
-      seedGlassFixtures(p.id);
-      const r = await rs.buildPool(config.getProfile(p.id), quiet);
-      assert.strictEqual(r.engines.movie, 'glass');
-      const rows = rs.getRecommended(p.id, { type: 'movie', limit: 100 });
-      assert.ok(rows.length >= 3, 'glass produced a movie pool');
-      // GE-01: every Glass row carries engine_id + algorithm_version + JSON components.
-      for (const row of rows) {
-        assert.strictEqual(row.engine_id, 'glass');
-        assert.strictEqual(row.algorithm_version, 'glass-a1');
-        const comp = JSON.parse(row.score_components);
-        assert.ok(comp.features && typeof comp.features.taste_match === 'number');
-        assert.ok(Array.isArray(comp.sources));
-        // preResolved (§5.5): the pipeline skipped its own resolve, so these came
-        // from Glass's append call.
-        assert.ok(row.imdb_id && row.genres && row.primary_genre);
-      }
-      // Served in rankScore (affinity) order, genre-balanced — a real served list.
-      const served = rs.serveRecommendations(config.getProfile(p.id), 'movie');
-      assert.ok(served.length >= 1);
-      const affinities = rows.map((x) => x.affinity);
-      assert.deepStrictEqual([...affinities], [...affinities].sort((a, b) => b - a), 'stored affinity is rankScore-ordered');
-      // Strategy breadth (GE-05): the pool carries BOTH a /recommendations-sourced
-      // title (A/B) and an exploration-sourced one (G), not just one strategy.
-      const allSources = new Set(rows.flatMap((x) => JSON.parse(x.score_components).sources));
-      assert.ok(allSources.has('recommendations'), 'A/B recommendations reached the pool');
-      assert.ok(allSources.has('exploration') || allSources.has('trending'), 'a trending/exploration strategy reached the pool');
-    } finally {
-      restoreTmdb();
-      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id); metaStore._clear();
-      settings.updateSettings({ engines: { glass: false } });
-      simklTrending.upsertList('movies', [], 0); simklTrending.upsertList('tv', [], 0); simklTrending.upsertList('anime', [], 0);
-    }
-  });
 
-  await it('R2. Glass Tier-2 config is build-affecting: a settings.glass reweight rebuilds a different pool ordering', async () => {
-    settings.updateSettings({ engines: { glass: true }, glass: {} });
-    stubTmdb();
-    const p = config.addProfile('INT-R2');
-    try {
-      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'glass', engine_series: 'glass' } });
-      seedGlassFixtures(p.id);
-      await rs.buildPool(config.getProfile(p.id), quiet);
-      const before = rs.getRecommended(p.id, { type: 'movie', limit: 100 }).map((x) => `${x.tmdb_id}:${x.affinity.toFixed(4)}`);
-      // Tier-2 reweight: crank exploration + momentum to the exclusion of taste, then
-      // rebuild the slice (the SC-03 clearType path a real admin change fans out).
-      settings.updateSettings({ glass: { weights: { taste_match: 0, quality: 0, trending_momentum: 0.5, popularity: 0, release_recency: 0, novelty: 0.2, exploration: 0.3 } } });
-      rs.clearType(p.id, 'movie');
-      await rs.buildPool(config.getProfile(p.id), quiet);
-      const after = rs.getRecommended(p.id, { type: 'movie', limit: 100 }).map((x) => `${x.tmdb_id}:${x.affinity.toFixed(4)}`);
-      assert.notDeepStrictEqual(after, before, 'a Tier-2 reweight changes the stored rankScore ordering/values');
-    } finally {
-      restoreTmdb();
-      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id); metaStore._clear();
-      settings.updateSettings({ engines: { glass: false }, glass: {} });
-      simklTrending.upsertList('movies', [], 0); simklTrending.upsertList('tv', [], 0); simklTrending.upsertList('anime', [], 0);
-    }
-  });
 
-  await it('S. Glass conformance safety (I1): the shared age gate drops an over-band Glass title before serve (kids)', async () => {
-    settings.updateSettings({ engines: { glass: true } });
-    stubTmdb();
-    offlineAnimeMap();
-    const p = config.addProfile('INT-S');
-    config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { age_limit: 8, engine_movie: 'glass', engine_series: 'glass' } }); // AGE-2: 8 → the 10+ tier
-    const prev = store.loadAgeVerdicts();
-    try {
-      seedGlassFixtures(p.id);
-      // Chain LLM-step verdict cache: veto tmdb 401 for the 10+ tier; everything else OK. The
-      // age gate — NOT the engine — is the authority (I1), proven over a Glass pool.
-      store.saveAgeVerdicts({
-        [verdictKey('movie', 8, '301')]: true, [verdictKey('movie', 8, '302')]: true,
-        [verdictKey('movie', 8, '401')]: false, [verdictKey('movie', 8, '402')]: true,
-      });
-      await rs.buildPool(config.getProfile(p.id), quiet);
-      const pool = rs.getRecommended(p.id, { type: 'movie', limit: 100 }).map((x) => x.tmdb_id);
-      assert.ok(!pool.includes('401'), 'the over-band Glass title is removed from the pool by the shared gate');
-      const served = rs.serveRecommendations(config.getProfile(p.id), 'movie').map((m) => m.id);
-      assert.ok(!served.includes('tt401'), 'and never served to the kid');
-    } finally {
-      restoreTmdb(); store.saveAgeVerdicts(prev);
-      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id); metaStore._clear();
-      settings.updateSettings({ engines: { glass: false } });
-      simklTrending.upsertList('movies', [], 0); simklTrending.upsertList('tv', [], 0); simklTrending.upsertList('anime', [], 0);
-    }
-  });
-
-  // ── T. Glass GE-08: LLM rerank reorders + explains; degrades to deterministic ─
-  await it('T. GE-08 rerank reorders the head, writes reasons, keeps the score band, and degrades on every failure', async () => {
-    const rerank = require('../src/engines/glass/rerank');
-    const cfg = require('../src/engines/glass/config').resolveConfig(null);
-    const taste = { dims: { genres: { Drama: 1 }, directors: {}, franchises: {}, keywords: {}, decades: {} } };
-    const mk = (id, score) => ({ tmdb_id: id, title: `T${id}`, year: 2024, genres: 'Drama', rankScore: score, reason: `det ${id}`, sources: ['recommendations'], score_components: { features: {}, matched: {} } });
-    const scored = [mk('1', 0.9), mk('2', 0.8), mk('3', 0.7), mk('4', 0.6)];
-    const chain = [{ type: 'custom', name: 'q', uri: 'http://x' }];
-
-    // The model reverses the top-3 (cap kept default; here all 4 are head) and gives reasons.
-    const chat = async () => ([{ id: '3', reason: 'freshest pick' }, { id: '1', reason: 'core taste' }, { id: '2' }, { id: '4', reason: 'x' }]);
-    const out = await rerank.rerankCandidates('movie', scored.map((c) => ({ ...c, score_components: { ...c.score_components } })), taste, cfg, { chain, chat, log: quiet });
-    assert.deepStrictEqual(out.map((c) => c.tmdb_id), ['3', '1', '2', '4']);          // model order
-    assert.deepStrictEqual(out.map((c) => c.rankScore), [0.9, 0.8, 0.7, 0.6]);        // original band re-stamped desc
-    assert.strictEqual(out[0].reason, 'freshest pick');                              // → because_title
-    assert.strictEqual(out[0].score_components.rerank.by, 'llm');
-    assert.strictEqual(out[2].reason, 'det 2');                                       // no reason from model → deterministic kept
-
-    // Unknown/duplicate ids are ignored (can't invent); dropped head items appended in order.
-    const partial = async () => ([{ id: '999' }, { id: '2', reason: 'ok' }, { id: '2' }]);
-    const out2 = await rerank.rerankCandidates('movie', scored.map((c) => ({ ...c })), taste, cfg, { chain, chat: partial, log: quiet });
-    assert.deepStrictEqual(out2.map((c) => c.tmdb_id), ['2', '1', '3', '4']);         // 2 first, rest original order
-    assert.deepStrictEqual(out2.map((c) => c.rankScore), [0.9, 0.8, 0.7, 0.6]);
-
-    // Degrade paths → the deterministic input is returned UNCHANGED, never throws.
-    const same = (arr) => arr.map((c) => c.tmdb_id);
-    assert.deepStrictEqual(same(await rerank.rerankCandidates('movie', scored, taste, cfg, { chain: [], chat, log: quiet })), ['1', '2', '3', '4']); // no local endpoint
-    assert.deepStrictEqual(same(await rerank.rerankCandidates('movie', scored, taste, cfg, { chain, chat: async () => { throw new Error('timeout'); }, log: quiet })), ['1', '2', '3', '4']);
-    assert.deepStrictEqual(same(await rerank.rerankCandidates('movie', scored, taste, cfg, { chain, chat: async () => [], log: quiet })), ['1', '2', '3', '4']); // empty reply
-    assert.deepStrictEqual(same(await rerank.rerankCandidates('movie', scored, taste, cfg, { chain, chat: async () => [{ id: 'nope' }], log: quiet })), ['1', '2', '3', '4']); // all-unknown
-    // enabled:false disables it even with a local endpoint.
-    const offCfg = require('../src/engines/glass/config').resolveConfig({ glass: { rerank: { enabled: false } } });
-    assert.deepStrictEqual(same(await rerank.rerankCandidates('movie', scored, taste, offCfg, { chain, chat, log: quiet })), ['1', '2', '3', '4']);
-  });
-
-  // ── U. Glass GE-08 through the engine: local-only chain, reasons reach the pool ─
-  await it('U. Glass engine invokes the rerank with a LOCAL-ONLY chain; reasons land in because_title', async () => {
-    const metaStore = require('../src/engines/glass/metaStore');
-    const glass = require('../src/engines/glass');
-    const pipeline = require('../src/engines/pipeline');
-    settings.updateSettings({ engines: { glass: true } });
-    stubTmdb();
-    const p = config.addProfile('INT-U');
-    try {
-      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'glass', engine_series: 'glass' } });
-      seedGlassFixtures(p.id);
-      let sawChain = null;
-      const glassChat = async (chain) => { sawChain = chain; return [{ id: '402', reason: 'a bold, trending choice' }, { id: '301', reason: 'matches your Nolan streak' }]; };
-      // Drive the shared pipeline directly so we can inject ctx (build path passes none).
-      const ctx = {
-        tmdbKey: 'itest-tmdb', mdblistKey: '', log: quiet, filters: config.getProfile(p.id).filters,
-        settings: { llm: { custom_uri: 'http://local', custom_name: 'qwen', groq_api_key: 'GROQKEY' } }, // both configured…
-        glassChat, glassRecsFetcher: async (_k, type) => (type === 'movie'
-          ? [{ type, tmdb_id: '301', title: 'Rec A', year: 2024, genre_ids: [18], vote_average: 8, vote_count: 5000, popularity: 30, adult: false, poster: null }] : []),
-      };
-      await pipeline.runEngineBuild(config.getProfile(p.id), 'movie', glass, ctx, () => {});
-      // …yet the rerank chain is LOCAL-ONLY (no Groq spill).
-      assert.ok(Array.isArray(sawChain) && sawChain.length === 1 && sawChain[0].type === 'custom', 'rerank used only the local provider');
-      const rows = rs.getRecommended(p.id, { type: 'movie', limit: 100 });
-      const r402 = rows.find((x) => x.tmdb_id === '402');
-      const r301 = rows.find((x) => x.tmdb_id === '301');
-      assert.ok(r402 && r402.because_title === 'a bold, trending choice', 'LLM reason persisted to because_title (§39)');
-      assert.ok(r301 && r301.because_title === 'matches your Nolan streak');
-      assert.ok(r402.affinity >= r301.affinity, 'the model put 402 first → it holds the top score slot');
-      assert.strictEqual(JSON.parse(r402.score_components).rerank.by, 'llm');
-    } finally {
-      restoreTmdb();
-      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id); metaStore._clear();
-      settings.updateSettings({ engines: { glass: false } });
-      simklTrending.upsertList('movies', [], 0); simklTrending.upsertList('tv', [], 0); simklTrending.upsertList('anime', [], 0);
-    }
-  });
-
-  // ── V. Glass GE-10: a user rejection steers taste away from similar candidates ─
-  await it('V. GE-10 feedback wiring: rejecting a title down-weights a candidate sharing its director, end to end', async () => {
-    const metaStore = require('../src/engines/glass/metaStore');
-    settings.updateSettings({ engines: { glass: true } });
-    stubTmdb();
-    const p = config.addProfile('INT-V');
-    try {
-      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'glass', engine_series: 'glass' } });
-      seedGlassFixtures(p.id);            // watched 101/102 + candidates all dir 'Nolan'
-      // Give the taste model a SECOND director so Nolan isn't the lone max (which
-      // normalization would pin to 1.0 regardless of magnitude): watched 102 → Villeneuve.
-      metaStore.put('movie', 102, { tmdb_id: '102', imdb_id: 'ttw2', type: 'movie', genres: ['Drama'], primary_genre: 'Drama', director: ['Villeneuve'], cast: ['A'], keywords: ['dream'], decade: 2020, original_language: 'en', runtime: 120, networks: [] });
-      await rs.buildPool(config.getProfile(p.id), quiet);
-      const before = rs.getRecommended(p.id, { type: 'movie', limit: 100 }).find((x) => x.tmdb_id === '301').affinity;
-
-      // Reject a (Nolan) title the profile has NOT watched. Its cached deep-meta
-      // pushes the 'Nolan' director dim toward negative, so candidate 301 (also
-      // Nolan) loses taste_match on the rebuild. dont_recommend is engine-agnostic.
-      metaStore.put('movie', 501, { tmdb_id: '501', imdb_id: 'tt501', type: 'movie', genres: ['Drama'], director: ['Nolan'], cast: ['A'], keywords: ['dream'], decade: 2020, original_language: 'en', runtime: 120, networks: [] });
-      rs.addDontRecommend(p.id, 'movie', '501', 'user');
-      rs.clearType(p.id, 'movie');
-      await rs.buildPool(config.getProfile(p.id), quiet);
-      const after = rs.getRecommended(p.id, { type: 'movie', limit: 100 }).find((x) => x.tmdb_id === '301').affinity;
-      assert.ok(after < before, `rejection lowered the similar candidate's score (${after} < ${before})`);
-    } finally {
-      restoreTmdb();
-      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id); metaStore._clear();
-      settings.updateSettings({ engines: { glass: false } });
-      simklTrending.upsertList('movies', [], 0); simklTrending.upsertList('tv', [], 0); simklTrending.upsertList('anime', [], 0);
-    }
-  });
-
-  // ── W. Glass GE-09: embed() transport parse + semantic layer (off/measure/weighted) ─
-  await it('W. GE-09 embed() parses OpenAI shape; semantic layer stores the feature, weight 0 = measure-only, weighted reorders', async () => {
-    const emb = require('../src/services/embeddings');
-    const semantic = require('../src/engines/glass/semantic');
-    const embedStore = require('../src/engines/glass/embedStore');
-    const metaStore = require('../src/engines/glass/metaStore');
-    const { resolveConfig } = require('../src/engines/glass/config');
-
-    // embed() transport: parses {data:[{index,embedding}]} and re-orders by index.
-    const origFetch = global.fetch;
-    global.fetch = async () => ({ ok: true, text: async () => '', json: async () => ({ data: [{ index: 1, embedding: [0, 1] }, { index: 0, embedding: [1, 0] }] }) });
-    try {
-      const vecs = await emb.embed({ uri: 'http://x', model: 'm' }, ['a', 'b']);
-      assert.deepStrictEqual(vecs, [[1, 0], [0, 1]]);   // sorted by index → input order
-    } finally { global.fetch = origFetch; }
-
-    // Semantic layer end to end with an injected embedder (content token → vector).
-    const embedFn = async (texts) => texts.map((t) => (t.includes('CLOSE') ? [1, 0] : [0, 1]));
-    const p = config.addProfile('INT-W');
-    try {
-      metaStore._clear(); embedStore._clear();
-      watchedStore.upsertMany(p.id, [{ type: 'movie', simkl_id: 1, imdb_id: 'ttw', tmdb_id: '1', title: 'W', year: 2024, watched_at: '2026-09-08T00:00:00Z' }]);
-      metaStore.put('movie', 1, { tmdb_id: '1', type: 'movie', title: 'Watched', overview: 'a CLOSE story', genres: ['Drama'] });      // taste vec → [1,0]
-      metaStore.put('movie', 10, { tmdb_id: '10', type: 'movie', title: 'A', overview: 'a CLOSE tale', genres: ['Drama'] });           // cosine 1
-      metaStore.put('movie', 11, { tmdb_id: '11', type: 'movie', title: 'B', overview: 'a FAR tale', genres: ['Drama'] });             // cosine 0
-      const mkScored = () => ([
-        { tmdb_id: '11', title: 'B', rankScore: 0.6, score_components: { features: { taste_match: 0.6 } } },
-        { tmdb_id: '10', title: 'A', rankScore: 0.5, score_components: { features: { taste_match: 0.5 } } },
-      ]);
-      // Disabled (default) → untouched.
-      const offCfg = resolveConfig(null);
-      assert.deepStrictEqual((await semantic.applySemantic(p, 'movie', mkScored(), {}, offCfg, { model: 'm', embedFn, log: quiet })).map((c) => c.tmdb_id), ['11', '10']);
-
-      // Enabled, weight 0 → feature STORED but order unchanged (measure-only).
-      const measCfg = resolveConfig({ glass: { embeddings: { enabled: true } } });
-      const meas = await semantic.applySemantic(p, 'movie', mkScored(), {}, measCfg, { model: 'm', embedFn, log: quiet });
-      assert.deepStrictEqual(meas.map((c) => c.tmdb_id), ['11', '10']);                       // unchanged
-      const byId = Object.fromEntries(meas.map((c) => [c.tmdb_id, c.score_components.features.semantic_similarity]));
-      assert.ok(Math.abs(byId['10'] - 1) < 1e-9 && Math.abs(byId['11'] - 0) < 1e-9);           // A close, B far
-      assert.ok(embedStore.count() > 0, 'vectors are cached');
-
-      // Enabled + weighted → the semantically-close A overtakes B.
-      const wCfg = resolveConfig({ glass: { embeddings: { enabled: true }, weights: { semantic_similarity: 1.0 } } });
-      const weighted = await semantic.applySemantic(p, 'movie', mkScored(), {}, wCfg, { model: 'm', embedFn, log: quiet });
-      assert.deepStrictEqual(weighted.map((c) => c.tmdb_id), ['10', '11']);                    // reordered by semantic weight
-    } finally {
-      config.removeProfile(p.id); watchedStore.deleteForProfile(p.id); metaStore._clear(); embedStore._clear();
-    }
-  });
-
-  // ── X. Glass engine wires GE-09: enabled → semantic_similarity persists to the pool ─
-  await it('X. Glass engine folds semantic_similarity into score_components when embeddings are enabled', async () => {
-    const metaStore = require('../src/engines/glass/metaStore');
-    const embedStore = require('../src/engines/glass/embedStore');
-    const glass = require('../src/engines/glass');
-    const pipeline = require('../src/engines/pipeline');
-    settings.updateSettings({ engines: { glass: true } });
-    stubTmdb();
-    const p = config.addProfile('INT-X');
-    try {
-      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'glass', engine_series: 'glass' } });
-      seedGlassFixtures(p.id); embedStore._clear();
-      let embedCalls = 0;
-      const ctx = {
-        tmdbKey: 'itest-tmdb', mdblistKey: '', log: quiet, filters: config.getProfile(p.id).filters,
-        settings: { llm: {}, glass: { embeddings: { enabled: true } } },   // Tier-2 turns it on
-        glassEmbed: async (texts) => { embedCalls++; return texts.map(() => [1, 0, 0]); },
-        glassRecsFetcher: async (_k, type) => (type === 'movie'
-          ? [{ type, tmdb_id: '301', title: 'Rec A', year: 2024, genre_ids: [18], vote_average: 8, vote_count: 5000, popularity: 30, adult: false, poster: null }] : []),
-      };
-      await pipeline.runEngineBuild(config.getProfile(p.id), 'movie', glass, ctx, () => {});
-      assert.ok(embedCalls > 0, 'the engine invoked the local embedder');
-      const rows = rs.getRecommended(p.id, { type: 'movie', limit: 100 });
-      assert.ok(rows.length >= 1);
-      for (const r of rows) {
-        const f = JSON.parse(r.score_components).features;
-        assert.ok(typeof f.semantic_similarity === 'number', 'semantic_similarity is stored for measurement');
-      }
-    } finally {
-      restoreTmdb();
-      config.removeProfile(p.id); rs.deleteForProfile(p.id); watchedStore.deleteForProfile(p.id); metaStore._clear(); embedStore._clear();
-      settings.updateSettings({ engines: { glass: false } });
-      simklTrending.upsertList('movies', [], 0); simklTrending.upsertList('tv', [], 0); simklTrending.upsertList('anime', [], 0);
-    }
-  });
 
   // ── Marquee ME-02: TMDB list endpoints + trending cache (stubbed fetch / injected fetcher) ─
   await it('marquee trendingMovies: rank continuous across pages + failure/short-page handling', async () => {
@@ -1920,7 +1640,7 @@ async function main() {
   await it('Trainer T1: listHistory — enrichment: ≤25 cap, throwing enrich, no-key, cached meta (F11.3b)', async () => {
     const trainer = require('../src/trainer');
     const watchedStore = require('../src/watchedStore');
-    const metaStore = require('../src/engines/glass/metaStore');
+    const metaStore = require('../src/engines/shared/metaStore');
     const db = require('../src/db');
     const profile = { id: 'p-lh11b', name: 'T', keys: { simkl_client_id: 'c', tmdb_api_key: 'test-key' }, simkl_auth: { access_token: 't' } };
     // 30 watched rows (all missing a poster) → the page enriches ≤ 25.
@@ -2292,7 +2012,7 @@ async function main() {
     const taste = require('../src/engines/marquee/taste');
     const cfg = require('../src/engines/marquee/config').resolveConfig({});
     const watchedStore = require('../src/watchedStore');
-    const metaStore = require('../src/engines/glass/metaStore');
+    const metaStore = require('../src/engines/shared/metaStore');
     const llmCache = require('../src/engines/marquee/llmCache');
     const profileId = 'p-brief';
     const nowMs = Date.parse('2026-06-01T00:00:00Z');
@@ -2388,8 +2108,8 @@ async function main() {
 
   await it('marquee ME-04: no ratings (the production case) — events identical to Glass, seeds by recency (T1)', async () => {
     const taste = require('../src/engines/marquee/taste');
-    const glassEvents = require('../src/engines/glass/events');
-    const glassTasteModel = require('../src/engines/glass/tasteModel');
+    const glassEvents = require('../src/engines/shared/events');
+    const glassTasteModel = require('../src/engines/shared/tasteModel');
     const cfg = require('../src/engines/marquee/config').resolveConfig({});
     const profileId = 'p-noratings';
     const nowMs = Date.parse('2026-06-01T00:00:00Z');
@@ -2422,7 +2142,7 @@ async function main() {
   await it('marquee ME-04: negative rating → negative director affinity (T2)', async () => {
     const taste = require('../src/engines/marquee/taste');
     const cfg = require('../src/engines/marquee/config').resolveConfig({});
-    const metaStore = require('../src/engines/glass/metaStore');
+    const metaStore = require('../src/engines/shared/metaStore');
     const profileId = 'p-negdir';
     const nowMs = Date.parse('2026-06-01T00:00:00Z');
     watchedStore.upsertMany(profileId, [
@@ -2475,7 +2195,7 @@ async function main() {
   const mqScoring = require('../src/engines/marquee/scoring');
   const mqFilters = require('../src/engines/marquee/filters');
   const mqCfg = require('../src/engines/marquee/config');
-  const glassMeta = require('../src/engines/glass/metaStore');
+  const glassMeta = require('../src/engines/shared/metaStore');
   const pipeline = require('../src/engines/pipeline');
 
   const mqGenreMap = { 28: 'Action', 18: 'Drama', 878: 'Science Fiction' };
@@ -3345,7 +3065,7 @@ async function main() {
   await it('ME-09: requirements — Simkl missing → movie skipped, existing rows kept', async () => {
     const p = config.addProfile('INT-MQREQ');
     try {
-      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', engine_series: 'genesis' } });
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', engine_series: 'marquee-tv' } });
       const profile = config.getProfile(p.id);
       // No simkl_auth → the requirement is unmet (TMDB key is global, present).
       assert.deepStrictEqual(marqueeEngine.requirements(profile), { ok: false, missing: ['Simkl connection'] });
@@ -3364,40 +3084,31 @@ async function main() {
     }
   });
 
-  await it('ME-09 CONFORMANCE SC-07: registered + disabled by default; enable → resolve', async () => {
+  await it('ME-09 CONFORMANCE: both Marquee engines always available (SC-07 removed)', async () => {
     assert.ok(engines.has('marquee'), 'marquee is registered');
+    assert.ok(engines.has('marquee-tv'), 'marquee-tv is registered');
     const p = config.addProfile('INT-MQSC07');
     try {
-      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', engine_series: 'marquee' } });
       const profile = config.getProfile(p.id);
-      // Disabled (default): not offered, movie + series floor to genesis.
-      assert.ok(!engines.availableFor(profile, 'movie').some((e) => e.id === 'marquee'), 'disabled → not offered');
-      assert.strictEqual(engines.resolveFor(profile, 'movie').id, 'genesis', 'disabled → movie floors to genesis');
-      assert.strictEqual(engines.resolveFor(profile, 'series').id, 'genesis', 'series → genesis (type unsupported)');
-      // Enabled: movie resolves to marquee; series still genesis (type unsupported).
-      settings.updateSettings({ engines: { marquee: true } });
-      assert.strictEqual(engines.resolveFor(profile, 'movie').id, 'marquee', 'enabled → movie resolves to marquee');
-      assert.strictEqual(engines.resolveFor(profile, 'series').id, 'genesis', 'enabled → series still genesis');
-      assert.ok(engines.availableFor(profile, 'movie').some((e) => e.id === 'marquee'), 'enabled → offered');
+      // Both engines always available (no enable/disable switch).
+      assert.ok(engines.availableFor(profile, 'movie').some((e) => e.id === 'marquee'), 'movie → marquee offered');
+      assert.ok(engines.availableFor(profile, 'series').some((e) => e.id === 'marquee-tv'), 'series → marquee-tv offered');
+      assert.strictEqual(engines.resolveFor(profile, 'movie').id, 'marquee');
+      assert.strictEqual(engines.resolveFor(profile, 'series').id, 'marquee-tv');
     } finally {
-      settings.updateSettings({ engines: { marquee: false } });
       config.removeProfile(p.id); rs.deleteForProfile(p.id);
     }
   });
 
-  await it('ME-09 CONFORMANCE I7: age-gated (unrestricted:false); offered to kids when enabled', async () => {
+  await it('ME-09 CONFORMANCE I7: age-gated (unrestricted:false); offered to kids (always on)', async () => {
     assert.strictEqual(marqueeEngine.capabilities.unrestricted, false, 'Marquee is age-gated (I7)');
     const p = config.addProfile('INT-MQI7');
     try {
       config.updateProfile(p.id, { filters: { age_limit: 12, engine_movie: 'marquee' } });
       const profile = config.getProfile(p.id);
-      // Disabled: not offered (SC-07), even though it is age-gated.
-      assert.ok(!engines.availableFor(profile, 'movie').some((e) => e.id === 'marquee'), 'disabled → not offered to kids');
-      // Enabled: offered — it is age-gated, so a kids profile may choose it.
-      settings.updateSettings({ engines: { marquee: true } });
-      assert.ok(engines.availableFor(profile, 'movie').some((e) => e.id === 'marquee'), 'enabled → offered to kids (age-gated)');
+      // Age-gated: offered to kids (they may choose it).
+      assert.ok(engines.availableFor(profile, 'movie').some((e) => e.id === 'marquee'), 'offered to kids (age-gated)');
     } finally {
-      settings.updateSettings({ engines: { marquee: false } });
       config.removeProfile(p.id); rs.deleteForProfile(p.id);
     }
   });
@@ -3414,7 +3125,7 @@ async function main() {
     });
     const prev = store.loadAgeVerdicts();
     try {
-      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { age_limit: 8, engine_movie: 'marquee', engine_series: 'genesis' } }); // AGE-2: 8 → the 10+ tier
+      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { age_limit: 8, engine_movie: 'marquee', engine_series: 'marquee-tv' } }); // AGE-2: 8 → the 10+ tier
       watchedStore.upsertMany(p.id, [
         { simkl_id: 1, type: 'movie', imdb_id: 'ttmqi1w', tmdb_id: 'mqi1w', title: 'Watched', year: 2024, watched_at: '2026-05-01T00:00:00Z' },
       ]);
@@ -3442,7 +3153,7 @@ async function main() {
   await it('ME-09 CONFORMANCE I4: the engine never writes imdb_rating (pipeline owns the column)', async () => {
     const p = config.addProfile('INT-MQI4');
     try {
-      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'marquee', engine_series: 'genesis' } });
+      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'marquee', engine_series: 'marquee-tv' } });
       watchedStore.upsertMany(p.id, [
         { simkl_id: 1, type: 'movie', imdb_id: 'ttmqi4w', tmdb_id: 'mqi4w', title: 'Watched', year: 2024, watched_at: '2026-05-01T00:00:00Z' },
       ]);
@@ -3473,18 +3184,18 @@ async function main() {
     tmdb.imdbAndCertFor = async (_k, _type, _id) => ({ imdb_id: 'ttmqisoS1', certification: null });
     const p = config.addProfile('INT-MQISO');
     try {
-      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'marquee', engine_series: 'genesis' } });
+      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'marquee', engine_series: 'marquee-tv' } });
       watchedStore.upsertMany(p.id, [
         { simkl_id: 1, type: 'movie', imdb_id: 'ttmqisowm', tmdb_id: 'mqisowm', title: 'Watched Movie', year: 2024, watched_at: '2026-05-01T00:00:00Z' },
         { simkl_id: 2, type: 'series', imdb_id: 'ttmqisows', tmdb_id: 'mqisows', title: 'Watched Series', year: 2024, watched_at: '2026-05-01T00:00:00Z' },
       ]);
       const r = await rs.buildPool(config.getProfile(p.id), quiet);
-      assert.deepStrictEqual(r.engines, { movie: 'marquee', series: 'genesis' }, 'per-type engine dispatch');
+      assert.deepStrictEqual(r.engines, { movie: 'marquee', series: 'marquee-tv' }, 'per-type engine dispatch');
       const movieRows = rs.getRecommended(p.id, { type: 'movie', limit: 100 });
       assert.ok(movieRows.length >= 1, 'a movie row was produced');
       for (const row of movieRows) assert.strictEqual(row.engine_id, 'marquee', 'movie row stamped marquee');
       const seriesRows = rs.getRecommended(p.id, { type: 'series', limit: 100 });
-      for (const row of seriesRows) assert.strictEqual(row.engine_id, 'genesis', 'series row stamped genesis');
+      for (const row of seriesRows) assert.strictEqual(row.engine_id, 'marquee-tv', 'series row stamped marquee-tv');
     } finally {
       tmdb.getRecommendations = origRecs; tmdb.getGenreMap = origGenreMap; tmdb.imdbAndCertFor = origImdbAndCertFor;
       settings.updateSettings({ engines: { marquee: false } });
@@ -3524,7 +3235,7 @@ async function main() {
     const reset = marqueeEngine._setTestSeams({ fetchers: mqSeam({ recs, deepMeta }), chain: [] });
     const prev = store.loadAgeVerdicts();
     try {
-      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { ...filters, engine_movie: 'marquee', engine_series: 'genesis' } });
+      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { ...filters, engine_movie: 'marquee', engine_series: 'marquee-tv' } });
       const seeds = ['mqe1', 'mqe2', 'mqe3', 'mqe4', 'mqe5'];
       watchedStore.upsertMany(p.id, seeds.map((s, i) => ({ simkl_id: i + 1, type: 'movie', imdb_id: 'tt' + s, tmdb_id: s, title: 'Seed ' + s, year: 2024, watched_at: '2026-05-01T00:00:00Z' })));
       // The 20 passers (n1–n4 per seed): verdict true for each (AGE-2: age_limit 10 → the 10+ tier).
@@ -3553,21 +3264,21 @@ async function main() {
     }
   });
 
-  await it('ME-09: Tier-2 admin config change rebuilds only the Marquee movie slice (parallel to Glass)', async () => {
-    settings.updateSettings({ engines: { marquee: true, glass: true }, marquee: {} });
+  await it('ME-09: Tier-2 admin config change rebuilds only the Marquee movie slice (profile isolation)', async () => {
+    settings.updateSettings({ marquee: {} });
     const reset = marqueeEngine._setTestSeams({ fetchers: mqSeam({ recs: () => [mqItem('mqt2a'), mqItem('mqt2b')] }), chain: [] });
     const pMq = config.addProfile('INT-MQT2-MQ');
-    const pGl = config.addProfile('INT-MQT2-GL');
+    const pOther = config.addProfile('INT-MQT2-OTHER');
     try {
-      config.updateProfile(pMq.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'marquee', engine_series: 'genesis' } });
-      config.updateProfile(pGl.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'glass', engine_series: 'genesis' } });
+      config.updateProfile(pMq.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'marquee', engine_series: 'marquee-tv' } });
+      config.updateProfile(pOther.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'marquee', engine_series: 'marquee-tv' } });
       watchedStore.upsertMany(pMq.id, [
         { simkl_id: 1, type: 'movie', imdb_id: 'ttmqt2w', tmdb_id: 'mqt2w', title: 'Watched', year: 2024, watched_at: '2026-05-01T00:00:00Z' },
       ]);
-      // A pre-existing Glass movie row + built_at that the Marquee rebuild must NOT touch.
-      rs.upsertCandidates(pGl.id, [{ type: 'movie', tmdb_id: 'mqt2g1', imdb_id: 'ttmqt2g1', title: 'Glass Row', year: 2024, vote_average: 8, vote_count: 1000, affinity: 0.9, rec_count: 2, popularity: 5, engine_id: 'glass' }]);
-      rs.setBuiltAt(pGl.id);
-      const glassBuiltAtBefore = rs.getBuiltAt(pGl.id);
+      // A pre-existing movie row on the other profile that the Marquee rebuild must NOT touch.
+      rs.upsertCandidates(pOther.id, [{ type: 'movie', tmdb_id: 'mqt2o1', imdb_id: 'ttmqt2o1', title: 'Other Row', year: 2024, vote_average: 8, vote_count: 1000, affinity: 0.9, rec_count: 2, popularity: 5, engine_id: 'marquee' }]);
+      rs.setBuiltAt(pOther.id);
+      const otherBuiltAtBefore = rs.getBuiltAt(pOther.id);
       // A real Tier-2 change ({} → { franchise_cap: 1 }) fans out a Marquee rebuild only.
       portalPutSettings({ marquee: { franchise_cap: 1 } });
       const snap = await waitRebuildJob(pMq.id);
@@ -3576,10 +3287,9 @@ async function main() {
       const mqRows = rs.getRecommended(pMq.id, { type: 'movie', limit: 100 });
       assert.ok(mqRows.length >= 1, 'the Marquee movie slice was rebuilt');
       for (const row of mqRows) assert.strictEqual(row.engine_id, 'marquee');
-      // The Glass profile is untouched: its row + built_at survive.
-      const glRows = rs.getRecommended(pGl.id, { type: 'movie', limit: 100 });
-      assert.ok(glRows.some((r) => r.tmdb_id === 'mqt2g1'), 'the Glass row is intact');
-      assert.strictEqual(rs.getBuiltAt(pGl.id), glassBuiltAtBefore, 'the Glass built_at is untouched');
+      // The other profile (also Marquee) is also rebuilt — its old row is replaced.
+      const otherRows = rs.getRecommended(pOther.id, { type: 'movie', limit: 100 });
+      assert.ok(!otherRows.some((r) => r.tmdb_id === 'mqt2o1'), 'the other profile old row was replaced by the rebuild');
       // A second identical save is a no-op: no rebuild, rows + built_at unchanged.
       const mqBefore = rs.getRecommended(pMq.id, { type: 'movie', limit: 100 }).map((x) => `${x.tmdb_id}:${x.affinity.toFixed(4)}`);
       const mqBuiltAtBefore = rs.getBuiltAt(pMq.id);
@@ -3589,9 +3299,9 @@ async function main() {
       assert.deepStrictEqual(mqAfter, mqBefore, 'no rebuild on an identical save');
       assert.strictEqual(rs.getBuiltAt(pMq.id), mqBuiltAtBefore, 'built_at unchanged on an identical save');
     } finally {
-      settings.updateSettings({ engines: { marquee: false, glass: false }, marquee: {} });
+      settings.updateSettings({ marquee: {} });
       config.removeProfile(pMq.id); rs.deleteForProfile(pMq.id); watchedStore.deleteForProfile(pMq.id);
-      config.removeProfile(pGl.id); rs.deleteForProfile(pGl.id);
+      config.removeProfile(pOther.id); rs.deleteForProfile(pOther.id);
       reset();
     }
   });
@@ -3729,7 +3439,7 @@ async function main() {
   });
 
   await it('SH-01: Glass scoreCandidate carries the real cert from the enriched meta onto the candidate (movie only)', async () => {
-    const { scoreCandidate } = require('../src/engines/glass/scoring');
+    const { scoreCandidate } = require('../src/engines/shared/scoring');
     const certs = require('../src/certs');
     const taste = { dims: { genres: { Action: 1 }, decades: {}, languages: {}, runtimeBands: {}, directors: {}, franchises: {}, cast: {}, keywords: {} }, genreMass: { Action: 1 } };
     const cfg = { weights: { taste_match: 0.5, quality: 0.3 }, taste_dims: { genres: 1, decade: 0, language: 0, runtime: 0, director: 0, franchise: 0, cast: 0, keywords: 0 }, keyword_min_shared: 1 };
@@ -3891,15 +3601,14 @@ async function main() {
       profile: 'TestProfile', holdout: 10,
       targets: [{ tmdb_id: 't1', title: 'Title One' }, { tmdb_id: 't2', title: 'Title Two' }],
       engines: {
-        genesis: { metrics: { hitAt20: 1, hitAt20Fraction: 0.1, recallAt100: 0.2, meanRankOfHits: 5, filterPass: 0.8, trendingShareAt20: null, stored: 100, buildSeconds: 1.5 }, hitTargets: ['t1'] },
-        marquee: { metrics: { hitAt20: 2, hitAt20Fraction: 0.2, recallAt100: 0.5, meanRankOfHits: 10, filterPass: 0.9, trendingShareAt20: 0.5, stored: 90, buildSeconds: 2.0 }, hitTargets: ['t1', 't2'] },
+        marquee: { metrics: { hitAt20: 1, hitAt20Fraction: 0.1, recallAt100: 0.2, meanRankOfHits: 5, filterPass: 0.8, trendingShareAt20: null, stored: 100, buildSeconds: 1.5 }, hitTargets: ['t1'] },
+        'marquee-tv': { metrics: { hitAt20: 2, hitAt20Fraction: 0.2, recallAt100: 0.5, meanRankOfHits: 10, filterPass: 0.9, trendingShareAt20: 0.5, stored: 90, buildSeconds: 2.0 }, hitTargets: ['t1', 't2'] },
       },
     };
     const out1 = bench.renderTable(results);
     const out2 = bench.renderTable(results);
     assert.strictEqual(out1, out2, 'stable output for a fixed results object');
     assert.ok(out1.includes('TestProfile'), 'profile name');
-    assert.ok(out1.includes('genesis'), 'genesis row');
     assert.ok(out1.includes('marquee'), 'marquee row');
     assert.ok(out1.includes('Title One'), 'target title');
     assert.ok(out1.includes('Title Two'), 'second target title');
@@ -4443,15 +4152,11 @@ async function main() {
 
       // Round-robin fallbacks (C6) — the existing genre rotation, logged once.
       const expectedRR = rs.balanceByGenre(passed, 20);
-      // (a) Genesis — a non-calibrated engine.
-      config.updateProfile(p.id, { filters: { engine_movie: 'genesis' } });
-      assert.deepStrictEqual(rs.selectServeFor(config.getProfile(p.id), 'movie', stored, { limit: 20 }), expectedRR, 'round-robin for Genesis');
-      config.updateProfile(p.id, { filters: { engine_movie: 'marquee' } });
-      // (b) No stored target.
+      // (a) No stored target.
       serveCalibration.deleteForProfile(p.id);
       assert.deepStrictEqual(rs.selectServeFor(config.getProfile(p.id), 'movie', stored, { limit: 20 }), expectedRR, 'round-robin when no target');
       // (c) Engine id mismatch (a target stored by another engine).
-      serveCalibration.setTarget(p.id, 'movie', 'genesis', target, 40, Date.now());
+      serveCalibration.setTarget(p.id, 'movie', 'unknown-engine', target, 40, Date.now());
       assert.deepStrictEqual(rs.selectServeFor(config.getProfile(p.id), 'movie', stored, { limit: 20 }), expectedRR, 'round-robin when engine_id mismatched');
       serveCalibration.setTarget(p.id, 'movie', 'marquee', target, 40, Date.now());
       // (d) Tier-2 strategy 'round_robin' (the admin override).
@@ -5005,8 +4710,8 @@ async function main() {
 
   await it('marquee m3: Loved decay is floored at cfg.loved.decay_floor (N3)', async () => {
     const taste = require('../src/engines/marquee/taste');
-    const glassTasteModel = require('../src/engines/glass/tasteModel');
-    const glassConfig = require('../src/engines/glass/config');
+    const glassTasteModel = require('../src/engines/shared/tasteModel');
+    const glassConfig = require('../src/engines/shared/tasteConfig');
     const cfg = mqCfgResolved;
     const floor = cfg.loved.decay_floor; // 0.5
     const hl = glassConfig.halfLivesFor(cfg, 'movie');
@@ -5069,7 +4774,7 @@ async function main() {
 
   await it('marquee m3: a no-feedback profile is unchanged (N9 identity)', async () => {
     const taste = require('../src/engines/marquee/taste');
-    const glassTasteModel = require('../src/engines/glass/tasteModel');
+    const glassTasteModel = require('../src/engines/shared/tasteModel');
     const profileId = 'p-n9';
     glassMeta._clear();
     // A no-feedback profile: watched films, NO ratings, NO ignores.
@@ -5147,8 +4852,6 @@ async function main() {
     rs.upsertCandidates(profileId, [{ type: 'movie', tmdb_id: 't12', imdb_id: 'ttt12', title: 'T', year: 2020, vote_average: 7, vote_count: 1000, affinity: 0.5, rec_count: 1, popularity: 5 }]);
     rs.setBuiltAt(profileId, T0);
     const marqueeProfile = { id: profileId, name: 'T12', filters: { engine_movie: 'marquee' } };
-    const genesisProfile = { id: profileId, name: 'T12', filters: { engine_movie: 'genesis' } };
-    settings.updateSettings({ engines: { marquee: true } });
     try {
       // fresh (no taste change) → no build needed.
       assert.strictEqual(rs.needsBuild(profileId, { profile: marqueeProfile, now: T0 }), false);
@@ -5165,14 +4868,7 @@ async function main() {
       tasteFeedback.markTrainingBuilt(profileId, T0 + 5 * min);
       assert.strictEqual(rs.needsBuild(profileId, { profile: marqueeProfile, now: T0 + 29 * min }), false, 'inside the new quiet period');
       assert.strictEqual(rs.needsBuild(profileId, { profile: marqueeProfile, now: T0 + 30 * min }), true, 'change during the build triggers the next build');
-      // the gate: a non-Marquee movie engine never triggers a taste rebuild.
-      tasteFeedback.recordChange(profileId, T0 + 40 * min);
-      assert.strictEqual(rs.needsBuild(profileId, { profile: genesisProfile, now: T0 + 50 * min }), false, 'non-Marquee profile: no taste rebuild');
-      // a disabled Marquee floors to Genesis → gated out.
-      settings.updateSettings({ engines: { marquee: false } });
-      assert.strictEqual(rs.needsBuild(profileId, { profile: marqueeProfile, now: T0 + 50 * min }), false, 'disabled Marquee → gated out');
     } finally {
-      settings.updateSettings({ engines: { marquee: false } });
       db.get().prepare('DELETE FROM taste_changes WHERE profile_id = ?').run(profileId);
       rs.deleteForProfile(profileId);
     }
@@ -5188,7 +4884,7 @@ async function main() {
     const reset = marqueeEngine._setTestSeams({ fetchers: mqSeam({ recs: () => [mqItem('t13a')] }), chain: [] });
     const prev = store.loadAgeVerdicts();
     try {
-      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'marquee', engine_series: 'genesis' } });
+      config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'marquee', engine_series: 'marquee-tv' } });
       watchedStore.upsertMany(p.id, [
         { simkl_id: 1, type: 'movie', imdb_id: 'ttt13w', tmdb_id: 't13w', title: 'Watched', year: 2024, watched_at: '2026-05-01T00:00:00Z' },
       ]);
@@ -5963,7 +5659,7 @@ async function main() {
     const express = require('express');
     const portal = require('../src/portal');
     const config = require('../src/config');
-    const metaStore = require('../src/engines/glass/metaStore');
+    const metaStore = require('../src/engines/shared/metaStore');
     const db = require('../src/db');
     const port = 7315;
     const app = express();
@@ -7793,14 +7489,14 @@ async function main() {
       profile: 'TVProfile', holdout: 10,
       targets: [{ tmdb_id: 'tv1', title: 'Show One' }, { tmdb_id: 'tv2', title: 'Show Two' }],
       engines: {
-        genesis: { metrics: { hitAt20: 1, hitAt20Fraction: 0.1, recallAt100: 0.2, meanRankOfHits: 5, filterPass: 0.8, trendingShareAt20: null, stored: 100, buildSeconds: 1.5 }, hitTargets: ['tv1'] },
+        'marquee-tv': { metrics: { hitAt20: 1, hitAt20Fraction: 0.1, recallAt100: 0.2, meanRankOfHits: 5, filterPass: 0.8, trendingShareAt20: null, stored: 100, buildSeconds: 1.5 }, hitTargets: ['tv1'] },
       },
     };
     const out1 = bench.renderTable(results);
     const out2 = bench.renderTable(results);
     assert.strictEqual(out1, out2, 'stable output for a fixed results object');
     assert.ok(out1.includes('TVProfile'), 'profile name');
-    assert.ok(out1.includes('genesis'), 'genesis row');
+    assert.ok(out1.includes('marquee-tv'), 'marquee-tv row');
     assert.ok(out1.includes('Show One'), 'target title');
     assert.ok(out1.includes('Show Two'), 'second target title');
   });
@@ -8212,7 +7908,7 @@ async function main() {
   // ── TV-2 N2: ensureTvMeta (fetch only missing/expired; writes both stores; TTL) ──
   await it('TV-2 N2: ensureTvMeta fetches missing, writes Glass metaStore + marquee_tv_meta, TTL 14d', async () => {
     const meta = require('../src/engines/marqueeTv/meta');
-    const glassMetaStore = require('../src/engines/glass/metaStore');
+    const glassMetaStore = require('../src/engines/shared/metaStore');
     const db = require('../src/db');
     const fetchCalls = [];
     const fetcher = (apiKey, id) => {
@@ -8568,16 +8264,6 @@ async function main() {
       assert.strictEqual(rs.needsBuild(p.id, { profile, now: T0 + 15 * min }), true, 'quiet period elapsed (Marquee TV)');
       tasteFeedback.markTrainingBuilt(p.id, T0 + 5 * min);
       assert.strictEqual(rs.needsBuild(p.id, { profile, now: T0 + 15 * min }), false, 'the build covered the change');
-      // (d) Genesis-series, Genesis-movie profile is unaffected.
-      const pG = config.addProfile('INT-TV-R-T7G');
-      config.updateProfile(pG.id, { filters: { engine_movie: 'genesis', engine_series: 'genesis' }, keys: { tmdb_api_key: 'itest-tmdb' }, simkl_auth: { access_token: 'tok' } });
-      const profileG = config.getProfile(pG.id);
-      rs.upsertCandidates(pG.id, [{ type: 'series', tmdb_id: 't7g', imdb_id: 'ttt7g', title: 'T', year: 2020, vote_average: 7, vote_count: 1000, affinity: 0.5, rec_count: 1, popularity: 5 }]);
-      rs.setBuiltAt(pG.id, T0);
-      tasteFeedback.recordChange(pG.id, T0 + 5 * min);
-      assert.strictEqual(rs.needsBuild(pG.id, { profile: profileG, now: T0 + 15 * min }), false, 'Genesis-series/Genesis-movie unaffected');
-      config.removeProfile(pG.id);
-      rs.deleteForProfile(pG.id);
     } finally {
       tasteFeedback.syncRatings = realSync;
       settings.updateSettings({ engines: { 'marquee-tv': false } });
@@ -9612,7 +9298,7 @@ async function main() {
   // Genesis while disabled, marquee-tv once enabled.
   await it('TV-2 E1: generate(series) end-to-end — no anime/Reality/excluded genre, pre-resolved, stats + summary; movie → []; registry dark', async () => {
     const marqueeTv = require('../src/engines/marqueeTv');
-    const glassMetaStore = require('../src/engines/glass/metaStore');
+    const glassMetaStore = require('../src/engines/shared/metaStore');
     const nowMs = Date.parse('2026-10-02T00:00:00Z');
     const p = config.addProfile('INT-TV2-E1');
     config.updateProfile(p.id, {
@@ -9703,15 +9389,10 @@ async function main() {
       // (2) generate(movie) → [].
       const movieOut = await marqueeTv.generate(profile, 'movie', ctx);
       assert.deepStrictEqual(movieOut, [], 'generate(movie) → []');
-      // (3) registry: get exists; isEnabled false by default; resolveFor →
-      //     Genesis while disabled, marquee-tv once enabled.
+      // (3) registry: get exists; always available (SC-07 removed).
       assert.ok(engines.get('marquee-tv'), 'engines.get(marquee-tv) exists');
-      assert.strictEqual(engines.isEnabled('marquee-tv'), false, 'isEnabled false by default');
-      assert.strictEqual(engines.resolveFor(profile, 'series').id, 'genesis', 'resolveFor → Genesis while disabled');
-      settings.updateSettings({ engines: { 'marquee-tv': true } });
-      assert.strictEqual(engines.resolveFor(profile, 'series').id, 'marquee-tv', 'resolveFor → marquee-tv once enabled');
+      assert.strictEqual(engines.resolveFor(profile, 'series').id, 'marquee-tv', 'resolveFor → marquee-tv (always on)');
     } finally {
-      settings.updateSettings({ engines: { 'marquee-tv': false } });
       config.removeProfile(p.id);
       watchedStore.deleteForProfile(p.id);
     }
@@ -9719,18 +9400,18 @@ async function main() {
 
   // ── TV-2 E2: the series bench runs marquee-tv alongside genesis ──
   // The reviewer's backtest is `bench-engines.js <profile> --type series
-  // --engines genesis,marquee-tv`. E2 proves that plumbing hermetically: a temp
-  // DB with series history (no watched series rows, so genesis returns [] with
-  // no network), the REAL genesis + marquee-tv engines through runBench, with
+  // --engines marquee,marquee-tv`. E2 proves that plumbing hermetically: a temp
+  // DB with series history (no watched series rows, so marquee returns [] with
+  // no network), the REAL marquee + marquee-tv engines through runBench, with
   // marquee-tv's network fetchers stubbed via the ctx.marqueeTvFetchers seam.
   // Both engines must complete and report metrics.
-  await it('TV-2 E2: series bench runs marquee-tv + genesis — both engines report', async () => {
+  await it('TV-2 E2: series bench runs marquee-tv + marquee — both engines report', async () => {
     const pipeline = require('../src/engines/pipeline');
     const p = config.addProfile('INT-TV2-E2');
     const nowMs = Date.parse('2026-10-02T00:00:00Z');
     const DAY = 86400e3;
     // 11 qualifying series_progress rows (holdout 1 needs 1+10). No watched
-    // series rows → genesis's seed list is empty → it returns [] with no network.
+    // series rows → marquee's seed list is empty → it returns [] with no network.
     const mk = (i) => ({
       simkl_id: i, kind: 'show', imdb_id: 'tt' + i, tmdb_id: 'e2' + i, title: 'Show ' + i, year: 2020,
       status: 'watching', watched_eps: 10, total_eps: 20, not_aired_eps: 0,
@@ -9772,7 +9453,7 @@ async function main() {
       watchedStore.upsertSeriesProgress(p.id, rows);
       const results = await bench.runBench({
         profile: config.getProfile(p.id),
-        engineIds: ['genesis', 'marquee-tv'],
+        engineIds: ['marquee', 'marquee-tv'],
         holdout: 1,
         type: 'series',
         deps: {
@@ -9782,10 +9463,10 @@ async function main() {
         },
       });
       // Both engines report.
-      assert.ok(results.engines.genesis, 'genesis reported');
+      assert.ok(results.engines.marquee, 'marquee reported');
       assert.ok(results.engines['marquee-tv'], 'marquee-tv reported');
-      // genesis: no watched series → 0 stored.
-      assert.strictEqual(results.engines.genesis.metrics.stored, 0, 'genesis stored 0 (no watched series)');
+      // marquee: doesn't support series → 0 stored.
+      assert.strictEqual(results.engines.marquee.metrics.stored, 0, 'marquee stored 0 (series unsupported)');
       // marquee-tv: its stub Simkl rec is stored (pre-resolved, pre-filtered).
       assert.ok(results.engines['marquee-tv'].metrics.stored >= 1, 'marquee-tv stored its candidate');
     } finally {
@@ -9919,7 +9600,7 @@ async function main() {
       // (1) Portal PUT /profiles/:id that changes engine_series.
       {
         const p = config.addProfile('INT-ENG1-C1-put');
-        config.updateProfile(p.id, { filters: { engine_series: 'genesis' } });
+        config.updateProfile(p.id, { filters: { engine_series: 'marquee-tv' } });
         drivePortal('PUT', '/profiles/:id', { filters: { engine_series: 'c1-fake' } }, { id: p.id });
         assert.ok(rebuildCalls.includes(p.id), 'PUT /profiles/:id (engine change) → rebuildAfterChange');
         assert.ok(!ensureCalls.includes(p.id), 'PUT /profiles/:id does NOT call ensureBuilt');
@@ -9938,29 +9619,7 @@ async function main() {
         config.removeProfile(p.id); rs.deleteForProfile(p.id);
       }
 
-      // (3) Mobile settings save that changes an engine (companion body carries
-      // the filters flat, not nested under `filters`).
-      {
-        const p = config.addProfile('INT-ENG1-C1-mobile');
-        config.updateProfile(p.id, { filters: { engine_series: 'genesis' } });
-        const res = fakeRes();
-        companion.settingsPostHandler({ profile: config.getProfile(p.id), body: { engine_series: 'c1-fake' } }, res);
-        assert.ok(rebuildCalls.includes(p.id), 'mobile settings save (engine change) → rebuildAfterChange');
-        assert.ok(!ensureCalls.includes(p.id), 'mobile settings save does NOT call ensureBuilt');
-        config.removeProfile(p.id); rs.deleteForProfile(p.id);
-      }
-
-      // (4) Disable revert (revertDisabledEngines) via PUT /settings.
-      {
-        const p = config.addProfile('INT-ENG1-C1-revert');
-        config.updateProfile(p.id, { filters: { engine_series: 'c1-fake' } });
-        portalPutSettings({ engines: { 'c1-fake': false } });
-        assert.ok(rebuildCalls.includes(p.id), 'disable revert → rebuildAfterChange');
-        assert.ok(!ensureCalls.includes(p.id), 'disable revert does NOT call ensureBuilt');
-        config.removeProfile(p.id); rs.deleteForProfile(p.id);
-      }
-
-      // (5) rebuildMarqueeProfiles via PUT /settings (a Tier-2 Marquee config change).
+      // (4) rebuildMarqueeProfiles via PUT /settings (a Tier-2 Marquee config change).
       {
         settings.updateSettings({ engines: { marquee: true }, marquee: {} });
         const p = config.addProfile('INT-ENG1-C1-marquee');
@@ -9972,21 +9631,10 @@ async function main() {
         settings.updateSettings({ engines: { marquee: false }, marquee: {} });
       }
 
-      // (6) rebuildGlassProfiles via PUT /settings (a Tier-2 Glass config change).
-      {
-        settings.updateSettings({ engines: { glass: true }, glass: {} });
-        const p = config.addProfile('INT-ENG1-C1-glass');
-        config.updateProfile(p.id, { simkl_auth: { access_token: 'x' }, filters: { engine_series: 'glass' } });
-        portalPutSettings({ glass: { some_key: 1 } });
-        assert.ok(rebuildCalls.includes(p.id), 'rebuildGlassProfiles → rebuildAfterChange');
-        assert.ok(!ensureCalls.includes(p.id), 'rebuildGlassProfiles does NOT call ensureBuilt');
-        config.removeProfile(p.id); rs.deleteForProfile(p.id);
-        settings.updateSettings({ engines: { glass: false }, glass: {} });
-      }
     } finally {
       rs.rebuildAfterChange = origRebuild;
       rs.ensureBuilt = origEnsure;
-      settings.updateSettings({ engines: { 'c1-fake': false, marquee: false, glass: false } });
+      settings.updateSettings({ engines: { 'c1-fake': false, marquee: false } });
       dispose();
     }
   });
@@ -10100,7 +9748,7 @@ async function main() {
   await it('T1a: 20-title movie catalog serves 20 unwatched (fallback genre-balanced path)', async () => {
     const p = config.addProfile('INT-WBF-T1a');
     try {
-      config.updateProfile(p.id, { filters: { engine_movie: 'genesis', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
       const rows = backfillMovieRows();
       rs.upsertCandidates(p.id, rows);
       const watchedIds = ['ttA1', 'ttA2', 'ttB1', 'ttB2', 'ttC1', 'ttD1'];
@@ -10188,7 +9836,7 @@ async function main() {
   await it('T3: authoritative + pending watches both disappear without a build (movies + shows, cross-type)', async () => {
     const p = config.addProfile('INT-WBF-T3');
     try {
-      config.updateProfile(p.id, { filters: { engine_movie: 'genesis', engine_series: 'genesis', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', engine_series: 'marquee-tv', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
       // 28 movie rows + 28 show rows.
       const movieRows = backfillMovieRows();
       const showRows = movieRows.map((r) => ({ ...r, type: 'series', tmdb_id: 's' + r.tmdb_id, imdb_id: 'tt' + 's' + r.tmdb_id }));
@@ -10229,7 +9877,7 @@ async function main() {
   await it('T4: record:true advances only the selected visible rows; read-only surfaces do not', async () => {
     const p = config.addProfile('INT-WBF-T4');
     try {
-      config.updateProfile(p.id, { filters: { engine_movie: 'genesis', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
       const rows = backfillMovieRows();
       rs.upsertCandidates(p.id, rows);
       const watchedIds = ['ttA1', 'ttA2', 'ttB1', 'ttB2', 'ttC1', 'ttD1'];
@@ -10278,7 +9926,7 @@ async function main() {
   await it('T5a: honest shortfall — 13 unwatched eligible rows serve 13 (no duplication/invention)', async () => {
     const p = config.addProfile('INT-WBF-T5a');
     try {
-      config.updateProfile(p.id, { filters: { engine_movie: 'genesis', engine_series: 'genesis', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      config.updateProfile(p.id, { filters: { engine_movie: 'marquee', engine_series: 'marquee-tv', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
       // 20 movie rows, 7 watched → 13 unwatched eligible.
       const rows = [];
       for (let i = 1; i <= 20; i++) rows.push(mkBackfillRow('M' + i, 'Action', 100 - i));
@@ -10300,7 +9948,7 @@ async function main() {
     try {
       // (a) All-watched pool: state 'ok', metas [].
       const p2 = config.addProfile('INT-WBF-T5b');
-      config.updateProfile(p2.id, { filters: { engine_movie: 'genesis', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      config.updateProfile(p2.id, { filters: { engine_movie: 'marquee', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
       const allRows = backfillMovieRows();
       rs.upsertCandidates(p2.id, allRows);
       for (const r of allRows) watchedStore.addPendingWatched(p2.id, { type: 'movie', imdbId: r.imdb_id });
@@ -10311,14 +9959,14 @@ async function main() {
       // (b) Genuinely-empty type pool (Simkl connected) → not_built, even when
       // the OTHER type (series) has rows.
       const p3 = config.addProfile('INT-WBF-T5c');
-      config.updateProfile(p3.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'genesis', engine_series: 'genesis', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      config.updateProfile(p3.id, { simkl_auth: { access_token: 'x' }, filters: { engine_movie: 'marquee', engine_series: 'marquee-tv', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
       rs.upsertCandidates(p3.id, backfillMovieRows().map((r) => ({ ...r, type: 'series', tmdb_id: 's' + r.tmdb_id, imdb_id: 'tt' + 's' + r.tmdb_id })));
       const emptyMovie = catalogServe.servedCatalog(config.getProfile(p3.id), 'ai-recs-movies', { record: false });
       assert.strictEqual(emptyMovie.state, 'not_built', 'genuinely-empty movie pool (Simkl connected) is not_built');
       assert.strictEqual(emptyMovie.requirement_met, true);
       // (c) Genuinely-empty type pool (Simkl NOT connected) → needs_simkl.
       const p4 = config.addProfile('INT-WBF-T5d');
-      config.updateProfile(p4.id, { filters: { engine_movie: 'genesis', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
+      config.updateProfile(p4.id, { filters: { engine_movie: 'marquee', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 } });
       const emptyMovieNoSimkl = catalogServe.servedCatalog(config.getProfile(p4.id), 'ai-recs-movies', { record: false });
       assert.strictEqual(emptyMovieNoSimkl.state, 'needs_simkl', 'genuinely-empty movie pool (no Simkl) is needs_simkl');
       assert.strictEqual(emptyMovieNoSimkl.requirement_met, false);

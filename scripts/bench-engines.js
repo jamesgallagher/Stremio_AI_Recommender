@@ -1,4 +1,4 @@
-// Engine backtest (ME-10, P5). Compares Genesis, Glass and Marquee on ONE
+// Engine backtest (ME-10, P5). Compares Marquee and Marquee TV on ONE
 // profile's REAL history: it holds out the most recent N watched movies, deletes
 // them from a throwaway copy of the store, rebuilds the movie pool with each
 // engine, and reports how many of the held-out titles each engine ranks into the
@@ -7,7 +7,7 @@
 //
 // Usage:
 //   node --experimental-sqlite scripts/bench-engines.js <profileName>
-//     [--holdout 10] [--engines genesis,glass,marquee] [--no-cache] [--json] [--keep]
+//     [--holdout 10] [--engines marquee,marquee-tv] [--no-cache] [--json] [--keep]
 //     [--marquee-config '<json>']
 //
 // What it READS: the live store (profiles.json, settings.json, store.db) —
@@ -21,13 +21,13 @@
 // so a bench run makes READ-ONLY live calls — TMDB (recommendations, similar,
 // discover, collections, trending refresh, deep meta for uncached candidates,
 // title search for LLM suggestions), MDBList (the pipeline's IMDb-rating step),
-// the local LLM (Glass's rerank; Marquee's brief, suggestions and fit), the
+// the local LLM (Marquee's brief, suggestions and fit), the
 // Simkl trending CDN (public), and authed Simkl GETs (Marquee's S2 recs, up to
 // 40 uncached summaries per Marquee run) — all paced through the governor. It
 // NEVER writes to Simkl or the live store, and it skips the Simkl RATINGS sync
 // (ctx.marqueeSkipSync). Everything fetched is cached in the throwaway copy
 // only — the store.db snapshot's cache tables (marquee_trending,
-// marquee_llm_cache, marquee_simkl_recs, glass_metadata, simkl_trending) and
+// marquee_llm_cache, marquee_simkl_recs, simkl_trending) and
 // the cache/ + meta/ files — so the live caches never warm up and the next
 // run starts equally cold.
 
@@ -37,19 +37,19 @@ const fs = require('fs');
 const REPO_ROOT = path.join(__dirname, '..');
 const USAGE =
   'Usage: node --experimental-sqlite scripts/bench-engines.js <profileName>\n'
-  + '  [--type movie|series] [--holdout 10] [--engines genesis,glass,marquee] [--no-cache] [--json] [--keep]\n'
+  + '  [--type movie|series] [--holdout 10] [--engines marquee,marquee-tv] [--no-cache] [--json] [--keep]\n'
   + "  [--serve-opts '<json>']\n"
   + "  [--marquee-config '<json>']\n"
   + 'Expect several minutes per profile on a cold cache (Marquee\'s LLM fit dominates).\n'
   + '  --type: movie (default) or series. A series run holds out the most recently STARTED\n'
   + '  shows that reached at least Engaged (real first-episode timestamps only) and defaults to\n'
-  + "  the Genesis baseline engine unless --engines is given.\n"
+  + "  the Marquee TV baseline engine unless --engines is given.\n"
   + "  --serve-opts: a JSON object of serve-config overrides (snake_case, e.g. '{\"window_factor\":4}')\n"
   + "  --marquee-config: a JSON object of Marquee config sections (e.g. '{\"agreement\":{\"genre_blend\":0}}'),\n"
   + '  merged section-wise into the SNAPSHOT\'s settings.json only — the live settings are never written.';
 
 function parseArgs(argv) {
-  const a = { profile: null, holdout: 10, type: 'movie', engines: ['genesis', 'glass', 'marquee'], enginesSet: false, noCache: false, json: false, keep: false, serveOpts: null, marqueeConfig: null, help: false };
+  const a = { profile: null, holdout: 10, type: 'movie', engines: ['marquee'], enginesSet: false, noCache: false, json: false, keep: false, serveOpts: null, marqueeConfig: null, help: false };
   for (let i = 0; i < argv.length; i++) {
     const x = argv[i];
     if (x === '--holdout') a.holdout = Number(argv[++i]);
@@ -94,9 +94,9 @@ async function main() {
   if (!a.profile) { console.error('profileName is required'); console.error(USAGE); process.exit(2); }
   if (!Number.isFinite(a.holdout) || a.holdout < 1) { console.error('--holdout must be a positive integer'); process.exit(2); }
   if (a.type !== 'movie' && a.type !== 'series') { console.error('--type must be movie or series'); process.exit(2); }
-  // TV-1 (plan §6): the series baseline is Genesis — default the engine set to
-  // ['genesis'] for a series run unless --engines was given explicitly.
-  if (a.type === 'series' && !a.enginesSet) a.engines = ['genesis'];
+  // The series baseline is Marquee TV — default the engine set to
+  // ['marquee-tv'] for a series run unless --engines was given explicitly.
+  if (a.type === 'series' && !a.enginesSet) a.engines = ['marquee-tv'];
 
   const liveDir = process.env.DATA_DIR || path.join(REPO_ROOT, 'data');
   const bench = require('../src/bench/engineBench');
@@ -128,6 +128,15 @@ async function main() {
     process.exit(2);
   }
 
+  // Unknown-engine check: exit 1 with a clear message.
+  const known = engines.list().map((e) => e.id);
+  for (const id of a.engines) {
+    if (!known.includes(id)) {
+      console.error(`bench-engines: unknown engine ${id} (known: ${known.join(', ')})`);
+      process.exit(1);
+    }
+  }
+
   const quiet = { log() {}, warn() {}, error() {} };
   console.log('Live read-only calls: TMDB, MDBList, local LLM, Simkl (trending CDN + ≤40 recs GETs). No writes to Simkl or the live store.');
   let results;
@@ -144,7 +153,7 @@ async function main() {
         // filters? Cached deep meta first; a read-only TMDB fetch (≤ holdout
         // calls) only when the cache lacks it or predates availability data.
         reachability: async (targetIds, filters) => {
-          const metaStore = require('../src/engines/glass/metaStore');
+          const metaStore = require('../src/engines/shared/metaStore');
           const tmdb = require('../src/services/tmdb');
           const mdblist = require('../src/services/mdblist');
           const animeMap = require('../src/services/animeMap');

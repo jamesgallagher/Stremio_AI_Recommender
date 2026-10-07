@@ -25,9 +25,8 @@ const key = (type, tmdbId) => `${type}:${tmdbId}`;
 // Map a NormalizedCandidate's CONTRACT fields onto the pool-row keys
 // upsertCandidates expects, accepting either the contract names
 // (rankScore/reason/recCount — what a conformant engine emits) or the internal
-// names (affinity/because_title/rec_count — what Genesis already carries). This
-// keeps the pool schema the single output contract (I4/I6) and lets
-// upsertCandidates stay dumb. Mutates + returns the candidate.
+// names (affinity/because_title/rec_count). This keeps the pool schema the
+// single output contract (I4/I6) and lets upsertCandidates stay dumb. Mutates + returns the candidate.
 function normalize(c) {
   c.affinity = c.rankScore ?? c.affinity ?? 0;
   c.because_title = c.reason ?? c.because_title ?? null;
@@ -56,8 +55,8 @@ async function runEngineBuild(profile, type, engine, ctx, onProgress = () => {},
   const { tmdbKey, filters = {}, log = console } = ctx;
 
   // Shared exclusion sets (I5), resolved once per build and shared with the
-  // engine via ctx so a pre-filtering engine (Genesis) and this invariant agree
-  // on the same data. Profile-wide, so both type-builds reuse them.
+  // engine via ctx so a pre-filtering engine and this invariant agree on the
+  // same data. Profile-wide, so both type-builds reuse them.
   ctx.watchedIds = ctx.watchedIds || watchedStore.watchedIdSets(profile.id);
   ctx.dont = ctx.dont || store.dontRecommendKeys(profile.id);
   ctx.stats = {};
@@ -66,9 +65,9 @@ async function runEngineBuild(profile, type, engine, ctx, onProgress = () => {},
   const cands = (await engine.generate(profile, type, ctx, (p, l) => onProgress(p * 0.40, l))) || [];
 
   // 2. Normalize + subtract watched + dont_recommend + porn for THIS type. The
-  //    shared invariant (I5): Genesis already pre-excluded, so this is a no-op
-  //    for it, but it GUARANTEES the gate for every engine. Porn is dropped here
-  //    too (I7 blacklist proper lives in the age gate).
+  //    shared invariant (I5): a pre-filtering engine already pre-excluded, so
+  //    this is a no-op for it, but it GUARANTEES the gate for every engine.
+  //    Porn is dropped here too (I7 blacklist proper lives in the age gate).
   const filtered = cands
     .map(normalize)
     .filter((c) => c.type === type)

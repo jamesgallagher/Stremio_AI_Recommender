@@ -641,7 +641,7 @@ async function unitTests() {
   await ok('handlers: trainer T1 — rate/ignore/finished/list act on the session profile only (M1/M2/M10)', async () => {
     const wStore = require('../../src/watchedStore');
     const tasteFeedback = require('../../src/tasteFeedback');
-    const metaStore = require('../../src/engines/glass/metaStore');
+    const metaStore = require('../../src/engines/shared/metaStore');
     const jobs = require('../../src/jobs');
     const origSet = simkl.setRatings;
     const origRemove = simkl.removeRatings;
@@ -920,7 +920,7 @@ async function unitTests() {
       recommendationStore.upsertCandidates(pid, rows);
       const watchedIds = ['ttA1', 'ttA2', 'ttB1', 'ttB2', 'ttC1', 'ttD1'];
       for (const imdbId of watchedIds) watchedStore.addPendingWatched(pid, { type: 'movie', imdbId });
-      const profile = { id: pid, filters: { engine_movie: 'genesis', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 }, companion: { catalog_only: true } };
+      const profile = { id: pid, filters: { engine_movie: 'marquee', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 }, companion: { catalog_only: true } };
       const res = fakeRes();
       handlers.recommendationsHandler({ query: { type: 'movie' }, profile }, res);
       assert.strictEqual(res.body.view, 'catalog');
@@ -948,7 +948,7 @@ async function unitTests() {
       recommendationStore.upsertCandidates(pid, rows);
       const watchedIds = ['ttA1', 'ttA2', 'ttB1', 'ttB2', 'ttC1', 'ttD1'];
       for (const imdbId of watchedIds) watchedStore.addPendingWatched(pid, { type: 'movie', imdbId });
-      const profile = { id: pid, filters: { engine_movie: 'genesis', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 }, companion: { catalog_only: true } };
+      const profile = { id: pid, filters: { engine_movie: 'marquee', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 }, companion: { catalog_only: true } };
       const catRes = fakeRes();
       handlers.recommendationsHandler({ query: { type: 'movie', view: 'catalog' }, profile }, catRes);
       const bench = catRes.body.items.slice(catRes.body.display_count);
@@ -977,7 +977,7 @@ async function unitTests() {
       for (let i = 1; i <= 500; i++) rows.push(mkCand({ tmdb_id: 'A' + i, imdb_id: 'ttA' + i, title: 'T' + 'A' + i, affinity: 500 - i, primary_genre: 'Action', genres: 'Action' }));
       for (let i = 1; i <= 10; i++) rows.push(mkCand({ tmdb_id: 'D' + i, imdb_id: 'ttD' + i, title: 'T' + 'D' + i, affinity: 0.9 - i * 0.01, primary_genre: 'Drama', genres: 'Drama' }));
       recommendationStore.upsertCandidates(pid, rows);
-      const profile = { id: pid, filters: { engine_movie: 'genesis', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 }, companion: { catalog_only: true } };
+      const profile = { id: pid, filters: { engine_movie: 'marquee', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 }, companion: { catalog_only: true } };
       const res = fakeRes();
       handlers.recommendationsHandler({ query: { type: 'movie', view: 'catalog' }, profile }, res);
       const stremio = catalogServe.servedCatalog(profile, 'ai-recs-movies', { record: false }).metas.map((m) => m.id);
@@ -999,7 +999,7 @@ async function unitTests() {
       recommendationStore.upsertCandidates(pid, [...movieRows, ...seriesRows]);
       const crossImdb = 'ttM1';
       watchedStore.addPendingWatched(pid, { type: 'series', imdbId: crossImdb });
-      const profile = { id: pid, filters: { engine_movie: 'genesis', engine_series: 'genesis', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 }, companion: { catalog_only: true } };
+      const profile = { id: pid, filters: { engine_movie: 'marquee', engine_series: 'marquee-tv', list_size: 20, min_rating: 0, excluded_genres: [], max_age_years: 0, age_limit: 0 }, companion: { catalog_only: true } };
       const before = recommendationStore.getRecommended(pid, { type: 'movie', limit: 100000 });
       const beforeByTmdb = new Map(before.map((r) => [r.tmdb_id, r]));
       const movieRes = fakeRes();
@@ -1048,14 +1048,12 @@ async function unitTests() {
     recommendationStore.deleteForProfile(pid);
   });
 
-  await ok('settings: toCompanionFilters exposes the editable filters (incl. title decay + per-type engine), never the age gate', () => {
-    const out = handlers.toCompanionFilters({ min_rating: 6, vote_count_floor: 1000, min_year: 2010, excluded_genres: ['Horror'], list_size: 20, title_decay_enabled: true, title_decay_days: 30, age_limit: 8, engine_movie: 'genesis', engine_series: 'genesis' });
-    assert.deepStrictEqual(Object.keys(out).sort(), ['engine_movie', 'engine_series', 'excluded_genres', 'list_size', 'min_rating', 'min_year', 'title_decay_days', 'title_decay_enabled', 'vote_count_floor']);
+  await ok('settings: toCompanionFilters exposes the editable filters (incl. title decay), never the age gate', () => {
+    const out = handlers.toCompanionFilters({ min_rating: 6, vote_count_floor: 1000, min_year: 2010, excluded_genres: ['Horror'], list_size: 20, title_decay_enabled: true, title_decay_days: 30, age_limit: 8, engine_movie: 'marquee', engine_series: 'marquee-tv' });
+    assert.deepStrictEqual(Object.keys(out).sort(), ['excluded_genres', 'list_size', 'min_rating', 'min_year', 'title_decay_days', 'title_decay_enabled', 'vote_count_floor']);
     assert.ok(!('age_limit' in out), 'age gate never exposed');
     assert.strictEqual(out.title_decay_enabled, true);
     assert.strictEqual(out.title_decay_days, 30);
-    assert.strictEqual(out.engine_movie, 'genesis'); // v7: per-type engine round-trips to the phone
-    assert.strictEqual(out.engine_series, 'genesis');
     assert.deepStrictEqual(out.excluded_genres, ['Horror']);
     assert.deepStrictEqual(handlers.toCompanionFilters({}).excluded_genres, []); // always an array
   });
@@ -1088,63 +1086,52 @@ async function unitTests() {
     assert.ok(!('age_limit' in res.body.filters), 'response never echoes the age gate');
   });
 
-  await ok('settings: POST forwards the per-type engine choice through the whitelist, still never the age gate (SC-02)', () => {
-    // The whitelist itself carries the two engine fields (SC-03's rebuild-on-change
-    // for companion saves depends on them being writable here).
-    assert.ok(handlers.COMPANION_FILTERS.includes('engine_movie'));
-    assert.ok(handlers.COMPANION_FILTERS.includes('engine_series'));
+  await ok('settings: POST never forwards engine fields (engines are fixed), still never the age gate', () => {
     const p = config.addProfile('SetEngine');
     config.updateProfile(p.id, { filters: { age_limit: 10 } }); // an age-limited profile
     const res = fakeRes();
     handlers.settingsPostHandler({
       profile: config.getProfile(p.id),
-      body: { engine_movie: 'genesis', engine_series: 'genesis', age_limit: 0 }, // age_limit MUST be dropped
+      body: { engine_movie: 'marquee', engine_series: 'marquee-tv', age_limit: 0, min_rating: 5 }, // engine + age_limit MUST be dropped; min_rating is writable
     }, res);
     assert.strictEqual(res.body.ok, true);
     const after = config.getProfile(p.id);
-    assert.strictEqual(after.filters.engine_movie, 'genesis');  // forwarded + written
-    assert.strictEqual(after.filters.engine_series, 'genesis');
     assert.strictEqual(after.filters.age_limit, 10, 'age gate untouched by the Companion');
-    assert.strictEqual(res.body.filters.engine_movie, 'genesis'); // echoed back to the phone
+    assert.strictEqual(after.filters.min_rating, 5, 'writable filter written');
+    assert.ok(!('engine_movie' in res.body.filters), 'engine not echoed back');
   });
 
-  await ok('settings: companionSettings ships per-type engine lists + requirements (SC-05), age + enablement gated server-side, no age leak', () => {
-    const settingsMod = require('../../src/settings');
+  await ok('settings: companionSettings ships per-type engine summary + requirements, no age leak', () => {
     const engines = require('../../src/engines');
 
-    // Genesis-only: both lists carry exactly Genesis; requirements present; the
-    // DTO is phone-safe (no capabilities / supported_types); no age in the
-    // requirement wording.
+    // Both Marquee engines: movie carries marquee, series carries marquee-tv;
+    // the DTO is phone-safe (no capabilities / supported_types).
     const p = config.addProfile('EngList');
     const s0 = handlers.companionSettings(config.getProfile(p.id));
-    assert.deepStrictEqual(s0.engines.available.movie.map((e) => e.id), ['genesis']);
-    assert.deepStrictEqual(s0.engines.available.series.map((e) => e.id), ['genesis']);
+    assert.strictEqual(s0.engines.movie.id, 'marquee');
+    assert.strictEqual(s0.engines.series.id, 'marquee-tv');
+    assert.deepStrictEqual(Object.keys(s0.engines.movie).sort(), ['description', 'id', 'name']); // no internal-flag leak
     assert.strictEqual(typeof s0.engines.requirements.movie.ok, 'boolean');
     assert.strictEqual(typeof s0.engines.requirements.series.ok, 'boolean');
-    assert.deepStrictEqual(Object.keys(s0.engines.available.movie[0]).sort(), ['description', 'id', 'name']); // no internal-flag leak
-    const reqWording = JSON.stringify([s0.engines.requirements.movie, s0.engines.requirements.series]).toLowerCase();
-    assert.ok(!reqWording.includes('age'), 'requirement wording never mentions age');
 
-    // I7 + SC-07 compose: register the canonical unrestricted fixture `fake-open`
-    // (test/fixtures/fake-engine.js, SC-06) and ENABLE it (SC-07 — otherwise
-    // availableFor excludes it as disabled). It is then offered to an adult profile
-    // and OMITTED from an age-limited one, with no age value sent either way.
+    // I7: register the canonical unrestricted fixture `fake-open`
+    // (test/fixtures/fake-engine.js, SC-06). resolveFor falls back to the
+    // type's default for an age-limited profile (I7 gate).
     const dispose = engines._register(fakeOpen);
-    settingsMod.updateSettings({ engines: { 'fake-open': true } });
     try {
       const adult = config.addProfile('EngAdult');
+      config.updateProfile(adult.id, { filters: { engine_movie: 'fake-open' } });
       const sA = handlers.companionSettings(config.getProfile(adult.id));
-      assert.ok(sA.engines.available.movie.some((e) => e.id === 'fake-open')); // offered to an adult
+      assert.strictEqual(sA.engines.movie.id, 'fake-open'); // resolved for an adult
 
       const kid = config.addProfile('EngKid');
-      config.updateProfile(kid.id, { filters: { age_limit: 12 } });
+      config.updateProfile(kid.id, { filters: { age_limit: 12, engine_movie: 'fake-open' } });
       const sK = handlers.companionSettings(config.getProfile(kid.id));
-      assert.ok(!sK.engines.available.movie.some((e) => e.id === 'fake-open')); // hidden from a kid
-      assert.ok(!sK.engines.available.series.some((e) => e.id === 'fake-open'));
+      assert.strictEqual(sK.engines.movie.id, 'marquee'); // I7: unrestricted engine falls back for a kid
       assert.ok(!('age_limit' in sK.filters), 'no age gate in the filters payload');
       assert.ok(!JSON.stringify(sK).includes('age_limit'), 'no age_limit anywhere in the settings response');
       config.removeProfile(adult.id); config.removeProfile(kid.id);
-    } finally { dispose(); settingsMod.updateSettings({ engines: { 'fake-open': false } }); }
+    } finally { dispose(); }
     config.removeProfile(p.id);
   });
 

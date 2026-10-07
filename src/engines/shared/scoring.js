@@ -13,7 +13,7 @@
 const metaStore = require('./metaStore');
 const animeMap = require('../../services/animeMap');
 const certs = require('../../certs');
-const { ALGORITHM_VERSION } = require('./config');
+const { ALGORITHM_VERSION } = require('./tasteConfig');
 
 const clamp01 = (x) => Math.max(0, Math.min(1, x));
 const { runtimeBand } = require('./tasteModel');

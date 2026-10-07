@@ -38,13 +38,12 @@ const DEFAULT_FILTERS = {
   title_decay_days: 60, // sustained-visibility window in days when enabled (clamped 14–365)
   // Which engine builds each catalog's candidates (v7 — see
   // docs/engine-abstraction). Per-type so Movies and Series can run different
-  // engines. Defaults to Genesis, the original TMDB-affinity engine (now the
-  // first plug-in). The valid-id source of truth is the engine registry
+  // engines. The valid-id source of truth is the engine registry
   // (src/engines), not a hardcoded list — so there's no drift; any unknown or
-  // type-unsupported id falls back to Genesis at read (migrate) and write
-  // (updateProfile). Requirement #5: default everything to the current engine.
-  engine_movie: 'genesis',
-  engine_series: 'genesis',
+  // type-unsupported id falls back to the type's default at read (migrate) and
+  // write (updateProfile).
+  engine_movie: 'marquee',
+  engine_series: 'marquee-tv',
 };
 
 // Auto-scrobble: mirror this profile's Nuvio/Stremio watched history into
@@ -173,9 +172,9 @@ function applyMigrations(p) {
   }
   // v7: per-type engine selection (see docs/engine-abstraction). Retire the dead
   // single-engine field (the v5 Trakt/AI concept, never actually wired) and add
-  // engine_movie/engine_series, each defaulting to Genesis. Any unknown or
-  // type-unsupported id (incl. the old 'trakt'/'ai', or a hand-edited value)
-  // coerces to Genesis so a stale value can never disable a type. Idempotent —
+  // engine_movie/engine_series. Any unknown or type-unsupported id (incl. the
+  // old 'trakt'/'ai', 'genesis', 'glass', or a hand-edited value) coerces to the
+  // type's default so a stale value can never disable a type. Idempotent —
   // safe to run on every load, like the other migrations.
   if (p.filters.engine !== undefined) delete p.filters.engine;
   {
@@ -184,7 +183,7 @@ function applyMigrations(p) {
       const f = `engine_${t}`;
       const cur = p.filters[f];
       const e = engines.get(cur);
-      p.filters[f] = (e && e.supportedTypes.includes(t)) ? cur : 'genesis';
+      p.filters[f] = (e && e.supportedTypes.includes(t)) ? cur : engines.DEFAULT_IDS[t];
     }
   }
   // v6: Simkl fields alongside the (still-present) Trakt ones.
@@ -309,7 +308,7 @@ function addProfile(name) {
 // config.js itself never touches recommendationStore (no dependency/cycle across
 // the layer). engineChanged is captured around the WHOLE update so it also picks
 // up an age-limit-driven revocation (§5.5 pt3), where raising age_limit rewrites
-// engine_<type> to 'genesis' without the field appearing in the patch.
+// engine_<type> to the type's default without the field appearing in the patch.
 function updateProfile(id, patch) {
   let updated = null;
   const engineChanged = [];
@@ -371,22 +370,12 @@ function updateProfile(id, patch) {
       if (f.vote_count_floor !== undefined) profile.filters.vote_count_floor = Math.max(0, parseInt(f.vote_count_floor, 10) || 0);
       // v7: per-type engine choice, validated against the registry AND the
       // profile's age limit (I7 / docs/engine-abstraction §5.5). An unknown,
-      // type-unsupported, or age-inappropriate id silently lands on Genesis —
-      // never an error, never a disabled type, never open content on a kids
-      // profile (safety over strictness). Judged on the EFFECTIVE age limit: the
-      // value AFTER this patch (age_limit is applied just above), so a body that
-      // raises age_limit and picks an unrestricted engine together is rejected on
-      // the new limit. (The slice-clear + rebuild that must follow a revocation
-      // is SC-03; this card only makes the stored value safe.)
-      // NOTE: global enablement (SC-07) is deliberately NOT checked here. It is a
-      // resolve-time floor, not a write constraint: engines.resolveFor() returns
-      // Genesis for a disabled engine on build/serve, and an admin disable fans out
-      // a persisted revert (portal.revertDisabledEngines). Gating the WRITE too
-      // would forbid the legitimate "pre-select an engine on a profile, then enable
-      // it globally" workflow — and only Genesis (permanently enabled) could ever be
-      // stored. So a stored id may name a currently-disabled engine; it simply
-      // never SERVES that engine (resolveFor floors it). Storing an unknown/
-      // type-unsupported/age-inappropriate id still coerces to Genesis below.
+      // type-unsupported, or age-inappropriate id silently lands on the type's
+      // default — never an error, never a disabled type, never open content on a
+      // kids profile (safety over strictness). Judged on the EFFECTIVE age limit:
+      // the value AFTER this patch (age_limit is applied just above), so a body
+      // that raises age_limit and picks an unrestricted engine together is
+      // rejected on the new limit.
       const engines = require('./engines'); // lazy: no config↔engines load cycle
       const effLimit = profile.filters.age_limit || 0;
       for (const t of ['movie', 'series']) {
@@ -395,7 +384,7 @@ function updateProfile(id, patch) {
           const e = engines.get(String(f[field]));
           const okType = e && e.supportedTypes.includes(t);
           const okAge = e && !(e.capabilities.unrestricted && effLimit > 0);
-          profile.filters[field] = (okType && okAge) ? e.id : 'genesis';
+          profile.filters[field] = (okType && okAge) ? e.id : engines.DEFAULT_IDS[t];
         }
       }
       // Safety re-validation: raising the age limit must REVOKE an already-stored
@@ -404,7 +393,7 @@ function updateProfile(id, patch) {
       if (effLimit > 0) {
         for (const t of ['movie', 'series']) {
           const cur = engines.get(profile.filters[`engine_${t}`]);
-          if (cur && cur.capabilities.unrestricted) profile.filters[`engine_${t}`] = 'genesis';
+          if (cur && cur.capabilities.unrestricted) profile.filters[`engine_${t}`] = engines.DEFAULT_IDS[t];
         }
       }
       if (f.title_decay_enabled !== undefined) profile.filters.title_decay_enabled = !!f.title_decay_enabled;

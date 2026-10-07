@@ -16,7 +16,7 @@
 //   filterPass      selectServe(limit=rows.length).length / rows.length
 //   trending@20     share of the top-20 served whose score_components.sources
 //                    includes 'trending' (null when the engine emits no
-//                    score_components — e.g. Genesis)
+//                    score_components)
 const pickTargets = (watched, holdout) => {
   // Spec §5.3: need holdout + 20 watched movies, else "not enough history".
   if (!Array.isArray(watched) || watched.length < holdout + 20) {
@@ -97,7 +97,7 @@ const metrics = (rows, targets, filters, { selectServe, stored, buildSeconds, re
 
   // trending@20: share of the top-20 served whose score_components.sources
   // includes 'trending'. null (n/a) when the engine emits no score_components
-  // at all (Genesis today) — 0 would be a false "no trending" signal.
+  // at all — 0 would be a false "no trending" signal.
   let trending = null;
   let hasComps = false;
   if (served20.length) {

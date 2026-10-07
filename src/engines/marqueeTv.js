@@ -24,8 +24,8 @@ const recommendationStore = require('../recommendationStore');
 const watchedStore = require('../watchedStore');
 const tasteFeedback = require('../tasteFeedback');
 const animeMap = require('../services/animeMap');
-const glassTaste = require('./glass/tasteModel');
-const glassConfig = require('./glass/config');
+const sharedTaste = require('./shared/tasteModel');
+const tasteConfig = require('./shared/tasteConfig');
 const marqueeTvConfig = require('./marqueeTv/config');
 const meta = require('./marqueeTv/meta');
 const simklRecs = require('./marqueeTv/simklRecs');
@@ -220,8 +220,8 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
   // 2. Taste: the Glass taste model over ladder-weighted events (§4.5) + seeds.
   const dontRows = recommendationStore.getDontRecommendRows(profile.id, 'series');
   const events = taste.tasteEvents(ladderEntries, dontRows, nowMs, isAnimeRow);
-  const glassCfg = glassConfig.resolveConfig(ctx.settings);
-  const tasteModel = glassTaste.buildTasteModel(profile.id, 'series', glassCfg, { nowMs, events });
+  const tasteCfg = tasteConfig.resolveConfig(ctx.settings);
+  const tasteModel = sharedTaste.buildTasteModel(profile.id, 'series', tasteCfg, { nowMs, events });
   const seedList = taste.seeds(ladderEntries, cfg, isAnimeRow);
   const seedValue = new Map();
   const seedTitles = new Map();
@@ -248,7 +248,7 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
 
   // 3. Gather (§5.4): T1/T2/T3/T5/T6, merged by tmdb_id.
   const sctx = { ...ctx, profile, apiKey: ctx.tmdbKey };
-  const tasteGenresTop = glassTaste.topGenres(tasteModel, 6);
+  const tasteGenresTop = sharedTaste.topGenres(tasteModel, 6);
   const raws = [];
   raws.push(...(await sources.sourceSimklRecs(sctx, seedList, { fetcher: f.simklRecs, log })));
   raws.push(...(await sources.sourceTmdbRecs(sctx, seedList, { fetcher: f.tmdbRecs, t2PerSeed: cfg.t2_per_seed, log })));
@@ -342,7 +342,7 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
     const c = { ...m, imdb_rating: (m.imdb_id && imdbRatings.has(m.imdb_id)) ? (imdbRatings.get(m.imdb_id) || 0) : 0 };
     if (!filter.check(c).ok) continue;
     // 7. Score (§4.7).
-    const { features, penalty, score } = scoring.scoreTv(c, m, tasteModel, glassCfg, {
+    const { features, penalty, score } = scoring.scoreTv(c, m, tasteModel, tasteCfg, {
       collabNorm: collabNorm.get(k.id) || 0,
       trendingRaw: k.trendingRaw,
       comfort,

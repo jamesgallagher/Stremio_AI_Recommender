@@ -8,8 +8,8 @@
 // owns that column; the MDBList value is carried only in scoreComponents.inputs.
 // MD-2: trending_eff = trending_raw × tasteGate(taste_match) — trending only
 // lifts films that already fit the viewer.
-const metaStore = require('../glass/metaStore');
-const glassScoring = require('../glass/scoring');
+const metaStore = require('../shared/metaStore');
+const sharedScoring = require('../shared/scoring');
 const features = require('./features');
 const recency = require('../../recency');
 const tmdb = require('../../services/tmdb');
@@ -159,7 +159,7 @@ async function scoreCandidates(profile, ctx, candidates, {
       continue;
     }
 
-    const tm = glassScoring.tasteMatch(meta, taste, cfg);
+    const tm = sharedScoring.tasteMatch(meta, taste, cfg);
     const trendingRaw = features.trendingRaw(cand.trending, { ...gatherMeta, risingTop: cfg.trending.rising_top, risingBonus: cfg.trending.rising_bonus });
     const cert = strictestCert(meta.certAU, meta.certUS);
     const feat = {
