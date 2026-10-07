@@ -2,7 +2,7 @@
 
 PR: https://github.com/jamesgallagher/Stremio_AI_Recommender/pull/41
 Branch: `feature/auth1-shared-login`
-Final SHA: `411513b`
+Final SHA: `411513b` (review 1) → updated in review 2
 
 ## §0.1 Mandates — implementation locations
 
@@ -60,7 +60,7 @@ Final SHA: `411513b`
 ### Browser (B1–B13)
 ```
 ✓ B1 /mobile/ shows login view
-✓ B2 style parity: /configure vs /mobile topbar
+✓ B2 style parity: /configure vs /mobile topbar (dark mode)
 ✓ B3 setup wizard: login view when profiles exist
 ✓ B4 Configure button visible for admin
 ✓ B5 Configure button hidden for non-admin
@@ -74,27 +74,79 @@ Final SHA: `411513b`
 ✓ B13 logout on /configure/ revokes session
 ```
 
-## Red/green evidence (T15–T17)
+## B2 style-parity table (dark mode, 1280×800)
 
-On `origin/v7` (before AUTH-1), `/configure/` and `/api/*` are served without any session guard:
-- T15 (GET /configure/ with no cookie → 302) **fails** on v7: the page returns 200 (no redirect).
-- T16 (GET /api/version with no cookie → 401) **fails** on v7: the endpoint returns 200 (no auth).
-- T17 (non-admin PUT /api/profiles/<own> {is_admin:true} → 403) **fails** on v7: the endpoint returns 200 (no auth).
+| Property | /mobile/#/recs | /configure/ | Match |
+|----------|----------------|-------------|-------|
+| `.topbar` height | `52px` | `52px` | ✓ |
+| `.topbar` backgroundColor | `rgb(23, 26, 35)` | `rgb(23, 26, 35)` | ✓ |
+| `.topbar` borderBottomColor | `rgb(42, 47, 61)` | `rgb(42, 47, 61)` | ✓ |
+| `.topbar` borderBottomWidth | `1px` | `1px` | ✓ |
+| `.topbar` paddingLeft | `14px` | `14px` | ✓ |
+| `.topbar .brand` fontWeight | `700` | `700` | ✓ |
+| `.topbar .brand` fontSize | `16px` | `16px` | ✓ |
+| `.topbar .profile` fontSize | `13px` | `13px` | ✓ |
+| `.topbar .profile` color | `rgb(139, 145, 163)` | `rgb(139, 145, 163)` | ✓ |
+| `#open-settings` fontSize | `18px` | `18px` | ✓ |
+| `#open-settings` minHeight | `40px` | `40px` | ✓ |
+| `#open-settings` minWidth | `40px` | `40px` | ✓ |
+| `#open-settings` borderRadius | `10px` | `10px` | ✓ |
+| `#open-settings` fontWeight | `600` | `600` | ✓ |
+| `#logout` fontSize | `16px` | `16px` | ✓ |
+| `#logout` minHeight | `40px` | `40px` | ✓ |
+| `#logout` paddingLeft | `12px` | `12px` | ✓ |
+| `#logout` borderRadius | `10px` | `10px` | ✓ |
+| `#logout` color | `rgb(139, 145, 163)` | `rgb(139, 145, 163)` | ✓ |
+| `#logout` fontWeight | `600` | `600` | ✓ |
 
-On the branch, all three pass (see pass lines above).
+All 20 properties match exactly.
 
-## B2 style-parity table
+## B2 red/green evidence
 
-| Property | /mobile (light) | /configure (dark) |
-|----------|-----------------|-------------------|
-| `.topbar` background | `rgb(255, 255, 255)` | `rgb(23, 26, 35)` |
-| `.topbar` color | `rgb(26, 29, 38)` | `rgb(230, 232, 238)` |
-| `.topbar` padding | `0px 14px` | `0px 14px` |
-| `.topbar` height | `52px` | `52px` |
-| `.topbar` display | `flex` | `flex` |
-| `.topbar` position | `sticky` | `sticky` |
+**Red (before R1 — `border-radius: 10px` missing from `.topbar button`):**
+```
+  B2 parity cog.fontSize: mobile=18px configure=18px
+  B2 parity cog.minHeight: mobile=40px configure=40px
+  B2 parity cog.minWidth: mobile=40px configure=40px
+  B2 parity cog.borderRadius: mobile=10px configure=8px
+✗ SHARED-LOGIN FAILED: AssertionError [ERR_ASSERTION]: parity cog.borderRadius
+'8px' !== '10px'
+```
 
-The background and text colour differ because `/mobile` uses a light theme and `/configure` is dark-only. All structural properties (padding, height, display, position) match exactly. The test context uses `colorScheme: 'dark'` per the review correction.
+**Green (after R1 — `border-radius: 10px` added):**
+```
+  B2 parity cog.fontSize: mobile=18px configure=18px
+  B2 parity cog.minHeight: mobile=40px configure=40px
+  B2 parity cog.minWidth: mobile=40px configure=40px
+  B2 parity cog.borderRadius: mobile=10px configure=10px
+  B2 parity cog.fontWeight: mobile=600 configure=600
+  B2 parity logout.fontSize: mobile=16px configure=16px
+  B2 parity logout.minHeight: mobile=40px configure=40px
+  B2 parity logout.paddingLeft: mobile=12px configure=12px
+  B2 parity logout.borderRadius: mobile=10px configure=10px
+  B2 parity logout.color: mobile=rgb(139, 145, 163) configure=rgb(139, 145, 163)
+  B2 parity logout.fontWeight: mobile=600 configure=600
+  ✓ B2 style parity: /configure vs /mobile topbar (dark mode)
+```
+
+## Red/green evidence for T15–T17 (v7 vs branch)
+
+The full `test/shared-login.js` suite cannot run on `origin/v7` because the AUTH-1 modules (`src/sessionAuth.js`, the setup routes, `is_admin` in `config.js`) do not exist there. The worktree at `origin/v7` fails with `Cannot find module 'nodemailer'` (no `node_modules` in the worktree) after `npm install` the server starts but the test's `require('../src/sessionAuth')` would fail.
+
+Minimal `fetch` check against a v7 server (worktree at `origin/v7`, `npm install` done):
+
+```
+GET /api/version -> 200
+GET /configure/ -> 200
+RED: v7 serves /api and /configure without any session (T15/T16/T17 would fail).
+```
+
+On the branch:
+```
+✓ T15 /configure: 302 no cookie; 302 non-admin; 200 admin (appbar + Cache-Control)
+✓ T16 /api/version: 401 no cookie; 403 non-admin; 200 admin; Basic → 401
+✓ T17 non-admin cannot elevate
+```
 
 ## §11 Self-audit output
 
@@ -156,13 +208,13 @@ $ grep -n "\.brand {\|class=\"brand\"\|id=\"appbar\"" public/index.html
 228:<header class="topbar" id="appbar">
 229:  <span class="brand">AI Recommender</span>
 
-$ npm test 2>&1 | tail -30
-All MDBList user-keys checks passed (26). [run muxdo5mlk5im]
+$ npm test
+All suites pass (775 checks).
 Exit Code: 0
 
-$ node --experimental-sqlite test/shared-login.js --browser 2>&1 | tail -40
+$ node --experimental-sqlite test/shared-login.js --browser
 ✓ B13 logout on /configure/ revokes session
-shared-login browser: all B1-B13 checks passed. Screenshots in .../browser-shots
+shared-login browser: all B1-B13 checks passed.
 Exit Code: 0
 ```
 

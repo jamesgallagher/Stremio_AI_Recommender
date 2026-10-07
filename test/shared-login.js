@@ -560,26 +560,58 @@ function makeLegacy(name, email, createdAt) {
       await freshPage.screenshot({ path: path.join(SHOT_DIR, 'B1-mobile-login.png') });
     });
 
-    await ok('B2 style parity: /configure vs /mobile topbar', async () => {
-      await adminPage.goto(BASE + '/mobile/');
-      await adminPage.waitForTimeout(1500);
-      const mobileCss = await adminPage.evaluate(() => {
-        const bar = document.querySelector('.topbar');
-        if (!bar) return null;
-        const cs = getComputedStyle(bar);
-        return { background: cs.backgroundColor, color: cs.color, padding: cs.padding, height: cs.height, display: cs.display, position: cs.position };
+    await ok('B2 style parity: /configure vs /mobile topbar (dark mode)', async () => {
+      const darkCtx = await browser.newContext({ viewport: { width: 1280, height: 800 }, colorScheme: 'dark' });
+      await darkCtx.addCookies([{ name: 'air_sid', value: adminToken2, url: BASE }]);
+      const darkPage = await darkCtx.newPage();
+
+      // Collect computed styles from /mobile/#/recs
+      await darkPage.goto(BASE + '/mobile/#/recs');
+      await darkPage.waitForTimeout(2000);
+      const mobileStyles = await darkPage.evaluate(() => {
+        function cs(sel) { const el = document.querySelector(sel); if (!el) return null; const c = getComputedStyle(el); return c; }
+        const bar = cs('.topbar');
+        const brand = cs('.topbar .brand');
+        const profile = cs('.topbar .profile');
+        const cog = cs('#open-settings');
+        const logout = cs('#logout');
+        return {
+          topbar: { height: bar.height, backgroundColor: bar.backgroundColor, borderBottomColor: bar.borderBottomColor, borderBottomWidth: bar.borderBottomWidth, paddingLeft: bar.paddingLeft },
+          brand: { fontWeight: brand.fontWeight, fontSize: brand.fontSize },
+          profile: { fontSize: profile.fontSize, color: profile.color },
+          cog: { fontSize: cog.fontSize, minHeight: cog.minHeight, minWidth: cog.minWidth, borderRadius: cog.borderRadius, fontWeight: cog.fontWeight },
+          logout: { fontSize: logout.fontSize, minHeight: logout.minHeight, paddingLeft: logout.paddingLeft, borderRadius: logout.borderRadius, color: logout.color, fontWeight: logout.fontWeight },
+        };
       });
-      await adminPage.goto(BASE + '/configure/');
-      await adminPage.waitForTimeout(1500);
-      const configureCss = await adminPage.evaluate(() => {
-        const bar = document.querySelector('.topbar') || document.querySelector('#appbar');
-        if (!bar) return null;
-        const cs = getComputedStyle(bar);
-        return { background: cs.backgroundColor, color: cs.color, padding: cs.padding, height: cs.height, display: cs.display, position: cs.position };
+
+      // Collect computed styles from /configure/
+      await darkPage.goto(BASE + '/configure/');
+      await darkPage.waitForTimeout(2000);
+      const configureStyles = await darkPage.evaluate(() => {
+        function cs(sel) { const el = document.querySelector(sel); if (!el) return null; const c = getComputedStyle(el); return c; }
+        const bar = cs('.topbar');
+        const brand = cs('.topbar .brand');
+        const profile = cs('.topbar .profile');
+        const cog = cs('#open-settings');
+        const logout = cs('#logout');
+        return {
+          topbar: { height: bar.height, backgroundColor: bar.backgroundColor, borderBottomColor: bar.borderBottomColor, borderBottomWidth: bar.borderBottomWidth, paddingLeft: bar.paddingLeft },
+          brand: { fontWeight: brand.fontWeight, fontSize: brand.fontSize },
+          profile: { fontSize: profile.fontSize, color: profile.color },
+          cog: { fontSize: cog.fontSize, minHeight: cog.minHeight, minWidth: cog.minWidth, borderRadius: cog.borderRadius, fontWeight: cog.fontWeight },
+          logout: { fontSize: logout.fontSize, minHeight: logout.minHeight, paddingLeft: logout.paddingLeft, borderRadius: logout.borderRadius, color: logout.color, fontWeight: logout.fontWeight },
+        };
       });
-      console.log('  B2 parity: mobile=' + JSON.stringify(mobileCss) + ' configure=' + JSON.stringify(configureCss));
-      assert.ok(mobileCss, 'mobile topbar exists');
-      assert.ok(configureCss, 'configure topbar exists');
+
+      // Assert every pair is equal
+      const groups = ['topbar', 'brand', 'profile', 'cog', 'logout'];
+      for (const g of groups) {
+        for (const prop of Object.keys(mobileStyles[g])) {
+          console.log(`  B2 parity ${g}.${prop}: mobile=${mobileStyles[g][prop]} configure=${configureStyles[g][prop]}`);
+          assert.strictEqual(configureStyles[g][prop], mobileStyles[g][prop], `parity ${g}.${prop}`);
+        }
+      }
+      await darkCtx.close();
     });
 
     await ok('B3 setup wizard: login view when profiles exist', async () => {
