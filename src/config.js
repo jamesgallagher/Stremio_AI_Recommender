@@ -308,7 +308,7 @@ function addProfile(name) {
 // config.js itself never touches recommendationStore (no dependency/cycle across
 // the layer). engineChanged is captured around the WHOLE update so it also picks
 // up an age-limit-driven revocation (§5.5 pt3), where raising age_limit rewrites
-// engine_<type> to 'genesis' without the field appearing in the patch.
+// engine_<type> to the type's default without the field appearing in the patch.
 function updateProfile(id, patch) {
   let updated = null;
   const engineChanged = [];

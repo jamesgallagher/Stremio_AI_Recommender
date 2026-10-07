@@ -37,19 +37,19 @@ const fs = require('fs');
 const REPO_ROOT = path.join(__dirname, '..');
 const USAGE =
   'Usage: node --experimental-sqlite scripts/bench-engines.js <profileName>\n'
-  + '  [--type movie|series] [--holdout 10] [--engines genesis,glass,marquee] [--no-cache] [--json] [--keep]\n'
+  + '  [--type movie|series] [--holdout 10] [--engines marquee,marquee-tv] [--no-cache] [--json] [--keep]\n'
   + "  [--serve-opts '<json>']\n"
   + "  [--marquee-config '<json>']\n"
   + 'Expect several minutes per profile on a cold cache (Marquee\'s LLM fit dominates).\n'
   + '  --type: movie (default) or series. A series run holds out the most recently STARTED\n'
   + '  shows that reached at least Engaged (real first-episode timestamps only) and defaults to\n'
-  + "  the Genesis baseline engine unless --engines is given.\n"
+  + "  the Marquee TV baseline engine unless --engines is given.\n"
   + "  --serve-opts: a JSON object of serve-config overrides (snake_case, e.g. '{\"window_factor\":4}')\n"
   + "  --marquee-config: a JSON object of Marquee config sections (e.g. '{\"agreement\":{\"genre_blend\":0}}'),\n"
   + '  merged section-wise into the SNAPSHOT\'s settings.json only — the live settings are never written.';
 
 function parseArgs(argv) {
-  const a = { profile: null, holdout: 10, type: 'movie', engines: ['genesis', 'glass', 'marquee'], enginesSet: false, noCache: false, json: false, keep: false, serveOpts: null, marqueeConfig: null, help: false };
+  const a = { profile: null, holdout: 10, type: 'movie', engines: ['marquee', 'marquee-tv'], enginesSet: false, noCache: false, json: false, keep: false, serveOpts: null, marqueeConfig: null, help: false };
   for (let i = 0; i < argv.length; i++) {
     const x = argv[i];
     if (x === '--holdout') a.holdout = Number(argv[++i]);
@@ -94,9 +94,9 @@ async function main() {
   if (!a.profile) { console.error('profileName is required'); console.error(USAGE); process.exit(2); }
   if (!Number.isFinite(a.holdout) || a.holdout < 1) { console.error('--holdout must be a positive integer'); process.exit(2); }
   if (a.type !== 'movie' && a.type !== 'series') { console.error('--type must be movie or series'); process.exit(2); }
-  // TV-1 (plan §6): the series baseline is Genesis — default the engine set to
-  // ['genesis'] for a series run unless --engines was given explicitly.
-  if (a.type === 'series' && !a.enginesSet) a.engines = ['genesis'];
+  // The series baseline is Marquee TV — default the engine set to
+  // ['marquee-tv'] for a series run unless --engines was given explicitly.
+  if (a.type === 'series' && !a.enginesSet) a.engines = ['marquee-tv'];
 
   const liveDir = process.env.DATA_DIR || path.join(REPO_ROOT, 'data');
   const bench = require('../src/bench/engineBench');
