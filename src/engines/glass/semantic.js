@@ -11,11 +11,11 @@
 // to a no-op on any failure (no endpoint, timeout, malformed) — never throws.
 const embeddings = require('../../services/embeddings');
 const embedStore = require('./embedStore');
-const metaStore = require('./metaStore');
-const events = require('./events');
-const { weightedScore } = require('./scoring');
-const { blendedWeight } = require('./tasteModel');
-const { halfLivesFor } = require('./config');
+const metaStore = require('../shared/metaStore');
+const events = require('../shared/events');
+const { weightedScore } = require('../shared/scoring');
+const { blendedWeight } = require('../shared/tasteModel');
+const { halfLivesFor } = require('../shared/tasteConfig');
 
 const DAY_MS = 24 * 3600e3;
 const clamp01 = (x) => Math.max(0, Math.min(1, x));

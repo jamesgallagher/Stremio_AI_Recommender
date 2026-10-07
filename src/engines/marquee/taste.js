@@ -11,11 +11,11 @@
 // degrades to "watched = +1" cleanly.
 const crypto = require('crypto');
 const watchedStore = require('../../watchedStore');
-const glassEvents = require('../glass/events');
-const glassTasteModel = require('../glass/tasteModel');
-const glassConfig = require('../glass/config');
-const watchedEnrichment = require('../glass/watchedEnrichment');
-const metaStore = require('../glass/metaStore');
+const tasteEvents = require('../shared/events');
+const sharedTaste = require('../shared/tasteModel');
+const tasteConfig = require('../shared/tasteConfig');
+const watchedEnrichment = require('../shared/watchedEnrichment');
+const metaStore = require('../shared/metaStore');
 const tasteFeedback = require('../../tasteFeedback');
 const simklCache = require('./simklCache');
 const llmCache = require('./llmCache');
@@ -46,7 +46,7 @@ function ratingWeight(rating, cfg) {
 // blended recency weight buildTasteModel applies (same days, half-lives,
 // horizon blend), so the floor is applied identically.
 function lovedFactor(days, cfg) {
-  const b = glassTasteModel.blendedWeight(days, glassConfig.halfLivesFor(cfg, 'movie'), cfg.horizon_blend);
+  const b = sharedTaste.blendedWeight(days, tasteConfig.halfLivesFor(cfg, 'movie'), cfg.horizon_blend);
   const floor = cfg.loved?.decay_floor ?? 0.5;
   if (b <= 0) return 1;
   return b >= floor ? 1 : floor / b;
@@ -66,7 +66,7 @@ function lovedFactor(days, cfg) {
 function buildEvents(profileId, cfg, { nowMs = Date.now(), ratings, ignored } = {}) {
   const ratingsMap = ratings || simklCache.getRatingsMap(profileId);
   const ignoredSet = ignored || tasteFeedback.ignoredSet(profileId, 'movie');
-  const events = glassEvents.buildEventList(profileId, 'movie', cfg, { nowMs });
+  const events = tasteEvents.buildEventList(profileId, 'movie', cfg, { nowMs });
   const kept = [];
   for (const ev of events) {
     if (ev.kind === 'watched' && ignoredSet.has(String(ev.tmdb_id))) continue; // N2: ignored films never steer taste
@@ -113,11 +113,11 @@ function seedOrder(profileId, cfg, { nowMs = Date.now(), ratings, ignored } = {}
     const rw = ratingWeight(r, cfg);
     const ts = w.watched_at ? Date.parse(w.watched_at) : NaN;
     const days = Number.isNaN(ts) ? 0 : Math.max(0, (nowMs - ts) / DAY_MS);
-    let weight = (rw != null ? rw : base) * glassTasteModel.blendedWeight(days, hl, blend);
+    let weight = (rw != null ? rw : base) * sharedTaste.blendedWeight(days, hl, blend);
     let loved = false;
     if (r === 10) {
       // N3: Loved decay floored at cfg.loved.decay_floor.
-      const b = glassTasteModel.blendedWeight(days, hl, blend);
+      const b = sharedTaste.blendedWeight(days, hl, blend);
       const floor = cfg.loved?.decay_floor ?? 0.5;
       weight = (rw != null ? rw : base) * Math.max(b, floor);
       loved = true;
@@ -161,7 +161,7 @@ function seedsFor(profileId, cfg, { nowMs, ratings, ignored } = {}) {
 function genreTarget(profileId, cfg, { nowMs = Date.now(), ratings, ignored } = {}) {
   const ratingsMap = ratings || simklCache.getRatingsMap(profileId);
   const ignoredSet = ignored || tasteFeedback.ignoredSet(profileId, 'movie');
-  const hl = glassConfig.halfLivesFor(cfg, 'movie');
+  const hl = tasteConfig.halfLivesFor(cfg, 'movie');
   const blend = cfg.horizon_blend;
   const base = cfg.feedback?.watched ?? 1;
   const rows = watchedStore.getWatched(profileId, { type: 'movie' }).filter((w) => w.tmdb_id);
@@ -174,7 +174,7 @@ function genreTarget(profileId, cfg, { nowMs = Date.now(), ratings, ignored } = 
     if (rw != null && rw <= 0) continue; // rated ≤ 4 → negative → excluded
     const ts = w.watched_at ? Date.parse(w.watched_at) : NaN;
     const days = Number.isNaN(ts) ? 0 : Math.max(0, (nowMs - ts) / DAY_MS);
-    let decay = glassTasteModel.blendedWeight(days, hl, blend);
+    let decay = sharedTaste.blendedWeight(days, hl, blend);
     if (r === 10) decay = Math.max(decay, cfg.loved?.decay_floor ?? 0.5); // Loved decay floor
     const weight = (rw != null ? rw : base) * decay;
     const meta = metaStore.get('movie', id);
@@ -195,7 +195,7 @@ async function buildTaste(profileId, apiKey, cfg, { nowMs = Date.now(), ratings,
   } catch (err) {
     log.warn(`[marquee] watched enrichment failed: ${err.message} — building taste without it`);
   }
-  return glassTasteModel.buildTasteModel(profileId, 'movie', cfg, {
+  return sharedTaste.buildTasteModel(profileId, 'movie', cfg, {
     nowMs,
     events: buildEvents(profileId, cfg, { nowMs, ratings, ignored }),
   });

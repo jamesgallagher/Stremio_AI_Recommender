@@ -686,7 +686,7 @@ async function main() {
 
   // ── P. Glass GE-03: the deep-metadata store enriches once, then serves cache ──
   await it('P. GE-03 metaStore.enrich fetches once, caches permanently, does not cache a failed fetch', async () => {
-    const metaStore = require('../src/engines/glass/metaStore');
+    const metaStore = require('../src/engines/shared/metaStore');
     metaStore._clear();
     let calls = 0;
     const fetcher = async (_k, type, tmdbId) => { calls++; return { tmdb_id: String(tmdbId), imdb_id: 'tt' + tmdbId, type, director: ['D'], keywords: ['k'] }; };
@@ -707,8 +707,8 @@ async function main() {
 
   // ── Q. Glass GE-04: watched-history enrichment — paced, capped, cached once ──
   await it('Q. GE-04 enrichWatchedBatch fills the Glass meta store, honours the cap, and is idempotent', async () => {
-    const metaStore = require('../src/engines/glass/metaStore');
-    const we = require('../src/engines/glass/watchedEnrichment');
+    const metaStore = require('../src/engines/shared/metaStore');
+    const we = require('../src/engines/shared/watchedEnrichment');
     metaStore._clear();
     const p = config.addProfile('INT-Q');
     try {
@@ -746,7 +746,7 @@ async function main() {
   // hop is a cache hit, and stub tmdb.getRecommendations + getGenreMap. This runs
   // the actual glass engine through buildRecommendations → shared pipeline (upsert,
   // preResolved skip) → pool, then buildPool's shared age gate, then serve.
-  const metaStore = require('../src/engines/glass/metaStore');
+  const metaStore = require('../src/engines/shared/metaStore');
   const GENRE_MAP = { 18: 'Drama', 27: 'Horror', 28: 'Action' };
   // Full deep-metas for every candidate the fixtures below produce.
   function seedGlassFixtures(pid) {
@@ -880,7 +880,7 @@ async function main() {
   // ── T. Glass GE-08: LLM rerank reorders + explains; degrades to deterministic ─
   await it('T. GE-08 rerank reorders the head, writes reasons, keeps the score band, and degrades on every failure', async () => {
     const rerank = require('../src/engines/glass/rerank');
-    const cfg = require('../src/engines/glass/config').resolveConfig(null);
+    const cfg = require('../src/engines/shared/tasteConfig').resolveConfig(null);
     const taste = { dims: { genres: { Drama: 1 }, directors: {}, franchises: {}, keywords: {}, decades: {} } };
     const mk = (id, score) => ({ tmdb_id: id, title: `T${id}`, year: 2024, genres: 'Drama', rankScore: score, reason: `det ${id}`, sources: ['recommendations'], score_components: { features: {}, matched: {} } });
     const scored = [mk('1', 0.9), mk('2', 0.8), mk('3', 0.7), mk('4', 0.6)];
@@ -908,13 +908,13 @@ async function main() {
     assert.deepStrictEqual(same(await rerank.rerankCandidates('movie', scored, taste, cfg, { chain, chat: async () => [], log: quiet })), ['1', '2', '3', '4']); // empty reply
     assert.deepStrictEqual(same(await rerank.rerankCandidates('movie', scored, taste, cfg, { chain, chat: async () => [{ id: 'nope' }], log: quiet })), ['1', '2', '3', '4']); // all-unknown
     // enabled:false disables it even with a local endpoint.
-    const offCfg = require('../src/engines/glass/config').resolveConfig({ glass: { rerank: { enabled: false } } });
+    const offCfg = require('../src/engines/shared/tasteConfig').resolveConfig({ glass: { rerank: { enabled: false } } });
     assert.deepStrictEqual(same(await rerank.rerankCandidates('movie', scored, taste, offCfg, { chain, chat, log: quiet })), ['1', '2', '3', '4']);
   });
 
   // ── U. Glass GE-08 through the engine: local-only chain, reasons reach the pool ─
   await it('U. Glass engine invokes the rerank with a LOCAL-ONLY chain; reasons land in because_title', async () => {
-    const metaStore = require('../src/engines/glass/metaStore');
+    const metaStore = require('../src/engines/shared/metaStore');
     const glass = require('../src/engines/glass');
     const pipeline = require('../src/engines/pipeline');
     settings.updateSettings({ engines: { glass: true } });
@@ -952,7 +952,7 @@ async function main() {
 
   // ── V. Glass GE-10: a user rejection steers taste away from similar candidates ─
   await it('V. GE-10 feedback wiring: rejecting a title down-weights a candidate sharing its director, end to end', async () => {
-    const metaStore = require('../src/engines/glass/metaStore');
+    const metaStore = require('../src/engines/shared/metaStore');
     settings.updateSettings({ engines: { glass: true } });
     stubTmdb();
     const p = config.addProfile('INT-V');
@@ -987,8 +987,8 @@ async function main() {
     const emb = require('../src/services/embeddings');
     const semantic = require('../src/engines/glass/semantic');
     const embedStore = require('../src/engines/glass/embedStore');
-    const metaStore = require('../src/engines/glass/metaStore');
-    const { resolveConfig } = require('../src/engines/glass/config');
+    const metaStore = require('../src/engines/shared/metaStore');
+    const { resolveConfig } = require('../src/engines/shared/tasteConfig');
 
     // embed() transport: parses {data:[{index,embedding}]} and re-orders by index.
     const origFetch = global.fetch;
@@ -1034,7 +1034,7 @@ async function main() {
 
   // ── X. Glass engine wires GE-09: enabled → semantic_similarity persists to the pool ─
   await it('X. Glass engine folds semantic_similarity into score_components when embeddings are enabled', async () => {
-    const metaStore = require('../src/engines/glass/metaStore');
+    const metaStore = require('../src/engines/shared/metaStore');
     const embedStore = require('../src/engines/glass/embedStore');
     const glass = require('../src/engines/glass');
     const pipeline = require('../src/engines/pipeline');
@@ -1920,7 +1920,7 @@ async function main() {
   await it('Trainer T1: listHistory — enrichment: ≤25 cap, throwing enrich, no-key, cached meta (F11.3b)', async () => {
     const trainer = require('../src/trainer');
     const watchedStore = require('../src/watchedStore');
-    const metaStore = require('../src/engines/glass/metaStore');
+    const metaStore = require('../src/engines/shared/metaStore');
     const db = require('../src/db');
     const profile = { id: 'p-lh11b', name: 'T', keys: { simkl_client_id: 'c', tmdb_api_key: 'test-key' }, simkl_auth: { access_token: 't' } };
     // 30 watched rows (all missing a poster) → the page enriches ≤ 25.
@@ -2292,7 +2292,7 @@ async function main() {
     const taste = require('../src/engines/marquee/taste');
     const cfg = require('../src/engines/marquee/config').resolveConfig({});
     const watchedStore = require('../src/watchedStore');
-    const metaStore = require('../src/engines/glass/metaStore');
+    const metaStore = require('../src/engines/shared/metaStore');
     const llmCache = require('../src/engines/marquee/llmCache');
     const profileId = 'p-brief';
     const nowMs = Date.parse('2026-06-01T00:00:00Z');
@@ -2388,8 +2388,8 @@ async function main() {
 
   await it('marquee ME-04: no ratings (the production case) — events identical to Glass, seeds by recency (T1)', async () => {
     const taste = require('../src/engines/marquee/taste');
-    const glassEvents = require('../src/engines/glass/events');
-    const glassTasteModel = require('../src/engines/glass/tasteModel');
+    const glassEvents = require('../src/engines/shared/events');
+    const glassTasteModel = require('../src/engines/shared/tasteModel');
     const cfg = require('../src/engines/marquee/config').resolveConfig({});
     const profileId = 'p-noratings';
     const nowMs = Date.parse('2026-06-01T00:00:00Z');
@@ -2422,7 +2422,7 @@ async function main() {
   await it('marquee ME-04: negative rating → negative director affinity (T2)', async () => {
     const taste = require('../src/engines/marquee/taste');
     const cfg = require('../src/engines/marquee/config').resolveConfig({});
-    const metaStore = require('../src/engines/glass/metaStore');
+    const metaStore = require('../src/engines/shared/metaStore');
     const profileId = 'p-negdir';
     const nowMs = Date.parse('2026-06-01T00:00:00Z');
     watchedStore.upsertMany(profileId, [
@@ -2475,7 +2475,7 @@ async function main() {
   const mqScoring = require('../src/engines/marquee/scoring');
   const mqFilters = require('../src/engines/marquee/filters');
   const mqCfg = require('../src/engines/marquee/config');
-  const glassMeta = require('../src/engines/glass/metaStore');
+  const glassMeta = require('../src/engines/shared/metaStore');
   const pipeline = require('../src/engines/pipeline');
 
   const mqGenreMap = { 28: 'Action', 18: 'Drama', 878: 'Science Fiction' };
@@ -3729,7 +3729,7 @@ async function main() {
   });
 
   await it('SH-01: Glass scoreCandidate carries the real cert from the enriched meta onto the candidate (movie only)', async () => {
-    const { scoreCandidate } = require('../src/engines/glass/scoring');
+    const { scoreCandidate } = require('../src/engines/shared/scoring');
     const certs = require('../src/certs');
     const taste = { dims: { genres: { Action: 1 }, decades: {}, languages: {}, runtimeBands: {}, directors: {}, franchises: {}, cast: {}, keywords: {} }, genreMass: { Action: 1 } };
     const cfg = { weights: { taste_match: 0.5, quality: 0.3 }, taste_dims: { genres: 1, decade: 0, language: 0, runtime: 0, director: 0, franchise: 0, cast: 0, keywords: 0 }, keyword_min_shared: 1 };
@@ -5005,8 +5005,8 @@ async function main() {
 
   await it('marquee m3: Loved decay is floored at cfg.loved.decay_floor (N3)', async () => {
     const taste = require('../src/engines/marquee/taste');
-    const glassTasteModel = require('../src/engines/glass/tasteModel');
-    const glassConfig = require('../src/engines/glass/config');
+    const glassTasteModel = require('../src/engines/shared/tasteModel');
+    const glassConfig = require('../src/engines/shared/tasteConfig');
     const cfg = mqCfgResolved;
     const floor = cfg.loved.decay_floor; // 0.5
     const hl = glassConfig.halfLivesFor(cfg, 'movie');
@@ -5069,7 +5069,7 @@ async function main() {
 
   await it('marquee m3: a no-feedback profile is unchanged (N9 identity)', async () => {
     const taste = require('../src/engines/marquee/taste');
-    const glassTasteModel = require('../src/engines/glass/tasteModel');
+    const glassTasteModel = require('../src/engines/shared/tasteModel');
     const profileId = 'p-n9';
     glassMeta._clear();
     // A no-feedback profile: watched films, NO ratings, NO ignores.
@@ -5963,7 +5963,7 @@ async function main() {
     const express = require('express');
     const portal = require('../src/portal');
     const config = require('../src/config');
-    const metaStore = require('../src/engines/glass/metaStore');
+    const metaStore = require('../src/engines/shared/metaStore');
     const db = require('../src/db');
     const port = 7315;
     const app = express();
@@ -8212,7 +8212,7 @@ async function main() {
   // ── TV-2 N2: ensureTvMeta (fetch only missing/expired; writes both stores; TTL) ──
   await it('TV-2 N2: ensureTvMeta fetches missing, writes Glass metaStore + marquee_tv_meta, TTL 14d', async () => {
     const meta = require('../src/engines/marqueeTv/meta');
-    const glassMetaStore = require('../src/engines/glass/metaStore');
+    const glassMetaStore = require('../src/engines/shared/metaStore');
     const db = require('../src/db');
     const fetchCalls = [];
     const fetcher = (apiKey, id) => {
@@ -9612,7 +9612,7 @@ async function main() {
   // Genesis while disabled, marquee-tv once enabled.
   await it('TV-2 E1: generate(series) end-to-end — no anime/Reality/excluded genre, pre-resolved, stats + summary; movie → []; registry dark', async () => {
     const marqueeTv = require('../src/engines/marqueeTv');
-    const glassMetaStore = require('../src/engines/glass/metaStore');
+    const glassMetaStore = require('../src/engines/shared/metaStore');
     const nowMs = Date.parse('2026-10-02T00:00:00Z');
     const p = config.addProfile('INT-TV2-E1');
     config.updateProfile(p.id, {

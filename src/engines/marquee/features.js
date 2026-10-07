@@ -5,8 +5,8 @@
 // Date.now() — the inputs are passed in. MD-2: trending only lifts films that
 // already fit the viewer (the taste gate), and trending is NOT counted in
 // consensus (it is its own feature, no double count).
-const glassScoring = require('../glass/scoring');
-const glassCandidates = require('../glass/candidates');
+const sharedScoring = require('../shared/scoring');
+const sharedCandidates = require('../shared/candidates');
 
 const clamp01 = (x) => Math.max(0, Math.min(1, x));
 
@@ -29,7 +29,7 @@ function trendingRaw(tr, { weekN, dayN, risingTop = 50, risingBonus = 0.1 } = {}
   const hasDay = t.tmdbDayRank != null && t.tmdbDayRank > 0;
   const inWeekTop = t.tmdbWeekRank != null && t.tmdbWeekRank > 0 && t.tmdbWeekRank <= risingTop;
   if (hasDay && !inWeekTop) day += risingBonus;
-  const simkl = glassScoring.trendingMomentum({ watched24h: t.simklWatched || 0, drop_rate: t.simklDrop ?? null });
+  const simkl = sharedScoring.trendingMomentum({ watched24h: t.simklWatched || 0, drop_rate: t.simklDrop ?? null });
   return clamp01(Math.max(week, day, simkl));
 }
 
@@ -191,7 +191,7 @@ const PRESCORE_DEFAULTS = { seed_affinity: 0.35, genre: 0.30, trending: 0.15, qu
 // (back-compatible: without it the m3 behaviour stands).
 function preScore(cand, taste, { weekN, dayN, maxSeedAff = 0, seedAffinityNorm = null, weights = PRESCORE_DEFAULTS } = {}) {
   const w = { ...PRESCORE_DEFAULTS, ...(weights || {}) };
-  const ga = Math.max(0, glassCandidates.genreAffinity(cand, taste));
+  const ga = Math.max(0, sharedCandidates.genreAffinity(cand, taste));
   const sa = seedAffinityNorm != null ? seedAffinityNorm : (maxSeedAff > 0 ? clamp01(seedAffinityRaw(cand) / maxSeedAff) : 0);
   const tr = trendingRaw(cand.trending, { weekN, dayN }) * clamp01(ga / (w.trending_genre_gate || 1));
   const q = (cand.vote_average || 0) / 10;

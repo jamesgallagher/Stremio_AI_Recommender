@@ -625,7 +625,7 @@ ok('settings: roundtrip, migration seeds from "James", isComplete, llmChain', ()
 });
 
 ok('glass/config: GE-07 resolveConfig merges Tier-2 over Tier-1 by section, ignores unknown keys, clones', () => {
-  const { resolveConfig, DEFAULTS, ALGORITHM_VERSION } = require('../src/engines/glass/config');
+  const { resolveConfig, DEFAULTS, ALGORITHM_VERSION } = require('../src/engines/shared/tasteConfig');
   const base = resolveConfig(null);
   assert.strictEqual(base.weights.taste_match, DEFAULTS.weights.taste_match);
   assert.strictEqual(ALGORITHM_VERSION, 'glass-a1');
@@ -997,7 +997,7 @@ ok('tmdb: GE-03 normalizeDeepMeta — movie director+collection, series showrunn
 });
 
 ok('glass/metaStore: GE-03 put/get/getMany round-trip + imdb index', () => {
-  const metaStore = require('../src/engines/glass/metaStore');
+  const metaStore = require('../src/engines/shared/metaStore');
   metaStore._clear();
   metaStore.put('movie', 27205, { tmdb_id: '27205', imdb_id: 'tt1375666', director: ['Nolan'], keywords: ['dream'] });
   metaStore.put('movie', 22, { tmdb_id: '22', imdb_id: 'tt0325980', collection: { id: 295, name: 'Pirates' } });
@@ -1015,9 +1015,9 @@ ok('glass/metaStore: GE-03 put/get/getMany round-trip + imdb index', () => {
 
 ok('glass/tasteModel: GE-05 builds 3-horizon dims, recency-weighted, normalized 0–1, type-scoped', () => {
   const watchedStore = require('../src/watchedStore');
-  const metaStore = require('../src/engines/glass/metaStore');
-  const { buildTasteModel, topGenres } = require('../src/engines/glass/tasteModel');
-  const { resolveConfig } = require('../src/engines/glass/config');
+  const metaStore = require('../src/engines/shared/metaStore');
+  const { buildTasteModel, topGenres } = require('../src/engines/shared/tasteModel');
+  const { resolveConfig } = require('../src/engines/shared/tasteConfig');
   const cfg = resolveConfig(null);
   const pid = 'glass-taste';
   const now = Date.parse('2026-09-10T00:00:00Z');
@@ -1050,7 +1050,7 @@ ok('glass/tasteModel: GE-05 builds 3-horizon dims, recency-weighted, normalized 
 });
 
 ok('glass/candidates: GE-05 dedupe unions sources, preScore ranks, exploration eligibility', () => {
-  const c = require('../src/engines/glass/candidates');
+  const c = require('../src/engines/shared/candidates');
   const taste = { dims: { genres: { Drama: 1, Action: 0.5 } } };
   // dedupe merges the same title from two strategies, unioning sources + keeping fields.
   const merged = c.dedupe([
@@ -1074,8 +1074,8 @@ ok('glass/candidates: GE-05 dedupe unions sources, preScore ranks, exploration e
 });
 
 ok('glass/scoring: GE-06 features 0–1, weighted rankScore, preResolved fields, intersect bonuses, tt-less dropped', () => {
-  const scoring = require('../src/engines/glass/scoring');
-  const { resolveConfig } = require('../src/engines/glass/config');
+  const scoring = require('../src/engines/shared/scoring');
+  const { resolveConfig } = require('../src/engines/shared/tasteConfig');
   const cfg = resolveConfig(null);
   const taste = {
     genreMass: { Drama: 10, Comedy: 2 },
@@ -1143,8 +1143,8 @@ ok('glass/embedStore + semantic.contentString: GE-09 Float32 BLOB round-trip, cr
 ok('glass/events: GE-10 weighted event list — watched positive, dont_recommend negative by reason', () => {
   const watchedStore = require('../src/watchedStore');
   const rs = require('../src/recommendationStore');
-  const { buildEventList } = require('../src/engines/glass/events');
-  const { resolveConfig } = require('../src/engines/glass/config');
+  const { buildEventList } = require('../src/engines/shared/events');
+  const { resolveConfig } = require('../src/engines/shared/tasteConfig');
   const cfg = resolveConfig(null);
   const pid = 'glass-events';
   watchedStore.deleteForProfile(pid); rs.deleteForProfile(pid);
@@ -1164,10 +1164,10 @@ ok('glass/events: GE-10 weighted event list — watched positive, dont_recommend
 });
 
 ok('glass/tasteModel+scoring: GE-10 a rejected dim goes negative and PENALIZES similar candidates', () => {
-  const { buildTasteModel } = require('../src/engines/glass/tasteModel');
-  const metaStore = require('../src/engines/glass/metaStore');
-  const scoring = require('../src/engines/glass/scoring');
-  const { resolveConfig } = require('../src/engines/glass/config');
+  const { buildTasteModel } = require('../src/engines/shared/tasteModel');
+  const metaStore = require('../src/engines/shared/metaStore');
+  const scoring = require('../src/engines/shared/scoring');
+  const { resolveConfig } = require('../src/engines/shared/tasteConfig');
   const cfg = resolveConfig(null);
   metaStore._clear();
   // Enrich a watched title (dir Villeneuve, Drama) and a REJECTED title (dir Bay, Action).
@@ -3428,7 +3428,7 @@ ok('marquee ME-04: buildBriefPrompt carries history + dims, never age/classifica
 
 ok('marquee ME-04: config copies Glass values independently + resolveConfig deep clone (spec §4.5)', () => {
   const marqueeCfg = require('../src/engines/marquee/config');
-  const glassCfg = require('../src/engines/glass/config');
+  const glassCfg = require('../src/engines/shared/tasteConfig');
   // intentionally start equal to Glass's (spec §4.5), but independent copies
   assert.deepStrictEqual(marqueeCfg.DEFAULTS.half_life_days, glassCfg.DEFAULTS.half_life_days);
   assert.deepStrictEqual(marqueeCfg.DEFAULTS.horizon_blend, glassCfg.DEFAULTS.horizon_blend);
@@ -6115,7 +6115,7 @@ ok('TV-2 F8: tasteEvents — one event per non-anime value>0 show + dont negativ
 ok('TV-2 F9: scoreTv — features × weights sum + Canceled+1-season penalty (spec §4.7)', () => {
   const { scoreTv } = require('../src/engines/marqueeTv/scoring');
   const cfg = require('../src/engines/marqueeTv/config').DEFAULTS;
-  const glassCfg = require('../src/engines/glass/config').resolveConfig({});
+  const glassCfg = require('../src/engines/shared/tasteConfig').resolveConfig({});
   const nowMs = Date.parse('2026-10-02T00:00:00Z');
   const c = { imdb_rating: 8, vote_average: 8, vote_count: 1000, number_of_episodes: 20, status: 'Returning Series', last_episode_air_date: '2026-09-22T00:00:00Z' };
   const meta = { genres: ['Drama'], keywords: [] };

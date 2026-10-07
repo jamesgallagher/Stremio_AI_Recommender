@@ -23,7 +23,7 @@ const trainer = require('./trainer');
 const tasteFeedback = require('./tasteFeedback');
 const engines = require('./engines');
 const catalogServe = require('./catalogServe');
-const metaStore = require('./engines/glass/metaStore');
+const metaStore = require('./engines/shared/metaStore');
 
 const { version } = require('../package.json');
 const USER_AGENT = `AI-Recommender/1.0 (+https://github.com/jamesgallagher/Stremio_AI_Recommender)`;

@@ -11,7 +11,7 @@
 // not-yet-enriched title contributes only its thin watched-store genre (graceful
 // degradation — the model just gets shallower, never wrong). PURE of network.
 const metaStore = require('./metaStore');
-const { halfLivesFor } = require('./config');
+const { halfLivesFor } = require('./tasteConfig');
 const { buildEventList } = require('./events');
 
 const DAY_MS = 24 * 3600e3;

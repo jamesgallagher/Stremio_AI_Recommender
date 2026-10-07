@@ -10,11 +10,11 @@
 // cancelled penalty. `c` is the candidate's merged meta ({ ...deep, ...extras }
 // + imdb_rating); `meta` is the same meta for the Glass taste match; `taste`
 // is the profile's Glass taste model; `glassCfg` is the resolved Glass config.
-const glassScoring = require('../glass/scoring');
+const sharedScoring = require('../shared/scoring');
 const mqFeatures = require('../marquee/features');
 
-function scoreTv(c, meta, taste, glassCfg, { collabNorm, trendingRaw, comfort, nowMs, cfg }) {
-  const tasteScore = glassScoring.tasteMatch(meta, taste, glassCfg).score;
+function scoreTv(c, meta, taste, tasteCfg, { collabNorm, trendingRaw, comfort, nowMs, cfg }) {
+  const tasteScore = sharedScoring.tasteMatch(meta, taste, tasteCfg).score;
   const features = {
     taste: tasteScore,
     collab: collabNorm,

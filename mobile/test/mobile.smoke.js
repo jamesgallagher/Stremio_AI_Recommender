@@ -641,7 +641,7 @@ async function unitTests() {
   await ok('handlers: trainer T1 — rate/ignore/finished/list act on the session profile only (M1/M2/M10)', async () => {
     const wStore = require('../../src/watchedStore');
     const tasteFeedback = require('../../src/tasteFeedback');
-    const metaStore = require('../../src/engines/glass/metaStore');
+    const metaStore = require('../../src/engines/shared/metaStore');
     const jobs = require('../../src/jobs');
     const origSet = simkl.setRatings;
     const origRemove = simkl.removeRatings;

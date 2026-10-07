@@ -144,7 +144,7 @@ async function main() {
         // filters? Cached deep meta first; a read-only TMDB fetch (≤ holdout
         // calls) only when the cache lacks it or predates availability data.
         reachability: async (targetIds, filters) => {
-          const metaStore = require('../src/engines/glass/metaStore');
+          const metaStore = require('../src/engines/shared/metaStore');
           const tmdb = require('../src/services/tmdb');
           const mdblist = require('../src/services/mdblist');
           const animeMap = require('../src/services/animeMap');
