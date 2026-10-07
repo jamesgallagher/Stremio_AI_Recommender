@@ -6313,17 +6313,10 @@ async function httpTests() {
   console.log('http:');
   require('../src/server');
   // AUTH-1: provision an admin session so /api requests carry the air_sid cookie.
-  const { provisionAdmin, cookieHeader } = require('./helpers/admin-session');
+  const { provisionAdmin, cookieHeader, attachCookie } = require('./helpers/admin-session');
   const { token: adminToken } = provisionAdmin();
   const adminCookie = cookieHeader(adminToken);
-  const rawFetch = global.fetch;
-  global.fetch = (url, opts = {}) => {
-    const u = typeof url === 'string' ? url : url.url || '';
-    if (u.includes('/api/') || u.includes('/configure')) {
-      opts.headers = { ...(opts.headers || {}), Cookie: adminCookie };
-    }
-    return rawFetch(url, opts);
-  };
+  attachCookie(BASE, adminCookie);
   // The migrateFromProfiles unit test above seeds the GLOBAL settings with
   // JAMES-* lookup keys. Now that the addon reads GLOBAL keys, clear them so the
   // addon-serve tests start from a known "no keys" baseline (tests that need a
@@ -7076,11 +7069,10 @@ async function httpTests() {
     global.fetch = async () => { throw new Error('Simkl must not be called on cancellation'); };
     try {
       // The cancellation redirects to the portal (fetch follows the 302 to the
-      // /configure/ page, which redirects to /mobile/?next= for sign-in).
-      // The existing grant is preserved (no overwrite).
+      // /configure/ page). The existing grant is preserved (no overwrite).
       const res = await origFetch(`${BASE}/simkl/oauth2/callback?error=access_denied&state=${encodeURIComponent(state)}`);
       assert.strictEqual(res.status, 200, 'cancellation lands on the portal page');
-      assert.ok(res.url.includes('/mobile/?next='), 'redirected to sign-in (portal behind admin auth)');
+      assert.ok(res.url.includes('/configure/'), 'redirected to the portal');
       // The existing grant is preserved (no overwrite).
       assert.strictEqual(config.getProfile(cancelProfile.id).simkl_auth.access_token, 'v2-existing', 'existing grant preserved on cancellation');
     } finally {

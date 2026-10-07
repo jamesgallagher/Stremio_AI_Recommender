@@ -219,119 +219,277 @@ function makeLegacy(name, email, createdAt) {
   // ---- HTTP surface (T12-T22) ----
   console.log('shared-login http:');
   require('../src/server');
-  const { provisionAdmin, cookieHeader } = require('./helpers/admin-session');
-  const { token: adminToken } = provisionAdmin();
-  const adminCookie = cookieHeader(adminToken);
+  const { provisionAdmin, cookieHeader, attachCookie } = require('./helpers/admin-session');
   const BASE = `http://localhost:${process.env.PORT}`;
 
-  // T12: GET /api/me returns is_admin
-  await ok('T12 GET /api/me returns is_admin', async () => {
-    const res = await fetch(`${BASE}/api/me`, { headers: { Cookie: adminCookie } });
-    assert.strictEqual(res.status, 200);
-    const body = await res.json();
-    assert.strictEqual(body.profile.is_admin, true);
+  // Reset the store so the setup-wizard tests (T12–T14) run against an empty store.
+  resetStore();
+
+  // Capturing mailer for the setup-wizard OTP (T13).
+  function capturingSender() {
+    const fn = async (args) => { fn.calls.push(args); return { sent: true, fake: true }; };
+    fn.calls = [];
+    fn.last = () => fn.calls[fn.calls.length - 1];
+    return fn;
+  }
+
+  // ---- T12: setup over HTTP (store is empty) ----
+  await ok('T12 setup: needed:true; bad email → 400; empty name → 400', async () => {
+    const res1 = await fetch(`${BASE}/mobile/api/setup`);
+    assert.strictEqual(res1.status, 200);
+    assert.deepStrictEqual(await res1.json(), { needed: true });
+    // Bad email → 400
+    const res2 = await fetch(`${BASE}/mobile/api/setup/request`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Test', email: 'not-an-email' }),
+    });
+    assert.strictEqual(res2.status, 400);
+    assert.ok((await res2.json()).error.includes('valid email'));
+    // Empty name → 400
+    const res3 = await fetch(`${BASE}/mobile/api/setup/request`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: '', email: 'test@example.com' }),
+    });
+    assert.strictEqual(res3.status, 400);
+    assert.ok((await res3.json()).error.includes('name'));
   });
 
-  // T13: requireAdminApi 401 {error, auth:'signin'} when no session
-  await ok('T13 /api 401 {error, auth:signin} without session', async () => {
-    const res = await fetch(`${BASE}/api/version`);
-    assert.strictEqual(res.status, 401);
-    const body = await res.json();
-    assert.deepStrictEqual(body, { error: 'Not signed in', auth: 'signin' });
+  // ---- T13: setup verify (in-process OTP + HTTP verify) ----
+  await ok('T13 setup verify: wrong code → 401; right code → 200 + Set-Cookie; admin; needed:false', async () => {
+    const mailer = capturingSender();
+    const r = await auth.requestSetupOtp({ name: 'Setup Admin', email: 'setup@example.com' }, { sendMail: mailer });
+    assert.ok(r.ok, 'requestSetupOtp ok');
+    const code = mailer.last().code;
+    // Wrong code → 401
+    const res1 = await fetch(`${BASE}/mobile/api/setup/verify`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'setup@example.com', code: '000000' }),
+    });
+    assert.strictEqual(res1.status, 401);
+    // Right code → 200 + Set-Cookie
+    const res2 = await fetch(`${BASE}/mobile/api/setup/verify`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'setup@example.com', code }),
+    });
+    assert.strictEqual(res2.status, 200);
+    const setCookie = res2.headers.get('set-cookie') || '';
+    assert.ok(setCookie.includes('air_sid='), 'air_sid set');
+    assert.ok(setCookie.includes('Path=/'), 'Path=/');
+    assert.ok(setCookie.includes('HttpOnly'), 'HttpOnly');
+    assert.ok(setCookie.includes('SameSite=Lax'), 'SameSite=Lax');
+    const maxAgeMatch = setCookie.match(/Max-Age=(\d+)/);
+    assert.ok(maxAgeMatch, 'Max-Age present');
+    const maxAge = parseInt(maxAgeMatch[1], 10);
+    assert.ok(maxAge > 2591995 && maxAge <= 2592000, 'Max-Age ≈ 2592000 (30 days)');
+    // Created profile is admin
+    const profiles = config.listProfiles();
+    assert.strictEqual(profiles.length, 1);
+    assert.strictEqual(profiles[0].is_admin, true);
+    assert.strictEqual(profiles[0].name, 'Setup Admin');
+    // needed:false
+    const res3 = await fetch(`${BASE}/mobile/api/setup`);
+    assert.deepStrictEqual(await res3.json(), { needed: false });
   });
 
-  // T14: requireAdminApi 403 {error, auth:'forbidden'} when session but not admin
-  await ok('T14 /api 403 {error, auth:forbidden} for non-admin session', async () => {
-    // Create a non-admin profile + session.
+  // ---- T14: setup request again → 409 ----
+  await ok('T14 setup request again → 409', async () => {
+    const res = await fetch(`${BASE}/mobile/api/setup/request`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Second', email: 'second@example.com' }),
+    });
+    assert.strictEqual(res.status, 409);
+    assert.ok((await res.json()).error.includes('Setup is already complete'));
+  });
+
+  // Provision an admin session for the remaining tests.
+  const { token: adminToken } = provisionAdmin();
+  const adminCookie = cookieHeader(adminToken);
+
+  // ---- T15: GET /configure/ (302 no cookie, 302 non-admin, 200 admin) ----
+  await ok('T15 /configure: 302 no cookie; 302 non-admin; 200 admin (appbar + Cache-Control)', async () => {
+    // No cookie → 302
+    const res1 = await fetch(`${BASE}/configure/`, { redirect: 'manual' });
+    assert.strictEqual(res1.status, 302);
+    assert.ok(res1.headers.get('location').includes('/mobile/?next='));
+    // Non-admin → 302
     const nonAdmin = config.addProfile('NonAdmin');
     config.updateProfile(nonAdmin.id, { email: 'nonadmin@example.com' });
-    const { token } = auth.createSession(nonAdmin.id);
-    const res = await fetch(`${BASE}/api/version`, { headers: { Cookie: `air_sid=${token}` } });
-    assert.strictEqual(res.status, 403);
-    const body = await res.json();
-    assert.deepStrictEqual(body, { error: 'Admins only', auth: 'forbidden' });
+    const { token: nonAdminToken } = auth.createSession(nonAdmin.id);
+    const res2 = await fetch(`${BASE}/configure/`, { headers: { Cookie: `air_sid=${nonAdminToken}` }, redirect: 'manual' });
+    assert.strictEqual(res2.status, 302);
+    assert.ok(res2.headers.get('location').includes('/mobile/?next='));
+    // Admin → 200 + appbar + Cache-Control
+    const res3 = await fetch(`${BASE}/configure/`, { headers: { Cookie: adminCookie } });
+    assert.strictEqual(res3.status, 200);
+    assert.strictEqual(res3.headers.get('cache-control'), 'no-store');
+    const html = await res3.text();
+    assert.ok(html.includes('id="appbar"'), 'appbar present');
   });
 
-  // T15: requireAdminApi passes when admin
-  await ok('T15 /api passes for admin session', async () => {
-    const res = await fetch(`${BASE}/api/version`, { headers: { Cookie: adminCookie } });
-    assert.strictEqual(res.status, 200);
+  // ---- T16: GET /api/version (401, 403, 200, Basic → 401) ----
+  await ok('T16 /api/version: 401 no cookie; 403 non-admin; 200 admin; Basic → 401', async () => {
+    // No cookie → 401
+    const res1 = await fetch(`${BASE}/api/version`);
+    assert.strictEqual(res1.status, 401);
+    assert.deepStrictEqual(await res1.json(), { error: 'Not signed in', auth: 'signin' });
+    // Non-admin → 403
+    const nonAdmin = config.listProfiles().find(p => !p.is_admin);
+    const { token: nonAdminToken } = auth.createSession(nonAdmin.id);
+    const res2 = await fetch(`${BASE}/api/version`, { headers: { Cookie: `air_sid=${nonAdminToken}` } });
+    assert.strictEqual(res2.status, 403);
+    assert.deepStrictEqual(await res2.json(), { error: 'Admins only', auth: 'forbidden' });
+    // Admin → 200
+    const res3 = await fetch(`${BASE}/api/version`, { headers: { Cookie: adminCookie } });
+    assert.strictEqual(res3.status, 200);
+    // Basic Auth header → 401 (Basic Auth is gone)
+    process.env.ADMIN_USER = 'admin';
+    process.env.ADMIN_PASSWORD = 'secret';
+    const basic = Buffer.from('admin:secret').toString('base64');
+    const res4 = await fetch(`${BASE}/api/version`, { headers: { Authorization: `Basic ${basic}` } });
+    assert.strictEqual(res4.status, 401);
+    delete process.env.ADMIN_USER;
+    delete process.env.ADMIN_PASSWORD;
   });
 
-  // T16: requireAdminPage 302 → /mobile/?next=%2Fconfigure%2F when no session
-  await ok('T16 /configure 302 → /mobile/?next= without session', async () => {
-    const res = await fetch(`${BASE}/configure/`, { redirect: 'manual' });
-    assert.strictEqual(res.status, 302);
-    assert.ok(res.headers.get('location').includes('/mobile/?next='));
+  // ---- T17: Non-admin can't elevate ----
+  await ok('T17 non-admin cannot elevate', async () => {
+    const nonAdmin = config.listProfiles().find(p => !p.is_admin);
+    const { token: nonAdminToken } = auth.createSession(nonAdmin.id);
+    // PUT /api/profiles/<own> {is_admin:true} → 403, file unchanged
+    const bytes = profilesBytes();
+    const res1 = await fetch(`${BASE}/api/profiles/${nonAdmin.id}`, {
+      method: 'PUT', headers: { Cookie: `air_sid=${nonAdminToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ is_admin: true }),
+    });
+    assert.strictEqual(res1.status, 403);
+    assert.strictEqual(profilesBytes(), bytes, 'file unchanged');
+    // POST /mobile/api/settings {is_admin:true, min_rating:6} → 200 but still not admin
+    const res2 = await fetch(`${BASE}/mobile/api/settings`, {
+      method: 'POST', headers: { Cookie: `air_sid=${nonAdminToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ is_admin: true, min_rating: 6 }),
+    });
+    assert.strictEqual(res2.status, 200);
+    assert.strictEqual(config.getProfile(nonAdmin.id).is_admin, false, 'still not admin');
+    // POST /mobile/api/settings {is_admin:true} alone → 400
+    const res3 = await fetch(`${BASE}/mobile/api/settings`, {
+      method: 'POST', headers: { Cookie: `air_sid=${nonAdminToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ is_admin: true }),
+    });
+    assert.strictEqual(res3.status, 400);
   });
 
-  // T17: requireAdminPage 302 → /mobile/?next=%2Fconfigure%2F when session but not admin
-  await ok('T17 /configure 302 → /mobile/?next= for non-admin session', async () => {
-    const nonAdmin = config.addProfile('NonAdmin2');
-    config.updateProfile(nonAdmin.id, { email: 'nonadmin2@example.com' });
-    const { token } = auth.createSession(nonAdmin.id);
-    const res = await fetch(`${BASE}/configure/`, { headers: { Cookie: `air_sid=${token}` }, redirect: 'manual' });
-    assert.strictEqual(res.status, 302);
-    assert.ok(res.headers.get('location').includes('/mobile/?next='));
-  });
-
-  // T18: requireAdminPage passes when admin
-  await ok('T18 /configure passes for admin session', async () => {
-    const res = await fetch(`${BASE}/configure/`, { headers: { Cookie: adminCookie } });
-    assert.strictEqual(res.status, 200);
-  });
-
-  // T19: Legacy cookie upgrade (mobile_sid → air_sid)
-  await ok('T19 legacy mobile_sid cookie upgrades to air_sid', async () => {
-    const res = await fetch(`${BASE}/api/me`, { headers: { Cookie: `mobile_sid=${adminToken}` } });
-    assert.strictEqual(res.status, 200);
-    const setCookies = res.headers.get('set-cookie') || '';
-    assert.ok(setCookies.includes('air_sid='), 'air_sid cookie set');
-    assert.ok(setCookies.includes('mobile_sid=') && setCookies.includes('Max-Age=0'), 'mobile_sid cleared');
-  });
-
-  // T20: clearSessionCookies clears both cookies
-  await ok('T20 logout clears both air_sid and mobile_sid', async () => {
-    const res = await fetch(`${BASE}/mobile/api/auth/logout`, { method: 'POST', headers: { Cookie: adminCookie } });
-    assert.strictEqual(res.status, 200);
-    const setCookies = res.headers.get('set-cookie') || '';
-    assert.ok(setCookies.includes('air_sid='), 'air_sid cleared');
-    assert.ok(setCookies.includes('mobile_sid='), 'mobile_sid cleared');
-  });
-
-  // T20 cleared the admin session — re-provision for T21/T22.
-  const { token: adminToken2 } = provisionAdmin();
-  const adminCookie2 = cookieHeader(adminToken2);
-
-  // T21: PUT /api/profiles/:id with is_admin error codes
-  await ok('T21 PUT is_admin error codes over HTTP', async () => {
-    const a = config.listProfiles().find((p) => p.is_admin === true);
-    // Demote the only admin → LAST_ADMIN (409).
-    const res1 = await fetch(`${BASE}/api/profiles/${a.id}`, {
-      method: 'PUT', headers: { Cookie: adminCookie2, 'Content-Type': 'application/json' },
+  // ---- T18: Admin flows over HTTP ----
+  await ok('T18 admin flows: demote self 409; promote B 200; demote self 200; same cookie → 403; DELETE → 409', async () => {
+    const admin = config.listProfiles().find(p => p.is_admin === true);
+    // Demote self while only admin → 409
+    const res1 = await fetch(`${BASE}/api/profiles/${admin.id}`, {
+      method: 'PUT', headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ is_admin: false }),
     });
     assert.strictEqual(res1.status, 409);
-    const body1 = await res1.json();
-    assert.ok(body1.error.includes('at least one admin'));
-    // BAD_ADMIN_FLAG (400).
-    const res2 = await fetch(`${BASE}/api/profiles/${a.id}`, {
-      method: 'PUT', headers: { Cookie: adminCookie2, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ is_admin: 'true' }),
+    assert.ok((await res1.json()).error.includes('at least one admin'));
+    // Promote B → 200
+    const b = config.listProfiles().find(p => p.id !== admin.id);
+    config.updateProfile(b.id, { email: 'b@example.com' });
+    const res2 = await fetch(`${BASE}/api/profiles/${b.id}`, {
+      method: 'PUT', headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ is_admin: true }),
     });
-    assert.strictEqual(res2.status, 400);
+    assert.strictEqual(res2.status, 200);
+    // Demote self → 200
+    const res3 = await fetch(`${BASE}/api/profiles/${admin.id}`, {
+      method: 'PUT', headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ is_admin: false }),
+    });
+    assert.strictEqual(res3.status, 200);
+    // Same cookie on /api/version → 403 (fresh read)
+    const res4 = await fetch(`${BASE}/api/version`, { headers: { Cookie: adminCookie } });
+    assert.strictEqual(res4.status, 403);
+    // DELETE of only remaining admin (B, using B's cookie) → 409
+    const { token: bToken } = auth.createSession(b.id);
+    const res5 = await fetch(`${BASE}/api/profiles/${b.id}`, { method: 'DELETE', headers: { Cookie: `air_sid=${bToken}` } });
+    assert.strictEqual(res5.status, 409);
   });
 
-  // T22: DELETE /api/profiles/:id with LAST_ADMIN
-  await ok('T22 DELETE only admin → 409 LAST_ADMIN', async () => {
-    const a = config.listProfiles().find((p) => p.is_admin === true);
-    const res = await fetch(`${BASE}/api/profiles/${a.id}`, { method: 'DELETE', headers: { Cookie: adminCookie2 } });
-    assert.strictEqual(res.status, 409);
-    const body = await res.json();
-    assert.ok(body.error.includes('at least one admin'));
+  // ---- T19: Legacy cookie upgrade (mobile_sid → air_sid) ----
+  await ok('T19 legacy mobile_sid → air_sid (GET /mobile/api/me, Max-Age window)', async () => {
+    const otpStore = require('../mobile/server/otpStore');
+    const admin = config.listProfiles().find(p => p.is_admin === true);
+    // Create a session with expiresAt = now + 3d
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = Date.now() + 3 * 86400e3;
+    otpStore.insertSession({ token, profileId: admin.id, createdAt: Date.now(), expiresAt });
+    // GET /mobile/api/me with mobile_sid → 200
+    const res1 = await fetch(`${BASE}/mobile/api/me`, { headers: { Cookie: `mobile_sid=${token}` } });
+    assert.strictEqual(res1.status, 200);
+    const setCookie = res1.headers.get('set-cookie') || '';
+    assert.ok(setCookie.includes('air_sid='), 'air_sid set');
+    assert.ok(setCookie.includes('Path=/'), 'Path=/');
+    const maxAgeMatch = setCookie.match(/Max-Age=(\d+)/);
+    assert.ok(maxAgeMatch, 'Max-Age present');
+    const maxAge = parseInt(maxAgeMatch[1], 10);
+    assert.ok(maxAge <= 259200 && maxAge > 259100, `Max-Age ${maxAge} in (259100, 259200]`);
+    // mobile_sid cleared
+    assert.ok(setCookie.includes('mobile_sid=') && setCookie.includes('Max-Age=0'), 'mobile_sid cleared');
+    // air_sid then works on /mobile/api/me
+    const res2 = await fetch(`${BASE}/mobile/api/me`, { headers: { Cookie: `air_sid=${token}` } });
+    assert.strictEqual(res2.status, 200);
   });
 
-  console.log(`\nshared-login http: all ${passed - 7} HTTP checks passed.`);
+  // ---- T20: Logout ----
+  await ok('T20 logout: clears both cookies; token revoked', async () => {
+    const res = await fetch(`${BASE}/mobile/api/auth/logout`, { method: 'POST', headers: { Cookie: adminCookie } });
+    assert.strictEqual(res.status, 200);
+    const setCookie = res.headers.get('set-cookie') || '';
+    assert.ok(setCookie.includes('air_sid='), 'air_sid cleared');
+    assert.ok(setCookie.includes('mobile_sid='), 'mobile_sid cleared');
+    // Token revoked: same cookie → 401
+    const res2 = await fetch(`${BASE}/mobile/api/me`, { headers: { Cookie: adminCookie } });
+    assert.strictEqual(res2.status, 401);
+  });
+
+  // ---- T21: /mobile/api/me is_admin; /api/me ----
+  await ok('T21 /mobile/api/me is_admin; /api/me → {profile:{id,name,is_admin:true}}', async () => {
+    // Re-provision after T20 revoked the session
+    const { token: newToken } = provisionAdmin();
+    const newCookie = cookieHeader(newToken);
+    // /mobile/api/me includes is_admin
+    const res1 = await fetch(`${BASE}/mobile/api/me`, { headers: { Cookie: newCookie } });
+    assert.strictEqual(res1.status, 200);
+    assert.strictEqual((await res1.json()).profile.is_admin, true);
+    // /api/me → {profile:{id,name,is_admin:true}}
+    const res2 = await fetch(`${BASE}/api/me`, { headers: { Cookie: newCookie } });
+    assert.strictEqual(res2.status, 200);
+    const body = await res2.json();
+    assert.strictEqual(body.profile.is_admin, true);
+    assert.ok(body.profile.id);
+    assert.ok(body.profile.name);
+  });
+
+  // ---- T22: scripts/set-admin.js via execFileSync ----
+  await ok('T22 set-admin.js: --email promotes; unknown email → exit 1; --profile + --email', () => {
+    const { execFileSync } = require('child_process');
+    const script = path.join(__dirname, '..', 'scripts', 'set-admin.js');
+    // Find a non-admin profile with an email
+    const nonAdmin = config.listProfiles().find(p => !p.is_admin && p.email);
+    // --email → exit 0, prints "Admin set:"
+    const out = execFileSync('node', ['--experimental-sqlite', script, '--email', nonAdmin.email], { encoding: 'utf8' });
+    assert.ok(out.includes('Admin set:'), 'prints Admin set:');
+    assert.strictEqual(config.getProfile(nonAdmin.id).is_admin, true, 'now admin');
+    // Unknown email → exit 1
+    assert.throws(() => {
+      execFileSync('node', ['--experimental-sqlite', script, '--email', 'unknown@nowhere.xyz'], { encoding: 'utf8' });
+    }, (e) => e.status === 1);
+    // --profile "Name" --email new@x.y → sets both
+    const p = config.addProfile('SetAdminTarget');
+    const out2 = execFileSync('node', ['--experimental-sqlite', script, '--profile', 'SetAdminTarget', '--email', 'new@x.y'], { encoding: 'utf8' });
+    assert.ok(out2.includes('Admin set:'), 'prints Admin set:');
+    const updated = config.getProfile(p.id);
+    assert.strictEqual(updated.is_admin, true, 'admin');
+    assert.strictEqual(updated.email, 'new@x.y', 'email set');
+  });
+
+  console.log(`\nshared-login http: all ${passed - 8} HTTP checks passed.`);
 
   // ---- T23: nextAfterSignIn pure helper (card §6.4) ----
   await ok('T23 nextAfterSignIn: /configure/ admin → redirect; non-admin → deny; other values → null', () => {

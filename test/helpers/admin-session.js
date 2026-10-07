@@ -33,4 +33,22 @@ function cookieHeader(token) {
   return `air_sid=${token}`;
 }
 
-module.exports = { provisionAdmin, cookieHeader };
+// Wrap global.fetch so that every request whose URL starts with `base` and
+// has no existing Cookie header gets `Cookie: <cookie>`. Returns a function
+// that restores the previous global.fetch.
+//
+// This is the card §8.1 helper: a URL-prefix match (not a substring match
+// like `includes('/api/')`), so external URLs containing `/api/` are untouched.
+function attachCookie(base, cookie) {
+  const rawFetch = global.fetch;
+  global.fetch = (url, opts = {}) => {
+    const u = typeof url === 'string' ? url : (url.url || '');
+    if (u.startsWith(base) && !(opts.headers && opts.headers.Cookie)) {
+      opts.headers = { ...(opts.headers || {}), Cookie: cookie };
+    }
+    return rawFetch(url, opts);
+  };
+  return () => { global.fetch = rawFetch; };
+}
+
+module.exports = { provisionAdmin, cookieHeader, attachCookie };
