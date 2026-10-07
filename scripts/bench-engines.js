@@ -1,4 +1,4 @@
-// Engine backtest (ME-10, P5). Compares Genesis, Glass and Marquee on ONE
+// Engine backtest (ME-10, P5). Compares Marquee and Marquee TV on ONE
 // profile's REAL history: it holds out the most recent N watched movies, deletes
 // them from a throwaway copy of the store, rebuilds the movie pool with each
 // engine, and reports how many of the held-out titles each engine ranks into the
@@ -7,7 +7,7 @@
 //
 // Usage:
 //   node --experimental-sqlite scripts/bench-engines.js <profileName>
-//     [--holdout 10] [--engines genesis,glass,marquee] [--no-cache] [--json] [--keep]
+//     [--holdout 10] [--engines marquee,marquee-tv] [--no-cache] [--json] [--keep]
 //     [--marquee-config '<json>']
 //
 // What it READS: the live store (profiles.json, settings.json, store.db) —
@@ -21,13 +21,13 @@
 // so a bench run makes READ-ONLY live calls — TMDB (recommendations, similar,
 // discover, collections, trending refresh, deep meta for uncached candidates,
 // title search for LLM suggestions), MDBList (the pipeline's IMDb-rating step),
-// the local LLM (Glass's rerank; Marquee's brief, suggestions and fit), the
+// the local LLM (Marquee's brief, suggestions and fit), the
 // Simkl trending CDN (public), and authed Simkl GETs (Marquee's S2 recs, up to
 // 40 uncached summaries per Marquee run) — all paced through the governor. It
 // NEVER writes to Simkl or the live store, and it skips the Simkl RATINGS sync
 // (ctx.marqueeSkipSync). Everything fetched is cached in the throwaway copy
 // only — the store.db snapshot's cache tables (marquee_trending,
-// marquee_llm_cache, marquee_simkl_recs, glass_metadata, simkl_trending) and
+// marquee_llm_cache, marquee_simkl_recs, simkl_trending) and
 // the cache/ + meta/ files — so the live caches never warm up and the next
 // run starts equally cold.
 
@@ -49,7 +49,7 @@ const USAGE =
   + '  merged section-wise into the SNAPSHOT\'s settings.json only — the live settings are never written.';
 
 function parseArgs(argv) {
-  const a = { profile: null, holdout: 10, type: 'movie', engines: ['marquee', 'marquee-tv'], enginesSet: false, noCache: false, json: false, keep: false, serveOpts: null, marqueeConfig: null, help: false };
+  const a = { profile: null, holdout: 10, type: 'movie', engines: ['marquee'], enginesSet: false, noCache: false, json: false, keep: false, serveOpts: null, marqueeConfig: null, help: false };
   for (let i = 0; i < argv.length; i++) {
     const x = argv[i];
     if (x === '--holdout') a.holdout = Number(argv[++i]);
@@ -126,6 +126,15 @@ async function main() {
   if (!profile) {
     console.error('profile not found: ' + a.profile);
     process.exit(2);
+  }
+
+  // Unknown-engine check: exit 1 with a clear message.
+  const known = engines.list().map((e) => e.id);
+  for (const id of a.engines) {
+    if (!known.includes(id)) {
+      console.error(`bench-engines: unknown engine ${id} (known: ${known.join(', ')})`);
+      process.exit(1);
+    }
   }
 
   const quiet = { log() {}, warn() {}, error() {} };

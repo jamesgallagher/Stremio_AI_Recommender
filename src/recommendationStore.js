@@ -60,8 +60,8 @@ const DECAY_COOLDOWN_MS = 90 * DAY_MS; // a decayed title may return to the pool
 const DECAY_MIN_DAYS = 8;              // must be shown on ≥ this many distinct days to decay
 
 // The vote-count floor is a build-time STORAGE gate (decided 2026-08-27): a
-// sub-floor title must never be stored, not merely hidden at serve. Genesis
-// applies it at candidate selection (selectStrong, now in engines/genesis.js);
+// sub-floor title must never be stored, not merely hidden at serve. The
+// profile's engine applies it at candidate selection (selectStrong);
 // purgeBelowVoteFloor below clears any already-stored row that has since fallen
 // under the floor, for EVERY engine. The rating floor / genres / recency are
 // DIFFERENT — cheap serve-time preferences over the stored pool (no rebuild).
@@ -255,7 +255,7 @@ function upsertCandidates(profileId, candidates, { ratingCheckedAt = null } = {}
     const now = Date.now();
     for (const c of candidates) {
       // GE-01: score_components accepts an object (stored as JSON) or a pre-stringified
-      // string; null when the engine doesn't emit it (e.g. Genesis today).
+      // string; null when the engine doesn't emit it.
       const comps = c.score_components == null ? null
         : (typeof c.score_components === 'string' ? c.score_components : JSON.stringify(c.score_components));
       stmt.run(profileId, c.type, c.tmdb_id, c.imdb_id || null, c.title, c.year, c.primary_genre || null, c.genres || null, c.vote_average ?? null, c.imdb_rating ?? null, ratingCheckedAt, c.vote_count ?? null, c.affinity, c.rec_count, c.because_title || null, comps, c.algorithm_version || null, c.engine_id || null, c.popularity, c.poster || null, now, c.certification || null);
@@ -800,15 +800,15 @@ function clearType(profileId, type) {
   return Number(r.changes || 0);
 }
 
-// Build the recommendation pool for a profile — now a thin TWO-TYPE GENESIS
-// WRAPPER (SC-01). Genesis produces candidates per type; the shared pipeline
-// (engines/pipeline.js) resolves/enriches/upserts/purges each type's slice. The
-// caller runs ageGatePool() after this to make the pool age-safe. Callers/tests
-// are unchanged — the return still carries { skipped?, seeds, stored, … } and
-// per-type dispatch-by-config arrives in SC-03.
+// Build the recommendation pool for a profile — now a thin TWO-TYPE
+// WRAPPER (SC-01). The profile's engine produces candidates per type; the
+// shared pipeline (engines/pipeline.js) resolves/enriches/upserts/purges each
+// type's slice. The caller runs ageGatePool() after this to make the pool
+// age-safe. Callers/tests are unchanged — the return still carries
+// { skipped?, seeds, stored, … } and per-type dispatch-by-config arrives in SC-03.
 //
-// NOTE: the STORE_CAP (300) is now applied PER TYPE (in Genesis), not across the
-// combined candidate set as the pre-abstraction monolith did. This is the
+// NOTE: the STORE_CAP (300) is now applied PER TYPE (in the engine), not across
+// the combined candidate set as the pre-abstraction monolith did. This is the
 // architecturally correct seam for SC-03 (independent per-type engines) and
 // matches the existing per-type SEED_CAP. Served catalogs are IDENTICAL — serve
 // only ever reads the strongest list_size titles per type, and the per-type pool
@@ -840,14 +840,15 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
   const spans = { movie: [0, 50], series: [50, 100] };
   const band = (lo, hi) => (pct, label) => onProgress(lo + (pct / 100) * (hi - lo), label);
 
-  // SC-03: dispatch each type to the engine the profile selected for it (Genesis
-  // is the guaranteed safe floor — resolveFor never returns an unknown engine, one
-  // that doesn't support the type, or an age-inappropriate one, so this can never
-  // disable or unsafely fill a type). A type whose resolved engine's requirements
-  // are unmet is SKIPPED with a logged reason and its existing pool rows are LEFT
-  // SERVING — a skip must NEVER wipe a slice (only an engine CHANGE does, via
-  // config.updateProfile → clearType). The engine id per type is threaded into the
-  // result + logs so the Advanced tab / API can show who produced each catalog.
+  // SC-03: dispatch each type to the engine the profile selected for it (the
+  // type's default is the guaranteed safe floor — resolveFor never returns an
+  // unknown engine, one that doesn't support the type, or an age-inappropriate
+  // one, so this can never disable or unsafely fill a type). A type whose
+  // resolved engine's requirements are unmet is SKIPPED with a logged reason
+  // and its existing pool rows are LEFT SERVING — a skip must NEVER wipe a
+  // slice (only an engine CHANGE does, via config.updateProfile → clearType).
+  // The engine id per type is threaded into the result + logs so the Advanced
+  // tab / API can show who produced each catalog.
   const results = {};
   const engineIds = {};
   const missing = [];
@@ -882,7 +883,7 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
   // candidates. Keying off seeds alone left such a build perpetually "skipped" — it
   // never stamped built_at, so needsBuild re-fired every tick (churn) and, worse,
   // buildPool skipped the age gate over rows that WERE stored. A build that stored
-  // anything is a real build. (Genesis with 0 seeds stores nothing → still skipped.)
+  // anything is a real build. (An engine with 0 seeds stores nothing → still skipped.)
   const ranAny = !m.skipped || !sr.skipped;
   const builtSeeds = m.seeds + sr.seeds;
   const builtStored = (m.stored || 0) + (sr.stored || 0);
@@ -1334,7 +1335,7 @@ async function buildPool(profile, log = console, onProgress = () => {}, opts = {
   // that reached the pool regardless of how the skip decision above is computed — a
   // future regression in that logic can never let un-vetted rows serve. The
   // serve-time band re-check is only a lowered-limit net (unrated → kept, no LLM),
-  // so this is the real gate. (Genesis with 0 seeds stores nothing → no-op.)
+  // so this is the real gate. (An engine with 0 seeds stores nothing → no-op.)
   const stored = (r.movie?.stored || 0) + (r.series?.stored || 0);
   if (!r.skipped || stored > 0) await ageGatePool(profile, log, (pct, label) => onProgress(85 + pct * 0.15, label)); // 85–100%
   return r;
