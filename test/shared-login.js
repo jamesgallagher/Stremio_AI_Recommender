@@ -523,6 +523,9 @@ function makeLegacy(name, email, createdAt) {
     const SHOT_DIR = path.join(process.env.DATA_DIR, 'browser-shots');
     fs.mkdirSync(SHOT_DIR, { recursive: true });
 
+    // Re-provision admin session (T20 revoked it).
+    const { token: adminToken2 } = provisionAdmin();
+
     const nonAdmin = config.addProfile('NonAdmin');
     config.updateProfile(nonAdmin.id, { email: 'nonadmin@test.local' });
     const { token: nonAdminToken } = auth.createSession(nonAdmin.id);
@@ -620,7 +623,7 @@ function makeLegacy(name, email, createdAt) {
       const res = await fetch(BASE + '/api/version', { headers: { Cookie: 'air_sid=' + nonAdminToken } });
       assert.strictEqual(res.status, 403);
       const body = await res.json();
-      assert.deepStrictEqual(body, { auth: 'forbidden' });
+      assert.deepStrictEqual(body, { error: 'Admins only', auth: 'forbidden' });
     });
 
     await ok('B9 legacy mobile_sid upgrades to air_sid', async () => {
@@ -637,9 +640,9 @@ function makeLegacy(name, email, createdAt) {
     await ok('B10 Admin checkbox in /configure Advanced', async () => {
       await adminPage.goto(BASE + '/configure/');
       await adminPage.waitForTimeout(1500);
-      const advancedTab = adminPage.locator('[data-tab="advanced"]');
+      const advancedTab = adminPage.locator('.tab-btn[data-tab="advanced"]');
       if (await advancedTab.isVisible()) { await advancedTab.click(); await adminPage.waitForTimeout(1000); }
-      const visible = await adminPage.locator('[data-is-admin]').isVisible();
+      const visible = await adminPage.locator('[data-admin]').isVisible();
       assert.ok(visible, 'Admin checkbox visible');
     });
 
