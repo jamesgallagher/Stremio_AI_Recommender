@@ -13,7 +13,7 @@ const secret = require('./services/crypto');
 const store = require('./store');
 
 // Secret fields (sealed on disk). Nested under their sections.
-const LLM_SECRET_FIELDS = ['custom_api_key', 'groq_api_key', 'groq_api_key_backup', 'embed_api_key'];
+const LLM_SECRET_FIELDS = ['custom_api_key', 'groq_api_key', 'groq_api_key_backup'];
 const KEY_SECRET_FIELDS = ['tmdb_api_key', 'mdblist_api_key', 'rpdb_api_key', 'tvdb_api_key'];
 
 const DEFAULT_RPDB_KEY = 't0-free-rpdb'; // generic free-tier key, as in v5
@@ -26,12 +26,6 @@ function blankSettings() {
       custom_api_key: '',     // may be empty for keyless local servers
       groq_api_key: '',       // cloud fallback #1
       groq_api_key_backup: '', // cloud fallback #2
-      // Glass GE-09 embeddings transport (LOCAL only). A SEPARATE model from the
-      // chat one (chat models embed poorly). embed_uri defaults to custom_uri when
-      // blank (same box); embed_model empty = embeddings not configured.
-      embed_uri: '',
-      embed_model: '',
-      embed_api_key: '',
     },
     keys: {
       tmdb_api_key: '',
@@ -39,21 +33,6 @@ function blankSettings() {
       rpdb_api_key: DEFAULT_RPDB_KEY,
       tvdb_api_key: '', // AGE-1: TVDB v4 key for country certifications (sealed at rest)
     },
-    // v7 (SC-07): admin-only global engine enablement map { engineId: bool }.
-    // Genesis is permanently enabled in code (engines.isEnabled), so its stored
-    // value is irrelevant — a non-Genesis engine is OFF until it appears here as
-    // `true`. Not a secret: plaintext, like the rest of the config metadata (the
-    // seal path below skips it). settings.js stays registry-agnostic — validation
-    // (drop unknown ids, force genesis:true) lives in the portal write path.
-    engines: {},
-    // Glass Tier-2 global admin config (GE-07 / GD-6). The backend control panel
-    // for the Glass engine's tuning (half-lives, weights, per-strategy counts —
-    // see engines/glass/config.js DEFAULTS). Empty = pure Tier-1 defaults. Not a
-    // secret: plaintext like `engines`. BUILD-AFFECTING — a change here fans out
-    // clearType+rebuild across Glass profiles (portal write path). settings.js
-    // stays glass-schema-agnostic: it stores the blob as-is; engines/glass/config
-    // .resolveConfig merges it over the defaults and ignores unknown keys.
-    glass: {},
     // Marquee Tier-2 global admin config (ME-09) — the same pattern as Glass
     // (GE-07) but Marquee's own blob: engines/marquee/config.resolveConfig
     // merges it over Marquee's DEFAULTS and ignores unknown keys. Empty =
@@ -70,7 +49,7 @@ function settingsLocked() { return locked; }
 // ---- sealing ----
 function sealSettings(s) {
   // ME-09: the Marquee Tier-2 blob is sealed like glass (plain object, no secrets).
-  const q = { llm: { ...s.llm }, keys: { ...s.keys }, engines: { ...(s.engines || {}) }, glass: { ...(s.glass || {}) }, marquee: { ...(s.marquee || {}) }, created_at: s.created_at };
+  const q = { llm: { ...s.llm }, keys: { ...s.keys }, marquee: { ...(s.marquee || {}) }, created_at: s.created_at };
   for (const f of LLM_SECRET_FIELDS) if (q.llm[f]) q.llm[f] = secret.seal(q.llm[f]);
   for (const f of KEY_SECRET_FIELDS) if (q.keys[f]) q.keys[f] = secret.seal(q.keys[f]);
   return q;
@@ -92,11 +71,15 @@ function applyDefaults(s) {
   const merged = {
     llm: { ...base.llm, ...(s.llm || {}) },
     keys: { ...base.keys, ...(s.keys || {}) },
-    engines: { ...base.engines, ...(s.engines || {}) }, // seeds {} on older files (SC-07)
-    glass: { ...base.glass, ...(s.glass || {}) },        // seeds {} on older files (GE-07)
     marquee: { ...base.marquee, ...(s.marquee || {}) },  // seeds {} on older files (ME-09)
     created_at: s.created_at ?? null,
   };
+  // Strip legacy keys (SC-07 engines, GE-07 glass, GE-09 embed) on read.
+  delete merged.engines;
+  delete merged.glass;
+  delete merged.llm.embed_uri;
+  delete merged.llm.embed_model;
+  delete merged.llm.embed_api_key;
   return merged;
 }
 
@@ -128,18 +111,9 @@ function updateSettings(patch) {
   }
   if (patch.llm) Object.assign(current.llm, patch.llm);
   if (patch.keys) Object.assign(current.keys, patch.keys);
-  // SC-07: merge the engine-enablement map (already validated by the caller —
-  // settings.js stores it as-is; enablement is resolved by engines.isEnabled).
-  if (patch.engines) Object.assign(current.engines, patch.engines);
-  // GE-07: Glass Tier-2 config. REPLACE-whole (the admin control panel reads the
-  // current blob then writes it back in full); any section left out just reverts to
-  // its Tier-1 default, since engines/glass/config.resolveConfig backfills from
-  // DEFAULTS. Stored as-is (plaintext). `{}` is a true reset to pure defaults.
-  if (patch.glass !== undefined) current.glass = (patch.glass && typeof patch.glass === 'object') ? patch.glass : {};
-  // ME-09: Marquee Tier-2 config — the same replace-whole semantics as Glass
-  // (GE-07): any section left out reverts to its Tier-1 default, since
-  // engines/marquee/config.resolveConfig backfills from DEFAULTS. `{}` is a
-  // true reset to pure defaults.
+  // ME-09: Marquee Tier-2 config — replace-whole: any section left out reverts
+  // to its Tier-1 default, since engines/marquee/config.resolveConfig backfills
+  // from DEFAULTS. `{}` is a true reset to pure defaults.
   if (patch.marquee !== undefined) current.marquee = (patch.marquee && typeof patch.marquee === 'object') ? patch.marquee : {};
   if (!current.created_at) current.created_at = Date.now();
   store.saveSettings(sealSettings(current));
@@ -194,16 +168,6 @@ function hasLlm(s = getSettings()) {
   return llmChain(s).length > 0;
 }
 
-// Glass GE-09: the local embeddings transport config, or null when not set up
-// (embed_model blank). embed_uri falls back to the custom LLM base (same box);
-// embed_api_key falls back to the custom key. Consumed by services/embeddings.
-function embedConfig(s = getSettings()) {
-  if (!s || !s.llm.embed_model) return null;
-  const uri = s.llm.embed_uri || s.llm.custom_uri;
-  if (!uri) return null;
-  return { uri, model: s.llm.embed_model, apiKey: s.llm.embed_api_key || s.llm.custom_api_key || '' };
-}
-
 // Effective lookup key for a profile. Keys are GLOBAL (Server Config) in v6; a
 // per-profile key is honoured only as a fallback for older profiles that still
 // carry one. `field` is a keys field (tmdb/mdblist/rpdb_api_key) or groq_api_key.
@@ -233,7 +197,6 @@ module.exports = {
   isComplete,
   llmChain,
   hasLlm,
-  embedConfig,
   keyFor,
   resolveMdblistKey,
   settingsLocked,

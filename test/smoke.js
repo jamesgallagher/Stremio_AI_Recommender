@@ -1031,21 +1031,6 @@ ok('glass/scoring: GE-06 features 0–1, weighted rankScore, preResolved fields,
   assert.ok(fresh > heavy);
 });
 
-ok('embeddings: GE-09 cosine (identical/orthogonal/opposite/zero/mismatch) + settings.embedConfig', () => {
-  const emb = require('../src/services/embeddings');
-  assert.ok(Math.abs(emb.cosine([1, 0, 0], [1, 0, 0]) - 1) < 1e-9);   // identical
-  assert.ok(Math.abs(emb.cosine([1, 0], [0, 1])) < 1e-9);             // orthogonal
-  assert.ok(Math.abs(emb.cosine([1, 0], [-1, 0]) + 1) < 1e-9);        // opposite
-  assert.strictEqual(emb.cosine([0, 0], [1, 1]), 0);                  // zero vector → 0 (never NaN)
-  assert.strictEqual(emb.cosine([1, 2, 3], [1, 2]), 0);              // length mismatch → 0
-  // embedConfig: null until embed_model set; falls back to custom_uri/custom_api_key; embed_uri wins.
-  const settings = require('../src/settings');
-  assert.strictEqual(settings.embedConfig({ llm: { embed_model: '', custom_uri: 'http://c' } }), null);
-  assert.deepStrictEqual(settings.embedConfig({ llm: { embed_model: 'nomic', custom_uri: 'http://c', custom_api_key: 'k' } }), { uri: 'http://c', model: 'nomic', apiKey: 'k' });
-  assert.strictEqual(settings.embedConfig({ llm: { embed_model: 'nomic', embed_uri: 'http://e', custom_uri: 'http://c' } }).uri, 'http://e');
-});
-
-
 ok('glass/events: GE-10 weighted event list — watched positive, dont_recommend negative by reason', () => {
   const watchedStore = require('../src/watchedStore');
   const rs = require('../src/recommendationStore');
