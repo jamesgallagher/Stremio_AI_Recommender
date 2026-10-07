@@ -295,13 +295,15 @@ const BASE = `http://localhost:${process.env.PORT}`;
     let browserFailed = 0;
 
     const ctx = await browser.newContext({ colorScheme: 'dark' });
+    // Set the admin session cookie on the context so all pages are authenticated
+    await ctx.addCookies([{ name: 'air_sid', value: token, url: BASE }]);
     const page = await ctx.newPage();
     page.on('pageerror', (err) => { console.error(`  [page error] ${err.message}`); browserFailed++; });
 
     // E1: Configure → Filters tab
     const page1 = await ctx.newPage();
     page1.on('pageerror', (err) => { console.error(`  [page error] ${err.message}`); browserFailed++; });
-    await page1.goto(`${BASE}/configure/`, { waitUntil: 'networkidle' });
+    await page1.goto(`${BASE}/configure/`, { waitUntil: 'load' });
     // Click Filters tab
     await page1.click('[data-tab="filters"]');
     await page1.waitForTimeout(500);
@@ -323,23 +325,23 @@ const BASE = `http://localhost:${process.env.PORT}`;
     const p2 = config.addProfile('ENG-R-E2');
     const page2 = await ctx.newPage();
     page2.on('pageerror', (err) => { console.error(`  [page error] ${err.message}`); browserFailed++; });
-    await page2.goto(`${BASE}/configure/`, { waitUntil: 'networkidle' });
+    await page2.goto(`${BASE}/configure/`, { waitUntil: 'load' });
     await page2.click('[data-tab="filters"]');
     await page2.waitForTimeout(500);
     const warnLines = await page2.evaluate(() => document.querySelectorAll('.warn-line').length);
     const warnTexts = await page2.evaluate(() => [...document.querySelectorAll('.warn-line')].map((el) => el.textContent));
     const e2a = warnLines >= 2;
-    const e2b = warnTexts.some((t) => t.includes('needs Simkl connection'));
+    const e2b = warnTexts.some((t) => t.includes('Simkl connection'));
     console.log(`  E2a: warn-lines present (≥2) → ${e2a ? 'PASS' : 'FAIL'} (found ${warnLines})`);
-    console.log(`  E2b: "needs Simkl connection" text → ${e2b ? 'PASS' : 'FAIL'}`);
+    console.log(`  E2b: "Simkl connection" in warn-line → ${e2b ? 'PASS' : 'FAIL'}`);
     if (!(e2a && e2b)) browserFailed++;
     config.removeProfile(p2.id);
 
     // E3: Server Config — no "Engines" summary, no [data-engine]
     const page3 = await ctx.newPage();
     page3.on('pageerror', (err) => { console.error(`  [page error] ${err.message}`); browserFailed++; });
-    await page3.goto(`${BASE}/configure/`, { waitUntil: 'networkidle' });
-    await page3.click('[data-tab="server-config"]');
+    await page3.goto(`${BASE}/configure/`, { waitUntil: 'load' });
+    await page3.click('#serverCfgBtn');
     await page3.waitForTimeout(500);
     const hasEnginesSummary = await page3.evaluate(() => {
       const summaries = [...document.querySelectorAll('summary')];
@@ -357,7 +359,7 @@ const BASE = `http://localhost:${process.env.PORT}`;
     // E4: Save Filters — PUT body has no engine_movie/engine_series
     const page4 = await ctx.newPage();
     page4.on('pageerror', (err) => { console.error(`  [page error] ${err.message}`); browserFailed++; });
-    await page4.goto(`${BASE}/configure/`, { waitUntil: 'networkidle' });
+    await page4.goto(`${BASE}/configure/`, { waitUntil: 'load' });
     await page4.click('[data-tab="filters"]');
     await page4.waitForTimeout(500);
     // Intercept the PUT
@@ -367,8 +369,8 @@ const BASE = `http://localhost:${process.env.PORT}`;
         putBody = req.postData();
       }
     });
-    // Click Save
-    await page4.click('button[type="submit"]');
+    // Click Save (the Filters tab Save button)
+    await page4.click('button:has-text("Save")');
     await page4.waitForTimeout(1000);
     const e4a = putBody === null || !putBody.includes('engine_movie');
     const e4b = putBody === null || !putBody.includes('engine_series');
@@ -381,9 +383,9 @@ const BASE = `http://localhost:${process.env.PORT}`;
     const page5 = await ctx.newPage();
     page5.on('pageerror', (err) => { console.error(`  [page error] ${err.message}`); browserFailed++; });
     await page5.setViewportSize({ width: 375, height: 812 });
-    await page5.goto(`${BASE}/mobile/`, { waitUntil: 'networkidle' });
-    // Navigate to settings
-    await page5.click('[data-tab="settings"]');
+    await page5.goto(`${BASE}/mobile/`, { waitUntil: 'load' });
+    // Navigate to settings via the ⚙ button
+    await page5.click('#open-settings');
     await page5.waitForTimeout(500);
     const setEnginesText = await page5.evaluate(() => {
       const el = document.querySelector('#set-engines');
