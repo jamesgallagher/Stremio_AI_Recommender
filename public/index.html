@@ -222,6 +222,8 @@
   .topbar button { font-family: inherit; font-size: 16px; font-weight: 600; border-radius: 10px; }
   .topbar button.ghost { min-height: 40px; padding: 8px 12px; }
   .topbar .icon-btn { min-height: 40px; min-width: 40px; padding: 6px 8px; font-size: 18px; line-height: 1; }
+  /* The Mobile button mirrors /mobile's Configure button, including hiding it where the phone bar has no room. */
+  @media (max-width: 479px) { #open-mobile { display: none; } }
 </style>
 </head>
 <body>
@@ -229,6 +231,7 @@
   <span class="brand">AI Recommender</span>
   <span class="spacer"></span>
   <span id="me-name" class="profile"></span>
+  <button id="open-mobile" class="ghost" type="button" onclick="location.href = '/mobile/'">Mobile</button>
   <button id="open-settings" class="ghost icon-btn" type="button" aria-label="Settings" title="Settings" onclick="openMySettings()">⚙</button>
   <button id="logout" class="ghost" type="button" onclick="logOut()">Log out</button>
 </header>

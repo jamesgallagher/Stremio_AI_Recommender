@@ -701,6 +701,24 @@ function makeLegacy(name, email, createdAt) {
       await nonAdminPage.screenshot({ path: path.join(SHOT_DIR, 'B12-nonadmin-configure.png') });
     });
 
+    await ok('B14 /configure Mobile button: sits between name and cog, opens /mobile signed in, hidden at 375px', async () => {
+      await adminPage.goto(BASE + '/configure/');
+      await adminPage.waitForTimeout(1500);
+      const order = await adminPage.evaluate(() => [...document.querySelector('#appbar').children].map(e => e.id || e.className));
+      assert.deepStrictEqual(order, ['brand', 'spacer', 'me-name', 'open-mobile', 'open-settings', 'logout']);
+      await adminPage.click('#open-mobile');
+      await adminPage.waitForURL(BASE + '/mobile/**');
+      await adminPage.waitForTimeout(1500);
+      assert.ok(await adminPage.locator('#shell').isVisible(), '/mobile shell (signed in), not the login view');
+      const narrowCtx = await browser.newContext({ viewport: { width: 375, height: 812 }, colorScheme: 'dark' });
+      await narrowCtx.addCookies([{ name: 'air_sid', value: adminToken2, url: BASE }]);
+      const narrow = await narrowCtx.newPage();
+      await narrow.goto(BASE + '/configure/');
+      await narrow.waitForTimeout(1500);
+      assert.strictEqual(await narrow.locator('#open-mobile').isVisible(), false, 'hidden below 480px');
+      await narrowCtx.close();
+    });
+
     await ok('B13 logout on /configure/ revokes session', async () => {
       await adminPage.goto(BASE + '/configure/');
       await adminPage.waitForTimeout(1500);
