@@ -46,9 +46,9 @@ router.get('/version', (req, res) => {
   res.json({ version, secrets_locked: config.secretsLocked(), encryption_available: crypto.encryptionAvailable() });
 });
 
-// AUTH-1: current admin's profile (behind requireAdminApi — req.profile is set).
+// AUTH-1: current admin's profile (behind requireAdminApi — req.account is set).
 router.get('/me', (req, res) => {
-  res.json({ profile: publicProfile(req.profile, req) });
+  res.json({ profile: { id: req.account.id, name: req.account.name, is_admin: true } });
 });
 
 // Rate-governor snapshot: per-service call totals, today's count vs any daily

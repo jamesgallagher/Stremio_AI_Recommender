@@ -75,10 +75,11 @@ const sessionAuth = require('./sessionAuth');
 // Boot migration: ensure at least one admin exists (promote the oldest
 // profile with an email if none is admin).
 try {
-  const promo = config.promoteFirstAdminIfMissing();
-  if (promo.reason === 'promoted') console.log(`[auth] promoted "${promo.promoted}" to admin (no admin existed)`);
+  const r = config.promoteFirstAdminIfMissing();
+  if (r.reason === 'promoted') console.log(`[auth] "${r.promoted}" is now the admin (first boot with shared sign-in)`);
+  else if (r.reason === 'no-email') console.warn('[auth] no admin exists and no profile has an email — run scripts/set-admin.js inside the container to choose one');
 } catch (err) {
-  console.warn(`[auth] promoteFirstAdminIfMissing failed: ${err.message}`);
+  console.warn(`[auth] admin migration skipped: ${err.message}`);
 }
 
 // Configure portal (session auth via air_sid cookie; optionally also put
@@ -277,7 +278,9 @@ const PORT = parseInt(process.env.PORT || '7000', 10);
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`AI Recommender listening on :${PORT}`);
   console.log(`Configure portal: http://localhost:${PORT}/configure/`);
-  console.log('[auth] Admin portal protected by shared email-OTP sign-in (air_sid)');
+  if (process.env.ADMIN_USER || process.env.ADMIN_PASSWORD) {
+    console.log('[auth] ADMIN_USER/ADMIN_PASSWORD are no longer used — /configure uses the shared sign-in (admin profiles). You can remove them.');
+  }
 });
 
 // Scheduler: keep lists warm and pruned so nobody ever waits on a cold open.

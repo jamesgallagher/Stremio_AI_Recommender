@@ -36,17 +36,22 @@ function clearSessionCookies(res) {
   res.append('Set-Cookie', base(LEGACY_COOKIE, '/mobile'));
 }
 
-// Resolve a session from the request. Reads air_sid first; if absent, tries
-// legacy mobile_sid and upgrades it (sets air_sid, clears mobile_sid).
-// Returns { profile, token, expiresAt } or null.
+// Resolve a session from the request. Reads air_sid first; if absent or no
+// longer valid, tries legacy mobile_sid and upgrades it (sets air_sid, clears
+// mobile_sid). Returns { profile, token, expiresAt } or null.
 function sessionFromRequest(req, res) {
   let token = readCookie(req, COOKIE);
   let upgraded = false;
-  if (!token) {
+  if (token) {
+    const detail = auth.resolveSessionDetail(token);
+    if (detail) return { profile: detail.profile, token, expiresAt: detail.expiresAt };
+    // air_sid present but invalid — fall through to legacy mobile_sid.
     token = readCookie(req, LEGACY_COOKIE);
-    if (token) upgraded = true;
+    if (token) upgraded = true; else return null;
+  } else {
+    token = readCookie(req, LEGACY_COOKIE);
+    if (token) upgraded = true; else return null;
   }
-  if (!token) return null;
   const detail = auth.resolveSessionDetail(token);
   if (!detail) return null;
   if (upgraded) {
@@ -58,23 +63,25 @@ function sessionFromRequest(req, res) {
   return { profile: detail.profile, token, expiresAt: detail.expiresAt };
 }
 
-// Guard for /api/* (JSON API): 401 {auth:'signin'} or 403 {auth:'forbidden'}.
+// Guard for /api/* (JSON API): 401 {error, auth:'signin'} or 403 {error, auth:'forbidden'}.
 function requireAdminApi(req, res, next) {
+  res.set('Cache-Control', 'no-store');
   const session = sessionFromRequest(req, res);
-  if (!session) return res.status(401).json({ auth: 'signin' });
-  if (session.profile.is_admin !== true) return res.status(403).json({ auth: 'forbidden' });
-  req.profile = session.profile;
+  if (!session) return res.status(401).json({ error: 'Not signed in', auth: 'signin' });
+  if (session.profile.is_admin !== true) return res.status(403).json({ error: 'Admins only', auth: 'forbidden' });
+  req.account = session.profile;
   req.sessionToken = session.token;
   next();
 }
 
 // Guard for /configure/ (HTML pages): 302 → /mobile/?next=%2Fconfigure%2F.
 function requireAdminPage(req, res, next) {
+  res.set('Cache-Control', 'no-store');
   const session = sessionFromRequest(req, res);
   if (!session || session.profile.is_admin !== true) {
     return res.redirect('/mobile/?next=%2Fconfigure%2F');
   }
-  req.profile = session.profile;
+  req.account = session.profile;
   req.sessionToken = session.token;
   next();
 }

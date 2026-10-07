@@ -232,16 +232,16 @@ function makeLegacy(name, email, createdAt) {
     assert.strictEqual(body.profile.is_admin, true);
   });
 
-  // T13: requireAdminApi 401 {auth:'signin'} when no session
-  await ok('T13 /api 401 {auth:signin} without session', async () => {
+  // T13: requireAdminApi 401 {error, auth:'signin'} when no session
+  await ok('T13 /api 401 {error, auth:signin} without session', async () => {
     const res = await fetch(`${BASE}/api/version`);
     assert.strictEqual(res.status, 401);
     const body = await res.json();
-    assert.deepStrictEqual(body, { auth: 'signin' });
+    assert.deepStrictEqual(body, { error: 'Not signed in', auth: 'signin' });
   });
 
-  // T14: requireAdminApi 403 {auth:'forbidden'} when session but not admin
-  await ok('T14 /api 403 {auth:forbidden} for non-admin session', async () => {
+  // T14: requireAdminApi 403 {error, auth:'forbidden'} when session but not admin
+  await ok('T14 /api 403 {error, auth:forbidden} for non-admin session', async () => {
     // Create a non-admin profile + session.
     const nonAdmin = config.addProfile('NonAdmin');
     config.updateProfile(nonAdmin.id, { email: 'nonadmin@example.com' });
@@ -249,7 +249,7 @@ function makeLegacy(name, email, createdAt) {
     const res = await fetch(`${BASE}/api/version`, { headers: { Cookie: `air_sid=${token}` } });
     assert.strictEqual(res.status, 403);
     const body = await res.json();
-    assert.deepStrictEqual(body, { auth: 'forbidden' });
+    assert.deepStrictEqual(body, { error: 'Admins only', auth: 'forbidden' });
   });
 
   // T15: requireAdminApi passes when admin
