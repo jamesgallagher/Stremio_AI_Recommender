@@ -9619,18 +9619,6 @@ async function main() {
         config.removeProfile(p.id); rs.deleteForProfile(p.id);
       }
 
-      // (3) Mobile settings save that changes an engine (companion body carries
-      // the filters flat, not nested under `filters`).
-      {
-        const p = config.addProfile('INT-ENG1-C1-mobile');
-        config.updateProfile(p.id, { filters: { engine_series: 'marquee-tv' } });
-        const res = fakeRes();
-        companion.settingsPostHandler({ profile: config.getProfile(p.id), body: { engine_series: 'c1-fake' } }, res);
-        assert.ok(rebuildCalls.includes(p.id), 'mobile settings save (engine change) → rebuildAfterChange');
-        assert.ok(!ensureCalls.includes(p.id), 'mobile settings save does NOT call ensureBuilt');
-        config.removeProfile(p.id); rs.deleteForProfile(p.id);
-      }
-
       // (4) rebuildMarqueeProfiles via PUT /settings (a Tier-2 Marquee config change).
       {
         settings.updateSettings({ engines: { marquee: true }, marquee: {} });

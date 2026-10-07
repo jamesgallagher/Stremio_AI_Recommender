@@ -1048,14 +1048,12 @@ async function unitTests() {
     recommendationStore.deleteForProfile(pid);
   });
 
-  await ok('settings: toCompanionFilters exposes the editable filters (incl. title decay + per-type engine), never the age gate', () => {
+  await ok('settings: toCompanionFilters exposes the editable filters (incl. title decay), never the age gate', () => {
     const out = handlers.toCompanionFilters({ min_rating: 6, vote_count_floor: 1000, min_year: 2010, excluded_genres: ['Horror'], list_size: 20, title_decay_enabled: true, title_decay_days: 30, age_limit: 8, engine_movie: 'marquee', engine_series: 'marquee-tv' });
-    assert.deepStrictEqual(Object.keys(out).sort(), ['engine_movie', 'engine_series', 'excluded_genres', 'list_size', 'min_rating', 'min_year', 'title_decay_days', 'title_decay_enabled', 'vote_count_floor']);
+    assert.deepStrictEqual(Object.keys(out).sort(), ['excluded_genres', 'list_size', 'min_rating', 'min_year', 'title_decay_days', 'title_decay_enabled', 'vote_count_floor']);
     assert.ok(!('age_limit' in out), 'age gate never exposed');
     assert.strictEqual(out.title_decay_enabled, true);
     assert.strictEqual(out.title_decay_days, 30);
-    assert.strictEqual(out.engine_movie, 'marquee'); // v7: per-type engine round-trips to the phone
-    assert.strictEqual(out.engine_series, 'marquee-tv');
     assert.deepStrictEqual(out.excluded_genres, ['Horror']);
     assert.deepStrictEqual(handlers.toCompanionFilters({}).excluded_genres, []); // always an array
   });
@@ -1088,49 +1086,36 @@ async function unitTests() {
     assert.ok(!('age_limit' in res.body.filters), 'response never echoes the age gate');
   });
 
-  await ok('settings: POST forwards the per-type engine choice through the whitelist, still never the age gate (SC-02)', () => {
-    // The whitelist itself carries the two engine fields (SC-03's rebuild-on-change
-    // for companion saves depends on them being writable here).
-    assert.ok(handlers.COMPANION_FILTERS.includes('engine_movie'));
-    assert.ok(handlers.COMPANION_FILTERS.includes('engine_series'));
+  await ok('settings: POST never forwards engine fields (engines are fixed), still never the age gate', () => {
     const p = config.addProfile('SetEngine');
     config.updateProfile(p.id, { filters: { age_limit: 10 } }); // an age-limited profile
     const res = fakeRes();
     handlers.settingsPostHandler({
       profile: config.getProfile(p.id),
-      body: { engine_movie: 'marquee', engine_series: 'marquee-tv', age_limit: 0 }, // age_limit MUST be dropped
+      body: { engine_movie: 'marquee', engine_series: 'marquee-tv', age_limit: 0, min_rating: 5 }, // engine + age_limit MUST be dropped; min_rating is writable
     }, res);
     assert.strictEqual(res.body.ok, true);
     const after = config.getProfile(p.id);
-    assert.strictEqual(after.filters.engine_movie, 'marquee');  // forwarded + written
-    assert.strictEqual(after.filters.engine_series, 'marquee-tv');
     assert.strictEqual(after.filters.age_limit, 10, 'age gate untouched by the Companion');
-    assert.strictEqual(res.body.filters.engine_movie, 'marquee'); // echoed back to the phone
+    assert.strictEqual(after.filters.min_rating, 5, 'writable filter written');
+    assert.ok(!('engine_movie' in res.body.filters), 'engine not echoed back');
   });
 
-  await ok('settings: companionSettings ships per-type engine lists + requirements (SC-05), age + enablement gated server-side, no age leak', () => {
-    const settingsMod = require('../../src/settings');
+  await ok('settings: companionSettings ships per-type engine lists, age-gated server-side, no age leak', () => {
     const engines = require('../../src/engines');
 
     // Both Marquee engines: movie list carries marquee, series list carries marquee-tv;
-    // requirements present; the DTO is phone-safe (no capabilities / supported_types);
-    // no age in the requirement wording.
+    // the DTO is phone-safe (no capabilities / supported_types).
     const p = config.addProfile('EngList');
     const s0 = handlers.companionSettings(config.getProfile(p.id));
     assert.deepStrictEqual(s0.engines.available.movie.map((e) => e.id), ['marquee']);
     assert.deepStrictEqual(s0.engines.available.series.map((e) => e.id), ['marquee-tv']);
-    assert.strictEqual(typeof s0.engines.requirements.movie.ok, 'boolean');
-    assert.strictEqual(typeof s0.engines.requirements.series.ok, 'boolean');
     assert.deepStrictEqual(Object.keys(s0.engines.available.movie[0]).sort(), ['description', 'id', 'name']); // no internal-flag leak
-    const reqWording = JSON.stringify([s0.engines.requirements.movie, s0.engines.requirements.series]).toLowerCase();
-    assert.ok(!reqWording.includes('age'), 'requirement wording never mentions age');
 
-    // I7 + SC-07 compose: register the canonical unrestricted fixture `fake-open`
-    // (test/fixtures/fake-engine.js, SC-06) and ENABLE it (SC-07 — otherwise
-    // availableFor excludes it as disabled). It is then offered to an adult profile
+    // I7: register the canonical unrestricted fixture `fake-open`
+    // (test/fixtures/fake-engine.js, SC-06). It is then offered to an adult profile
     // and OMITTED from an age-limited one, with no age value sent either way.
     const dispose = engines._register(fakeOpen);
-    settingsMod.updateSettings({ engines: { 'fake-open': true } });
     try {
       const adult = config.addProfile('EngAdult');
       const sA = handlers.companionSettings(config.getProfile(adult.id));
@@ -1144,7 +1129,7 @@ async function unitTests() {
       assert.ok(!('age_limit' in sK.filters), 'no age gate in the filters payload');
       assert.ok(!JSON.stringify(sK).includes('age_limit'), 'no age_limit anywhere in the settings response');
       config.removeProfile(adult.id); config.removeProfile(kid.id);
-    } finally { dispose(); settingsMod.updateSettings({ engines: { 'fake-open': false } }); }
+    } finally { dispose(); }
     config.removeProfile(p.id);
   });
 
