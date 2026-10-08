@@ -510,7 +510,7 @@ async function ok(name, fn) {
     const validXml = '<anime id="1" restricted="false"><type>TV Series</type><episodecount>10</episodecount><title xml:lang="x-jat" type="main">Test</title><permanent>8.0</permanent></anime>';
     anidb._setFetch(async (url) => {
       fetchCalls.push({ url, at: t });
-      return { text: async () => validXml };
+      return { status: 200, text: async () => validXml };
     });
 
     const profile = { keys: { anidb_client: 'test-client', anidb_clientver: 1 } };
@@ -533,7 +533,7 @@ async function ok(name, fn) {
     // 3. Repeat guard: the same aid after an error within 24h → repeat.
     anidb._setFetch(async (url) => {
       fetchCalls.push({ url, at: t });
-      return { text: async () => '<error>some error</error>' };
+      return { status: 200, text: async () => '<error>some error</error>' };
     });
     advance();
     const r4 = await anidb.getAnime(3, profile, console);
@@ -554,7 +554,7 @@ async function ok(name, fn) {
     db.get().prepare('UPDATE anidb_clients SET day_calls = 0 WHERE client = ?').run('test-client');
     anidb._setFetch(async (url) => {
       fetchCalls.push({ url, at: t });
-      return { text: async () => '<error>You have been banned</error>' };
+      return { status: 200, text: async () => '<error>You have been banned</error>' };
     });
     advance();
     const r7 = await anidb.getAnime(5, profile, console);
@@ -578,6 +578,117 @@ async function ok(name, fn) {
     assert.strictEqual(atBefore, atAfter, 'attempt state survives reload');
   });
 
+  // ---- A12b: serialised concurrent getAnime — every gap ≥ 4000 ms ----
+  await ok('A12b: serialised concurrent getAnime — every gap ≥ 4000 ms', async () => {
+    const anidb = require('../src/services/anidb');
+    anidb.init();
+    anidb._resetForTests();
+    anidb._resetClock();
+
+    const fetchCalls = [];
+    const validXml = '<anime id="1" restricted="false"><type>TV Series</type><episodecount>10</episodecount><title xml:lang="x-jat" type="main">Test</title><permanent>8.0</permanent></anime>';
+    anidb._setFetch(async (url) => {
+      fetchCalls.push({ url, at: Date.now() });
+      await new Promise(r => setTimeout(r, 300)); // simulate 300ms network
+      return { status: 200, text: async () => validXml };
+    });
+
+    const profile = { keys: { anidb_client: 'test-client', anidb_clientver: 1 } };
+    const results = await Promise.all([
+      anidb.getAnime(101, profile, console),
+      anidb.getAnime(102, profile, console),
+      anidb.getAnime(103, profile, console),
+    ]);
+    assert.strictEqual(results.length, 3);
+    for (const r of results) assert.ok(r.data, 'each request succeeded');
+    assert.strictEqual(fetchCalls.length, 3, 'exactly 3 fetches');
+    // Every gap between fetch starts ≥ 4000 ms.
+    for (let i = 1; i < fetchCalls.length; i++) {
+      const gap = fetchCalls[i].at - fetchCalls[i - 1].at;
+      assert.ok(gap >= 4000, `gap ${i} = ${gap}ms ≥ 4000ms`);
+    }
+  });
+
+  // ---- A12c: HTTP 503 three times → error, exactly 3 fetches, day count rose by 3, spacing ----
+  await ok('A12c: HTTP 503 three times → error, exactly 3 fetches, day count rose by 3, spacing', async () => {
+    const anidb = require('../src/services/anidb');
+    const db = require('../src/db');
+    anidb.init();
+    anidb._resetForTests();
+    anidb._resetClock();
+
+    const fetchCalls = [];
+    anidb._setFetch(async (url) => {
+      fetchCalls.push({ url, at: Date.now() });
+      return { status: 503, text: async () => '' };
+    });
+
+    const profile = { keys: { anidb_client: 'test-client', anidb_clientver: 1 } };
+    const r = await anidb.getAnime(201, profile, console);
+    assert.strictEqual(r.error, 'http 503');
+    assert.strictEqual(fetchCalls.length, 3, 'exactly 3 fetches');
+    // Day count rose by 3.
+    const row = db.get().prepare('SELECT day_calls FROM anidb_clients WHERE client = ?').get('test-client');
+    assert.strictEqual(row.day_calls, 3, 'day_calls rose by 3');
+    // Each fetch started ≥ 4000 ms after the previous one.
+    for (let i = 1; i < fetchCalls.length; i++) {
+      const gap = fetchCalls[i].at - fetchCalls[i - 1].at;
+      assert.ok(gap >= 4000, `gap ${i} = ${gap}ms ≥ 4000ms`);
+    }
+  });
+
+  // ---- A12d: banned body → banned_until ≈ now+48h; next getAnime → skipped (no fetch) ----
+  await ok('A12d: banned body → banned_until ≈ now+48h; next getAnime → skipped (no fetch)', async () => {
+    const anidb = require('../src/services/anidb');
+    const db = require('../src/db');
+    anidb.init();
+    anidb._resetForTests();
+    anidb._resetClock();
+
+    const fetchCalls = [];
+    anidb._setFetch(async (url) => {
+      fetchCalls.push({ url, at: Date.now() });
+      return { status: 200, text: async () => '<error code="555">client banned</error>' };
+    });
+
+    const profile = { keys: { anidb_client: 'test-client', anidb_clientver: 1 } };
+    const r1 = await anidb.getAnime(301, profile, console);
+    assert.strictEqual(r1.skipped, 'banned');
+    // banned_until ≈ now + 48h.
+    const status = anidb.clientStatus(profile);
+    assert.ok(status.banned_until - Date.now() >= 48 * 3600e3 - 5000, 'banned_until ≈ now + 48h');
+    // Next getAnime (new aid) → skipped: 'banned' with no fetch.
+    const r2 = await anidb.getAnime(302, profile, console);
+    assert.strictEqual(r2.skipped, 'banned');
+    assert.strictEqual(fetchCalls.length, 1, 'no second fetch');
+  });
+
+  // ---- A12e: day_calls=149, first attempt 503 → one fetch, then skipped: 'cap' ----
+  await ok('A12e: day_calls=149, first attempt 503 → one fetch, then skipped: cap', async () => {
+    const anidb = require('../src/services/anidb');
+    const db = require('../src/db');
+    anidb.init();
+    anidb._resetForTests();
+    anidb._resetClock();
+
+    const fetchCalls = [];
+    anidb._setFetch(async (url) => {
+      fetchCalls.push({ url, at: Date.now() });
+      return { status: 503, text: async () => '' };
+    });
+
+    const profile = { keys: { anidb_client: 'test-client', anidb_clientver: 1 } };
+    // Set day_calls = 149 for today (ensure the row exists first).
+    const { sydneyDay } = require('../src/aiSchedule');
+    const day = sydneyDay(Date.now());
+    db.get().prepare('INSERT OR IGNORE INTO anidb_clients (client) VALUES (?)').run('test-client');
+    db.get().prepare('UPDATE anidb_clients SET day = ?, day_calls = 149 WHERE client = ?').run(day, 'test-client');
+
+    const r = await anidb.getAnime(401, profile, console);
+    assert.strictEqual(r.skipped, 'cap');
+    assert.strictEqual(fetchCalls.length, 1, 'exactly one fetch');
+  });
+
   // ---- A13: AniDB testClient — success caches, second test no request, bad client ----
   await ok('A13: AniDB testClient — success caches, second test no request, bad client', async () => {
     const anidb = require('../src/services/anidb');
@@ -590,7 +701,7 @@ async function ok(name, fn) {
     const validXml = '<anime id="1" restricted="false"><type>TV Series</type><episodecount>10</episodecount><title xml:lang="x-jat" type="main">Test</title><permanent>8.0</permanent></anime>';
     anidb._setFetch(async (url) => {
       fetchCalls.push({ url, at: t });
-      return { text: async () => validXml };
+      return { status: 200, text: async () => validXml };
     });
     const advance = () => { t += 4000; };
 
@@ -609,7 +720,7 @@ async function ok(name, fn) {
     // 3. Bad client: returns ✗ AniDB doesn't recognise this client.
     anidb._setFetch(async (url) => {
       fetchCalls.push({ url, at: t });
-      return { text: async () => '<error code="302">client version missing or invalid</error>' };
+      return { status: 200, text: async () => '<error code="302">client version missing or invalid</error>' };
     });
     advance(); // spacing for the new client
     const r3 = await anidb.testClient({ client: 'bad-client', clientver: 1 });

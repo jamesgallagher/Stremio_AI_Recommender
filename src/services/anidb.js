@@ -1,10 +1,12 @@
 // AN-1a: the AniDB HTTP client. Fetches a single anime record by aid with
-// strict flood control: ≥ 4000 ms spacing (server-wide, one request in flight
-// at a time), a 30-day cache, a 24h repeat guard, a 150/day cap per client,
-// back-off on timeout/5xx, and a ban circuit. Errors are detected in the BODY
-// (HTTP 200 with an <error> body), not the status code.
+// strict flood control: ≥ 4000 ms spacing enforced by exclusive() +
+// waitForSpacing (server-wide, one request in flight at a time), a 30-day
+// cache, a 24h repeat guard, a 150/day cap per client, back-off on
+// timeout/5xx, and a ban circuit. Errors are detected in the BODY (HTTP 200
+// with an <error> body), not the status code.
 const db = require('../db');
 const settings = require('../settings');
+const { sydneyDay } = require('../aiSchedule');
 
 const CACHE_TTL_MS = 30 * 86400e3; // 30-day cache
 const REPEAT_GUARD_MS = 86400e3; // 24h repeat guard
@@ -19,23 +21,33 @@ let fetchImpl = global.fetch;
 function _setFetch(fn) { fetchImpl = fn; }
 // Clock seam: tests control time through this.
 let now = () => Date.now();
-function _setNow(fn) { now = fn; }
+let fakeClock = false;
+function _setNow(fn) { now = fn; fakeClock = true; }
+function _resetClock() { now = () => Date.now(); fakeClock = false; }
 // Server-wide spacing: the last request start (in-memory). On restart this is
 // 0, so the persisted last_request_at (per client) is the fallback.
 let lastRequestAt = 0;
 
 // Waits that respect the clock seam, so tests don't sleep for real.
 async function sleep(ms) {
-  const target = now() + ms;
-  while (now() < target) {
-    await new Promise((r) => setTimeout(r, 1));
+  if (fakeClock) {
+    const target = now() + ms;
+    while (now() < target) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+  } else {
+    await new Promise((r) => setTimeout(r, ms));
   }
 }
 
-// Sydney calendar day (UTC+10), YYYY-MM-DD.
-function sydneyDay(t) {
-  const d = new Date(t + 10 * 3600e3);
-  return d.toISOString().slice(0, 10);
+// One request in flight, server-wide (all clients share one IP). Every AniDB
+// request goes through exclusive(), which also enforces the 4 s spacing, the
+// persisted last_request_at, the ban and the daily cap.
+let chain = Promise.resolve();
+function exclusive(fn) {
+  const run = chain.then(fn, fn);
+  chain = run.catch(() => {});
+  return run;
 }
 
 // §6.3: slim JSON and the parser (reference code; keep the regexes).
@@ -163,20 +175,34 @@ async function waitForSpacing(client) {
   updateClient(client, { last_request_at: now() });
 }
 
-// §6.1: the endpoint.
-async function requestAnime(client, clientver, aid) {
-  const url = `http://api.anidb.net:9001/httpapi?request=anime&client=${encodeURIComponent(client)}&clientver=${clientver}&protover=1&aid=${aid}`;
-  const res = await fetchImpl(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
-  return await res.text();
+// One HTTP request under all the rules → { xml } | { skipped } | { transient } | { http }.
+async function guardedRequest(client, clientver, aid) {
+  return exclusive(async () => {
+    const row = clientRow(client);
+    if (row.banned_until && now() < row.banned_until) return { skipped: 'banned' };
+    if (row.day === sydneyDay(now()) && row.day_calls >= DAILY_CAP) return { skipped: 'cap' };
+    await waitForSpacing(client);
+    recordDayCall(client);                 // every attempt counts
+    let res;
+    try {
+      res = await fetchImpl(`http://api.anidb.net:9001/httpapi?request=anime&client=${encodeURIComponent(client)}&clientver=${clientver}&protover=1&aid=${aid}`,
+        { signal: AbortSignal.timeout(TIMEOUT_MS) });
+    } catch {
+      return { transient: 'timeout' };
+    }
+    if (res.status >= 500) return { transient: `http ${res.status}` };
+    if (res.status !== 200) return { http: res.status };
+    return { xml: await res.text() };
+  });
 }
 
-// §6.1: classify an <error> body — ban circuit, bad client, other.
+// §6.1: classify an <error> body — ban circuit first, then bad client, other.
 function classifyError(xml, errorText) {
   const errMatch = xml.match(/<error([^>]*)>([^<]*)<\/error>/);
   const attrs = errMatch ? errMatch[1] : '';
   const code = attrs.match(/code="(\d+)"/);
-  if ((code && code[1] === '302') || /client/i.test(errorText)) return 'client';
   if (/banned/i.test(errorText)) return 'banned';
+  if ((code && code[1] === '302') || /client/i.test(errorText)) return 'client';
   return 'other';
 }
 
@@ -195,36 +221,28 @@ async function getAnime(aid, profile, log) {
   const attempt = db.get().prepare('SELECT at FROM anidb_attempts WHERE aid = ?').get(aid);
   if (attempt && now() - attempt.at < REPEAT_GUARD_MS) return { skipped: 'repeat' };
 
-  // 4. ban → banned.
-  const row = clientRow(client.client);
-  if (row.banned_until && now() < row.banned_until) return { skipped: 'banned' };
-
-  // 5. daily cap → cap.
-  const day = sydneyDay(now());
-  if (row.day === day && row.day_calls >= DAILY_CAP) return { skipped: 'cap' };
-
-  // 6. spacing + request.
-  await waitForSpacing(client.client);
-  recordDayCall(client.client);
-
-  // §6.1 back-off: at most 3 attempts, waiting 4s, 16s, 60s.
+  // 4–6. guardedRequest with back-off: at most 3 attempts.
   for (let i = 0; i < 3; i++) {
-    let xml;
-    try {
-      xml = await requestAnime(client.client, client.clientver, aid);
-    } catch (err) {
-      // Timeout or network error.
+    const r = await guardedRequest(client.client, client.clientver, aid);
+
+    if (r.skipped) return { skipped: r.skipped };
+    if (r.transient) {
       if (i < 2) {
         await sleep(BACKOFF_DELAYS[i]);
         continue;
       }
-      recordAttempt(aid, 'timeout');
-      return { error: 'timeout' };
+      recordAttempt(aid, r.transient);
+      return { error: r.transient };
+    }
+    if (r.http) {
+      recordAttempt(aid, 'http ' + r.http);
+      return { error: 'http ' + r.http };
     }
 
-    const parsed = parseAnime(xml);
+    // { xml } result: parse and classify.
+    const parsed = parseAnime(r.xml);
     if (parsed.error) {
-      const kind = classifyError(xml, parsed.error);
+      const kind = classifyError(r.xml, parsed.error);
       if (kind === 'banned') {
         const bannedUntil = now() + BAN_MS;
         updateClient(client.client, { banned_until: bannedUntil, last_error: 'banned' });
@@ -260,31 +278,27 @@ async function testClient({ client, clientver }) {
     return { ok: true, detail: `✓ Client accepted (checked ${hhmm})` };
   }
 
-  // Ban → no request.
-  if (row.banned_until && now() < row.banned_until) {
-    return { ok: false, error: `✗ AniDB has banned this client until ${new Date(row.banned_until).toLocaleString()}` };
-  }
+  // One guarded request (no retries).
+  const r = await guardedRequest(client, clientver, 1);
 
-  // Daily cap → no request.
-  const day = sydneyDay(now());
-  if (row.day === day && row.day_calls >= DAILY_CAP) {
+  if (r.skipped) {
+    if (r.skipped === 'banned') {
+      return { ok: false, error: `✗ AniDB has banned this client until ${new Date(row.banned_until).toLocaleString()}` };
+    }
     return { ok: false, error: '✗ Daily limit reached — try tomorrow' };
   }
-
-  // Spacing + request aid 1.
-  await waitForSpacing(client);
-  recordDayCall(client);
-
-  let xml;
-  try {
-    xml = await requestAnime(client, clientver, 1);
-  } catch (err) {
+  if (r.transient) {
+    updateClient(client, { last_test_at: now(), last_test_ok: 0 });
     return { ok: false, error: '✗ AniDB unreachable' };
   }
+  if (r.http) {
+    updateClient(client, { last_test_at: now(), last_test_ok: 0 });
+    return { ok: false, error: `✗ AniDB unreachable` };
+  }
 
-  const parsed = parseAnime(xml);
+  const parsed = parseAnime(r.xml);
   if (parsed.error) {
-    const kind = classifyError(xml, parsed.error);
+    const kind = classifyError(r.xml, parsed.error);
     if (kind === 'banned') {
       const bannedUntil = now() + BAN_MS;
       updateClient(client, { banned_until: bannedUntil, last_error: 'banned', last_test_at: now(), last_test_ok: 0 });
@@ -326,7 +340,8 @@ function clientStatus(profile) {
 // Test seam: clear all state (in-memory + persisted) on the current DATA_DIR.
 function _resetForTests() {
   lastRequestAt = 0;
+  chain = Promise.resolve();
   db.get().exec('DELETE FROM anidb_anime; DELETE FROM anidb_attempts; DELETE FROM anidb_clients;');
 }
 
-module.exports = { init, getAnime, cachedAnime, testClient, clientStatus, parseAnime, _setFetch, _setNow, _resetForTests };
+module.exports = { init, getAnime, cachedAnime, testClient, clientStatus, parseAnime, _setFetch, _setNow, _resetClock, _resetForTests };

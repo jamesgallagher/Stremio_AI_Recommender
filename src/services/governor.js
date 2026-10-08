@@ -50,10 +50,6 @@ const LIMITS = {
   // MyAnimeList API v2 (AN-1a): the first source for anime age ratings when a
   // client id is available. Paced at 1 req/s with a breaker.
   mal: { minIntervalMs: 1000, breaker: { threshold: 5, cooldownMs: 60000 } },
-  // AniDB HTTP API (AN-1a): one request every 4 s, server-wide (all clients
-  // share one queue / IP). The anidb client also enforces a persisted
-  // last_request_at so a restart can't burst.
-  anidb: { minIntervalMs: 4000 },
 };
 
 const DEFAULT_BACKOFF_MS = 5000; // when a 429 carries no usable Retry-After
