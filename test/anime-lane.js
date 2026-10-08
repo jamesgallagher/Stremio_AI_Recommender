@@ -435,6 +435,54 @@ async function ok(name, fn) {
     }
   });
 
+  // ---- A9b: HTTP test routes — MAL rating map, AniDB plain text ----
+  await ok('A9b: HTTP test routes — MAL rating map, AniDB plain text', async () => {
+    const p = config.addProfile('AN1A-A9b');
+    try {
+      // Stub global fetch for MAL API.
+      const realFetch = global.fetch;
+      global.fetch = async (url, opts) => {
+        if (String(url).includes('api.myanimelist.net')) {
+          return { ok: true, status: 200, json: async () => ({ id: 1, title: 'Cowboy Bebop', rating: 'r' }) };
+        }
+        return realFetch(url, opts);
+      };
+
+      // POST /api/profiles/:id/test/mal-user → detail has the mapped rating.
+      let res = await fetch(`${BASE}/api/profiles/${p.id}/test/mal-user`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key: 'test-key' }),
+      });
+      let body = await res.json();
+      assert.ok(body.ok, 'mal test ok');
+      assert.strictEqual(body.detail, 'MyAnimeList key valid (Cowboy Bebop rated R)', 'MAL rating mapped');
+
+      // Stub fetch for AniDB (bad client).
+      global.fetch = async (url, opts) => {
+        if (String(url).includes('api.anidb.net')) {
+          return { status: 200, text: async () => '<error code="302">client version missing or invalid</error>' };
+        }
+        return realFetch(url, opts);
+      };
+
+      // POST /api/profiles/:id/test/anidb-user → error has no ✗.
+      res = await fetch(`${BASE}/api/profiles/${p.id}/test/anidb-user`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ client: 'a9b-bad', clientver: 1 }),
+      });
+      body = await res.json();
+      assert.ok(!body.ok, 'anidb test not ok');
+      assert.ok(!body.error.includes('✗'), 'no ✗ in error: ' + body.error);
+      assert.strictEqual(body.error, "AniDB doesn't recognise this client", 'plain text error');
+
+      global.fetch = realFetch;
+    } finally {
+      config.removeProfile(p.id);
+    }
+  });
+
   // ---- A10: HTTP companion — engine_anime in GET/POST /mobile/api/settings ----
   await ok('A10: HTTP companion — engine_anime in GET/POST /mobile/api/settings', async () => {
     const p = config.addProfile('AN1A-A10');
@@ -708,7 +756,7 @@ async function ok(name, fn) {
     // 1. Success: caches aid 1.
     const r1 = await anidb.testClient({ client: 'test-client', clientver: 1 });
     assert.ok(r1.ok, 'testClient success');
-    assert.strictEqual(r1.detail, '✓ Client accepted', 'success text');
+    assert.strictEqual(r1.detail, 'Client accepted', 'success text');
     assert.strictEqual(fetchCalls.length, 1, 'one request');
 
     // 2. Second test within 24h: no request, returns "checked HH:MM".
@@ -717,7 +765,7 @@ async function ok(name, fn) {
     assert.ok(r2.detail.includes('checked'), 'checked text');
     assert.strictEqual(fetchCalls.length, 1, 'no new request for second test');
 
-    // 3. Bad client: returns ✗ AniDB doesn't recognise this client.
+    // 3. Bad client: returns AniDB doesn't recognise this client.
     anidb._setFetch(async (url) => {
       fetchCalls.push({ url, at: t });
       return { status: 200, text: async () => '<error code="302">client version missing or invalid</error>' };
@@ -725,7 +773,34 @@ async function ok(name, fn) {
     advance(); // spacing for the new client
     const r3 = await anidb.testClient({ client: 'bad-client', clientver: 1 });
     assert.ok(!r3.ok, 'bad client not ok');
-    assert.strictEqual(r3.error, '✗ AniDB doesn\'t recognise this client', 'bad client text');
+    assert.strictEqual(r3.error, "AniDB doesn't recognise this client", 'bad client text');
+  });
+
+  // ---- A13b: testClient results contain no ✓ or ✗ ----
+  await ok('A13b: testClient results contain no ✓ or ✗', async () => {
+    const anidb = require('../src/services/anidb');
+    anidb.init();
+    anidb._resetForTests();
+    anidb._resetClock();
+
+    const validXml = '<anime id="1" restricted="false"><type>TV Series</type><episodecount>10</episodecount><title xml:lang="x-jat" type="main">Test</title><permanent>8.0</permanent></anime>';
+    anidb._setFetch(async (url) => ({ status: 200, text: async () => validXml }));
+
+    // Good stub → detail === 'Client accepted'
+    const r1 = await anidb.testClient({ client: 'a13b-client', clientver: 1 });
+    assert.ok(r1.ok, 'success');
+    assert.strictEqual(r1.detail, 'Client accepted', 'no ✓ prefix');
+
+    // Second call → matches /^Client accepted \(checked \d\d:\d\d\)$/
+    const r2 = await anidb.testClient({ client: 'a13b-client', clientver: 1 });
+    assert.ok(r2.ok, 'second success');
+    assert.ok(/^Client accepted \(checked \d\d:\d\d\)$/.test(r2.detail), 'checked format: ' + r2.detail);
+
+    // Bad client (different name) → error === "AniDB doesn't recognise this client"
+    anidb._setFetch(async (url) => ({ status: 200, text: async () => '<error code="302">client version missing or invalid</error>' }));
+    const r3 = await anidb.testClient({ client: 'a13b-bad', clientver: 1 });
+    assert.ok(!r3.ok, 'bad client not ok');
+    assert.strictEqual(r3.error, "AniDB doesn't recognise this client", 'no ✗ prefix');
   });
 
   // ---- A14: MAL API — ratings calls api.myanimelist.net first, nsfw black → adult, Jikan fast-fail ----

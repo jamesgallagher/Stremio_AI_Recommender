@@ -520,6 +520,17 @@ router.post('/profiles/:id/test/mdblist-user', async (req, res) => {
 // Per-profile MyAnimeList user-key test (Advanced → API Keys). Same modes as
 // mdblist-user: {key: <draft>} tests an unsaved draft; {use_saved: true} tests
 // the stored user key server-side.
+async function malKeyCheck(key) {
+  const res = await fetch('https://api.myanimelist.net/v2/anime/1?fields=rating', {
+    headers: { 'X-MAL-CLIENT-ID': key, 'User-Agent': USER_AGENT },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!res.ok) return { ok: false, error: `MyAnimeList test failed (${res.status})` };
+  const data = await res.json();
+  const rating = require('./services/mal').MAL_RATING_MAP[data.rating] || 'unrated';
+  return { ok: true, detail: `MyAnimeList key valid (Cowboy Bebop rated ${rating})` };
+}
+
 router.post('/profiles/:id/test/mal-user', async (req, res) => {
   const profile = config.getProfile(req.params.id);
   if (!profile) return res.status(404).json({ error: 'Profile not found' });
@@ -539,18 +550,7 @@ router.post('/profiles/:id/test/mal-user', async (req, res) => {
     if (!testKey) return res.json({ ok: false, error: 'MyAnimeList user key not set' });
   }
   try {
-    const res2 = await fetch('https://api.myanimelist.net/v2/anime/1?fields=rating', {
-      headers: { 'X-MAL-CLIENT-ID': testKey, 'User-Agent': USER_AGENT },
-    });
-    if (res2.ok) {
-      const data = await res2.json();
-      const rating = data?.data?.rating || 'unknown';
-      console.log(`[test] ${profile.name}/mal-user: OK — ${rating}`);
-      res.json({ ok: true, detail: `MyAnimeList key valid (Cowboy Bebop rated ${rating})` });
-    } else {
-      console.error(`[test] ${profile.name}/mal-user: FAIL — ${res2.status}`);
-      res.json({ ok: false, error: `MyAnimeList test failed (${res2.status})` });
-    }
+    res.json(await malKeyCheck(testKey));
   } catch (err) {
     console.error(`[test] ${profile.name}/mal-user: ERROR — ${err.message}`);
     res.json({ ok: false, error: `MyAnimeList test failed: ${err.message}` });
@@ -579,18 +579,7 @@ router.post('/profiles/:id/test/anidb-user', async (req, res) => {
     if (!testClient) return res.json({ ok: false, error: 'AniDB client not set' });
   }
   try {
-    const result = await anidb.testClient({ client: testClient, clientver: testClientver });
-    if (result.ok) {
-      res.json({ ok: true, detail: '✓ Client accepted' });
-    } else if (result.error === 'client') {
-      res.json({ ok: false, error: "✗ AniDB doesn't recognise this client" });
-    } else if (result.banned_until) {
-      res.json({ ok: false, error: `✗ AniDB has banned this client until ${new Date(result.banned_until).toLocaleString()}` });
-    } else if (result.cap) {
-      res.json({ ok: false, error: '✗ Daily limit reached — try tomorrow' });
-    } else {
-      res.json({ ok: false, error: `✗ ${result.error || 'test failed'}` });
-    }
+    res.json(await anidb.testClient({ client: testClient, clientver: testClientver }));
   } catch (err) {
     res.json({ ok: false, error: `AniDB test failed: ${err.message}` });
   }
@@ -1364,15 +1353,7 @@ async function testMal(profile) {
   const key = profile.keys.mal_client_id;
   if (!key) return { ok: false, error: 'MyAnimeList key not set' };
   try {
-    const res = await fetch('https://api.myanimelist.net/v2/anime/1?fields=rating', {
-      headers: { 'X-MAL-CLIENT-ID': key, 'User-Agent': USER_AGENT },
-    });
-    if (res.ok) {
-      const data = await res.json();
-      const rating = data?.data?.rating || 'unknown';
-      return { ok: true, detail: `MyAnimeList key valid (Cowboy Bebop rated ${rating})` };
-    }
-    return { ok: false, error: `MyAnimeList test failed (${res.status})` };
+    return await malKeyCheck(key);
   } catch (err) {
     return { ok: false, error: `MyAnimeList test failed: ${err.message}` };
   }
@@ -1421,18 +1402,7 @@ router.post('/settings/test/anidb', async (req, res) => {
   const v = Number(clientver) || 0;
   if (!c) return res.json({ ok: false, error: 'AniDB client not set' });
   try {
-    const result = await anidb.testClient({ client: c, clientver: v || 1 });
-    if (result.ok) {
-      res.json({ ok: true, detail: '✓ Client accepted' });
-    } else if (result.error === 'client') {
-      res.json({ ok: false, error: "✗ AniDB doesn't recognise this client" });
-    } else if (result.banned_until) {
-      res.json({ ok: false, error: `✗ AniDB has banned this client until ${new Date(result.banned_until).toLocaleString()}` });
-    } else if (result.cap) {
-      res.json({ ok: false, error: '✗ Daily limit reached — try tomorrow' });
-    } else {
-      res.json({ ok: false, error: `✗ ${result.error || 'test failed'}` });
-    }
+    res.json(await anidb.testClient({ client: c, clientver: v || 1 }));
   } catch (err) {
     res.json({ ok: false, error: `AniDB test failed: ${err.message}` });
   }

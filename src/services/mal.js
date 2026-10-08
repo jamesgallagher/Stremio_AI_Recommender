@@ -300,4 +300,4 @@ function blockedForAge(verdict, limit) {
   return verdict.minAge > limit;
 }
 
-module.exports = { ratings, classify, parseAnime, cachedVerdict, isBlacklisted, blockedForAge, BANDS, LOOKUP_CAP };
+module.exports = { ratings, classify, parseAnime, cachedVerdict, isBlacklisted, blockedForAge, BANDS, LOOKUP_CAP, MAL_RATING_MAP };

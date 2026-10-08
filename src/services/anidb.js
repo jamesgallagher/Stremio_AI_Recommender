@@ -273,9 +273,8 @@ async function testClient({ client, clientver }) {
 
   // Cached OK within 24h → no request.
   if (row.last_test_ok && now() - row.last_test_at < 86400e3) {
-    const d = new Date(row.last_test_at);
-    const hhmm = String(d.getUTCHours()).padStart(2, '0') + ':' + String(d.getUTCMinutes()).padStart(2, '0');
-    return { ok: true, detail: `✓ Client accepted (checked ${hhmm})` };
+    const hhmm = new Date(row.last_test_at).toLocaleTimeString('en-AU', { timeZone: 'Australia/Sydney', hour: '2-digit', minute: '2-digit', hour12: false });
+    return { ok: true, detail: `Client accepted (checked ${hhmm})` };
   }
 
   // One guarded request (no retries).
@@ -283,17 +282,17 @@ async function testClient({ client, clientver }) {
 
   if (r.skipped) {
     if (r.skipped === 'banned') {
-      return { ok: false, error: `✗ AniDB has banned this client until ${new Date(row.banned_until).toLocaleString()}` };
+      return { ok: false, error: `AniDB has banned this client until ${new Date(row.banned_until).toLocaleString('en-AU', { timeZone: 'Australia/Sydney' })}` };
     }
-    return { ok: false, error: '✗ Daily limit reached — try tomorrow' };
+    return { ok: false, error: 'Daily limit reached — try tomorrow' };
   }
   if (r.transient) {
     updateClient(client, { last_test_at: now(), last_test_ok: 0 });
-    return { ok: false, error: '✗ AniDB unreachable' };
+    return { ok: false, error: 'AniDB unreachable' };
   }
   if (r.http) {
     updateClient(client, { last_test_at: now(), last_test_ok: 0 });
-    return { ok: false, error: `✗ AniDB unreachable` };
+    return { ok: false, error: 'AniDB unreachable' };
   }
 
   const parsed = parseAnime(r.xml);
@@ -302,20 +301,20 @@ async function testClient({ client, clientver }) {
     if (kind === 'banned') {
       const bannedUntil = now() + BAN_MS;
       updateClient(client, { banned_until: bannedUntil, last_error: 'banned', last_test_at: now(), last_test_ok: 0 });
-      return { ok: false, error: `✗ AniDB has banned this client until ${new Date(bannedUntil).toLocaleString()}` };
+      return { ok: false, error: `AniDB has banned this client until ${new Date(bannedUntil).toLocaleString('en-AU', { timeZone: 'Australia/Sydney' })}` };
     }
     if (kind === 'client') {
       updateClient(client, { last_error: 'client', last_test_at: now(), last_test_ok: 0 });
-      return { ok: false, error: '✗ AniDB doesn\'t recognise this client' };
+      return { ok: false, error: "AniDB doesn't recognise this client" };
     }
     updateClient(client, { last_error: parsed.error, last_test_at: now(), last_test_ok: 0 });
-    return { ok: false, error: `✗ ${parsed.error}` };
+    return { ok: false, error: parsed.error };
   }
 
   // Success: cache aid 1 and record the test.
   cacheAnime(1, parsed);
   updateClient(client, { last_test_at: now(), last_test_ok: 1 });
-  return { ok: true, detail: '✓ Client accepted' };
+  return { ok: true, detail: 'Client accepted' };
 }
 
 // §6.4: clientStatus — the Advanced-tab status line.
