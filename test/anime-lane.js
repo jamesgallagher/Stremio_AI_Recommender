@@ -738,6 +738,28 @@ async function ok(name, fn) {
     console.log(`A12f: smallest gap across 5 runs = ${smallest}ms`);
   });
 
+  // ---- A12g: stamp is the instant of the send; a throwing fetch is a transient, not a crash ----
+  await ok('A12g: persisted/in-memory stamp equals the clock at fetch; sync-throwing fetch → transient', async () => {
+    const anidb = require('../src/services/anidb');
+    const validXml = '<anime id="1" restricted="false"><type>TV Series</type><episodecount>10</episodecount><title xml:lang="x-jat" type="main">Test</title><permanent>8.0</permanent></anime>';
+    const profile = { keys: { anidb_client: 'test-client', anidb_clientver: 1 } };
+    anidb.init();
+    anidb._resetForTests();
+    let t = 1_000_000;
+    anidb._setNow(() => ++t); // every clock read ticks 1 ms, so a stamp taken before the send differs from the send time
+    let fetchedAt = null;
+    anidb._setFetch(async () => { fetchedAt = t; return { status: 200, text: async () => validXml }; });
+    const r = await anidb.getAnime(201, profile, console);
+    assert.ok(r.data, 'request succeeded');
+    const persisted = require('../src/db').get().prepare('SELECT MAX(last_request_at) AS m FROM anidb_clients').get().m;
+    assert.strictEqual(persisted, fetchedAt, `stamp ${persisted} must equal clock at send ${fetchedAt}`);
+    t += 5000;
+    anidb._setFetch(() => { throw new Error('sync boom'); });
+    const r2 = await anidb.getAnime(202, profile, console);
+    assert.ok(!r2.data, 'throwing fetch yields no data, no crash');
+    anidb._resetClock();
+  });
+
   // ---- A12c: HTTP 503 three times → error, exactly 3 fetches, day count rose by 3, spacing ----
   await ok('A12c: HTTP 503 three times → error, exactly 3 fetches, day count rose by 3, spacing', async () => {
     const anidb = require('../src/services/anidb');

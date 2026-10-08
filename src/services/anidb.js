@@ -184,8 +184,11 @@ async function guardedRequest(client, clientver, aid) {
     recordDayCall(client);                 // every attempt counts
     const sentAt = now();
     lastRequestAt = sentAt;
-    const pending = fetchImpl(`http://api.anidb.net:9001/httpapi?request=anime&client=${encodeURIComponent(client)}&clientver=${clientver}&protover=1&aid=${aid}`,
-      { signal: AbortSignal.timeout(TIMEOUT_MS) });
+    let pending;
+    try {
+      pending = fetchImpl(`http://api.anidb.net:9001/httpapi?request=anime&client=${encodeURIComponent(client)}&clientver=${clientver}&protover=1&aid=${aid}`,
+        { signal: AbortSignal.timeout(TIMEOUT_MS) });
+    } catch { pending = Promise.reject(new Error('send failed')); }
     updateClient(client, { last_request_at: sentAt });
     let res;
     try { res = await pending; } catch { return { transient: 'timeout' }; }
