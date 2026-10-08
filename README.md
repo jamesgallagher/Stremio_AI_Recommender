@@ -62,6 +62,7 @@ Rebuilds happen in the background and never purge a good list on failure.
 > - **Bench + promote-on-watch**, Watch Later (Trakt watchlist) catalog,
 >   "Anime" exclusion filter, curated MDBList extras, auto-scrobble, RPDB,
 >   and encryption all carry over unchanged.
+> - **Anime (opt-in per profile):** Marquee Anime builds "Recommended for you - Anime".
 > - **Superseded v2 behavior notes below:** fill-to-quota LLM rounds, the
 >   rolling avoid-list ("Fresh picks daily"), and generation-prompt details
 >   no longer apply on this branch.
