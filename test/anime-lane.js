@@ -4,6 +4,8 @@
 // Browser checks: node --experimental-sqlite test/anime-lane.js --browser
 'use strict';
 const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
 
 process.env.DATA_DIR = require('os').tmpdir() + '/ai-rec-an1a-' + Date.now();
 process.env.PORT = '7316'; // distinct from engines-marquee-only (7315)
@@ -776,6 +778,226 @@ async function ok(name, fn) {
       config.removeProfile(p.id);
     }
   });
+
+  // ---- Browser checks B1–B8 (only with --browser) ----
+  if (process.argv.includes('--browser')) {
+    const { chromium } = require('playwright');
+    const browser = await chromium.launch({ headless: true });
+    const screenshotDir = path.join(__dirname, 'screenshots');
+    if (!fs.existsSync(screenshotDir)) fs.mkdirSync(screenshotDir);
+    const pageErrors = [];
+    const adminCookie = { name: 'air_sid', value: token, url: BASE };
+
+    // B1: Filters tab at 1280 px — three columns.
+    await ok('B1: Filters tab at 1280px — three engine columns', async () => {
+      const context = await browser.newContext({ viewport: { width: 1280, height: 800 }, colorScheme: 'dark' });
+      await context.addCookies([adminCookie]);
+      const page = await context.newPage();
+      page.on('pageerror', (e) => pageErrors.push(e.message));
+      await page.goto(`${BASE}/configure/`);
+      // Wait for the Filters tab to be active.
+      await page.waitForSelector('[data-tab="filters"]');
+      // Three columns: Movies, Shows, Anime.
+      const cols = await page.locator('.cols-3 > div').count();
+      assert.strictEqual(cols, 3, 'three columns');
+      const labels = await page.locator('.cols-3 > div label').allInnerTexts();
+      assert.deepStrictEqual(labels, ['Movies', 'Shows', 'Anime'], 'labels');
+      // Movie and series selects have 1 option each, not disabled.
+      const movieSel = page.locator('[data-filter="engine_movie"]');
+      const seriesSel = page.locator('[data-filter="engine_series"]');
+      assert.strictEqual(await movieSel.locator('option').count(), 1, 'movie 1 option');
+      assert.strictEqual(await seriesSel.locator('option').count(), 1, 'series 1 option');
+      assert.strictEqual(await movieSel.getAttribute('disabled'), null, 'movie not disabled');
+      assert.strictEqual(await seriesSel.getAttribute('disabled'), null, 'series not disabled');
+      // Anime select shows Disabled.
+      const animeSel = page.locator('[data-filter="engine_anime"]');
+      assert.strictEqual(await animeSel.inputValue(), 'off', 'anime shows off');
+      const hint = await page.locator('[data-anime-hint]').innerText();
+      assert.ok(hint.includes('Disabled: no anime row'), 'anime hint text');
+      await page.screenshot({ path: path.join(screenshotDir, 'engines-1280.png') });
+      await context.close();
+    });
+
+    // B2: Change Anime to Marquee Anime — hint swaps, save sends correct body.
+    await ok('B2: Change Anime to Marquee Anime — hint + save', async () => {
+      const context = await browser.newContext({ viewport: { width: 1280, height: 800 }, colorScheme: 'dark' });
+      await context.addCookies([adminCookie]);
+      const page = await context.newPage();
+      page.on('pageerror', (e) => pageErrors.push(e.message));
+      await page.goto(`${BASE}/configure/`);
+      await page.waitForSelector('[data-tab="filters"]');
+      const p = config.addProfile('AN1A-B2');
+      try {
+        // Select the profile in the URL.
+        await page.goto(`${BASE}/configure/#filters?profile=${p.id}`);
+        await page.waitForSelector('[data-filter="engine_anime"]');
+        // Change to marquee-anime.
+        await page.selectOption('[data-filter="engine_anime"]', 'marquee-anime');
+        // Hint swaps.
+        const hint = await page.locator('[data-anime-hint]').innerText();
+        assert.ok(hint.includes('Recommended for you - Anime'), 'hint swaps');
+        // Warn line appears (no client saved).
+        const animeWarn = await page.locator('.warn-line[data-anime-warn]').count();
+        assert.strictEqual(animeWarn, 1, 'anime warn line present');
+        const warn = await page.locator('.warn-line[data-anime-warn]').innerText();
+        assert.ok(warn.includes('AniDB client'), 'warn line');
+        // Save and check the PUT body.
+        const putBody = [];
+        await page.route('**/api/profiles/**', (route) => {
+          if (route.request().method() === 'PUT') putBody.push(route.request().postData());
+          route.continue();
+        });
+        await page.locator('.tab-panel[data-tab="filters"] .save-bar button').click();
+        await page.waitForTimeout(500);
+        assert.ok(putBody.length > 0, 'PUT sent');
+        const body = JSON.parse(putBody[0]);
+        assert.strictEqual(body.filters?.engine_anime, 'marquee-anime', 'engine_anime in PUT');
+        assert.strictEqual(body.filters?.engine_movie, undefined, 'no engine_movie');
+        assert.strictEqual(body.filters?.engine_series, undefined, 'no engine_series');
+        // Toast.
+        const toast = await page.locator('.toast, [class*=toast]').first().innerText().catch(() => '');
+        assert.ok(toast.includes('Anime engine enabled'), 'toast text');
+      } finally {
+        config.removeProfile(p.id);
+        await context.close();
+      }
+    });
+
+    // B3: 400 px — three engine fields stack in one column.
+    await ok('B3: 400px — three engine fields stack', async () => {
+      const context = await browser.newContext({ viewport: { width: 400, height: 800 }, colorScheme: 'dark' });
+      await context.addCookies([adminCookie]);
+      const page = await context.newPage();
+      page.on('pageerror', (e) => pageErrors.push(e.message));
+      await page.goto(`${BASE}/configure/`);
+      await page.waitForSelector('[data-tab="filters"]');
+      const cols = await page.locator('.cols-3 > div').count();
+      assert.strictEqual(cols, 3, 'three columns');
+      await page.screenshot({ path: path.join(screenshotDir, 'engines-400.png') });
+      await context.close();
+    });
+
+    // B4: Catalogs tab — 2 rows with anime off, 3 rows with it on.
+    await ok('B4: Catalogs tab — 2/3 rows with anime off/on', async () => {
+      const context = await browser.newContext({ viewport: { width: 1280, height: 800 }, colorScheme: 'dark' });
+      await context.addCookies([adminCookie]);
+      const page = await context.newPage();
+      page.on('pageerror', (e) => pageErrors.push(e.message));
+      const p = config.addProfile('AN1A-B4');
+      try {
+        await page.goto(`${BASE}/configure/`);
+        await page.waitForSelector('#userSelect');
+        // Select the B4 profile in the dropdown.
+        await page.selectOption('#userSelect', p.id);
+        await page.waitForSelector('[data-tab="catalogs"]');
+        // With anime off: 2 "Recommended for you" rows (movie + series).
+        const recRows = await page.locator('.tab-panel[data-tab="catalogs"] .cat-item .name:has-text("Recommended for you")').count();
+        assert.strictEqual(recRows, 2, 'two Recommended for you rows when off');
+        // Enable anime.
+        await page.locator('.tab-btn[data-tab="filters"]').click();
+        await page.waitForSelector('[data-filter="engine_anime"]');
+        await page.selectOption('[data-filter="engine_anime"]', 'marquee-anime');
+        // The Filters tab's Save button (not the Server Config Save).
+        await page.locator('.tab-panel[data-tab="filters"] .save-bar button').click();
+        await page.waitForTimeout(500);
+        // Reload to get the updated profile data (the page doesn't re-render after save).
+        await page.reload();
+        await page.waitForSelector('#userSelect');
+        await page.selectOption('#userSelect', p.id);
+        // Switch to the catalogs tab.
+        await page.locator('.tab-btn[data-tab="catalogs"]').click();
+        await page.waitForSelector('[data-tab="catalogs"]');
+        const recRowsOn = await page.locator('.tab-panel[data-tab="catalogs"] .cat-item .name:has-text("Recommended for you")').count();
+        assert.strictEqual(recRowsOn, 3, 'three Recommended for you rows when on');
+      } finally {
+        config.removeProfile(p.id);
+        await context.close();
+      }
+    });
+
+    // B5: Advanced → API Keys — section title, blocks in order.
+    await ok('B5: Advanced → API Keys — section + blocks', async () => {
+      const context = await browser.newContext({ viewport: { width: 1280, height: 800 }, colorScheme: 'dark' });
+      await context.addCookies([adminCookie]);
+      const page = await context.newPage();
+      page.on('pageerror', (e) => pageErrors.push(e.message));
+      const p = config.addProfile('AN1A-B5');
+      try {
+        await page.goto(`${BASE}/configure/#advanced?profile=${p.id}`);
+        await page.waitForSelector('[data-tab="advanced"]');
+        // Section title.
+        const title = await page.locator('.sec-title', { hasText: 'API Keys' }).innerText();
+        assert.ok(title.includes('API Keys'), 'API Keys title');
+        // Three blocks in order: MDBList, MyAnimeList, AniDB.
+        const labels = await page.locator('[data-tab="advanced"] label').allInnerTexts();
+        const mdbIdx = labels.findIndex((l) => l.includes('MDBList'));
+        const malIdx = labels.findIndex((l) => l.includes('MyAnimeList'));
+        const anidbIdx = labels.findIndex((l) => l.includes('AniDB'));
+        assert.ok(mdbIdx >= 0, 'MDBList label');
+        assert.ok(malIdx >= 0, 'MyAnimeList label');
+        assert.ok(anidbIdx >= 0, 'AniDB label');
+        assert.ok(mdbIdx < malIdx && malIdx < anidbIdx, 'order MDBList < MAL < AniDB');
+        await page.screenshot({ path: path.join(screenshotDir, 'api-keys.png') });
+      } finally {
+        config.removeProfile(p.id);
+        await context.close();
+      }
+    });
+
+    // B6: Server Config — MAL + AniDB fields present.
+    await ok('B6: Server Config — MAL + AniDB fields', async () => {
+      const context = await browser.newContext({ viewport: { width: 1280, height: 800 }, colorScheme: 'dark' });
+      await context.addCookies([adminCookie]);
+      const page = await context.newPage();
+      page.on('pageerror', (e) => pageErrors.push(e.message));
+      await page.goto(`${BASE}/configure/`);
+      // Server Config is a separate card (not a tab) — force it visible.
+      await page.click('#serverCfgBtn');
+      await page.waitForSelector('#serverConfig');
+      const serverConfig = page.locator('#serverConfig');
+      const malField = await serverConfig.locator('text=MyAnimeList').count();
+      const anidbField = await serverConfig.locator('text=AniDB').count();
+      assert.ok(malField > 0, 'MAL field present');
+      assert.ok(anidbField > 0, 'AniDB field present');
+      await context.close();
+    });
+
+    // B7: /mobile → ⚙ → Filters at 390×844 — three engine selects.
+    await ok('B7: Mobile Filters — three engine selects', async () => {
+      const context = await browser.newContext({ viewport: { width: 390, height: 844 }, colorScheme: 'dark' });
+      const page = await context.newPage();
+      page.on('pageerror', (e) => pageErrors.push(e.message));
+      const p = config.addProfile('AN1A-B7');
+      try {
+        // Login to the mobile companion.
+        const token = require('../mobile/server/auth').createSession(p.id).token;
+        await context.addCookies([{ name: 'air_sid', value: token, url: `${BASE}/mobile/` }]);
+        await page.goto(`${BASE}/mobile/#/settings`);
+        await page.waitForSelector('#set-engine-anime');
+        // Three engine selects.
+        const movieSel = await page.locator('#set-engine-movie').count();
+        const seriesSel = await page.locator('#set-engine-series').count();
+        const animeSel = await page.locator('#set-engine-anime').count();
+        assert.strictEqual(movieSel, 1, 'movie select');
+        assert.strictEqual(seriesSel, 1, 'series select');
+        assert.strictEqual(animeSel, 1, 'anime select');
+        // Anime sub-text.
+        const sub = await page.locator('#set-engine-anime-sub').innerText();
+        assert.ok(sub.includes('Disabled'), 'anime sub text');
+        await page.screenshot({ path: path.join(screenshotDir, 'mobile-engines.png') });
+      } finally {
+        config.removeProfile(p.id);
+        await context.close();
+      }
+    });
+
+    // B8: No page errors on any page.
+    await ok('B8: No page errors', async () => {
+      assert.deepStrictEqual(pageErrors, [], 'no page errors');
+    });
+
+    await browser.close();
+  }
 
   console.log(`\nAll anime-lane checks passed (${passed}).${failed ? ` FAILED: ${failed}` : ''}`);
   process.exit(failed ? 1 : 0);
