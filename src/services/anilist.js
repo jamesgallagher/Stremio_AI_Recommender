@@ -18,22 +18,22 @@ const ADULT_GENRES = /^(hentai|erotica)$/i;
 const QUERY = 'query($id:Int){Media(idMal:$id,type:ANIME){isAdult genres}}';
 const REQUEST_TIMEOUT_MS = 10000;
 
-const LIST_QUERY = `query($page:Int,$sort:[MediaSort],$genreIn:[String],$genreNotIn:[String],$tagNotIn:[String]){
+const LIST_QUERY = `query($page:Int,$sort:[MediaSort],$tagIn:[String],$genreNotIn:[String],$tagNotIn:[String]){
   Page(page:$page, perPage:50){
     media(type:ANIME, isAdult:false, format_in:[TV,ONA,TV_SHORT], status_not_in:[NOT_YET_RELEASED],
-          sort:$sort, genre_in:$genreIn, genre_not_in:$genreNotIn, tag_not_in:$tagNotIn){
+          sort:$sort, tag_in:$tagIn, genre_not_in:$genreNotIn, tag_not_in:$tagNotIn){
       id idMal format genres averageScore popularity startDate{year} title{romaji english}
     }
   }
 }`;
 const LISTS = {
   trending: { sort: ['TRENDING_DESC'] },
-  // Kid-friendly: popular, gentle genres; never these genres or content tags.
+  // Kid-friendly: popular, the AniList 'Kids' demographic tag; never these genres or content tags.
   kids: {
     sort: ['POPULARITY_DESC'],
-    genreIn: ['Comedy', 'Adventure', 'Slice of Life', 'Sports', 'Fantasy'],
+    tagIn: ['Kids'],
     genreNotIn: ['Ecchi', 'Hentai', 'Horror', 'Psychological', 'Thriller'],
-    tagNotIn: ['Nudity', 'Gore', 'Sexual Content', 'Suicide', 'Torture'],
+    tagNotIn: ['Nudity', 'Gore', 'Suicide', 'Torture'],
   },
 };
 

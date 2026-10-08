@@ -83,14 +83,17 @@ async function ok(name, fn) {
       // trending
       await anilist.trendingAnime({ list: 'trending', page: 1 });
       assert.deepStrictEqual(captured.variables.sort, ['TRENDING_DESC']);
-      assert.strictEqual(captured.variables.genreIn, undefined);
+      assert.strictEqual(captured.variables.tagIn, undefined, 'trending sends no tagIn');
       assert.ok(captured.query.includes('isAdult:false'), 'query has isAdult:false');
       assert.ok(captured.query.includes('format_in:[TV,ONA,TV_SHORT]'), 'query has format_in');
       // kids
       await anilist.trendingAnime({ list: 'kids', page: 1 });
-      assert.deepStrictEqual(captured.variables.genreIn, ['Comedy', 'Adventure', 'Slice of Life', 'Sports', 'Fantasy']);
+      assert.deepStrictEqual(captured.variables.tagIn, ['Kids']);
+      assert.strictEqual(captured.variables.genreIn, undefined, 'no genreIn variable');
       assert.deepStrictEqual(captured.variables.genreNotIn, ['Ecchi', 'Hentai', 'Horror', 'Psychological', 'Thriller']);
-      assert.deepStrictEqual(captured.variables.tagNotIn, ['Nudity', 'Gore', 'Sexual Content', 'Suicide', 'Torture']);
+      assert.deepStrictEqual(captured.variables.tagNotIn, ['Nudity', 'Gore', 'Suicide', 'Torture']);
+      assert.ok(captured.query.includes('tag_in:$tagIn'), 'query has tag_in');
+      assert.ok(!captured.query.includes('genre_in'), 'query has no genre_in');
     } finally {
       global.fetch = realFetch;
     }
@@ -137,6 +140,7 @@ async function ok(name, fn) {
       },
       listSize: () => 20,
       tier: () => null,
+      tvMeta: async () => new Map(),
     };
     const ctx = { log: console };
     const cands = await trending.build({ name: 'T3', id: 'T3' }, ctx, deps);
@@ -189,6 +193,7 @@ async function ok(name, fn) {
           if (n >= 12) return { csmMaxAge: 12, label: '12+' };
           return { csmMaxAge: 10, label: '10+' };
         },
+        tvMeta: async () => new Map(),
       };
     };
     // age_limit 10 → kids called twice
@@ -235,6 +240,7 @@ async function ok(name, fn) {
       },
       listSize: () => size,
       tier: () => null,
+      tvMeta: async () => new Map(),
     });
     let ctx = { log: console };
     let cands = await trending.build({ name: 'T5', id: 'T5' }, ctx, makeDeps(20));
@@ -261,6 +267,7 @@ async function ok(name, fn) {
       },
       listSize: () => 20,
       tier: () => null,
+      tvMeta: async () => new Map(),
     };
     let cands = await trending.build({ name: 'T6', id: 'T6' }, { log }, d);
     assert.strictEqual(cands.length, 1, 'Simkl candidate still returned');
@@ -279,6 +286,7 @@ async function ok(name, fn) {
       },
       listSize: () => 20,
       tier: () => null,
+      tvMeta: async () => new Map(),
     };
     cands = await trending.build({ name: 'T6', id: 'T6' }, { log }, d);
     assert.deepStrictEqual(cands, [], 'all sources fail → []');
@@ -301,6 +309,7 @@ async function ok(name, fn) {
       },
       listSize: () => 20,
       tier: () => null,
+      tvMeta: async () => new Map(),
     };
     try {
       settings.updateSettings({ keys: { tmdb_api_key: 'test-tmdb-key' } });
@@ -325,6 +334,42 @@ async function ok(name, fn) {
     } finally {
       trending.build = realBuild;
     }
+  });
+
+  // ---- T8: TMDB naming — show title/year/poster from TMDB, fallback + throw ----
+  await ok('T8: TMDB naming — show names from TMDB, fallback + throw', async () => {
+    const trending = require('../src/engines/marqueeAnime/trending');
+    const makeSimkl = () => [
+      { mal: 3, tmdb_id: '94664', imdb_id: 'tt0000001', title: 'Mushoku S2', year: 2021, ratings: { mal: { rating: 8, votes: 100 } }, rank: 1 },
+      { mal: 5, tmdb_id: '5000', imdb_id: 'tt5000', title: 'Other Show', year: 2020, ratings: { mal: { rating: 7, votes: 50 } }, rank: 2 },
+    ];
+    const makeAniMap = () => ({
+      ensureLoaded: async () => {},
+      byMal: (id) => (id === 3 ? { tv: '94664', imdb: 'tt0000001', type: 'TV' } : (id === 5 ? { tv: '5000', imdb: 'tt5000', type: 'TV' } : null)),
+      byAnilist: () => null,
+    });
+    // (a) TMDB naming applied to the present id; a missing id keeps its source title.
+    const tmdbMeta = new Map([['94664', { title: 'Mushoku Tensei: Jobless Reincarnation', year: 2021, poster: 'https://image.tmdb.org/x.jpg' }]]);
+    let d = { simklList: makeSimkl, anilistList: () => [], animeMap: makeAniMap(), listSize: () => 20, tier: () => null, tvMeta: async () => tmdbMeta };
+    let ctx = { log: console };
+    let cands = await trending.build({ name: 'T8', id: 'T8' }, ctx, d);
+    assert.strictEqual(cands.length, 2, 'two candidates');
+    const mushoku = cands.find((c) => c.tmdb_id === '94664');
+    assert.strictEqual(mushoku.title, 'Mushoku Tensei: Jobless Reincarnation', 'TMDB title');
+    assert.strictEqual(mushoku.year, 2021, 'TMDB year');
+    assert.strictEqual(mushoku.poster, 'https://image.tmdb.org/x.jpg', 'TMDB poster');
+    const other = cands.find((c) => c.tmdb_id === '5000');
+    assert.strictEqual(other.title, 'Other Show', 'missing id keeps source title');
+    // (b) tvMeta throws → candidates still returned with source names, one warning logged.
+    const warns = [];
+    const log = { log: () => {}, warn: (m) => warns.push(m) };
+    d = { simklList: makeSimkl, anilistList: () => [], animeMap: makeAniMap(), listSize: () => 20, tier: () => null, tvMeta: () => { throw new Error('TMDB down'); } };
+    ctx = { log };
+    cands = await trending.build({ name: 'T8', id: 'T8' }, ctx, d);
+    assert.strictEqual(cands.length, 2, 'candidates still returned');
+    assert.strictEqual(cands.find((c) => c.tmdb_id === '94664').title, 'Mushoku S2', 'source name kept on throw');
+    assert.strictEqual(cands.find((c) => c.tmdb_id === '5000').title, 'Other Show', 'source name kept on throw');
+    assert.strictEqual(warns.filter((m) => m.includes('TMDB naming failed')).length, 1, 'one warning logged');
   });
 
   console.log(`\nAll anime-trending checks passed (${passed}).${failed ? ` FAILED: ${failed}` : ''}`);

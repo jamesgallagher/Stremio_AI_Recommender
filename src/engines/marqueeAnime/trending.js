@@ -9,6 +9,7 @@ const DEFAULT_DEPS = {
   animeMap: require('../../services/animeMap'),
   listSize: (p) => require('../../recommendationStore').listSizeFor(p),
   tier: (p) => require('../../ageVerification').tierFor(p.filters || {}),
+  tvMeta: (apiKey, ids, log) => require('../marqueeTv/meta').ensureTvMeta(apiKey, ids, { log }),
 };
 
 const isShowType = (t) => t === 'TV' || t === 'ONA';
@@ -160,6 +161,19 @@ async function build(profile, ctx, deps = DEFAULT_DEPS) {
   const target = 4 * deps.listSize(profile);
   candidates.sort((a, b) => (b.rankScore - a.rankScore) || (a.tmdb_id < b.tmdb_id ? -1 : a.tmdb_id > b.tmdb_id ? 1 : 0));
   const kept = candidates.slice(0, target);
+
+  // Name each show from TMDB (its real show title, first-air year and poster), not the
+  // per-season AniList/Simkl name. Best effort: a failed lookup keeps the source name.
+  let metas = new Map();
+  try { metas = await deps.tvMeta(ctx.tmdbKey, kept.map((c) => c.tmdb_id), log); }
+  catch (err) { log.warn(`[marquee-anime] ${name}: TMDB naming failed (${err.message}) — keeping source names`); }
+  for (const c of kept) {
+    const m = metas.get(c.tmdb_id);
+    if (!m) continue;
+    if (m.title) c.title = m.title;
+    if (m.year) c.year = m.year;
+    if (m.poster) c.poster = m.poster;
+  }
 
   // 8. Stats.
   ctx.stats = { seeds: 0, raw: simklItems.length + anilistItems.length + kidsItems.length, strong: shows.size, kept: kept.length };
