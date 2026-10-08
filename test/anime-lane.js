@@ -138,6 +138,185 @@ async function ok(name, fn) {
     }
   });
 
+  // ---- A5: build plumbing — fake anime engine stores 3 rows, movie/series unchanged ----
+  await ok('A5: build plumbing — fake anime engine stores 3 anime rows; movie/series unchanged; pruneOtherEngines(series) leaves anime', async () => {
+    const rec = require('../src/recommendationStore');
+
+    // Register fake movie/series engines (no Simkl needed) + a fake anime engine.
+    const fakeMovie = {
+      id: 'fake-movie', name: 'Fake Movie', supportedTypes: ['movie'],
+      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+      requirements() { return { ok: true, missing: [] }; },
+      async generate() { return []; },
+      ALGORITHM_VERSION: 'fake-movie-v1',
+    };
+    const fakeSeries = {
+      id: 'fake-series', name: 'Fake Series', supportedTypes: ['series'],
+      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+      requirements() { return { ok: true, missing: [] }; },
+      async generate() { return []; },
+      ALGORITHM_VERSION: 'fake-series-v1',
+    };
+    const fakeAnime = {
+      id: 'fake-anime', name: 'Fake Anime', supportedTypes: ['anime'],
+      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+      requirements() { return { ok: true, missing: [] }; },
+      async generate(profile, type, ctx) {
+        ctx.stats = { seeds: 3, raw: 3, strong: 3, kept: 3 };
+        return [
+          { type: 'anime', tmdb_id: '9001', imdb_id: 'tt9001', title: 'Anime One', year: 2020, primary_genre: 'Action', genres: 'Action,Anime', vote_average: 7.5, affinity: 0.9, rec_count: 3, because_title: 'Watched Show', poster: '/p1.jpg', popularity: 0 },
+          { type: 'anime', tmdb_id: '9002', imdb_id: 'tt9002', title: 'Anime Two', year: 2021, primary_genre: 'Fantasy', genres: 'Fantasy,Anime', vote_average: 8.0, affinity: 0.8, rec_count: 2, because_title: 'Watched Show', poster: '/p2.jpg', popularity: 0 },
+          { type: 'anime', tmdb_id: '9003', imdb_id: 'tt9003', title: 'Anime Three', year: 2022, primary_genre: 'Comedy', genres: 'Comedy,Anime', vote_average: 7.0, affinity: 0.7, rec_count: 1, because_title: 'Watched Show', poster: '/p3.jpg', popularity: 0 },
+        ];
+      },
+      ALGORITHM_VERSION: 'fake-anime-v1',
+    };
+    const unregMovie = engines._register(fakeMovie);
+    const unregSeries = engines._register(fakeSeries);
+    const unregAnime = engines._register(fakeAnime);
+
+    settings.updateSettings({ keys: { tmdb_api_key: 'test-tmdb-key' } });
+
+    const p = config.addProfile('AN1A-A5');
+    try {
+      // Profile with the fake engines.
+      config.updateProfile(p.id, { filters: { engine_movie: 'fake-movie', engine_series: 'fake-series', engine_anime: 'fake-anime' } });
+      const prof = config.getProfile(p.id);
+
+      // Build with the anime engine on.
+      const r1 = await rec.buildRecommendations(prof, console);
+      assert.strictEqual(r1.anime && r1.anime.stored, 3, 'anime stored 3 rows');
+      assert.strictEqual(r1.engines.anime, 'fake-anime', 'engines.anime is fake-anime');
+
+      // Verify 3 rows with type='anime' in the pool.
+      const animeRows = rec.getRecommended(p.id, { type: 'anime' });
+      assert.strictEqual(animeRows.length, 3, '3 anime rows in pool');
+      assert.ok(animeRows.every((r) => r.type === 'anime'), 'all rows type=anime');
+
+      // Movie/series row counts are identical with and without the anime engine.
+      const movieCount = rec.getRecommended(p.id, { type: 'movie' }).length;
+      const seriesCount = rec.getRecommended(p.id, { type: 'series' }).length;
+
+      // Turn off the anime engine and rebuild — movie/series counts unchanged.
+      config.updateProfile(p.id, { filters: { engine_anime: 'off' } });
+      const prof2 = config.getProfile(p.id);
+      const r2 = await rec.buildRecommendations(prof2, console);
+      assert.strictEqual(r2.engines && r2.engines.anime, undefined, 'no engines.anime when off');
+      assert.strictEqual(r2.anime, undefined, 'no anime key when off');
+      assert.strictEqual(rec.getRecommended(p.id, { type: 'movie' }).length, movieCount, 'movie count unchanged');
+      assert.strictEqual(rec.getRecommended(p.id, { type: 'series' }).length, seriesCount, 'series count unchanged');
+
+      // Re-enable and verify pruneOtherEngines('series') leaves anime rows untouched.
+      config.updateProfile(p.id, { filters: { engine_anime: 'fake-anime' } });
+      const prof3 = config.getProfile(p.id);
+      await rec.buildRecommendations(prof3, console);
+      const animeBefore = rec.getRecommended(p.id, { type: 'anime' }).length;
+      rec.pruneOtherEngines(p.id, 'series', 'fake-series');
+      const animeAfter = rec.getRecommended(p.id, { type: 'anime' }).length;
+      assert.strictEqual(animeAfter, animeBefore, 'pruneOtherEngines(series) leaves anime rows');
+    } finally {
+      config.removeProfile(p.id);
+      unregMovie();
+      unregSeries();
+      unregAnime();
+      settings.updateSettings({ keys: { tmdb_api_key: '' } });
+    }
+  });
+
+  // ---- A6: serve — type mapping, excluded-genre, dont_recommend ----
+  await ok('A6: serve — serveRecommendations type=series; excluded Anime genre; dont_recommend series hides anime', async () => {
+    const rec = require('../src/recommendationStore');
+
+    const p = config.addProfile('AN1A-A6');
+    try {
+      // Seed 3 anime rows + 1 series row (Anime-tagged) directly into the pool.
+      rec.upsertCandidates(p.id, [
+        { type: 'anime', tmdb_id: '9101', imdb_id: 'tt9101', title: 'Anime A', year: 2020, primary_genre: 'Action', genres: 'Action,Anime', vote_average: 7.5, affinity: 0.9, rec_count: 3, because_title: 'W', poster: '/p1.jpg', imdb_rating: 7.5, popularity: 0 },
+        { type: 'anime', tmdb_id: '9102', imdb_id: 'tt9102', title: 'Anime B', year: 2021, primary_genre: 'Fantasy', genres: 'Fantasy,Anime', vote_average: 8.0, affinity: 0.8, rec_count: 2, because_title: 'W', poster: '/p2.jpg', imdb_rating: 8.0, popularity: 0 },
+        { type: 'anime', tmdb_id: '9103', imdb_id: 'tt9103', title: 'Anime C', year: 2022, primary_genre: 'Comedy', genres: 'Comedy,Anime', vote_average: 7.0, affinity: 0.7, rec_count: 1, because_title: 'W', poster: '/p3.jpg', imdb_rating: 7.0, popularity: 0 },
+        { type: 'series', tmdb_id: '9201', imdb_id: 'tt9201', title: 'Show D', year: 2020, primary_genre: 'Drama', genres: 'Drama,Anime', vote_average: 7.0, affinity: 0.6, rec_count: 1, because_title: 'W', poster: '/p4.jpg', imdb_rating: 7.0, popularity: 0 },
+      ], { ratingCheckedAt: Date.now() });
+
+      const prof = config.getProfile(p.id);
+
+      // serveRecommendations(p, 'anime') items have type: 'series'.
+      const animeServed = rec.serveRecommendations(prof, 'anime', { record: false });
+      assert.strictEqual(animeServed.length, 3, '3 anime rows served');
+      assert.ok(animeServed.every((r) => r.type === 'series'), 'all served items type=series');
+
+      // A profile excluding the "Anime" genre still gets anime-lane rows,
+      // while its series slice still drops Anime-tagged rows.
+      config.updateProfile(p.id, { filters: { excluded_genres: ['Anime'] } });
+      const prof2 = config.getProfile(p.id);
+      const animeServed2 = rec.serveRecommendations(prof2, 'anime', { record: false });
+      assert.strictEqual(animeServed2.length, 3, 'anime lane still serves 3 with excluded_genres Anime');
+      const seriesServed = rec.serveRecommendations(prof2, 'series', { record: false });
+      assert.strictEqual(seriesServed.length, 0, 'series slice drops Anime-tagged row');
+
+      // A dont_recommend row of type 'series' with an anime row's tmdb_id hides that anime row.
+      rec.addDontRecommend(p.id, 'series', '9101', 'user');
+      const prof3 = config.getProfile(p.id);
+      const animeServed3 = rec.serveRecommendations(prof3, 'anime', { record: false });
+      assert.strictEqual(animeServed3.length, 2, 'dont_recommend series:9101 hides anime row');
+      assert.ok(!animeServed3.some((r) => r.id === 'tt9101'), 'tt9101 hidden');
+    } finally {
+      config.removeProfile(p.id);
+    }
+  });
+
+  // ---- A7: staged path — anime acceptance failure keeps old rows, promotes movie/series ----
+  await ok('A7: staged path — anime acceptance failure keeps old anime rows, promotes movie/series, logs warning', async () => {
+    const rec = require('../src/recommendationStore');
+
+    // Register a fake anime engine that returns NO candidates (new eligible = 0).
+    const fakeAnime = {
+      id: 'fake-anime-a7',
+      name: 'Fake Anime A7',
+      supportedTypes: ['anime'],
+      capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
+      requirements() { return { ok: true, missing: [] }; },
+      async generate() { return []; },
+      ALGORITHM_VERSION: 'fake-anime-a7-v1',
+    };
+    const unregister = engines._register(fakeAnime);
+
+    const p = config.addProfile('AN1A-A7');
+    try {
+      // Seed 3 old anime rows in the pool.
+      rec.upsertCandidates(p.id, [
+        { type: 'anime', tmdb_id: '9301', imdb_id: 'tt9301', title: 'Old Anime 1', year: 2020, primary_genre: 'Action', genres: 'Action,Anime', vote_average: 7.5, affinity: 0.9, rec_count: 3, because_title: 'W', poster: '/p1.jpg', imdb_rating: 7.5, popularity: 0 },
+        { type: 'anime', tmdb_id: '9302', imdb_id: 'tt9302', title: 'Old Anime 2', year: 2021, primary_genre: 'Fantasy', genres: 'Fantasy,Anime', vote_average: 8.0, affinity: 0.8, rec_count: 2, because_title: 'W', poster: '/p2.jpg', imdb_rating: 8.0, popularity: 0 },
+        { type: 'anime', tmdb_id: '9303', imdb_id: 'tt9303', title: 'Old Anime 3', year: 2022, primary_genre: 'Comedy', genres: 'Comedy,Anime', vote_average: 7.0, affinity: 0.7, rec_count: 1, because_title: 'W', poster: '/p3.jpg', imdb_rating: 7.0, popularity: 0 },
+      ], { ratingCheckedAt: Date.now() });
+
+      settings.updateSettings({ keys: { tmdb_api_key: 'test-tmdb-key' } });
+
+      config.updateProfile(p.id, { filters: { engine_anime: 'fake-anime-a7' } });
+      const prof = config.getProfile(p.id);
+
+      // Capture log output.
+      const logLines = [];
+      const log = { log: (msg) => logLines.push(msg), warn: (msg) => logLines.push(msg), error: (msg) => logLines.push(msg) };
+
+      // Run the staged build.
+      const r = await rec.stagedBuildPool(prof, log, () => {}, { kind: 'daily' });
+
+      // The anime acceptance gate should have failed (old eligible 3, new 0).
+      assert.ok(logLines.some((l) => l.includes('anime acceptance gate failed')), 'anime acceptance gate failed logged');
+
+      // Old anime rows are kept (not wiped).
+      const animeRows = rec.getRecommended(p.id, { type: 'anime' });
+      assert.strictEqual(animeRows.length, 3, '3 old anime rows kept');
+
+      // Movie/series were still promoted (stored 0 since no candidates, but no skip).
+      assert.ok(r.movie && r.series, 'movie and series in result');
+    } finally {
+      config.removeProfile(p.id);
+      unregister();
+      settings.updateSettings({ keys: { tmdb_api_key: '' } });
+    }
+  });
+
   console.log(`\nAll anime-lane checks passed (${passed}).${failed ? ` FAILED: ${failed}` : ''}`);
   process.exit(failed ? 1 : 0);
 })().catch((e) => {

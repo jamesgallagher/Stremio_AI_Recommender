@@ -24,6 +24,7 @@ const tmdb = require('./services/tmdb');
 const recency = require('./recency');
 const animeMap = require('./services/animeMap');
 const watchedStore = require('./watchedStore');
+const lanes = require('./lanes');
 // Trainer T2 (N8): the taste-feedback store's rebuild trigger (Marquee-only).
 const tasteFeedback = require('./tasteFeedback');
 // recommendationStore keeps the pool table, serve path, decay, age gate, and the
@@ -72,7 +73,7 @@ function init() {
   db.get().exec(`
     CREATE TABLE IF NOT EXISTS recommended (
       profile_id  TEXT NOT NULL,
-      type        TEXT NOT NULL,          -- 'movie' | 'series'
+      type        TEXT NOT NULL,          -- 'movie' | 'series' | 'anime' (src/lanes.js)
       tmdb_id     TEXT NOT NULL,
       imdb_id     TEXT,
       title       TEXT,
@@ -348,12 +349,12 @@ async function refreshStaleRatings(profileId, mdblistKey, log = console, { now =
   const setRating = conn.prepare('UPDATE recommended SET imdb_rating = ?, imdb_rating_at = ? WHERE profile_id = ? AND type = ? AND imdb_id = ?');
   const stampOnly = conn.prepare('UPDATE recommended SET imdb_rating_at = ? WHERE profile_id = ? AND type = ? AND imdb_id = ?');
   let updated = 0;
-  for (const t of ['movie', 'series']) {
+  for (const t of lanes.LANES) {
     const ids = due.filter((r) => r.type === t).map((r) => r.imdb_id);
     if (!ids.length) continue;
     let ratings;
     try {
-      ratings = await getRatings(t, ids);
+      ratings = await getRatings(lanes.lookupType(t), ids);
     } catch (err) {
       log.warn(`[rec] rating refresh (${t}) failed: ${err.message} — retrying next build`);
       continue; // leave imdb_rating_at untouched so these rows stay due
@@ -411,11 +412,11 @@ async function ageGatePool(profile, log = console, onProgress = () => {}) {
     const tier = ageVerify.tierFor({ age_limit: limit });
     onProgress(50, 'Age-checking with the verification chain…');
     const sources = require('./ageVerification/sources').buildSources(profile, log);
-    for (const type of ['movie', 'series']) {
+    for (const type of lanes.LANES) {
       const survivors = getRecommended(profile.id, { type, limit: 100000 });
       if (!survivors.length) continue;
       const titles = survivors.map((r) => ({
-        key: `${type}:${r.tmdb_id}`,
+        key: `${lanes.lookupType(type)}:${r.tmdb_id}`,
         imdb_id: r.imdb_id,
         adult: r.adult || false,
         title: r.title,
@@ -423,7 +424,7 @@ async function ageGatePool(profile, log = console, onProgress = () => {}) {
         genres: r.primary_genre ? [r.primary_genre] : [],
         certification: r.certification || r.age_classification,
       }));
-      const result = await ageVerify.verify(titles, type, tier, sources, log);
+      const result = await ageVerify.verify(titles, lanes.lookupType(type), tier, sources, log);
       for (const [k, v] of result) {
         const tmdbId = k.split(':')[1];
         if (v.verdict === 'block') { hardDrop(profile.id, type, tmdbId); vetoed++; }
@@ -475,11 +476,11 @@ async function stagedAgeGate(profile, stagedByType, log = console, onProgress = 
   const limit = profile.filters?.age_limit || 0;
   onProgress(0, 'Age-gating the staged candidates…');
 
-  const out = { movie: [], series: [] };
+  const out = { movie: [], series: [], anime: [] };
   let dropped = 0;
   let vetoed = 0;
 
-  for (const type of ['movie', 'series']) {
+  for (const type of lanes.LANES) {
     const cands = stagedByType[type] || [];
     if (!cands.length) continue;
 
@@ -501,7 +502,7 @@ async function stagedAgeGate(profile, stagedByType, log = console, onProgress = 
       onProgress(50, 'Age-checking the staged candidates…');
       const sources = require('./ageVerification/sources').buildSources(profile, log);
       const titles = keptCands.map((c) => ({
-        key: `${type}:${c.tmdb_id}`,
+        key: `${lanes.lookupType(type)}:${c.tmdb_id}`,
         imdb_id: c.imdb_id,
         adult: c.adult || false,
         title: c.title,
@@ -509,10 +510,10 @@ async function stagedAgeGate(profile, stagedByType, log = console, onProgress = 
         genres: c.primary_genre ? [c.primary_genre] : [],
         certification: c.certification || c.age_classification,
       }));
-      const result = await ageVerify.verify(titles, type, tier, sources, log);
+      const result = await ageVerify.verify(titles, lanes.lookupType(type), tier, sources, log);
       const finalCands = [];
       for (const c of keptCands) {
-        const v = result.get(`${type}:${c.tmdb_id}`);
+        const v = result.get(`${lanes.lookupType(type)}:${c.tmdb_id}`);
         if (v && v.verdict === 'block') { vetoed++; continue; }
         if (v && (v.verdict === 'allow' || v.verdict === 'block')) {
           c.certification = `${v.source}:${v.rating || ''}`;
@@ -525,9 +526,9 @@ async function stagedAgeGate(profile, stagedByType, log = console, onProgress = 
     }
   }
 
-  const total = out.movie.length + out.series.length;
+  const total = out.movie.length + out.series.length + out.anime.length;
   log.log(`[rec] ${profile.name}: staged age gate — ${dropped} NSFW/band dropped, ${vetoed} LLM-vetoed, ${total} remain`);
-  return { movie: out.movie, series: out.series, dropped, vetoed };
+  return { movie: out.movie, series: out.series, anime: out.anime, dropped, vetoed };
 }
 
 // Acceptance gate: per type, the new eligible visible count must be >=
@@ -538,14 +539,14 @@ async function stagedAgeGate(profile, stagedByType, log = console, onProgress = 
 // intact. Returns { ok, movie: {oldEligible, newEligible, minRequired, ok}, series: ... }.
 function acceptanceGate(profile, stagedByType, filters) {
   const listSize = listSizeFor(profile);
-  const result = { ok: true, movie: null, series: null };
+  const result = { ok: true, movie: null, series: null, anime: null };
   // Current watched + suppression state at gate time (a title watched or
   // suppressed during generation must not count toward the eligible set).
   const watchedImdb = watchedStore.watchedIdSets(profile.id).imdb;
   const dnr = dontRecommendKeys(profile.id);
   const tmdb = require('./services/tmdb');
-  for (const type of ['movie', 'series']) {
-    const voteFloor = tmdb.voteFloor(filters, type);
+  for (const type of lanes.LANES) {
+    const voteFloor = type === 'anime' ? 0 : tmdb.voteFloor(filters, type);
     // OLD eligible: the actual currently served catalog. selectedRecommendationRows
     // does NOT apply the vote-count floor to stored rows at serve time (the floor
     // is enforced by atomicPromotion deleting below-floor rows during promotion).
@@ -554,7 +555,7 @@ function acceptanceGate(profile, stagedByType, filters) {
     const oldRows = getRecommended(profile.id, { type, limit: 100000 });
     const oldEligible = oldRows.filter((r) => {
       if (r.imdb_id && watchedImdb.has(r.imdb_id)) return false;
-      if (dnr.has(`${type}:${r.tmdb_id}`)) return false;
+      if (lanes.dnrTypes(type).some((t) => dnr.has(`${t}:${r.tmdb_id}`))) return false;
       return filterServable([r], filters).length === 1;
     }).length;
     // NEW eligible: distinct pool identities (tmdb_id) that would survive
@@ -566,14 +567,14 @@ function acceptanceGate(profile, stagedByType, filters) {
       newRows.filter((c) => {
         if (c.vote_count != null && c.vote_count < voteFloor) return false;
         if (c.imdb_id && watchedImdb.has(c.imdb_id)) return false;
-        if (dnr.has(`${type}:${c.tmdb_id}`)) return false;
+        if (lanes.dnrTypes(type).some((t) => dnr.has(`${t}:${c.tmdb_id}`))) return false;
         return filterServable([c], filters).length === 1;
       }).map((c) => String(c.tmdb_id))
     ).size;
     const minRequired = Math.min(listSize, oldEligible);
     const ok = newEligible >= minRequired;
     result[type] = { oldEligible, newEligible, minRequired, ok };
-    if (!ok) result.ok = false;
+    if (!ok && type !== 'anime') result.ok = false;
   }
   return result;
 }
@@ -596,10 +597,10 @@ function atomicPromotion(profileId, stagedByType, { kind, filters, engineIds, ra
     // reinserted. The dont_recommend table is not modified by this transaction,
     // so reading it here is safe.
     const dnr = dontRecommendKeys(profileId);
-    for (const type of ['movie', 'series']) {
+    for (const type of lanes.LANES) {
       const cands = stagedByType[type] || [];
       if (cands.length) {
-        stagedByType[type] = cands.filter((c) => !dnr.has(`${type}:${c.tmdb_id}`));
+        stagedByType[type] = cands.filter((c) => !lanes.dnrTypes(type).some((t) => dnr.has(`${t}:${c.tmdb_id}`)));
       }
     }
     const stmt = conn.prepare(`
@@ -615,7 +616,7 @@ function atomicPromotion(profileId, stagedByType, { kind, filters, engineIds, ra
         certification = COALESCE(excluded.certification, recommended.certification)
     `);
 
-    for (const type of ['movie', 'series']) {
+    for (const type of lanes.LANES) {
       const cands = stagedByType[type] || [];
       const engineId = engineIds[type];
       if (!cands.length) continue;
@@ -695,10 +696,13 @@ async function stagedBuildPool(profile, log = console, onProgress = () => {}, { 
   };
 
   // Staged generation (both types).
-  const stagedByType = { movie: [], series: [] };
+  const stagedByType = { movie: [], series: [], anime: [] };
   const engineIds = {};
   const missing = [];
-  const spans = { movie: [0, 50], series: [50, 80] };
+  const animeEngine = engines.resolveFor(profile, 'anime');
+  const spans = animeEngine
+    ? { movie: [0, 45], series: [45, 72], anime: [72, 80] }
+    : { movie: [0, 50], series: [50, 80] };
   const band = (lo, hi) => (pct, label) => onProgress(lo + (pct / 100) * (hi - lo), label);
 
   for (const type of ['movie', 'series']) {
@@ -716,10 +720,25 @@ async function stagedBuildPool(profile, log = console, onProgress = () => {}, { 
     stagedByType[type] = r.servable;
   }
 
+  // AN-1a: the anime lane stages AFTER movie+series, only when its engine is on.
+  if (animeEngine) {
+    engineIds.anime = animeEngine.id;
+    const req = animeEngine.requirements(profile);
+    if (!req.ok) {
+      const miss = req.missing || [];
+      log.warn(`[rec] ${profile.name}/anime: ${animeEngine.name} unavailable — missing ${miss.join(', ') || 'requirements'} (keeping existing anime rows)`);
+    } else {
+      log.log(`[rec] ${profile.name}/anime: staging with ${animeEngine.name}`);
+      const r = await pipeline.runEngineBuild(profile, 'anime', animeEngine, ctx, band(...spans.anime), { stage: true });
+      stagedByType.anime = r.servable;
+    }
+  }
+
   // Age-gate the staged candidates in memory.
   const ageResult = await stagedAgeGate(profile, stagedByType, log, (pct, label) => onProgress(80 + pct * 0.1, label));
   stagedByType.movie = ageResult.movie;
   stagedByType.series = ageResult.series;
+  stagedByType.anime = ageResult.anime;
 
   // Acceptance gate per type.
   const gate = acceptanceGate(profile, stagedByType, filters);
@@ -734,6 +753,12 @@ async function stagedBuildPool(profile, log = console, onProgress = () => {}, { 
       series: { stored: gate.series?.newEligible || 0 },
       total: 0,
     };
+  }
+  // AN-1a: an anime acceptance failure only skips the anime promotion (old anime
+  // rows stay serving); it never blocks movie/series.
+  if (gate.anime && !gate.anime.ok) {
+    log.warn(`[rec] ${profile.name}: anime acceptance gate failed (new ${gate.anime.newEligible} < min ${gate.anime.minRequired}) — keeping existing anime rows`);
+    stagedByType.anime = [];
   }
 
   // Atomic promotion.
@@ -764,14 +789,18 @@ async function stagedBuildPool(profile, log = console, onProgress = () => {}, { 
   setBuiltAt(profile.id);
   tasteFeedback.markTrainingBuilt(profile.id, trainingSnap.changed_at);
 
-  const stored = (stagedByType.movie.length || 0) + (stagedByType.series.length || 0);
-  log.log(`[rec] ${profile.name}: staged ${kind} build — ${stagedByType.movie.length} movie(s) + ${stagedByType.series.length} series (total ${countRecommended(profile.id)})`);
-  return {
+  const animeStored = stagedByType.anime.length || 0;
+  const stored = (stagedByType.movie.length || 0) + (stagedByType.series.length || 0) + animeStored;
+  const animeLog = animeStored ? ` + anime ${animeStored} via marquee-anime` : '';
+  log.log(`[rec] ${profile.name}: staged ${kind} build — ${stagedByType.movie.length} movie(s) + ${stagedByType.series.length} series${animeLog} (total ${countRecommended(profile.id)})`);
+  const result = {
     movie: { stored: stagedByType.movie.length },
     series: { stored: stagedByType.series.length },
     stored,
     total: countRecommended(profile.id),
   };
+  if (animeEngine) result.anime = { stored: animeStored };
+  return result;
 }
 
 // Reset: wipe the pool AND the user's don't-recommend flags for a profile.
@@ -837,7 +866,10 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
     filters,
     log,
   };
-  const spans = { movie: [0, 50], series: [50, 100] };
+  const animeEngine = engines.resolveFor(profile, 'anime');
+  const spans = animeEngine
+    ? { movie: [0, 45], series: [45, 90], anime: [90, 100] }
+    : { movie: [0, 50], series: [50, 100] };
   const band = (lo, hi) => (pct, label) => onProgress(lo + (pct / 100) * (hi - lo), label);
 
   // SC-03: dispatch each type to the engine the profile selected for it (the
@@ -869,6 +901,26 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
     r.engine = engine.id;
     results[type] = r;
   }
+
+  // AN-1a: the anime lane builds AFTER movie+series, only when its engine is on.
+  // It never decides whether the build as a whole counts (ranAny/builtSeeds stay
+  // movie+series), and a requirement miss or an empty result leaves the existing
+  // anime rows serving.
+  if (animeEngine) {
+    engineIds.anime = animeEngine.id;
+    const req = animeEngine.requirements(profile);
+    if (!req.ok) {
+      const miss = req.missing || [];
+      log.warn(`[rec] ${profile.name}/anime: ${animeEngine.name} unavailable — missing ${miss.join(', ') || 'requirements'} (keeping existing anime rows)`);
+      results.anime = { ...skipResult(animeEngine), missing: miss };
+    } else {
+      log.log(`[rec] ${profile.name}/anime: building with ${animeEngine.name}`);
+      const r = await pipeline.runEngineBuild(profile, 'anime', animeEngine, ctx, band(...spans.anime));
+      r.engine = animeEngine.id;
+      results.anime = r;
+    }
+  }
+
   const m = results.movie;
   const sr = results.series;
 
@@ -891,7 +943,9 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
     const reason = !ranAny
       ? `engine not ready — missing ${[...new Set(missing)].join(', ') || 'requirements'}`
       : 'no watched titles to seed from';
-    return { skipped: true, reason, engines: engineIds, movie: m, series: sr };
+    const skipResult = { skipped: true, reason, engines: engineIds, movie: m, series: sr };
+    if (animeEngine) skipResult.anime = results.anime;
+    return skipResult;
   }
 
   // Whole-pool IMDb-rating heal — runs ONCE after BOTH types (like the age gate),
@@ -916,8 +970,9 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
   const seeds = m.seeds + sr.seeds;
   const stored = m.stored + sr.stored;
   const purged = m.purged + sr.purged;
-  log.log(`[rec] ${profile.name}: ${seeds} seed(s) → ${m.strong + sr.strong} unique → ${stored} servable (movies ${m.stored} via ${engineIds.movie}, series ${sr.stored} via ${engineIds.series})${purged ? `, ${purged} purged below vote floor` : ''}${refreshed.updated ? `, ${refreshed.updated} rating(s) refreshed` : ''} (total ${countRecommended(profile.id)})`);
-  return {
+  const animeLog = animeEngine && results.anime && !results.anime.skipped ? ` + anime ${results.anime.stored} via marquee-anime` : '';
+  log.log(`[rec] ${profile.name}: ${seeds} seed(s) → ${m.strong + sr.strong} unique → ${stored} servable (movies ${m.stored} via ${engineIds.movie}, series ${sr.stored} via ${engineIds.series})${animeLog}${purged ? `, ${purged} purged below vote floor` : ''}${refreshed.updated ? `, ${refreshed.updated} rating(s) refreshed` : ''} (total ${countRecommended(profile.id)})`);
+  const result = {
     seeds,
     raw: m.raw + sr.raw,
     strong: m.strong + sr.strong,
@@ -930,6 +985,8 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
     movie: m,           // per-type detail (engine id, stored, or {skipped,missing})
     series: sr,
   };
+  if (animeEngine) result.anime = results.anime;
+  return result;
 }
 
 // ---- build state ----
@@ -970,7 +1027,7 @@ function passesAgeBand(row, filters = {}) {
   if (!tier) return true;                           // no limit: unchanged
   // 1. A stored verdict for THIS tier wins.
   if (row.type && row.tmdb_id) {
-    const v = require('./ageVerification/store').getVerdict(row.type, row.tmdb_id, tier.id);
+    const v = require('./ageVerification/store').getVerdict(lanes.lookupType(row.type), row.tmdb_id, tier.id);
     if (v) return v.verdict === 'allow';
   }
   // 2. No verdict: judge the row's OWN stored classification against the tier (no network).
@@ -984,7 +1041,7 @@ function passesAgeBand(row, filters = {}) {
     const [src, rest] = raw.includes(':') ? raw.split(/:(.*)/s) : [null, raw];
     if (src === 'csm') { const n = parseInt(rest, 10); if (Number.isFinite(n) && n > tier.csmMaxAge) return false; }
     else if (src === 'llm') { if (rest === 'no') return false; }
-    else if (require('./ageVerification/ratings').classify(rest, row.type || 'movie', tier) === 'block') return false;
+    else if (require('./ageVerification/ratings').classify(rest, lanes.lookupType(row.type || 'movie'), tier) === 'block') return false;
   }
   // 3. Unknown stays KEPT (unchanged rule).
   return true;
@@ -1028,6 +1085,8 @@ function balanceByGenre(rows, limit = SERVE_LIMIT) {
 function filterServable(rows, filters = {}, { nowYear = new Date().getFullYear() } = {}) {
   const minRating = filters.min_rating || 0;
   const excluded = new Set(filters.excluded_genres || []);
+  const excludedNoAnime = new Set([...excluded].filter((g) => g !== 'Anime'));
+  const excludedLane = (r) => (r.type === 'anime' ? excludedNoAnime : excluded);
   const minYear = recency.minYearOf(filters, nowYear); // decade floor (src/recency.js); 0 = none
 
   return (rows || []).filter((r) => {
@@ -1038,7 +1097,7 @@ function filterServable(rows, filters = {}, { nowYear = new Date().getFullYear()
     const shownRating = r.imdb_rating > 0 ? r.imdb_rating : (r.vote_average || 0);
     if (minRating > 0 && shownRating > 0 && shownRating < minRating) return false;
     const genres = (r.genres || '').split(',').filter(Boolean);
-    if (genres.some((g) => excluded.has(g))) return false;                    // excluded genre (full list, incl. Anime)
+    if (genres.some((g) => excludedLane(r).has(g))) return false;            // excluded genre (full list, incl. Anime)
     // Release-year floor — MOVIES ONLY. Series run for years from an old first-air
     // date, so a recency cut-off would wrongly drop still-running shows.
     if (minYear > 0 && r.type === 'movie' && r.year && r.year < minYear) return false;
@@ -1091,6 +1150,7 @@ function selectServeFor(profile, type, rows, { limit = SERVE_LIMIT } = {}) {
       return String(a.tmdb_id) < String(b.tmdb_id) ? -1 : 1;
     });
   const engine = require('./engines').resolveFor(profile, type); // lazy (avoids a require cycle)
+  if (!engine) return balanceByGenre(passed, limit); // anime lane: no engine → plain genre balance
   const opts = engine.serveOptions ? engine.serveOptions(settings.getSettings()) : null;
   const t = serveCalibration.getTarget(profile.id, type);
   const p = t ? serveCalibration.applyExclusions(t.target, (profile?.filters || {}).excluded_genres) : null;
@@ -1161,7 +1221,7 @@ function selectedRecommendationRows(profile, type, { limit } = {}) {
   const rows = getRecommended(profile.id, { type, limit: 100000 });
   const watchedImdb = watchedStore.watchedIdSets(profile.id).imdb;
   const dnr = dontRecommendKeys(profile.id);
-  const unwatched = rows.filter((row) => !watchedImdb.has(row.imdb_id) && !dnr.has(`${type}:${row.tmdb_id}`));
+  const unwatched = rows.filter((row) => !watchedImdb.has(row.imdb_id) && !lanes.dnrTypes(type).some((t) => dnr.has(`${t}:${row.tmdb_id}`)));
   return selectServeFor(profile, type, unwatched, {
     limit: limit ?? listSizeFor(profile),
   });
@@ -1180,7 +1240,7 @@ function serveRecommendations(profile, type, { limit, record = true } = {}) {
   if (record) recordImpressions(profile.id, picked);
   return picked.map((r) => ({
     id: r.imdb_id,
-    type,
+    type: lanes.itemType(type),
     name: r.title,
     poster: r.poster || null,
     releaseInfo: r.year ? String(r.year) : null,
