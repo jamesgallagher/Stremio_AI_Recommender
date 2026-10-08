@@ -433,6 +433,41 @@ async function ok(name, fn) {
     }
   });
 
+  // ---- A10: HTTP companion — engine_anime in GET/POST /mobile/api/settings ----
+  await ok('A10: HTTP companion — engine_anime in GET/POST /mobile/api/settings', async () => {
+    const p = config.addProfile('AN1A-A10');
+    try {
+      // GET: engines.anime.id is 'off' by default.
+      let res = await fetch(`${BASE}/mobile/api/settings`);
+      let body = await res.json();
+      assert.strictEqual(body.engines.anime.id, 'off', 'engines.anime.id is off');
+      assert.deepStrictEqual(body.engines.requirements.anime, { ok: true, missing: [] }, 'requirements.anime ok when off');
+      assert.strictEqual('engine_anime' in body.filters, false, 'engine_anime never in filters');
+
+      // POST: set engine_anime to marquee-anime.
+      res = await fetch(`${BASE}/mobile/api/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ engine_anime: 'marquee-anime' }),
+      });
+      assert.strictEqual(res.status, 200, 'POST 200');
+      body = await res.json();
+      assert.strictEqual(body.engines.anime.id, 'marquee-anime', 'engines.anime.id is marquee-anime');
+
+      // POST: set engine_anime to 'evil' → stored 'off'.
+      res = await fetch(`${BASE}/mobile/api/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ engine_anime: 'evil' }),
+      });
+      assert.strictEqual(res.status, 200, 'POST 200');
+      body = await res.json();
+      assert.strictEqual(body.engines.anime.id, 'off', 'engines.anime.id is off (evil rejected)');
+    } finally {
+      config.removeProfile(p.id);
+    }
+  });
+
   // ---- A11: AniDB parser — fixture + error body ----
   await ok('A11: AniDB parser — fixture values + error body', async () => {
     const anidb = require('../src/services/anidb');

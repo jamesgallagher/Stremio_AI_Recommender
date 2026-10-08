@@ -396,3 +396,4 @@ select:focus { border-color: var(--accent); }
 @media (max-height: 700px) {
   .tq-hint { display: none; }
 }
+.warn-line { color: var(--warn); font-size: 13px; margin-top: 6px; }

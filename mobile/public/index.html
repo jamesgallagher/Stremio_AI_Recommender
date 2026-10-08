@@ -139,8 +139,23 @@
         <div class="settab" data-settab="filters">
         <div class="card stack">
           <div class="field">
-            <label>Engines</label>
-            <p class="sub" id="set-engines"></p>
+            <label for="set-engine-movie">Movies engine</label>
+            <select id="set-engine-movie"><option value="marquee">Marquee Cinema</option></select>
+            <p class="sub">Required.</p>
+          </div>
+          <div class="field">
+            <label for="set-engine-series">Shows engine</label>
+            <select id="set-engine-series"><option value="marquee-tv">Marquee TV</option></select>
+            <p class="sub">Required.</p>
+          </div>
+          <div class="field">
+            <label for="set-engine-anime">Anime engine</label>
+            <select id="set-engine-anime">
+              <option value="off">Disabled</option>
+              <option value="marquee-anime">Marquee Anime</option>
+            </select>
+            <p class="sub" id="set-engine-anime-sub"></p>
+            <div id="set-engine-warn"></div>
           </div>
 
           <div class="field">
