@@ -611,6 +611,70 @@ async function ok(name, fn) {
     }
   });
 
+  // ---- A15: migration — one-time lane migration, idempotent, report ----
+  await ok('A15: migration — one-time lane migration, idempotent, report', async () => {
+    const migration = require('../src/anime/migration');
+    const watchedStore = require('../src/watchedStore');
+    const db = require('../src/db');
+    const animeMap = require('../src/services/animeMap');
+
+    // Set up a fake anime map index (ttA1 is anime, ttB is not).
+    animeMap._setIndex({
+      at: Date.now(), etag: 'a15',
+      byImdb: { ttA1: { mal: 1, anidb: 23 } },
+      byTmdb: { A1: { mal: 1, anidb: 23 } },
+    });
+
+    // Create a profile.
+    const p = config.addProfile('AN1A-A15');
+    try {
+      // Seed series_progress rows: one kind='anime', one kind='show' that the detector flags.
+      const conn = db.get();
+      const now = Date.now();
+      conn.prepare("INSERT INTO series_progress (profile_id, simkl_id, kind, tmdb_id, imdb_id, title, watched_eps, status, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(p.id, 101, 'anime', 'A1', 'ttA1', 'Cowboy Bebop', 5, 'completed', now);
+      conn.prepare("INSERT INTO series_progress (profile_id, simkl_id, kind, tmdb_id, imdb_id, title, watched_eps, status, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(p.id, 102, 'show', 'A1', 'ttA1', 'Cowboy Bebop', 2, 'watching', now);
+      // A non-anime show row (should not be counted).
+      conn.prepare("INSERT INTO series_progress (profile_id, simkl_id, kind, tmdb_id, imdb_id, title, watched_eps, status, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(p.id, 103, 'show', 'B1', 'ttB', 'Some Show', 10, 'completed', now);
+
+      // Seed taste rows (type='series') whose tmdb_id is in the anime history.
+      conn.prepare("INSERT INTO taste_ratings (profile_id, type, tmdb_id, rating) VALUES (?, ?, ?, ?)").run(p.id, 'series', 'A1', 5);
+      conn.prepare("INSERT INTO taste_ignore (profile_id, type, tmdb_id, at) VALUES (?, ?, ?, ?)").run(p.id, 'series', 'A1', Date.now());
+      conn.prepare("INSERT INTO dont_recommend (profile_id, type, tmdb_id, reason, at) VALUES (?, ?, ?, ?, ?)").run(p.id, 'series', 'A1', 'user', Date.now());
+
+      // Seed a recommended row with type='series' that the Fribb map flags as anime.
+      conn.prepare("INSERT INTO recommended (profile_id, type, tmdb_id, imdb_id, title, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(p.id, 'series', 'A1', 'ttA1', 'Cowboy Bebop', Date.now());
+
+      // Run the migration.
+      await migration.runAll(console);
+
+      // Verify the report.
+      const report = migration.getReport(p.id);
+      assert.ok(report, 'report exists');
+      assert.strictEqual(report.anime_simkl, 1, 'one Simkl anime');
+      assert.strictEqual(report.anime_detected_in_shows, 1, 'one detected under shows');
+      assert.strictEqual(report.engaged, 1, 'one engaged (completed)');
+      assert.strictEqual(report.ratings, 1, 'one rating');
+      assert.strictEqual(report.ignores, 1, 'one ignore');
+      assert.strictEqual(report.dont_recommend, 1, 'one dont_recommend');
+      assert.strictEqual(report.series_pool_removed, 1, 'one series pool row removed');
+
+      // The recommended row was deleted.
+      const recRow = conn.prepare("SELECT * FROM recommended WHERE profile_id = ? AND type = 'series' AND tmdb_id = 'A1'").get(p.id);
+      assert.strictEqual(recRow, undefined, 'anime series row removed from pool');
+
+      // Idempotent: run again, no change.
+      await migration.runAll(console);
+      const report2 = migration.getReport(p.id);
+      assert.deepStrictEqual(report2, report, 'second run produces the same report');
+    } finally {
+      config.removeProfile(p.id);
+    }
+  });
+
   console.log(`\nAll anime-lane checks passed (${passed}).${failed ? ` FAILED: ${failed}` : ''}`);
   process.exit(failed ? 1 : 0);
 })().catch((e) => {
