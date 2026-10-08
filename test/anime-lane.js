@@ -610,8 +610,8 @@ async function ok(name, fn) {
     });
 
     const profile = { keys: { anidb_client: 'test-client', anidb_clientver: 1 } };
-    // Advance the clock by 4000ms (one spacing interval) before each request.
-    const advance = () => { t += 4000; };
+    // Advance the clock by 4050ms (spacing + 50 ms margin) before each request.
+    const advance = () => { t += 4050; };
 
     // 1. Spacing: two getAnime calls for different aids start ≥ 4000 ms apart.
     const r1 = await anidb.getAnime(1, profile, console);
@@ -703,6 +703,61 @@ async function ok(name, fn) {
       const gap = fetchCalls[i].at - fetchCalls[i - 1].at;
       assert.ok(gap >= 4000, `gap ${i} = ${gap}ms ≥ 4000ms`);
     }
+  });
+
+  // ---- A12f: A12b looped 5× — every gap ≥ 4000 ms in every run ----
+  await ok('A12f: A12b looped 5× — every gap ≥ 4000 ms in every run', async () => {
+    const anidb = require('../src/services/anidb');
+    const validXml = '<anime id="1" restricted="false"><type>TV Series</type><episodecount>10</episodecount><title xml:lang="x-jat" type="main">Test</title><permanent>8.0</permanent></anime>';
+    const profile = { keys: { anidb_client: 'test-client', anidb_clientver: 1 } };
+    let smallest = Infinity;
+    for (let run = 0; run < 5; run++) {
+      anidb.init();
+      anidb._resetForTests();
+      anidb._resetClock();
+      const fetchCalls = [];
+      anidb._setFetch(async (url) => {
+        fetchCalls.push({ url, at: Date.now() });
+        await new Promise(r => setTimeout(r, 300)); // simulate 300ms network
+        return { status: 200, text: async () => validXml };
+      });
+      const results = await Promise.all([
+        anidb.getAnime(101 + run * 3, profile, console),
+        anidb.getAnime(102 + run * 3, profile, console),
+        anidb.getAnime(103 + run * 3, profile, console),
+      ]);
+      assert.strictEqual(results.length, 3);
+      for (const r of results) assert.ok(r.data, 'each request succeeded');
+      assert.strictEqual(fetchCalls.length, 3, 'exactly 3 fetches');
+      for (let i = 1; i < fetchCalls.length; i++) {
+        const gap = fetchCalls[i].at - fetchCalls[i - 1].at;
+        smallest = Math.min(smallest, gap);
+        assert.ok(gap >= 4000, `run ${run} gap ${i} = ${gap}ms ≥ 4000ms`);
+      }
+    }
+    console.log(`A12f: smallest gap across 5 runs = ${smallest}ms`);
+  });
+
+  // ---- A12g: stamp is the instant of the send; a throwing fetch is a transient, not a crash ----
+  await ok('A12g: persisted/in-memory stamp equals the clock at fetch; sync-throwing fetch → transient', async () => {
+    const anidb = require('../src/services/anidb');
+    const validXml = '<anime id="1" restricted="false"><type>TV Series</type><episodecount>10</episodecount><title xml:lang="x-jat" type="main">Test</title><permanent>8.0</permanent></anime>';
+    const profile = { keys: { anidb_client: 'test-client', anidb_clientver: 1 } };
+    anidb.init();
+    anidb._resetForTests();
+    let t = 1_000_000;
+    anidb._setNow(() => ++t); // every clock read ticks 1 ms, so a stamp taken before the send differs from the send time
+    let fetchedAt = null;
+    anidb._setFetch(async () => { fetchedAt = t; return { status: 200, text: async () => validXml }; });
+    const r = await anidb.getAnime(201, profile, console);
+    assert.ok(r.data, 'request succeeded');
+    const persisted = require('../src/db').get().prepare('SELECT MAX(last_request_at) AS m FROM anidb_clients').get().m;
+    assert.strictEqual(persisted, fetchedAt, `stamp ${persisted} must equal clock at send ${fetchedAt}`);
+    t += 5000;
+    anidb._setFetch(() => { throw new Error('sync boom'); });
+    const r2 = await anidb.getAnime(202, profile, console);
+    assert.ok(!r2.data, 'throwing fetch yields no data, no crash');
+    anidb._resetClock();
   });
 
   // ---- A12c: HTTP 503 three times → error, exactly 3 fetches, day count rose by 3, spacing ----
@@ -799,7 +854,7 @@ async function ok(name, fn) {
       fetchCalls.push({ url, at: t });
       return { status: 200, text: async () => validXml };
     });
-    const advance = () => { t += 4000; };
+    const advance = () => { t += 4050; };
 
     // 1. Success: caches aid 1.
     const r1 = await anidb.testClient({ client: 'test-client', clientver: 1 });
