@@ -352,6 +352,7 @@ setInterval(tick, TICK_MS);
 
 // Also warm on boot (after a short delay so the container settles)
 setTimeout(async () => {
-  try { require('./anime/migration').runAll(console); } catch (err) { console.error(`[anime] migration failed: ${err.message}`); }
+  try { await require('./anime/migration').runAll(console); }
+  catch (err) { console.error(`[anime] migration failed: ${err.message}`); }
   tick().catch((err) => console.error(`[scheduler] boot tick failed: ${err.message}`));
 }, 15e3);

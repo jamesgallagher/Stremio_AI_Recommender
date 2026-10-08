@@ -943,9 +943,9 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
     const reason = !ranAny
       ? `engine not ready — missing ${[...new Set(missing)].join(', ') || 'requirements'}`
       : 'no watched titles to seed from';
-    const skipResult = { skipped: true, reason, engines: engineIds, movie: m, series: sr };
-    if (animeEngine) skipResult.anime = results.anime;
-    return skipResult;
+    const skipped = { skipped: true, reason, engines: engineIds, movie: m, series: sr };
+    if (animeEngine) skipped.anime = results.anime;
+    return skipped;
   }
 
   // Whole-pool IMDb-rating heal — runs ONCE after BOTH types (like the age gate),

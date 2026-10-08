@@ -965,14 +965,43 @@ async function ok(name, fn) {
     }
   });
 
+  // ---- A15b: fresh DATA_DIR where taste tables were never created → runAll resolves, markers with zero counts ----
+  await ok('A15b: missing taste tables → runAll resolves, zero counts', async () => {
+    const migration = require('../src/anime/migration');
+    const db = require('../src/db');
+
+    // Create a profile but do NOT create the taste tables.
+    const p = config.addProfile('AN1A-A15b');
+    try {
+      // Ensure the taste tables do not exist (keep `recommended` — the portal needs it).
+      db.get().exec('DROP TABLE IF EXISTS taste_ratings; DROP TABLE IF EXISTS taste_ignore; DROP TABLE IF EXISTS dont_recommend;');
+
+      // Run the migration — it should resolve without error.
+      await migration.runAll(console);
+
+      // The marker is written with zero counts.
+      const report = migration.getReport(p.id);
+      assert.ok(report, 'report exists');
+      assert.strictEqual(report.ratings, 0, 'ratings 0');
+      assert.strictEqual(report.ignores, 0, 'ignores 0');
+      assert.strictEqual(report.dont_recommend, 0, 'dont_recommend 0');
+      assert.strictEqual(report.series_pool_removed, 0, 'series_pool_removed 0');
+    } finally {
+      config.removeProfile(p.id);
+    }
+  });
+
   // ---- Browser checks B1–B8 (only with --browser) ----
   if (process.argv.includes('--browser')) {
     const { chromium } = require('playwright');
     const browser = await chromium.launch({ headless: true });
-    const screenshotDir = path.join(__dirname, 'screenshots');
+    const screenshotDir = path.join(process.env.DATA_DIR, 'screenshots');
     if (!fs.existsSync(screenshotDir)) fs.mkdirSync(screenshotDir);
     const pageErrors = [];
     const adminCookie = { name: 'air_sid', value: token, url: BASE };
+
+    // Seed a TMDB key + LLM so the portal leaves setup mode.
+    settings.updateSettings({ keys: { tmdb_api_key: 'x'.repeat(32) }, llm: { groq_api_key: 'gsk_test' } });
 
     // B1: Filters tab at 1280 px — three columns.
     await ok('B1: Filters tab at 1280px — three engine columns', async () => {
@@ -983,6 +1012,8 @@ async function ok(name, fn) {
       await page.goto(`${BASE}/configure/`);
       // Wait for the Filters tab to be active.
       await page.waitForSelector('[data-tab="filters"]');
+      // Click the Filters tab button to ensure it's active.
+      await page.locator('.tab-btn[data-tab="filters"]').click();
       // Three columns: Movies, Shows, Anime.
       const cols = await page.locator('.cols-3 > div').count();
       assert.strictEqual(cols, 3, 'three columns');
@@ -1000,7 +1031,8 @@ async function ok(name, fn) {
       assert.strictEqual(await animeSel.inputValue(), 'off', 'anime shows off');
       const hint = await page.locator('[data-anime-hint]').innerText();
       assert.ok(hint.includes('Disabled: no anime row'), 'anime hint text');
-      await page.screenshot({ path: path.join(screenshotDir, 'engines-1280.png') });
+      // Screenshot the Engines .sec-box element.
+      await page.locator('.tab-panel[data-tab="filters"] .sec-box').first().screenshot({ path: path.join(screenshotDir, 'engines-1280.png') });
       await context.close();
     });
 
@@ -1101,16 +1133,18 @@ async function ok(name, fn) {
       }
     });
 
-    // B5: Advanced → API Keys — section title, blocks in order.
+    // B5: Advanced → API Keys — section + blocks, test buttons, number input style.
     await ok('B5: Advanced → API Keys — section + blocks', async () => {
       const context = await browser.newContext({ viewport: { width: 1280, height: 800 }, colorScheme: 'dark' });
       await context.addCookies([adminCookie]);
       const page = await context.newPage();
       page.on('pageerror', (e) => pageErrors.push(e.message));
       const p = config.addProfile('AN1A-B5');
+      const anidb = require('../src/services/anidb');
       try {
         await page.goto(`${BASE}/configure/#advanced?profile=${p.id}`);
         await page.waitForSelector('[data-tab="advanced"]');
+        await page.locator('.tab-btn[data-tab="advanced"]').click();
         // Section title.
         const title = await page.locator('.sec-title', { hasText: 'API Keys' }).innerText();
         assert.ok(title.includes('API Keys'), 'API Keys title');
@@ -1123,7 +1157,56 @@ async function ok(name, fn) {
         assert.ok(malIdx >= 0, 'MyAnimeList label');
         assert.ok(anidbIdx >= 0, 'AniDB label');
         assert.ok(mdbIdx < malIdx && malIdx < anidbIdx, 'order MDBList < MAL < AniDB');
-        await page.screenshot({ path: path.join(screenshotDir, 'api-keys.png') });
+        // 1. Assert .key-sep count = 2 inside the API Keys box.
+        const apiKeysBox = page.locator('.sec-box', { has: page.locator('text=MDBList personal API key') });
+        const keySepCount = await apiKeysBox.locator('.key-sep').count();
+        assert.strictEqual(keySepCount, 2, 'two key separators');
+
+        // 2. Stub AniDB in-process with the aid23 fixture, fill name + version, click Test.
+        const aid23Xml = fs.readFileSync(path.join(__dirname, 'fixtures', 'anidb-aid23.xml'), 'utf8');
+        anidb._setFetch(async (url) => ({ status: 200, text: async () => aid23Xml }));
+        await apiKeysBox.locator('[data-key="anidb_client"]').fill('test-client');
+        await apiKeysBox.locator('[data-key="anidb_clientver"]').fill('1');
+        await apiKeysBox.locator('button:has-text("Test")').nth(2).click();
+        await page.waitForTimeout(500);
+        const anidbRes = await apiKeysBox.locator('[data-tres="anidb-user"]').innerText();
+        assert.ok(anidbRes.includes('✓ Client accepted'), 'AniDB test success: ' + anidbRes);
+
+        // 3. Stub a bad client, change the name, click Test.
+        anidb._setFetch(async (url) => ({ status: 200, text: async () => '<error code="302">client version missing or invalid</error>' }));
+        await apiKeysBox.locator('[data-key="anidb_client"]').fill('bad-client');
+        await apiKeysBox.locator('button:has-text("Test")').nth(2).click();
+        await page.waitForTimeout(5000); // spacing guard: ≥ 4000ms between requests
+        const anidbRes2 = await apiKeysBox.locator('[data-tres="anidb-user"]').innerText();
+        assert.ok(anidbRes2.includes('✗ AniDB doesn\'t recognise this client'), 'AniDB bad client: ' + anidbRes2);
+
+        // 4. Stub global.fetch for MAL, fill the MAL key, click its Test.
+        const realFetch = global.fetch;
+        global.fetch = async (url, opts) => {
+          if (String(url).includes('api.myanimelist.net')) {
+            return { ok: true, status: 200, json: async () => ({ id: 1, title: 'Cowboy Bebop', rating: 'r' }) };
+          }
+          return realFetch(url, opts);
+        };
+        await apiKeysBox.locator('[data-key="mal_client_id"]').fill('test-mal-key');
+        await apiKeysBox.locator('button:has-text("Test")').nth(1).click();
+        await page.waitForTimeout(500);
+        const malRes = await apiKeysBox.locator('[data-tres="mal-user"]').innerText();
+        assert.ok(malRes.includes('✓ MyAnimeList key valid (Cowboy Bebop rated R)'), 'MAL test: ' + malRes);
+        global.fetch = realFetch;
+
+        // 5. Assert the version input's computed background-color is not white.
+        const bg = await apiKeysBox.locator('[data-key="anidb_clientver"]').evaluate((el) => getComputedStyle(el).backgroundColor);
+        assert.notStrictEqual(bg, 'rgb(255, 255, 255)', 'number input not white: ' + bg);
+
+        // 6. Click AniDB Clear and assert both inputs are empty.
+        await apiKeysBox.locator('button:has-text("Clear")').nth(2).click();
+        await page.waitForTimeout(500);
+        assert.strictEqual(await apiKeysBox.locator('[data-key="anidb_client"]').inputValue(), '', 'client cleared');
+        assert.strictEqual(await apiKeysBox.locator('[data-key="anidb_clientver"]').inputValue(), '', 'clientver cleared');
+
+        // 7. Screenshot the API Keys .sec-box.
+        await apiKeysBox.screenshot({ path: path.join(screenshotDir, 'api-keys.png') });
       } finally {
         config.removeProfile(p.id);
         await context.close();
