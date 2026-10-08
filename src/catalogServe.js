@@ -17,8 +17,9 @@ const watchedStore = require('./watchedStore');
 // client auto-appends "— Movie(s)" on the board, and our own portal/companion
 // lists append the type themselves from def.type. Baking it in double-prints it.
 const AI_CATALOGS = {
-  'ai-recs-movies': { type: 'movie', name: 'Recommended for you' },
-  'ai-recs-series': { type: 'series', name: 'Recommended for you' },
+  'ai-recs-movies': { type: 'movie', lane: 'movie', itemType: 'movie', name: 'Recommended for you' },
+  'ai-recs-series': { type: 'series', lane: 'series', itemType: 'series', name: 'Recommended for you' },
+  'ai-recs-anime': { type: 'anime', lane: 'anime', itemType: 'series', name: 'Recommended for you' },
 };
 
 // RPDB (ratingposterdb.com): poster images with the rating rendered on them.
@@ -54,7 +55,7 @@ function servedCatalog(profile, catalogId, { record = false } = {}) {
 
   if (aiCatalog) {
     const hasSimkl = !!profile.simkl_auth?.access_token;
-    const raw = recommendationStore.serveRecommendations(profile, def.type, { record });
+    const raw = recommendationStore.serveRecommendations(profile, def.lane, { record });
     if (!raw.length) {
       // The watched-first selection can legitimately produce zero visible rows
       // when the pool has rows but every one is watched or excluded — that is a
@@ -62,7 +63,7 @@ function servedCatalog(profile, catalogId, { record = false } = {}) {
       // genuinely empty type pool by checking whether the type has at least one
       // stored row (countRecommended counts BOTH types and would mistake a
       // movie-empty pool for a built movie pool).
-      const poolHasRows = recommendationStore.getRecommended(profile.id, { type: def.type, limit: 1 }).length > 0;
+      const poolHasRows = recommendationStore.getRecommended(profile.id, { type: def.lane, limit: 1 }).length > 0;
       if (poolHasRows) {
         return { id: catalogId, name: def.name, type: def.type, source: 'ai', requirement_met: true, state: 'ok', metas: [] };
       }

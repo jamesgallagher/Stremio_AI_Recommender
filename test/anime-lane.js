@@ -16,6 +16,8 @@ const config = require('../src/config');
 const settings = require('../src/settings');
 const store = require('../src/store');
 
+const BASE = `http://localhost:${process.env.PORT}`;
+
 let passed = 0;
 let failed = 0;
 async function ok(name, fn) {
@@ -314,6 +316,53 @@ async function ok(name, fn) {
       config.removeProfile(p.id);
       unregister();
       settings.updateSettings({ keys: { tmdb_api_key: '' } });
+    }
+  });
+
+  // ---- A8: HTTP manifest + catalog route ----
+  console.log('anime-lane http:');
+  require('../src/server');
+  const { provisionAdmin, cookieHeader, attachCookie } = require('./helpers/admin-session');
+  const { token } = provisionAdmin();
+  const restore = attachCookie(BASE, cookieHeader(token));
+
+  await ok('A8: HTTP manifest + catalog route — anime off/on, 404 when off, placeholder type=series', async () => {
+    const p = config.addProfile('AN1A-A8');
+    try {
+      // Get the profile token for the addon route.
+      const prof = config.getProfile(p.id);
+      const profileToken = prof.token;
+
+      // Anime engine OFF (default): no ai-recs-anime in manifest, types lacks anime.
+      const manifestOff = await (await fetch(`${BASE}/addon/${profileToken}/manifest.json`)).json();
+      assert.ok(!manifestOff.catalogs.some((c) => c.id === 'ai-recs-anime'), 'no ai-recs-anime when off');
+      assert.ok(!manifestOff.types.includes('anime'), 'types lacks anime when off');
+
+      // Catalog route → 404 when off.
+      const resOff = await fetch(`${BASE}/addon/${profileToken}/catalog/anime/ai-recs-anime.json`);
+      assert.strictEqual(resOff.status, 404, '404 when off');
+
+      // Anime engine ON: catalog present, types includes anime.
+      config.updateProfile(p.id, { filters: { engine_anime: 'marquee-anime' } });
+      const manifestOn = await (await fetch(`${BASE}/addon/${profileToken}/manifest.json`)).json();
+      const animeCatalog = manifestOn.catalogs.find((c) => c.id === 'ai-recs-anime');
+      assert.ok(animeCatalog, 'ai-recs-anime present when on');
+      assert.strictEqual(animeCatalog.type, 'anime', 'catalog type is anime');
+      assert.strictEqual(animeCatalog.name, 'Recommended for you', 'catalog name');
+      assert.ok(manifestOn.types.includes('anime'), 'types includes anime when on');
+      // Present after ai-recs-series.
+      const seriesIdx = manifestOn.catalogs.findIndex((c) => c.id === 'ai-recs-series');
+      const animeIdx = manifestOn.catalogs.findIndex((c) => c.id === 'ai-recs-anime');
+      assert.ok(animeIdx > seriesIdx, 'ai-recs-anime after ai-recs-series');
+
+      // When on but empty, the placeholder card has type: 'series'.
+      const resOn = await fetch(`${BASE}/addon/${profileToken}/catalog/anime/ai-recs-anime.json`);
+      assert.strictEqual(resOn.status, 200, '200 when on');
+      const body = await resOn.json();
+      assert.strictEqual(body.metas.length, 1, 'one placeholder card');
+      assert.strictEqual(body.metas[0].type, 'series', 'placeholder type is series');
+    } finally {
+      config.removeProfile(p.id);
     }
   });
 
