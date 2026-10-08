@@ -1,11 +1,18 @@
-// Engine registry (SC-01). Two engines remain after ENG-R (7.44):
-// Marquee Cinema (movies) and Marquee TV (series). Genesis and Glass were
-// retired — their shared modules live in engines/shared/ and Marquee runs on them.
+// Engine registry (SC-01). Three engines after AN-1a:
+// Marquee Cinema (movies), Marquee TV (series) and Marquee Anime (anime).
+// Genesis and Glass were retired — their shared modules live in engines/shared/
+// and Marquee runs on them.
 const marquee = require('./marquee');
 const marqueeTv = require('./marqueeTv');
+const marqueeAnime = require('./marqueeAnime');
 
-const REGISTRY = new Map([[marquee.id, marquee], [marqueeTv.id, marqueeTv]]);
-const DEFAULT_IDS = { movie: 'marquee', series: 'marquee-tv' };
+const REGISTRY = new Map([[marquee.id, marquee], [marqueeTv.id, marqueeTv], [marqueeAnime.id, marqueeAnime]]);
+const OFF = 'off';
+// The engine each lane uses by default. 'anime' defaults to OFF (Disabled): the
+// lane is opt-in per profile (AN-1a mandate 3).
+const DEFAULT_IDS = Object.freeze({ movie: 'marquee', series: 'marquee-tv', anime: OFF });
+// Lanes whose engine may be switched off. Movies and Shows are mandatory.
+const OPTIONAL_LANES = new Set(['anime']);
 
 function get(id) { return REGISTRY.get(id) || null; }
 function list() { return [...REGISTRY.values()]; }
@@ -29,17 +36,23 @@ function availableFor(profile, type) {
   return listForType(type).filter((e) => !(limited && e.capabilities.unrestricted));
 }
 
-// resolveFor: the effective engine for (profile, type). Falls back to the
-// type's default (DEFAULT_IDS) when the stored id is unknown, doesn't support
-// the type, OR is an unrestricted engine on an age-limited profile — so even
-// a hand-edited profiles.json can never build/serve from a switched-off engine
-// or serve open content to a kids profile (I7).
+// isValidFor: may `id` be stored as engine_<type>? OFF only for optional lanes.
+function isValidFor(type, id) {
+  if (id === OFF) return OPTIONAL_LANES.has(type);
+  const e = get(id);
+  return !!(e && e.supportedTypes.includes(type));
+}
+
+// resolveFor: the effective engine for (profile, type), or NULL when an optional
+// lane is off. Movies/Series never return null (they fall back to the default).
+// Every caller that can pass 'anime' must handle null (AN-1a §2.2).
 function resolveFor(profile, type) {
   const id = profile?.filters?.[`engine_${type}`];
+  if (OPTIONAL_LANES.has(type) && (id === undefined || id === null || id === OFF)) return null;
   const e = get(id);
-  if (!e || !e.supportedTypes.includes(type)) return defaultFor(type);
+  if (!e || !e.supportedTypes.includes(type)) return defaultFor(type);   // anime: get('off') → null
   if (e.capabilities.unrestricted && (profile?.filters?.age_limit || 0) > 0) return defaultFor(type);
   return e;
 }
 
-module.exports = { get, list, listForType, has, defaultFor, availableFor, resolveFor, DEFAULT_IDS, _register };
+module.exports = { get, list, listForType, has, defaultFor, availableFor, resolveFor, isValidFor, OFF, DEFAULT_IDS, _register };

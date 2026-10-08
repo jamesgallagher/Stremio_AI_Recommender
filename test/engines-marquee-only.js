@@ -32,9 +32,10 @@ const BASE = `http://localhost:${process.env.PORT}`;
   // ---- N1: registry has exactly marquee + marquee-tv ----
   await ok('N1: registry — list, listForType, get', async () => {
     const ids = engines.list().map((e) => e.id);
-    assert.deepStrictEqual(ids.sort(), ['marquee', 'marquee-tv']);
+    assert.deepStrictEqual(ids.sort(), ['marquee', 'marquee-anime', 'marquee-tv']);
     assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['marquee']);
     assert.deepStrictEqual(engines.listForType('series').map((e) => e.id), ['marquee-tv']);
+    assert.deepStrictEqual(engines.listForType('anime').map((e) => e.id), ['marquee-anime']);
     assert.strictEqual(engines.get('genesis'), null);
     assert.strictEqual(engines.get('glass'), null);
   });
