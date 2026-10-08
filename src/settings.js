@@ -14,7 +14,7 @@ const store = require('./store');
 
 // Secret fields (sealed on disk). Nested under their sections.
 const LLM_SECRET_FIELDS = ['custom_api_key', 'groq_api_key', 'groq_api_key_backup'];
-const KEY_SECRET_FIELDS = ['tmdb_api_key', 'mdblist_api_key', 'rpdb_api_key', 'tvdb_api_key'];
+const KEY_SECRET_FIELDS = ['tmdb_api_key', 'mdblist_api_key', 'rpdb_api_key', 'tvdb_api_key', 'mal_client_id', 'anidb_client'];
 
 const DEFAULT_RPDB_KEY = 't0-free-rpdb'; // generic free-tier key, as in v5
 
@@ -32,6 +32,9 @@ function blankSettings() {
       mdblist_api_key: '',
       rpdb_api_key: DEFAULT_RPDB_KEY,
       tvdb_api_key: '', // AGE-1: TVDB v4 key for country certifications (sealed at rest)
+      mal_client_id: '',    // AN-1a: MyAnimeList Client ID (server fallback)
+      anidb_client: '',     // AN-1a: AniDB HTTP client name (server fallback)
+      anidb_clientver: 0,   // AN-1a: that client's registered version number
     },
     // Marquee Tier-2 global admin config (ME-09) — the same pattern as Glass
     // (GE-07) but Marquee's own blob: engines/marquee/config.resolveConfig
@@ -111,6 +114,11 @@ function updateSettings(patch) {
   }
   if (patch.llm) Object.assign(current.llm, patch.llm);
   if (patch.keys) Object.assign(current.keys, patch.keys);
+  // AN-1a: anidb_clientver is a positive integer or 0 (unset).
+  if (patch.keys && patch.keys.anidb_clientver !== undefined) {
+    const v = parseInt(patch.keys.anidb_clientver, 10);
+    current.keys.anidb_clientver = Number.isFinite(v) && v > 0 ? v : 0;
+  }
   // ME-09: Marquee Tier-2 config — replace-whole: any section left out reverts
   // to its Tier-1 default, since engines/marquee/config.resolveConfig backfills
   // from DEFAULTS. `{}` is a true reset to pure defaults.
@@ -189,6 +197,30 @@ function resolveMdblistKey(profile) {
   return { key: '', source: 'none' };
 }
 
+// AN-1a: MyAnimeList Client ID — personal first, then server, then none.
+function resolveMalKey(profile) {
+  const personal = (profile?.keys?.mal_client_id || '').trim();
+  if (personal) return { key: personal, source: 'user' };
+  const global = (getSettings()?.keys?.mal_client_id || '').trim();
+  if (global) return { key: global, source: 'server' };
+  return { key: '', source: 'none' };
+}
+
+// AN-1a: AniDB HTTP client — personal pair first, then server pair, then none.
+// A pair needs BOTH a name and a version >= 1; half a pair is "none" at that level.
+function resolveAnidbClient(profile) {
+  const pick = (k) => {
+    const client = (k?.anidb_client || '').trim();
+    const clientver = parseInt(k?.anidb_clientver, 10);
+    return client && clientver > 0 ? { client, clientver } : null;
+  };
+  const personal = pick(profile?.keys);
+  if (personal) return { ...personal, source: 'user' };
+  const global = pick(getSettings()?.keys);
+  if (global) return { ...global, source: 'server' };
+  return { client: '', clientver: 0, source: 'none' };
+}
+
 module.exports = {
   blankSettings,
   getSettings,
@@ -199,6 +231,8 @@ module.exports = {
   hasLlm,
   keyFor,
   resolveMdblistKey,
+  resolveMalKey,
+  resolveAnidbClient,
   settingsLocked,
   DEFAULT_RPDB_KEY,
   LLM_SECRET_FIELDS,

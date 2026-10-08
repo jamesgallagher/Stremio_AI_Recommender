@@ -6819,13 +6819,14 @@ async function httpTests() {
   assert.ok(genres.genres.includes('Horror') && genres.genres.includes('Kids'));
   console.log('  ✓ /api/genres');
 
-  // /api/engines — the static registry (two Marquee engines).
+  // /api/engines — the static registry (three Marquee engines).
   const eng = await (await fetch(`${BASE}/api/engines`)).json();
-  assert.deepStrictEqual(eng.engines.map((e) => e.id), ['marquee', 'marquee-tv']);
+  assert.deepStrictEqual(eng.engines.map((e) => e.id), ['marquee', 'marquee-tv', 'marquee-anime']);
   assert.deepStrictEqual(eng.engines[0].supported_types, ['movie']);
   assert.deepStrictEqual(eng.engines[1].supported_types, ['series']);
+  assert.deepStrictEqual(eng.engines[2].supported_types, ['anime']);
   assert.ok(eng.engines[0].description);
-  console.log('  ✓ /api/engines advertises the registry (Marquee Cinema + Marquee TV)');
+  console.log('  ✓ /api/engines advertises the registry (Marquee Cinema + Marquee TV + Marquee Anime)');
 
   // Create a profile through the API
   let res = await fetch(`${BASE}/api/profiles`, {
@@ -7742,12 +7743,12 @@ async function httpTests() {
   {
     const engines = require('../src/engines');
     const eng0 = await (await fetch(`${BASE}/api/engines`)).json();
-    assert.deepStrictEqual(eng0.engines.map((e) => e.id).sort(), ['marquee', 'marquee-tv']);
+    assert.deepStrictEqual(eng0.engines.map((e) => e.id).sort(), ['marquee', 'marquee-anime', 'marquee-tv']);
     for (const e of eng0.engines) {
-      assert.ok(e.id === 'marquee' || e.id === 'marquee-tv');
+      assert.ok(['marquee', 'marquee-tv', 'marquee-anime'].includes(e.id));
       assert.ok(e.supported_types.length > 0);
     }
-    console.log('  ✓ /api/engines: both Marquee engines listed');
+    console.log('  ✓ /api/engines: the three Marquee engines listed');
   }
 
   // ---- Trainer T1: portal routes over HTTP (F11.5) ----

@@ -323,9 +323,11 @@ function companionSettings(profile) {
     engines: {
       movie: engDTO(engines.resolveFor(profile, 'movie')),
       series: engDTO(engines.resolveFor(profile, 'series')),
+      anime: engines.resolveFor(profile, 'anime') ? engDTO(engines.resolveFor(profile, 'anime')) : { id: 'off', name: 'Disabled', description: '' },
       requirements: {
         movie: engines.resolveFor(profile, 'movie').requirements(profile),
         series: engines.resolveFor(profile, 'series').requirements(profile),
+        anime: engines.resolveFor(profile, 'anime')?.requirements(profile) || { ok: true, missing: [] },
       },
     },
   };
@@ -349,6 +351,10 @@ function settingsPostHandler(req, res) {
   const patch = {};
   const filterPatch = {};
   for (const k of COMPANION_FILTERS) if (b[k] !== undefined) filterPatch[k] = b[k];
+  // AN-1a: the anime engine is phone-editable (Disabled | Marquee Anime). It is NOT a
+  // companion filter (never returned in `filters`); config.updateProfile validates it
+  // (an unknown value lands on 'off'). engine_movie/engine_series stay non-editable.
+  if (b.engine_anime !== undefined) filterPatch.engine_anime = String(b.engine_anime);
   if (Object.keys(filterPatch).length) patch.filters = filterPatch; // age_limit can never be a key here
   if (b.catalog_only !== undefined) patch.companion = { catalog_only: !!b.catalog_only };
   if (b.catalogs && typeof b.catalogs === 'object') {

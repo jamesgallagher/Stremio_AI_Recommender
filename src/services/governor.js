@@ -47,6 +47,9 @@ const LIMITS = {
   jikan: { minIntervalMs: 1050, breaker: { threshold: 5, cooldownMs: 60000 } },
   anilist: { minIntervalMs: 2000, breaker: { threshold: 5, cooldownMs: 60000 } },
   groq: { minIntervalMs: 2100 },
+  // MyAnimeList API v2 (AN-1a): the first source for anime age ratings when a
+  // client id is available. Paced at 1 req/s with a breaker.
+  mal: { minIntervalMs: 1000, breaker: { threshold: 5, cooldownMs: 60000 } },
 };
 
 const DEFAULT_BACKOFF_MS = 5000; // when a 429 carries no usable Retry-After

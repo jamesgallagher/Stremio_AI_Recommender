@@ -104,18 +104,22 @@ function dnrPage({ ok, title }, profile) {
 }
 
 function manifestFor(profile, baseUrl = '') {
+  const animeEngine = require('./engines').resolveFor(profile, 'anime');
+  const types = ['movie', 'series'];
+  if (animeEngine) types.push('anime');
   return {
     id: `au.com.jscc.airecommender.${profile.id.substring(0, 8)}`,
     version,
     name: `AI Recommender — ${profile.name}`,
     description: `Personalized movie & series recommendations for ${profile.name}, generated from Simkl watch history.`,
     ...(baseUrl ? { logo: `${baseUrl}/logo.png` } : {}),
-    types: ['movie', 'series'],
+    types,
     idPrefixes: ['tt'],
     resources: ['catalog', 'meta'],
     catalogs: [
       { type: 'movie', id: 'ai-recs-movies', name: CATALOGS['ai-recs-movies'].name, extra: [{ name: 'skip', isRequired: false }] },
       { type: 'series', id: 'ai-recs-series', name: CATALOGS['ai-recs-series'].name, extra: [{ name: 'skip', isRequired: false }] },
+      ...(animeEngine ? [{ type: 'anime', id: 'ai-recs-anime', name: CATALOGS['ai-recs-anime'].name, extra: [{ name: 'skip', isRequired: false }] }] : []),
       ...catalogs.enabledExtras(profile).filter((d) => hasContent(profile, d)).map((d) => (
         { type: d.type, id: d.id, name: d.name, extra: [{ name: 'skip', isRequired: false }] }
       )),
@@ -337,6 +341,10 @@ router.get('/catalog/:type/:catalogId{/:extra}', async (req, res) => {
     || (extraDef && !(catalogs.isEnabled(profile, extraDef) && catalogs.ageAppropriate(profile, extraDef)))) {
     return res.status(404).json({ error: 'Unknown catalog' });
   }
+  // AN-1a: the anime catalog is refused when the anime engine is off (mandate 4).
+  if (aiCatalog && aiCatalog.lane === 'anime' && !require('./engines').resolveFor(profile, 'anime')) {
+    return res.status(404).json({ error: 'Unknown catalog' });
+  }
 
   // Pagination beyond the list: empty (list is a fixed-size daily selection)
   const extra = (req.params.extra || '').replace(/\.json$/, '');
@@ -373,7 +381,7 @@ router.get('/catalog/:type/:catalogId{/:extra}', async (req, res) => {
     if (served.source === 'simkl_plantowatch') {
       return res.json({ metas: [], cacheMaxAge: 5 * 60 });
     }
-    return res.json({ metas: skip > 0 ? [] : [errorCard(def.type, emptyCardText(served))], cacheMaxAge: 5 * 60 });
+    return res.json({ metas: skip > 0 ? [] : [errorCard(def.itemType, emptyCardText(served))], cacheMaxAge: 5 * 60 });
   }
 
   const sliced = skip > 0 ? served.metas.slice(skip) : served.metas;

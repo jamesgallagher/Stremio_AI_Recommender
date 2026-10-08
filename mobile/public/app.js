@@ -446,7 +446,7 @@
   const setEls = {
     tabs: document.querySelectorAll('#settings-tabs .seg'),
     msg: $('settings-msg'),
-    engines: $('set-engines'),
+    engineAnime: $('set-engine-anime'), engineAnimeSub: $('set-engine-anime-sub'), engineWarn: $('set-engine-warn'),
     minRating: $('set-min-rating'), recency: $('set-recency'), listSize: $('set-list-size'),
     voteFloor: $('set-vote-floor'), genres: $('set-genres'), catalogOnly: $('set-catalog-only'),
     titleDecay: $('set-title-decay'), titleDecayDays: $('set-title-decay-days'), titleDecayDaysField: $('set-title-decay-days-field'),
@@ -455,22 +455,38 @@
   };
   const setSettingsMsg = (t, kind) => { setEls.msg.textContent = t || ''; setEls.msg.className = 'msg' + (kind ? ' ' + kind : ''); };
 
-  // Per-type engine summary line + requirement warnings (card §7.1/§7.2).
+  // AN-1a: Movies/Shows have one mandatory engine each; Anime is Disabled or Marquee Anime.
+  const ANIME_SUB = {
+    off: 'Disabled: no anime row in Stremio or Nuvio, and no Anime ratings.',
+    'marquee-anime': 'Builds "Recommended for you - Anime". Uses your watched anime; until you\'ve properly watched 5, it shows age-appropriate trending anime.',
+  };
   function fillEngines(data) {
     const eng = data.engines || {};
-    const movieName = (eng.movie && eng.movie.name) || 'marquee';
-    const seriesName = (eng.series && eng.series.name) || 'marquee-tv';
+    const anime = (eng.anime && eng.anime.id) || 'off';
+    setEls.engineAnime.value = anime;
+    setEls.engineAnimeSub.textContent = ANIME_SUB[anime] || ANIME_SUB.off;
     const reqs = eng.requirements || {};
-    let html = `${movieName} (movies) · ${seriesName} (shows)`;
-    for (const type of ['movie', 'series']) {
+    const lines = [];
+    for (const type of ['movie', 'series', 'anime']) {
       const req = reqs[type];
-      if (req && !req.ok && Array.isArray(req.missing) && req.missing.length) {
-        const engName = type === 'movie' ? movieName : seriesName;
-        html += `<div class="warn-line">⚠ ${engName} needs ${req.missing.join(', ')}.</div>`;
+      if (type === 'anime' && anime === 'off') continue;
+      if (req && !req.ok && Array.isArray(req.missing)) {
+        for (const m of req.missing) {
+          const name = (eng[type] && eng[type].name) || '';
+          const p = document.createElement('p');
+          p.className = 'warn-line';
+          p.textContent = m === 'AniDB client'
+            ? '⚠ Marquee Anime needs an AniDB client — add one in Configure → Advanced → API Keys.'
+            : `⚠ ${name} needs ${m}.`;
+          lines.push(p);
+        }
       }
     }
-    setEls.engines.innerHTML = html;
+    setEls.engineWarn.replaceChildren(...lines);
   }
+  setEls.engineAnime.addEventListener('change', () => {
+    setEls.engineAnimeSub.textContent = ANIME_SUB[setEls.engineAnime.value] || ANIME_SUB.off;
+  });
 
   function switchSettingsTab(tab) {
     setEls.tabs.forEach((s) => s.classList.toggle('active', s.dataset.settab === tab));
@@ -743,7 +759,9 @@
 
   async function saveSettings() {
     setEls.save.disabled = true; setSettingsMsg('Saving…');
+    const prevAnime = setEls.engineAnime.value;
     const payload = {
+      engine_anime: setEls.engineAnime.value,
       min_rating: parseFloat(setEls.minRating.value),
       min_year: parseInt(setEls.recency.value, 10),
       list_size: parseInt(setEls.listSize.value, 10),
@@ -757,7 +775,14 @@
       const res = await apiFetch('/settings', { method: 'POST', body: JSON.stringify(payload) });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) { setSettingsMsg(data.error || 'Could not save — try again.', 'err'); return; }
-      setSettingsMsg('Saved. Your list updates the next time it loads.', 'ok');
+      const newAnime = payload.engine_anime;
+      if (prevAnime === 'off' && newAnime === 'marquee-anime') {
+        setSettingsMsg('Saved. Anime engine enabled — building your anime row.', 'ok');
+      } else if (prevAnime === 'marquee-anime' && newAnime === 'off') {
+        setSettingsMsg('Saved. Anime engine disabled — anime row removed.', 'ok');
+      } else {
+        setSettingsMsg('Saved. Your list updates the next time it loads.', 'ok');
+      }
       recs.loaded = false; // filters/view changed — the Recommendations tab refetches on next visit
     } catch { setSettingsMsg('Could not save — try again.', 'err'); }
     finally { setEls.save.disabled = false; }

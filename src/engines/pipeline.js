@@ -19,6 +19,7 @@
 const tmdb = require('../services/tmdb');
 const animeMap = require('../services/animeMap');
 const watchedStore = require('../watchedStore');
+const lanes = require('../lanes');
 
 const key = (type, tmdbId) => `${type}:${tmdbId}`;
 
@@ -72,7 +73,7 @@ async function runEngineBuild(profile, type, engine, ctx, onProgress = () => {},
     .map(normalize)
     .filter((c) => c.type === type)
     .filter((c) => !ctx.watchedIds.tmdb.has(c.tmdb_id))
-    .filter((c) => !ctx.dont.has(key(c.type, c.tmdb_id)))
+    .filter((c) => !lanes.dnrTypes(c.type).some((t) => ctx.dont.has(key(t, c.tmdb_id))))
     .filter((c) => !c.adult);
 
   // 3. Resolve tt-id + poster + genre names + Anime tag — unless the engine
@@ -124,7 +125,7 @@ async function runEngineBuild(profile, type, engine, ctx, onProgress = () => {},
     const mdblist = require('../services/mdblist');
     const ids = servable.map((c) => c.imdb_id);
     try {
-      const ratings = await mdblist.imdbRatings(mdblistKey, type, ids, log);
+      const ratings = await mdblist.imdbRatings(mdblistKey, lanes.lookupType(type), ids, log);
       let rated = 0;
       for (const c of servable) { const v = ratings.get(c.imdb_id); if (v != null) { c.imdb_rating = v; rated++; } }
       log.log(`[rec] ${profile.name}: IMDb ratings resolved for ${rated}/${servable.length} ${type} recommendation(s)`);

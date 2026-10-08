@@ -78,6 +78,50 @@ function jikanReason(err) {
   return err ? err.message : 'unknown';
 }
 
+// AN-1a: MAL API v2 — the first source for anime age ratings when a client id
+// is available. Paced via the governor's 'mal' lane.
+const MAL_API = 'https://api.myanimelist.net/v2';
+const MAL_TIMEOUT_MS = 10000;
+const MAL_RATING_MAP = { g: 'G', pg: 'PG', pg_13: 'PG-13', r: 'R', 'r+': 'R+', rx: 'Rx' };
+
+async function fetchRatingMalApi(malId, clientId) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await governor.schedule('mal', () => fetch(`${MAL_API}/anime/${encodeURIComponent(malId)}?fields=rating,nsfw,genres`, {
+        headers: { 'X-MAL-CLIENT-ID': clientId, 'User-Agent': USER_AGENT, Accept: 'application/json' },
+        signal: AbortSignal.timeout(MAL_TIMEOUT_MS),
+      }));
+      if (res.status === 404) return { code: null, minAge: null, adult: false, adultish: false };
+      // 429 (rate) and 5xx (gateway) are transient — one retry after 3 s.
+      if (res.status === 429 || res.status >= 500) {
+        lastErr = new Error(`MAL API anime/${malId} failed (${res.status})`);
+        lastErr.status = res.status;
+        if (attempt < 2) { await sleep(3000); continue; }
+        throw lastErr;
+      }
+      if (!res.ok) {
+        const err = new Error(`MAL API anime/${malId} failed (${res.status})`);
+        err.status = res.status;
+        throw err; // 4xx (not 404/429) is not transient — don't retry
+      }
+      const data = await res.json();
+      const rating = data?.rating ? MAL_RATING_MAP[data.rating] : null;
+      const genres = (data?.genres || []).map((g) => g?.name).filter(Boolean);
+      const verdict = classify(rating) || { code: null, minAge: null, adult: false, adultish: false };
+      if (data?.nsfw === 'black' || genres.some((g) => ADULT_GENRES.test(g))) verdict.adult = true;
+      return verdict;
+    } catch (err) {
+      if (err.circuitOpen) throw err;
+      if (err.status && err.status < 500 && err.status !== 429) throw err;
+      lastErr = err;
+      if (attempt < 2) { await sleep(3000); continue; }
+      throw lastErr;
+    }
+  }
+  throw lastErr;
+}
+
 // Jikan sits behind Cloudflare and is genuinely flaky: 429s (rate) plus 5xx
 // gateway errors (502/503/504) come in bursts, and a torn keep-alive socket
 // surfaces as a network-level "fetch failed". All three are TRANSIENT, so we
@@ -115,6 +159,11 @@ async function fetchRating(malId) {
       if (err.circuitOpen) throw err;
       // Non-transient 4xx (not 404/429): don't retry.
       if (err.status && err.status < 500 && err.status !== 429) throw err;
+      // AN-1a: a connection timeout is NOT transient — fall straight through to
+      // the next source (no retry). Today each timeout costs 3 × 10 s.
+      const cause = err && err.cause;
+      const code = cause && (cause.code || cause.message);
+      if (code === 'UND_ERR_CONNECT_TIMEOUT' || code === 'ETIMEDOUT') throw err;
       // Network-level failure (fetch failed / timeout / socket reset): transient.
       lastErr = err;
       if (attempt < MAX_ATTEMPTS) { await sleep(RETRY_BACKOFF_MS); continue; }
@@ -138,10 +187,10 @@ function isDefinitiveHit(entry, now) {
 
 // Ratings for many MAL ids. Returns Map<malId, verdict|null>. null means
 // "unknown", which callers MUST treat as "fall through to the LLM", never as
-// a reason to drop. Lookup order per miss: Jikan -> AniList (same MAL id) ->
-// stale cache -> unrated. A rating source outage therefore degrades to, at
-// worst, today's behaviour, and usually not even that.
-async function ratings(malIds, log = console) {
+// a reason to drop. Lookup order per miss (AN-1a): MAL API (when a client id
+// is available) -> Jikan -> AniList (same MAL id) -> stale cache -> unrated.
+// A rating source outage therefore degrades to, at worst, today's behaviour.
+async function ratings(malIds, log = console, { malClientId } = {}) {
   const out = new Map();
   const now = Date.now();
   const cache = store.loadAnimeRatings();
@@ -165,6 +214,17 @@ async function ratings(malIds, log = console) {
   const fetched = new Map(); // id -> { verdict, source } to persist
   let firstOpenLog = true;   // log the "circuit open" note once, not per title
   for (const id of queue) {
+    // AN-1a: MAL API first (when a client id is available), then Jikan, then AniList.
+    if (malClientId) {
+      try {
+        const verdict = await fetchRatingMalApi(id, malClientId);
+        fetched.set(id, { verdict, source: 'malapi' });
+        await sleep(RATE_DELAY_MS);
+        continue;
+      } catch (malApiErr) {
+        log.log(`[mal] ${id}: MAL API failed (${jikanReason(malApiErr)}) — falling through to Jikan`);
+      }
+    }
     try {
       fetched.set(id, { verdict: await fetchRating(id), source: 'mal' });
     } catch (malErr) {
@@ -240,4 +300,4 @@ function blockedForAge(verdict, limit) {
   return verdict.minAge > limit;
 }
 
-module.exports = { ratings, classify, parseAnime, cachedVerdict, isBlacklisted, blockedForAge, BANDS, LOOKUP_CAP };
+module.exports = { ratings, classify, parseAnime, cachedVerdict, isBlacklisted, blockedForAge, BANDS, LOOKUP_CAP, MAL_RATING_MAP };

@@ -26,7 +26,7 @@
   .badge.warn { color: var(--warn); border-color: var(--warn); }
   .badge.err { color: var(--err); border-color: var(--err); }
   label { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 4px; }
-  input[type=text], input[type=password], input[type=email], select {
+  input[type=text], input[type=password], input[type=email], input[type=number], select {
     width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border);
     background: var(--card2); color: var(--text); font-size: 14px; outline: none;
   }
@@ -111,6 +111,7 @@
   .keyfield .eye:hover { background: transparent; color: var(--text); }
   .keyrow { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
   .keyrow .keyfield { flex: 1; }
+  .key-sep { border-top: 1px solid var(--border); margin: 14px 0; }
   .install { background: var(--card2); border: 1px dashed var(--border); border-radius: 8px; padding: 10px; font-family: monospace; font-size: 12px; word-break: break-all; margin-top: 6px; }
   .muted { color: var(--muted); font-size: 12px; }
   .status-line { font-size: 12px; color: var(--muted); margin-top: 8px; }
@@ -118,7 +119,8 @@
   .diag div { margin: 2px 0; }
   .pin { font-size: 28px; letter-spacing: 6px; font-weight: 700; color: var(--accent); }
   .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-  @media (max-width: 640px) { .cols { grid-template-columns: 1fr; } .genres { grid-template-columns: 1fr 1fr; } }
+  .cols-3 { grid-template-columns: 1fr 1fr 1fr; }
+  @media (max-width: 640px) { .cols { grid-template-columns: 1fr; } .cols-3 { grid-template-columns: 1fr; } .genres { grid-template-columns: 1fr 1fr; } }
   details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin: 12px 0 4px; }
   /* Profile tabs — one card, tab bar + panels; switching is pure show/hide (no re-render) */
   .tabs { display: flex; flex-wrap: wrap; gap: 2px; margin-top: 14px; border-bottom: 1px solid var(--border); }
@@ -136,7 +138,7 @@
   .tab-panel > .muted + .sec-title, .tab-panel > .warn-line + .sec-title { margin-top: 4px; }
   .sec-box { background: var(--card2); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
   .sec-box > label:first-child, .sec-box .cols:first-child label { margin-top: 0; }
-  .sec-box input[type=text], .sec-box input[type=password], .sec-box input[type=email], .sec-box select { background: var(--card); }
+  .sec-box input[type=text], .sec-box input[type=password], .sec-box input[type=email], .sec-box input[type=number], .sec-box select { background: var(--card); }
   .sec-box .genres label, .sec-box .cat-item, .sec-box .tr-row, .sec-box .tr-chip, .sec-box .install, .sec-box .diag { background: var(--card); }
   .sec-box .tr-thumb { background: var(--card2); }
   .sec-box .cats, .sec-box .genres { margin-top: 0; }
@@ -369,6 +371,113 @@ function mdblistKeyRow(id, value) {
   </div><span class="tres" data-tres="mdblist-user"></span>`;
 }
 
+// AN-1a: MyAnimeList key row (Advanced → API Keys). Identical layout to
+// mdblistKeyRow, with data-key="mal_client_id" and the MAL-specific test/clear.
+function malKeyRow(id, value) {
+  const v = esc(value || '');
+  return `<div class="keyrow">
+    <div class="keyfield">
+      <input type="password" data-key="mal_client_id" data-orig="${v}" value="${v}" placeholder="not set" autocomplete="off" spellcheck="false" ${IGNORE_PW_MANAGERS}>
+      <button type="button" class="eye" onclick="toggleKey(this)" title="Show / hide">${EYE_OFF}</button>
+    </div>
+    <button class="ghost mini" onclick="testMalUser('${id}', this)">Test</button>
+    <button class="ghost mini" onclick="clearMalUser('${id}')">Clear</button>
+  </div><span class="tres" data-tres="mal-user"></span>`;
+}
+
+// AN-1a: render the MAL key source status line.
+function renderMalStatus(p) {
+  const source = p.anime_status?.mal?.source;
+  if (!source) return '';
+  const label = source === 'user' ? 'Your key' : source === 'server' ? 'Server key' : 'No key — using Jikan (slower)';
+  return `<div class="muted" style="font-size:11px;margin-top:6px">Key source: <b>${label}</b></div>`;
+}
+
+// AN-1a: render the AniDB client status line.
+function renderAnidbStatus(p) {
+  const anidb = p.anime_status?.anidb;
+  if (!anidb) return '';
+  const source = anidb.source === 'user' ? 'Your client' : anidb.source === 'server' ? 'Server client' : 'None — Marquee Anime can\'t build';
+  let line2 = '';
+  if (anidb.banned_until) {
+    line2 = `Today: ${anidb.today || 0} / 150 requests · Status: blocked by AniDB until ${new Date(anidb.banned_until).toLocaleString()}`;
+  } else if (anidb.last_error) {
+    line2 = `Today: ${anidb.today || 0} / 150 requests · Status: last error: ${esc(anidb.last_error)}`;
+  } else {
+    line2 = `Today: ${anidb.today || 0} / 150 requests · Status: OK`;
+  }
+  return `<div class="muted" style="font-size:11px;margin-top:6px">Client source: <b>${source}</b></div>
+    <div class="muted" style="font-size:11px;margin-top:2px">${line2}</div>`;
+}
+
+// AN-1a: test the per-profile MAL key (draft or saved).
+async function testMalUser(id, btn) {
+  const card = document.querySelector(`[data-id="${id}"]`);
+  const out = card.querySelector('[data-tres="mal-user"]');
+  const input = card.querySelector('[data-key="mal_client_id"]');
+  btn.disabled = true;
+  out.className = 'tres'; out.textContent = 'testing…';
+  try {
+    const draft = input.value.trim();
+    const body = draft !== (input.dataset.orig || '') ? { key: draft } : { use_saved: true };
+    const r = await api(`/profiles/${id}/test/mal-user`, { method: 'POST', body });
+    out.className = 'tres ' + (r.ok ? 'ok' : 'err');
+    out.textContent = r.ok ? `✓ ${r.detail}` : `✗ ${r.error}`;
+  } catch (err) {
+    out.className = 'tres err';
+    out.textContent = '✗ ' + err.message;
+  }
+  btn.disabled = false;
+}
+
+// AN-1a: clear the per-profile MAL key (explicit null).
+async function clearMalUser(id) {
+  await api('/profiles/' + id, { method: 'PUT', body: { keys: { mal_client_id: null } } });
+  const card = document.querySelector(`[data-id="${id}"]`);
+  const mal = card?.querySelector('[data-key="mal_client_id"]');
+  if (mal) {
+    mal.value = '';
+    mal.dataset.orig = '';
+    mal.placeholder = 'not set';
+  }
+  dirty = false; toast('MyAnimeList key cleared'); pollStatus();
+}
+
+// AN-1a: test the per-profile AniDB client (draft or saved).
+async function testAnidbUser(id, btn) {
+  const card = document.querySelector(`[data-id="${id}"]`);
+  const out = card.querySelector('[data-tres="anidb-user"]');
+  const clientInput = card.querySelector('[data-key="anidb_client"]');
+  const verInput = card.querySelector('[data-key="anidb_clientver"]');
+  btn.disabled = true;
+  out.className = 'tres'; out.textContent = 'testing…';
+  try {
+    const client = clientInput.value.trim();
+    const clientver = verInput.value.trim();
+    const clientChanged = client !== (clientInput.dataset.orig || '');
+    const verChanged = clientver !== (verInput.dataset.orig || '');
+    const body = (clientChanged || verChanged) ? { client, clientver } : { use_saved: true };
+    const r = await api(`/profiles/${id}/test/anidb-user`, { method: 'POST', body });
+    out.className = 'tres ' + (r.ok ? 'ok' : 'err');
+    out.textContent = r.ok ? `✓ ${r.detail}` : `✗ ${r.error}`;
+  } catch (err) {
+    out.className = 'tres err';
+    out.textContent = '✗ ' + err.message;
+  }
+  btn.disabled = false;
+}
+
+// AN-1a: clear the per-profile AniDB client (explicit null on both fields).
+async function clearAnidbUser(id) {
+  await api('/profiles/' + id, { method: 'PUT', body: { keys: { anidb_client: null, anidb_clientver: null } } });
+  const card = document.querySelector(`[data-id="${id}"]`);
+  const clientInput = card?.querySelector('[data-key="anidb_client"]');
+  const verInput = card?.querySelector('[data-key="anidb_clientver"]');
+  if (clientInput) { clientInput.value = ''; clientInput.dataset.orig = ''; }
+  if (verInput) { verInput.value = ''; verInput.dataset.orig = ''; }
+  dirty = false; toast('AniDB client cleared'); pollStatus();
+}
+
 function toast(msg) {
   const t = $('#toast');
   t.textContent = msg; t.style.display = 'block';
@@ -499,11 +608,11 @@ function render(profiles) {
       </div>
 
       <div class="tab-panel" data-tab="filters">
-        <div class="muted" style="margin-bottom:8px;font-size:11px">Movies are built by <b>Marquee Cinema</b> and shows by <b>Marquee TV</b>. Rating floor, excluded genres, recency and list size apply at <b>serve time</b> over the stored pool — change one and it takes effect immediately, no rebuild. The <b>age limit</b> and <b>minimum vote count</b> are baked in at build, so they apply on the next rebuild.</div>
+        <div class="muted" style="margin-bottom:8px;font-size:11px">Movies are built by <b>Marquee Cinema</b>, shows by <b>Marquee TV</b>, and anime by <b>Marquee Anime</b> when it's enabled. Rating floor, excluded genres, recency and list size apply at <b>serve time</b> over the stored pool — change one and it takes effect immediately, no rebuild. The <b>age limit</b> and <b>minimum vote count</b> are baked in at build, so they apply on the next rebuild.</div>
 
         <div class="sec-title">Engines</div>
         <div class="sec-box">
-          ${engineSummary(p)}
+          ${engineFields(p)}
         </div>
 
         <div class="sec-title">Quality</div>
@@ -587,8 +696,9 @@ function render(profiles) {
           <div class="cats">
             ${catItemHtml({ pid: p.id, id: 'ai-recs-movies', name: 'Recommended for you', type: 'movie', checked: true, locked: true })}
             ${catItemHtml({ pid: p.id, id: 'ai-recs-series', name: 'Recommended for you', type: 'series', checked: true, locked: true })}
+            ${p.filters.engine_anime !== 'off' ? catItemHtml({ pid: p.id, id: 'ai-recs-anime', name: 'Recommended for you', type: 'series', checked: true, locked: true, label: 'Recommended for you — Anime' }) : ''}
           </div>
-          <div class="hint">The two AI recommendation catalogs (movies + series) are always on.</div>
+          <div class="hint">The AI recommendation catalogs are always on. The Anime row appears when Marquee Anime is enabled in Filters → Engines.</div>
         </div>
 
         <div class="sec-title">Watch Later</div>
@@ -750,12 +860,31 @@ function render(profiles) {
           </div>
         </div>
 
-        <div class="sec-title">MDBList</div>
+        <div class="sec-title">API Keys</div>
         <div class="sec-box">
-          <label>Personal API key <a class="getkey" href="https://mdblist.com/preferences/" target="_blank" rel="noopener">get key ↗</a></label>
+          <label>MDBList personal API key <a class="getkey" href="https://mdblist.com/preferences/" target="_blank" rel="noopener">get key ↗</a></label>
           ${mdblistKeyRow(p.id, p.keys.mdblist_api_key)}
           <div id="mdblist-status-${p.id}">${renderMdblistStatus(p)}</div>
           <div class="hint">Takes priority over the server key; leave blank to use the server key. With neither set, MDBList lookups are unavailable (kids age rules fail closed).</div>
+
+          <div class="key-sep"></div>
+          <label>MyAnimeList Client ID <a class="getkey" href="https://myanimelist.net/apiconfig" target="_blank" rel="noopener">get key ↗</a></label>
+          ${malKeyRow(p.id, p.keys.mal_client_id)}
+          <div id="mal-status-${p.id}">${renderMalStatus(p)}</div>
+          <div class="hint">Optional. Used by Marquee Anime for age ratings and recommendations. Takes priority over the server key; leave blank to use the server key.</div>
+
+          <div class="key-sep"></div>
+          <label>AniDB client <a class="getkey" href="https://anidb.net/software/add" target="_blank" rel="noopener">register ↗</a></label>
+          <div class="cols">
+            <div><label>Client name</label><input type="text" data-key="anidb_client" data-orig="${esc(p.keys.anidb_client || '')}" value="${esc(p.keys.anidb_client || '')}" placeholder="not set" autocomplete="off" spellcheck="false" ${IGNORE_PW_MANAGERS}></div>
+            <div><label>Client version</label><input type="number" min="1" step="1" data-key="anidb_clientver" data-orig="${p.keys.anidb_clientver || ''}" value="${p.keys.anidb_clientver || ''}" placeholder="1"></div>
+          </div>
+          <div class="keyrow" style="margin-top:8px">
+            <button class="ghost mini" onclick="testAnidbUser('${p.id}', this)">Test</button>
+            <button class="ghost mini" onclick="clearAnidbUser('${p.id}')">Clear</button>
+          </div><span class="tres" data-tres="anidb-user"></span>
+          <div id="anidb-status-${p.id}">${renderAnidbStatus(p)}</div>
+          <div class="hint">Required for Marquee Anime. AniDB bans clients that ask too fast, so the app paces itself (one request every 4 seconds, at most 150 a day) and keeps every title for 30 days.</div>
         </div>
 
         <div class="sec-title">Recommendations</div>
@@ -793,9 +922,9 @@ function render(profiles) {
           </div>
         </div>
 
-        <div class="save-bar" data-note="— saves the email, admin, Simkl credentials &amp; MDBList key">
+        <div class="save-bar" data-note="— saves the email, admin, Simkl credentials &amp; API keys">
           <button onclick="saveAdvanced('${p.id}').catch(e => toast('Save failed: ' + e.message))">Save</button>
-          <span class="muted save-note">— saves the email, admin, Simkl credentials &amp; MDBList key</span>
+          <span class="muted save-note">— saves the email, admin, Simkl credentials &amp; API keys</span>
         </div>
       </div>
     </div>`;
@@ -832,21 +961,63 @@ function switchTab(btn, name) {
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 // Per-type engine summary line + requirement warnings (card §6.1). Reads names
-// from ENGINES (GET /api/engines); renders a warn-line per unmet requirement.
-function engineSummary(p) {
-  const movieEng = ENGINES.find(e => e.id === p.engines?.movie);
-  const seriesEng = ENGINES.find(e => e.id === p.engines?.series);
-  const line = `${movieEng ? movieEng.name : p.engines?.movie || 'marquee'} (movies) · ${seriesEng ? seriesEng.name : p.engines?.series || 'marquee-tv'} (shows)`;
+// AN-1a: one dropdown per lane. Movies/Shows have one (mandatory) engine each —
+// a real, enabled select with a single option. Anime: Disabled (default) or
+// Marquee Anime. Names come from GET /engines.
+const ANIME_HINT = {
+  off: 'Disabled: no anime row in Stremio or Nuvio, and no Anime ratings.',
+  'marquee-anime': 'Builds "Recommended for you - Anime". Uses your watched anime; until you\'ve properly watched 5, it shows age-appropriate trending anime.',
+};
+function engineFields(p) {
+  const nameOf = (id) => (ENGINES.find(e => e.id === id) || {}).name || id;
   const reqs = p.engines?.requirements || {};
-  const warns = [];
-  for (const type of ['movie', 'series']) {
+  const warn = (type) => {
     const req = reqs[type];
-    if (req && !req.ok && Array.isArray(req.missing) && req.missing.length) {
-      const engName = (type === 'movie' ? movieEng : seriesEng)?.name || '';
-      warns.push(`<div class="warn-line">⚠ ${esc(engName)} needs ${esc(req.missing.join(', '))}.</div>`);
+    if (!req || req.ok || !Array.isArray(req.missing)) return '';
+    return req.missing.map(m => m === 'AniDB client'
+      ? '<div class="warn-line">⚠ Marquee Anime needs an AniDB client — add one in Advanced → API Keys.</div>'
+      : `<div class="warn-line">⚠ ${esc(nameOf(p.engines[type]))} needs ${esc(m)}.</div>`).join('');
+  };
+  const anime = p.filters.engine_anime || 'off';
+  const ban = p.anime_status?.anidb?.banned_until && anime !== 'off'
+    ? `<div class="warn-line">⚠ AniDB has blocked this client until ${esc(new Date(p.anime_status.anidb.banned_until).toLocaleString())}. Anime enrichment is paused.</div>`
+    : '';
+  return `<div class="cols cols-3">
+    <div><label for="eng-movie-${p.id}">Movies</label>
+      <select id="eng-movie-${p.id}" data-filter="engine_movie"><option value="marquee" selected>${esc(nameOf('marquee'))}</option></select>
+      <div class="hint">Required. Builds "Recommended for you" in Movies.</div>${warn('movie')}</div>
+    <div><label for="eng-series-${p.id}">Shows</label>
+      <select id="eng-series-${p.id}" data-filter="engine_series"><option value="marquee-tv" selected>${esc(nameOf('marquee-tv'))}</option></select>
+      <div class="hint">Required. Builds "Recommended for you" in Series.</div>${warn('series')}</div>
+    <div><label for="eng-anime-${p.id}">Anime</label>
+      <select id="eng-anime-${p.id}" data-filter="engine_anime" onchange="onAnimeEngine('${p.id}', this)">
+        <option value="off"${anime === 'off' ? ' selected' : ''}>Disabled</option>
+        <option value="marquee-anime"${anime === 'marquee-anime' ? ' selected' : ''}>${esc(nameOf('marquee-anime'))}</option>
+      </select>
+      <div class="hint" data-anime-hint>${esc(ANIME_HINT[anime] || ANIME_HINT.off)}</div>${anime !== 'off' ? warn('anime') : ''}${ban}</div>
+  </div>`;
+}
+// Live hint swap on change (no save needed to read it). Also adds/removes the
+// warn line for the anime engine requirements.
+function onAnimeEngine(id, sel) {
+  const box = sel.closest('div');
+  const hint = box.querySelector('[data-anime-hint]');
+  if (hint) hint.textContent = ANIME_HINT[sel.value] || ANIME_HINT.off;
+  // Remove any existing anime warn line.
+  const existingWarn = box.querySelector('.warn-line[data-anime-warn]');
+  if (existingWarn) existingWarn.remove();
+  // Add the warn line when the anime engine is on and the AniDB client is not set.
+  if (sel.value !== 'off') {
+    const p = PROFILES.find(x => x.id === id);
+    const hasAnidb = p?.keys_set?.anidb_client;
+    if (!hasAnidb) {
+      const warnDiv = document.createElement('div');
+      warnDiv.className = 'warn-line';
+      warnDiv.setAttribute('data-anime-warn', 'true');
+      warnDiv.textContent = '⚠ Marquee Anime needs an AniDB client — add one in Advanced → API Keys.';
+      box.appendChild(warnDiv);
     }
   }
-  return `<div class="muted" style="font-size:12px">${esc(line)}</div>${warns.join('')}`;
 }
 
 // Effective catalog toggle: explicit profile setting wins, else the
@@ -872,8 +1043,8 @@ function catRestrict(c) {
 
 // One catalog row: checkbox + "<Name> — <Type>" on line 1, restriction on line
 // 2, and a preview button OUTSIDE the label so clicking it never toggles enable.
-function catItemHtml({ pid, id, name, type, checked, locked, restrict }) {
-  const title = esc(name) + ' — ' + catTypeLabel(type);
+function catItemHtml({ pid, id, name, type, checked, locked, restrict, label }) {
+  const title = label || (esc(name) + ' — ' + catTypeLabel(type));
   return '<div class="cat-item' + (locked ? ' locked' : '') + '">'
     + '<label><span class="cat-title">'
     + '<input type="checkbox"' + (checked ? ' checked' : '') + (locked ? ' disabled' : ' data-catalog="' + esc(id) + '"') + '>'
@@ -1090,12 +1261,16 @@ function renderServerConfig(data) {
       </div>
     </details>
 
-    <details open><summary>API keys — TMDB, MDBList, RPDB, TVDB</summary>
+    <details open><summary>API keys — TMDB, MDBList, RPDB, TVDB, MyAnimeList, AniDB</summary>
       <div class="cols" style="margin-top:6px">
         <div><label>TMDB <span class="muted">(required)</span></label>${keyRowS('tmdb', 'tmdb_api_key', keys.tmdb_api_key)}</div>
         <div><label>MDBList</label>${keyRowS('mdblist', 'mdblist_api_key', keys.mdblist_api_key)}</div>
         <div><label>RPDB</label>${keyRowS('rpdb', 'rpdb_api_key', keys.rpdb_api_key)}</div>
         <div><label>TVDB <span class="muted">(optional — TV-14 age chain)</span></label>${tvdbKeyRow(keys.tvdb_api_key)}</div>
+        <div><label>MyAnimeList <span class="muted">(optional — anime fallback)</span></label>${keyRowS('mal', 'mal_client_id', keys.mal_client_id)}</div>
+        <div><label>AniDB client <span class="muted">(fallback for Marquee Anime)</span></label>
+          <div class="cols"><div>${textField('anidb_client', keys.anidb_client, 'client name')}</div><div><input type="number" min="1" step="1" data-key="anidb_clientver" data-orig="${keys.anidb_clientver || ''}" value="${keys.anidb_clientver || ''}" placeholder="version"></div></div>
+          <div class="keyrow"><button class="ghost mini" onclick="testSettingAnidb(this)">Test</button></div><span class="tres" data-tres="anidb_client"></span></div>
       </div>
     </details>
 
@@ -1186,6 +1361,10 @@ function collectSettings() {
   // means "replace the saved key".
   const tvdb = val('tvdb_api_key');
   if (tvdb) keys.tvdb_api_key = tvdb;
+  // AN-1a: MAL + AniDB server keys.
+  keys.mal_client_id = val('mal_client_id');
+  keys.anidb_client = val('anidb_client');
+  keys.anidb_clientver = parseInt(val('anidb_clientver'), 10) || 0;
   return {
     llm: {
       custom_name: val('custom_name'), custom_uri: val('custom_uri'), custom_api_key: val('custom_api_key'),
@@ -1228,6 +1407,20 @@ async function testSettingKey(service, dataKey, btn) {
       ? (key ? { key } : { use_saved: true })
       : { key };
     const r = await api(`/settings/test/${service}`, { method: 'POST', body });
+    out.textContent = r.ok ? ('✓ ' + (r.detail || 'valid')) : ('✗ ' + (r.error || 'failed'));
+    out.className = 'tres ' + (r.ok ? 'ok' : 'err');
+  } catch (e) { out.textContent = '✗ ' + e.message; out.className = 'tres err'; }
+}
+
+// AN-1a: test the server AniDB client (POST /settings/test/anidb).
+async function testSettingAnidb(btn) {
+  const el = $('#serverConfig');
+  const out = el.querySelector('[data-tres="anidb_client"]');
+  const client = el.querySelector('[data-key="anidb_client"]')?.value.trim();
+  const clientver = el.querySelector('[data-key="anidb_clientver"]')?.value.trim();
+  out.textContent = 'testing…'; out.className = 'tres';
+  try {
+    const r = await api('/settings/test/anidb', { method: 'POST', body: { client, clientver } });
     out.textContent = r.ok ? ('✓ ' + (r.detail || 'valid')) : ('✗ ' + (r.error || 'failed'));
     out.className = 'tres ' + (r.ok ? 'ok' : 'err');
   } catch (e) { out.textContent = '✗ ' + e.message; out.className = 'tres err'; }
@@ -1392,6 +1585,35 @@ async function saveAdvanced(id) {
       captured.mdblist_api_key = { value: v, node: mdb };
     }
   }
+  // AN-1a: per-profile MAL key (same pattern as MDBList).
+  const mal = card.querySelector('[data-key="mal_client_id"]');
+  if (mal) {
+    const v = mal.value.trim();
+    const orig = mal.dataset.orig || '';
+    if (v !== orig && v !== '') {
+      keys.mal_client_id = v;
+      captured.mal_client_id = { value: v, node: mal };
+    }
+  }
+  // AN-1a: per-profile AniDB client name + version.
+  const anidbClient = card.querySelector('[data-key="anidb_client"]');
+  if (anidbClient) {
+    const v = anidbClient.value.trim();
+    const orig = anidbClient.dataset.orig || '';
+    if (v !== orig && v !== '') {
+      keys.anidb_client = v;
+      captured.anidb_client = { value: v, node: anidbClient };
+    }
+  }
+  const anidbVer = card.querySelector('[data-key="anidb_clientver"]');
+  if (anidbVer) {
+    const v = anidbVer.value.trim();
+    const orig = anidbVer.dataset.orig || '';
+    if (v !== orig && v !== '') {
+      keys.anidb_clientver = parseInt(v, 10) || 0;
+      captured.anidb_clientver = { value: v, node: anidbVer };
+    }
+  }
   await api('/profiles/' + id, { method: 'PUT', body: { email, is_admin: !!adminBox?.checked, simkl_auth_version: authVersion, ...(Object.keys(keys).length ? { keys } : {}) } });
   // After success, update originals to the ACKNOWLEDGED submitted values (not
   // current DOM values, which may have changed while awaiting). Only touch
@@ -1507,6 +1729,7 @@ async function saveFilters(id) {
   const card = document.querySelector(`[data-id="${id}"]`);
   const ageOn = card.querySelector('[data-filter=age_limit_on]').checked;
   const decayOn = card.querySelector('[data-filter=title_decay_on]').checked;
+  const prevAnime = PROFILES.find(x => x.id === id)?.filters?.engine_anime || 'off';
   const filters = {
     min_rating: parseFloat(card.querySelector('[data-filter=min_rating]').value),
     vote_count_floor: parseInt(card.querySelector('[data-filter=vote_count_floor]').value, 10),
@@ -1516,11 +1739,19 @@ async function saveFilters(id) {
     excluded_genres: [...card.querySelectorAll('.genres input:checked')].map(i => i.value),
     title_decay_enabled: decayOn,
     title_decay_days: parseInt(card.querySelector('[data-filter=title_decay_days]').value, 10),
+    engine_anime: card.querySelector('[data-filter=engine_anime]').value,
   };
   await api('/profiles/' + id, { method: 'PUT', body: { filters } });
   dirty = false;
   setPanelDirty(savedPanel(id, 'filters'), false);
-  toast('Filters saved — applies at serve time (rating/genre/recency) or next rebuild');
+  const newAnime = filters.engine_anime;
+  if (prevAnime === 'off' && newAnime === 'marquee-anime') {
+    toast('Filters saved — Anime engine enabled, building your anime row.');
+  } else if (prevAnime === 'marquee-anime' && newAnime === 'off') {
+    toast('Filters saved — Anime engine disabled, anime row removed.');
+  } else {
+    toast('Filters saved — applies at serve time (rating/genre/recency) or next rebuild');
+  }
   pollStatus();
 }
 

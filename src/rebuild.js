@@ -204,7 +204,7 @@ async function applyAnimeGate(metas, profile, log = console) {
   }
   if (!malByMeta.size) return metas;
 
-  const verdicts = await mal.ratings([...malByMeta.values()], log);
+  const verdicts = await mal.ratings([...malByMeta.values()], log, { malClientId: settings.resolveMalKey(profile).key });
   const out = [];
   let blocked = 0;
   let aged = 0;

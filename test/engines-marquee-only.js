@@ -32,9 +32,10 @@ const BASE = `http://localhost:${process.env.PORT}`;
   // ---- N1: registry has exactly marquee + marquee-tv ----
   await ok('N1: registry — list, listForType, get', async () => {
     const ids = engines.list().map((e) => e.id);
-    assert.deepStrictEqual(ids.sort(), ['marquee', 'marquee-tv']);
+    assert.deepStrictEqual(ids.sort(), ['marquee', 'marquee-anime', 'marquee-tv']);
     assert.deepStrictEqual(engines.listForType('movie').map((e) => e.id), ['marquee']);
     assert.deepStrictEqual(engines.listForType('series').map((e) => e.id), ['marquee-tv']);
+    assert.deepStrictEqual(engines.listForType('anime').map((e) => e.id), ['marquee-anime']);
     assert.strictEqual(engines.get('genesis'), null);
     assert.strictEqual(engines.get('glass'), null);
   });
@@ -146,17 +147,17 @@ const BASE = `http://localhost:${process.env.PORT}`;
     const s = settings.getSettings();
     assert.strictEqual(s.engines, undefined, 'engines not stored');
     assert.strictEqual(s.glass, undefined, 'glass not stored');
-    // GET /api/engines returns exactly two items with keys id,name,description,supported_types
+    // GET /api/engines returns exactly three items with keys id,name,description,supported_types
     const res2 = await fetch(`${BASE}/api/engines`, { headers: { Cookie: cookieHeader(token) } });
     assert.strictEqual(res2.status, 200);
     const body = await res2.json();
-    assert.strictEqual(body.engines.length, 2, 'two engines');
+    assert.strictEqual(body.engines.length, 3, 'three engines');
     for (const e of body.engines) {
       const keys = Object.keys(e).sort();
       assert.deepStrictEqual(keys, ['description', 'id', 'name', 'supported_types'], `engine ${e.id} has exact keys`);
     }
     const ids = body.engines.map((e) => e.id).sort();
-    assert.deepStrictEqual(ids, ['marquee', 'marquee-tv']);
+    assert.deepStrictEqual(ids, ['marquee', 'marquee-anime', 'marquee-tv']);
   });
 
   // ---- N6: HTTP GET /api/profiles — engines shape with no available ----
@@ -219,8 +220,8 @@ const BASE = `http://localhost:${process.env.PORT}`;
   });
 
   // ---- N9: DEFAULT_IDS is correct (was N2) ----
-  await ok('N9: DEFAULT_IDS = { movie: marquee, series: marquee-tv }', async () => {
-    assert.deepStrictEqual(engines.DEFAULT_IDS, { movie: 'marquee', series: 'marquee-tv' });
+  await ok('N9: DEFAULT_IDS = { movie: marquee, series: marquee-tv, anime: off }', async () => {
+    assert.deepStrictEqual(engines.DEFAULT_IDS, { movie: 'marquee', series: 'marquee-tv', anime: 'off' });
   });
 
   // ---- N10: defaultFor returns the correct engine (was N3) ----
