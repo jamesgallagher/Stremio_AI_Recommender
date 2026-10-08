@@ -18,6 +18,25 @@ const ADULT_GENRES = /^(hentai|erotica)$/i;
 const QUERY = 'query($id:Int){Media(idMal:$id,type:ANIME){isAdult genres}}';
 const REQUEST_TIMEOUT_MS = 10000;
 
+const LIST_QUERY = `query($page:Int,$sort:[MediaSort],$tagIn:[String],$genreNotIn:[String],$tagNotIn:[String]){
+  Page(page:$page, perPage:50){
+    media(type:ANIME, isAdult:false, format_in:[TV,ONA,TV_SHORT], status_not_in:[NOT_YET_RELEASED],
+          sort:$sort, tag_in:$tagIn, genre_not_in:$genreNotIn, tag_not_in:$tagNotIn){
+      id idMal format genres averageScore popularity startDate{year} title{romaji english}
+    }
+  }
+}`;
+const LISTS = {
+  trending: { sort: ['TRENDING_DESC'] },
+  // Kid-friendly: popular, the AniList 'Kids' demographic tag; never these genres or content tags.
+  kids: {
+    sort: ['POPULARITY_DESC'],
+    tagIn: ['Kids'],
+    genreNotIn: ['Ecchi', 'Hentai', 'Horror', 'Psychological', 'Thriller'],
+    tagNotIn: ['Nudity', 'Gore', 'Suicide', 'Torture'],
+  },
+};
+
 const UNRATED = () => ({ code: null, minAge: null, adult: false, adultish: false });
 
 // Map an AniList Media node into our verdict shape. Pure, for testability.
@@ -57,4 +76,25 @@ async function fetchRating(malId) {
   throw err;
 }
 
-module.exports = { fetchRating, parseMedia };
+// AN-1b: one page of an AniList trending/kids list. Throws (with .status) on
+// 429 or any non-OK status — no retry; the caller skips that source.
+async function trendingAnime({ list, page }) {
+  const spec = LISTS[list];
+  if (!spec) throw new Error(`Unknown AniList list: ${list}`);
+  const variables = { page, ...spec };
+  const res = await governor.schedule('anilist', () => fetch(API, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ query: LIST_QUERY, variables }),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  }));
+  if (!res.ok) {
+    const err = new Error(`AniList ${list} page ${page} failed (${res.status})`);
+    err.status = res.status;
+    throw err;
+  }
+  const body = await res.json().catch(() => null);
+  return body?.data?.Page?.media || [];
+}
+
+module.exports = { fetchRating, parseMedia, trendingAnime };

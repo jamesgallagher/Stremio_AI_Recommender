@@ -900,8 +900,8 @@ async function ok(name, fn) {
     }
   });
 
-  // ---- A16: animeMap index — cached index without v:2 triggers full rebuild, rebuilt index carries anidb ----
-  await ok('A16: animeMap index — cached index without v:2 triggers full rebuild, rebuilt index carries anidb', async () => {
+  // ---- A16: animeMap index — cached index without v:3 triggers full rebuild, rebuilt index carries anidb ----
+  await ok('A16: animeMap index — cached index without v:3 triggers full rebuild, rebuilt index carries anidb', async () => {
     const animeMap = require('../src/services/animeMap');
     const store = require('../src/store');
 
@@ -930,7 +930,7 @@ async function ok(name, fn) {
     };
 
     try {
-      // Seed a cached index without v:2.
+      // Seed a cached index without v:3.
       store.saveAnimeIndex({ at: Date.now(), etag: 'etag-1', byImdb: { tt1: { mal: 1 } }, byTmdb: { 100: { mal: 1 } } });
       // Reset the module's in-memory index so it reads from the store.
       animeMap._setIndex(null);
@@ -939,8 +939,8 @@ async function ok(name, fn) {
       // The stale index triggered a full download (no ETag short-circuit).
       assert.ok(downloadCalls > 0, 'full download happened');
       assert.strictEqual(headCalls, 0, 'no ETag HEAD (stale ignores ETag)');
-      // The rebuilt index carries v:2 and anidb.
-      assert.strictEqual(idx.v, 2, 'v:2');
+      // The rebuilt index carries v:3 and anidb.
+      assert.strictEqual(idx.v, 3, 'v:3');
       const rec = animeMap.lookup('tt1', 100);
       assert.ok(rec, 'lookup works');
       assert.strictEqual(rec.anidb, 23, 'anidb field present');

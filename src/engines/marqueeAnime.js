@@ -1,10 +1,7 @@
-// Marquee Anime (AN-1a). Registered so the anime lane, the settings and the UI
-// ship and are testable end to end. generate() returns NO candidates until AN-1b:
-// a profile with the engine on serves the "List warming up" card. Do NOT add
-// sources here in AN-1a.
+// Marquee Anime (AN-1b card 1): age-appropriate trending anime from Simkl + AniList.
 const settings = require('../settings');
 
-const ALGORITHM_VERSION = 'marquee-anime-a0';
+const ALGORITHM_VERSION = 'marquee-anime-a1';
 
 module.exports = {
   id: 'marquee-anime',
@@ -20,8 +17,7 @@ module.exports = {
     return { ok: missing.length === 0, missing };
   },
   async generate(profile, type, ctx) {
-    ctx.stats = { seeds: 0, raw: 0, strong: 0, kept: 0 };
-    return [];
+    return require('./marqueeAnime/trending').build(profile, ctx);
   },
   ALGORITHM_VERSION,
 };

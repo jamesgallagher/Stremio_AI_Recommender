@@ -36,11 +36,21 @@ function tmdbIdsOf(item) {
   return toIdList(t);
 }
 
+// AN-1b: reverse lookups — AniList/MAL id → the TV show (tmdb tv id + first tt). Only entries
+// with a TMDB **tv** id and an IMDb id; movies and unmapped entries are skipped.
+const show = (item) => {
+  const tv = item.themoviedb_id && typeof item.themoviedb_id === 'object' ? item.themoviedb_id.tv : null;
+  const imdb = toIdList(item.imdb_id)[0] || null;
+  return tv && imdb ? { tv: String(tv), imdb, type: item.type || null } : null;
+};
+
 // Reduce each record to the four fields we use. Holding the parsed 7.5 MB
 // resident buys nothing.
 function buildIndex(list) {
   const byImdb = Object.create(null);
   const byTmdb = Object.create(null);
+  const byAnilist = Object.create(null);
+  const byMal = Object.create(null);
   let count = 0;
   for (const item of Array.isArray(list) ? list : []) {
     if (!item || !item.mal_id) continue;
@@ -56,8 +66,13 @@ function buildIndex(list) {
     for (const id of tmdbIdsOf(item)) {
       if (!byTmdb[id]) byTmdb[id] = rec;
     }
+    const sh = show(item);
+    if (sh) {
+      if (item.anilist_id && !byAnilist[item.anilist_id]) byAnilist[item.anilist_id] = sh;
+      if (item.mal_id && !byMal[item.mal_id]) byMal[item.mal_id] = sh;
+    }
   }
-  return { byImdb, byTmdb, count };
+  return { byImdb, byTmdb, byAnilist, byMal, count };
 }
 
 async function head(url) {
@@ -66,11 +81,11 @@ async function head(url) {
 
 // Refresh if stale. ETag-conditional: a matching ETag costs one HEAD and no
 // download. Returns true when the index changed.
-// AN-1a: a cached index without v === 2 is stale (the anidb field never
-// appears, because the ETag is unchanged). Do a full download, ignoring the ETag.
+// AN-1a/AN-1b: a cached index without v === 3 is stale (the anidb field and
+// reverse maps never appear, because the ETag is unchanged). Do a full download, ignoring the ETag.
 async function refresh(log = console, { force = false } = {}) {
   const cached = index || store.loadAnimeIndex();
-  const stale = !cached || cached.v !== 2;
+  const stale = !cached || cached.v !== 3;
   if (cached && !force && !stale && Date.now() - cached.at < REFRESH_MS) {
     index = cached;
     return false;
@@ -81,7 +96,7 @@ async function refresh(log = console, { force = false } = {}) {
       const etag = res.headers.get('etag');
       if (res.ok && etag && etag === cached.etag) {
         // Unchanged upstream — stamp it so we don't re-check for another day.
-        index = { ...cached, at: Date.now(), v: 2 };
+        index = { ...cached, at: Date.now(), v: 3 };
         store.saveAnimeIndex(index);
         log.log('[anime] id map unchanged upstream (ETag match)');
         return false;
@@ -91,7 +106,7 @@ async function refresh(log = console, { force = false } = {}) {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const etag = res.headers.get('etag') || '';
     const built = buildIndex(await res.json());
-    index = { at: Date.now(), etag, v: 2, byImdb: built.byImdb, byTmdb: built.byTmdb };
+    index = { at: Date.now(), etag, v: 3, byImdb: built.byImdb, byTmdb: built.byTmdb, byAnilist: built.byAnilist, byMal: built.byMal };
     store.saveAnimeIndex(index);
     log.log(`[anime] id map refreshed — ${built.count} anime indexed`);
     return true;
@@ -110,10 +125,10 @@ async function refresh(log = console, { force = false } = {}) {
 
 // Idempotent, concurrency-safe load. Multiple profiles rebuilding at once must
 // not each download the file.
-// AN-1a: a cached index without v === 2 is stale (the anidb field never
-// appears, because the ETag is unchanged). Force a full download.
+// AN-1a/AN-1b: a cached index without v === 3 is stale (the anidb field and
+// reverse maps never appear, because the ETag is unchanged). Force a full download.
 async function ensureLoaded(log = console) {
-  const stale = !index || index.v !== 2;
+  const stale = !index || index.v !== 3;
   if (!stale && Date.now() - index.at < REFRESH_MS) return index;
   if (!inFlight) {
     inFlight = refresh(log, { force: stale }).finally(() => { inFlight = null; });
@@ -131,7 +146,11 @@ function lookup(imdbId, tmdbId) {
 
 const isAnime = (imdbId, tmdbId) => !!lookup(imdbId, tmdbId);
 
-// Test seam — v:2 so ensureLoaded treats it as fresh (no download).
-function _setIndex(i) { index = i ? { ...i, v: 2 } : null; }
+// Test seam — v:3 so ensureLoaded treats it as fresh (no download).
+function _setIndex(i) { index = i ? { ...i, v: 3 } : null; }
 
-module.exports = { ensureLoaded, refresh, lookup, isAnime, buildIndex, toIdList, tmdbIdsOf, REMOTE_URL, _setIndex };
+// AN-1b: reverse lookups — AniList/MAL id → the TV show (tmdb tv id + first tt).
+function byAnilist(id) { return index?.byAnilist?.[id] || null; }
+function byMal(id) { return index?.byMal?.[id] || null; }
+
+module.exports = { ensureLoaded, refresh, lookup, isAnime, buildIndex, toIdList, tmdbIdsOf, REMOTE_URL, _setIndex, byAnilist, byMal };
