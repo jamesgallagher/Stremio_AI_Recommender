@@ -196,11 +196,11 @@ async function ok(name, fn) {
         tvMeta: async () => new Map(),
       };
     };
-    // age_limit 10 → kids called twice
+    // age_limit 10 → kids called 4 times (pages 1,2,3,4)
     let d = makeDeps(10);
     let ctx = { log: console };
     await trending.build({ name: 'T4', id: 'T4', filters: { age_limit: 10 } }, ctx, d);
-    assert.strictEqual(d.kidsCalls(), 2, 'age_limit 10 → kids called twice');
+    assert.strictEqual(d.kidsCalls(), 4, 'age_limit 10 → kids called 4 times');
     // age_limit 14 → never called
     d = makeDeps(14);
     ctx = { log: console };
@@ -211,6 +211,49 @@ async function ok(name, fn) {
     ctx = { log: console };
     await trending.build({ name: 'T4', id: 'T4', filters: { age_limit: 0 } }, ctx, d);
     assert.strictEqual(d.kidsCalls(), 0, 'age_limit 0 → kids never called');
+    // age_limit 10, page 3 throws → pages 1–2's kids items are still used (assign-as-you-go).
+    let kidsCalls = 0;
+    const throwingDeps = {
+      simklList: () => [],
+      anilistList: (list, page) => {
+        if (list === 'kids') {
+          kidsCalls++;
+          if (page === 3) { const e = new Error('AniList kids page 3 failed'); e.status = 429; throw e; }
+          return [kidsShow];
+        }
+        if (list === 'trending' && page === 1) return [trendingShow];
+        return [];
+      },
+      animeMap: {
+        ensureLoaded: async () => {},
+        byMal: (id) => {
+          if (id === 100) return { tv: '1000', imdb: 'tt1000', type: 'TV' };
+          if (id === 200) return { tv: '2000', imdb: 'tt2000', type: 'TV' };
+          return null;
+        },
+        byAnilist: (id) => {
+          if (id === 100) return { tv: '1000', imdb: 'tt1000', type: 'TV' };
+          if (id === 200) return { tv: '2000', imdb: 'tt2000', type: 'TV' };
+          return null;
+        },
+      },
+      listSize: () => 20,
+      tier: (p) => {
+        const n = p?.filters?.age_limit || 0;
+        if (n <= 0) return null;
+        if (n >= 15) return { csmMaxAge: 15, label: '15+' };
+        if (n >= 14) return { csmMaxAge: 14, label: 'TV-14' };
+        if (n >= 12) return { csmMaxAge: 12, label: '12+' };
+        return { csmMaxAge: 10, label: '10+' };
+      },
+      tvMeta: async () => new Map(),
+    };
+    ctx = { log: console };
+    const candsThrow = await trending.build({ name: 'T4', id: 'T4', filters: { age_limit: 10 } }, ctx, throwingDeps);
+    assert.strictEqual(kidsCalls, 3, 'kids called for pages 1,2,3 (page 3 threw)');
+    const kidsCandThrow = candsThrow.find((c) => c.tmdb_id === '1000');
+    assert.ok(kidsCandThrow, 'pages 1–2 kids item still used');
+    assert.strictEqual(kidsCandThrow.reason, 'Popular with younger viewers');
     // A show found only by kids has reason 'Popular with younger viewers' and ranks above an otherwise-equal trending-only show.
     d = makeDeps(10);
     ctx = { log: console };

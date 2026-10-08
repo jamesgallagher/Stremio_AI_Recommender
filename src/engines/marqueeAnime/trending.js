@@ -52,8 +52,8 @@ async function build(profile, ctx, deps = DEFAULT_DEPS) {
   let kidsItems = [];
   if (kidsOn) {
     try {
-      kidsItems = (await deps.anilistList('kids', 1)) || [];
-      kidsItems = kidsItems.concat((await deps.anilistList('kids', 2)) || []);
+      // 4 pages: on live data 2 pages left a 10+ profile at 22 of 30 after the age gate; 4 pages gave 44.
+      for (let pg = 1; pg <= 4; pg++) kidsItems = kidsItems.concat((await deps.anilistList('kids', pg)) || []);
     } catch (err) {
       log.warn(`[marquee-anime] ${name}: AniList kids list unavailable (${err.message})`);
     }
