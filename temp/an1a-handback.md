@@ -3,7 +3,7 @@
 **Branch:** `feature/an1a-anime-lane`
 **PR:** [#44](https://github.com/jamesgallagher/Stremio_AI_Recommender/pull/44) → `v7`
 **Version:** 7.45.0-beta
-**Final SHA:** (see commit below)
+**Final SHA:** `c983f02`
 
 ## Scope
 
@@ -57,7 +57,7 @@
 
 ### Fix 3/3: Boot safety, table guards, real browser checks, hand-back
 
-**Commit:** (this commit) — `r1 fix 3/3: awaited boot migration, table guards, real browser checks, hand-back`
+**Commit:** `c983f02` — `r1 fix 3/3: awaited boot migration, table guards, real browser checks, hand-back`
 
 - `src/server.js`: boot `setTimeout` now `await`s the migration before `tick()`
 - `src/anime/migration.js`: `hasTable()` guards for `taste_ratings`, `taste_ignore`, `dont_recommend`, `recommended`; per-profile `try/catch`
@@ -71,26 +71,56 @@
 
 ## STOP #1 and #2
 
-**STOP #1:** The AniDB flood control (Fix 1/3) was the critical path. The `exclusive()` + `guardedRequest()` pattern ensures one request in flight server-wide, with ≥4000ms spacing enforced by `waitForSpacing` (in-memory + persisted `last_request_at`). The 150/day cap is checked per-client per Sydney day. The 48h ban circuit is triggered by a banned body or 3 consecutive 5xx/timeout failures.
+**STOP #1:** registering Marquee Anime broke five registry-count assertions (smoke.js ×3, N5, N9). Claude authorised those edits in `prompt_an1a_stop1_reply.md` (commit a6fea77). Card §5.3 was amended: build results have no `anime` key when anime is off.
 
-**STOP #2:** The browser harness (B1-B8) required real Playwright interaction with the configure portal. The test seeds `settings.updateSettings({ keys: { tmdb_api_key: 'x'.repeat(32) }, llm: { groq_api_key: 'gsk_test' } })` so the portal leaves setup mode. Screenshots go to `path.join(process.env.DATA_DIR, 'screenshots')`. B5 stubs `anidb._setFetch` and `global.fetch` in-process, clicks Test buttons, and asserts rendered text.
+**STOP #2:** `mobile.smoke.js:1053` showed `engine_anime` must not be a companion filter. Card §11.4 was corrected: `COMPANION_FILTERS` is unchanged, and the POST accepts `engine_anime` explicitly. No existing test was edited.
+
+## Ban circuit
+
+The 48 h ban circuit opens only on an AniDB `<error>` body matching `/banned/i`. 5xx and timeouts are retried (3 attempts, 4 s / 16 s back-off) and then reported as an error.
+
+## R1 identity result
+
+R1 (Movies/Shows identity): performed by Claude on a copy of the live database (2026-10-08). v7.44 vs this branch, all 7 profiles: the 14 movie/series pools and served lists are identical. Not run by Bob.
 
 ## Browser harness evidence (B1-B8)
 
 | Check | What it shows | Screenshot |
 |-------|-------------|------------|
-| B1 | Filters tab at 1280px — three engine columns (movie/series/anime) | `DATA_DIR/screenshots/filters-1280.png` |
-| B2 | Change Anime to Marquee Anime — hint + save | `DATA_DIR/screenshots/anime-engine-change.png` |
-| B3 | 400px — three engine fields stack vertically | `DATA_DIR/screenshots/filters-400.png` |
-| B4 | Catalogs tab — 2/3 rows with anime off/on | `DATA_DIR/screenshots/catalogs.png` |
-| B5 | Advanced → API Keys — section + blocks: AniDB test success (✓ Client accepted), bad client (✗ AniDB doesn't recognise this client), MAL test (✓ MyAnimeList key valid), number input not white, Clear empties both inputs | `DATA_DIR/screenshots/api-keys.png` |
-| B6 | Server Config — MAL + AniDB fields present | `DATA_DIR/screenshots/server-config.png` |
-| B7 | Mobile Filters — three engine selects at 390×844 | `DATA_DIR/screenshots/mobile-filters.png` |
-| B8 | No page errors (no `pageerror` events during all browser checks) | — |
+| B1 | Filters tab at 1280px — three engine columns (movie/series/anime) | `engines-1280.png` (element screenshot of the Filters `.sec-box`) |
+| B2 | Change Anime to Marquee Anime — hint + save | no screenshot (assertions only) |
+| B3 | 400px — three engine fields stack vertically | `engines-400.png` (full page at 400px) |
+| B4 | Catalogs tab — 2/3 rows with anime off/on | no screenshot (assertions only) |
+| B5 | Advanced → API Keys — section + blocks: AniDB test success (✓ Client accepted), bad client (✗ AniDB doesn't recognise this client), MAL test (✓ MyAnimeList key valid), number input not white, Clear empties both inputs | `api-keys.png` (element screenshot of the API Keys `.sec-box`) |
+| B6 | Server Config — MAL + AniDB fields present | no screenshot (assertions only) |
+| B7 | Mobile Filters — three engine selects at 390×844 | `mobile-engines.png` (full page at 390×844) |
+| B8 | No page errors (no `pageerror` events during all browser checks) | no screenshot (assertions only) |
 
-## R1 identity result
+## §0.1 mandates → file:line
 
-The R1 identity check (verifying that the AniDB client identity is correctly classified) was **performed by Claude on a live-data copy**. The `scripts/an1a-identity.js` script was deleted after the check was completed. The identity classification logic is covered by the A11 (parser fixture values) and A12d (banned body) tests.
+| Mandate | File:line |
+|---------|-----------|
+| 1. Anime lane (itemType, lookupType, dnrTypes) | `src/lanes.js` |
+| 2. Marquee Anime engine (registry, resolveFor, isValidFor) | `src/engines/index.js`, `src/engines/marqueeAnime.js` |
+| 3. Config (engine_anime default/migration/updateProfile) | `src/config.js` |
+| 4. Settings (resolveMalKey/resolveAnidbClient user>server>none + sealing) | `src/settings.js` |
+| 5. Build plumbing (fake anime engine stores 3 anime rows; movie/series unchanged; pruneOtherEngines(series) leaves anime) | `src/recommendationStore.js` |
+| 6. Serve (serveRecommendations type=series; excluded Anime genre; dont_recommend series hides anime) | `src/recommendationStore.js` |
+| 7. Staged path (anime acceptance failure keeps old anime rows, promotes movie/series, logs warning) | `src/recommendationStore.js` |
+| 8. HTTP routes (manifest + catalog, portal, companion) | `src/portal.js`, `src/addon.js`, `mobile/server/router.js` |
+| 9. Mobile companion (engine_anime in GET/POST /mobile/api/settings) | `mobile/server/router.js` |
+
+## Red lines
+
+| Test | Red line |
+|------|----------|
+| A12b | `gap 2 = 4ms ≥ 4000ms` (failed on 6365167, confirmed by Claude) |
+| A12c | not captured |
+| A12d | not captured |
+| A12e | not captured |
+| A13b | not captured |
+| A9b | not captured |
+| A15b | not captured |
 
 ## Self-audit output
 
