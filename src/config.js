@@ -44,6 +44,7 @@ const DEFAULT_FILTERS = {
   // write (updateProfile).
   engine_movie: 'marquee',
   engine_series: 'marquee-tv',
+  engine_anime: 'off', // AN-1a: the anime lane is opt-in; 'off' = Disabled (no row, no build).
 };
 
 // Auto-scrobble: mirror this profile's Nuvio/Stremio watched history into
@@ -73,7 +74,7 @@ const DEFAULT_COMPANION = { catalog_only: true };
 // simkl_v2_client_id/secret (AUTH V2): a separate, newly-registered Simkl app
 // (Server apps & services). Kept distinct from the V1 pair — never overwrite a
 // V1 credential with a V2 one, and vice versa (mandate M3).
-const SECRET_KEY_FIELDS = ['simkl_client_id', 'simkl_client_secret', 'simkl_v2_client_id', 'simkl_v2_client_secret', 'tmdb_api_key', 'groq_api_key', 'rpdb_api_key', 'mdblist_api_key'];
+const SECRET_KEY_FIELDS = ['simkl_client_id', 'simkl_client_secret', 'simkl_v2_client_id', 'simkl_v2_client_secret', 'tmdb_api_key', 'groq_api_key', 'rpdb_api_key', 'mdblist_api_key', 'mal_client_id', 'anidb_client'];
 // refresh_token is sealed (AUTH V2): the V2 refresh token is a secret that must
 // never reach the browser or logs. client_id is the credential that minted the
 // token (M3) — sealed so the migration's best-effort V1 bind (which runs before
@@ -106,6 +107,9 @@ function newProfile(name) {
       groq_api_key: '',
       rpdb_api_key: DEFAULT_RPDB_KEY, // rating-overlay posters; free key pre-set
       mdblist_api_key: '', // required: extra catalogs + Common Sense age checks
+      mal_client_id: '',     // AN-1a: personal MyAnimeList Client ID (optional; server key is the fallback)
+      anidb_client: '',      // AN-1a: personal AniDB HTTP client name (required by Marquee Anime unless the server has one)
+      anidb_clientver: 0,    // AN-1a: that client's registered version number
     },
     simkl_auth: null, // v6: { access_token, connected_at } — Simkl PIN token (V1); V2 adds version/refresh_token/expires_at/scope/client_id
     // AUTH V1/V2: the preferred connection version — what Connect starts. Does
@@ -127,6 +131,9 @@ function newProfile(name) {
 function applyMigrations(p) {
   if (p.keys.rpdb_api_key === undefined) p.keys.rpdb_api_key = DEFAULT_RPDB_KEY;
   if (p.keys.mdblist_api_key === undefined) p.keys.mdblist_api_key = '';
+  if (p.keys.mal_client_id === undefined) p.keys.mal_client_id = '';
+  if (p.keys.anidb_client === undefined) p.keys.anidb_client = '';
+  if (p.keys.anidb_clientver === undefined) p.keys.anidb_clientver = 0;
   // Gemini -> Groq (LLM provider switch): the old key is useless for Groq, so
   // it's dropped rather than carried over. Users paste a Groq key.
   if (p.keys.groq_api_key === undefined) p.keys.groq_api_key = '';
@@ -179,11 +186,10 @@ function applyMigrations(p) {
   if (p.filters.engine !== undefined) delete p.filters.engine;
   {
     const engines = require('./engines'); // lazy: keep config's load graph light
-    for (const t of ['movie', 'series']) {
+    for (const t of ['movie', 'series', 'anime']) {
       const f = `engine_${t}`;
       const cur = p.filters[f];
-      const e = engines.get(cur);
-      p.filters[f] = (e && e.supportedTypes.includes(t)) ? cur : engines.DEFAULT_IDS[t];
+      p.filters[f] = engines.isValidFor(t, cur) ? cur : engines.DEFAULT_IDS[t];
     }
   }
   // v6: Simkl fields alongside the (still-present) Trakt ones.
@@ -317,7 +323,7 @@ function updateProfile(id, patch) {
     if (!profile) return;
     // Snapshot the per-type engine ids BEFORE any mutation (applyMigrations has
     // already run inside mutateProfiles, so both fields exist here).
-    const beforeEngines = { movie: profile.filters.engine_movie, series: profile.filters.engine_series };
+    const beforeEngines = { movie: profile.filters.engine_movie, series: profile.filters.engine_series, anime: profile.filters.engine_anime };
     if (patch.name !== undefined) profile.name = String(patch.name);
     if (patch.email !== undefined) {
       // Normalize consistently with the Mobile Companion lookup (trim + case
@@ -343,6 +349,11 @@ function updateProfile(id, patch) {
     }
     if (profile.is_admin === true && !profile.email) throw accountError('ADMIN_NEEDS_EMAIL', 'An admin needs an email address to sign in.');
     if (patch.keys) Object.assign(profile.keys, patch.keys);
+    // AN-1a: anidb_clientver is a positive integer or 0 (unset).
+    if (patch.keys && patch.keys.anidb_clientver !== undefined) {
+      const v = parseInt(patch.keys.anidb_clientver, 10);
+      profile.keys.anidb_clientver = Number.isFinite(v) && v > 0 ? v : 0;
+    }
     if (patch.filters) {
       const f = patch.filters;
       if (f.min_rating !== undefined) profile.filters.min_rating = Math.max(0, Number(f.min_rating) || 0);
@@ -378,13 +389,18 @@ function updateProfile(id, patch) {
       // rejected on the new limit.
       const engines = require('./engines'); // lazy: no config↔engines load cycle
       const effLimit = profile.filters.age_limit || 0;
-      for (const t of ['movie', 'series']) {
+      for (const t of ['movie', 'series', 'anime']) {
         const field = `engine_${t}`;
         if (f[field] !== undefined) {
-          const e = engines.get(String(f[field]));
-          const okType = e && e.supportedTypes.includes(t);
-          const okAge = e && !(e.capabilities.unrestricted && effLimit > 0);
-          profile.filters[field] = (okType && okAge) ? e.id : engines.DEFAULT_IDS[t];
+          if (t === 'anime') {
+            const value = String(f[field]);
+            profile.filters[field] = engines.isValidFor('anime', value) ? value : 'off';
+          } else {
+            const e = engines.get(String(f[field]));
+            const okType = e && e.supportedTypes.includes(t);
+            const okAge = e && !(e.capabilities.unrestricted && effLimit > 0);
+            profile.filters[field] = (okType && okAge) ? e.id : engines.DEFAULT_IDS[t];
+          }
         }
       }
       // Safety re-validation: raising the age limit must REVOKE an already-stored
@@ -442,7 +458,7 @@ function updateProfile(id, patch) {
       if (patch.companion.catalog_only !== undefined) profile.companion.catalog_only = !!patch.companion.catalog_only;
     }
     // Report which type(s) swapped producer — a selection change OR a revocation.
-    for (const t of ['movie', 'series']) {
+    for (const t of ['movie', 'series', 'anime']) {
       if (beforeEngines[t] !== profile.filters[`engine_${t}`]) engineChanged.push(t);
     }
     updated = profile;
