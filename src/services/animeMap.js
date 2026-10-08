@@ -47,6 +47,7 @@ function buildIndex(list) {
     const rec = { mal: item.mal_id };
     if (item.kitsu_id) rec.kitsu = item.kitsu_id;
     if (item.anilist_id) rec.anilist = item.anilist_id;
+    if (item.anidb_id) rec.anidb = item.anidb_id;
     if (item.type) rec.type = item.type;
     count++;
     for (const id of toIdList(item.imdb_id)) {
@@ -65,19 +66,22 @@ async function head(url) {
 
 // Refresh if stale. ETag-conditional: a matching ETag costs one HEAD and no
 // download. Returns true when the index changed.
+// AN-1a: a cached index without v === 2 is stale (the anidb field never
+// appears, because the ETag is unchanged). Do a full download, ignoring the ETag.
 async function refresh(log = console, { force = false } = {}) {
   const cached = index || store.loadAnimeIndex();
-  if (cached && !force && Date.now() - cached.at < REFRESH_MS) {
+  const stale = !cached || cached.v !== 2;
+  if (cached && !force && !stale && Date.now() - cached.at < REFRESH_MS) {
     index = cached;
     return false;
   }
   try {
-    if (cached?.etag && !force) {
+    if (cached?.etag && !force && !stale) {
       const res = await head(REMOTE_URL);
       const etag = res.headers.get('etag');
       if (res.ok && etag && etag === cached.etag) {
         // Unchanged upstream — stamp it so we don't re-check for another day.
-        index = { ...cached, at: Date.now() };
+        index = { ...cached, at: Date.now(), v: 2 };
         store.saveAnimeIndex(index);
         log.log('[anime] id map unchanged upstream (ETag match)');
         return false;
@@ -87,7 +91,7 @@ async function refresh(log = console, { force = false } = {}) {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const etag = res.headers.get('etag') || '';
     const built = buildIndex(await res.json());
-    index = { at: Date.now(), etag, byImdb: built.byImdb, byTmdb: built.byTmdb };
+    index = { at: Date.now(), etag, v: 2, byImdb: built.byImdb, byTmdb: built.byTmdb };
     store.saveAnimeIndex(index);
     log.log(`[anime] id map refreshed — ${built.count} anime indexed`);
     return true;
@@ -106,10 +110,13 @@ async function refresh(log = console, { force = false } = {}) {
 
 // Idempotent, concurrency-safe load. Multiple profiles rebuilding at once must
 // not each download the file.
+// AN-1a: a cached index without v === 2 is stale (the anidb field never
+// appears, because the ETag is unchanged). Force a full download.
 async function ensureLoaded(log = console) {
-  if (index && Date.now() - index.at < REFRESH_MS) return index;
+  const stale = !index || index.v !== 2;
+  if (!stale && Date.now() - index.at < REFRESH_MS) return index;
   if (!inFlight) {
-    inFlight = refresh(log).finally(() => { inFlight = null; });
+    inFlight = refresh(log, { force: stale }).finally(() => { inFlight = null; });
   }
   await inFlight;
   return index;
@@ -124,7 +131,7 @@ function lookup(imdbId, tmdbId) {
 
 const isAnime = (imdbId, tmdbId) => !!lookup(imdbId, tmdbId);
 
-// Test seam
-function _setIndex(i) { index = i; }
+// Test seam — v:2 so ensureLoaded treats it as fresh (no download).
+function _setIndex(i) { index = i ? { ...i, v: 2 } : null; }
 
 module.exports = { ensureLoaded, refresh, lookup, isAnime, buildIndex, toIdList, tmdbIdsOf, REMOTE_URL, _setIndex };

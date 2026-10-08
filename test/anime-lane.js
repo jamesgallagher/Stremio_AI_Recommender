@@ -513,6 +513,104 @@ async function ok(name, fn) {
     assert.strictEqual(r3.error, '✗ AniDB doesn\'t recognise this client', 'bad client text');
   });
 
+  // ---- A14: MAL API — ratings calls api.myanimelist.net first, nsfw black → adult, Jikan fast-fail ----
+  await ok('A14: MAL API — ratings calls api.myanimelist.net first, nsfw black → adult, Jikan fast-fail', async () => {
+    const mal = require('../src/services/mal');
+    const store = require('../src/store');
+
+    // Stub the global fetch.
+    const realFetch = global.fetch;
+    let malApiCalls = 0;
+    let jikanCalls = 0;
+    let anilistCalls = 0;
+    global.fetch = async (url, opts) => {
+      if (url.includes('api.myanimelist.net')) {
+        malApiCalls++;
+        return { status: 200, ok: true, json: async () => ({ rating: 'r', nsfw: 'black', genres: [{ name: 'Action' }] }) };
+      }
+      if (url.includes('api.jikan.moe')) {
+        jikanCalls++;
+        const err = new Error('fetch failed');
+        err.cause = { code: 'UND_ERR_CONNECT_TIMEOUT' };
+        throw err;
+      }
+      if (url.includes('graphql.anilist.co')) {
+        anilistCalls++;
+        return { status: 200, ok: true, json: async () => ({ data: { Media: { isAdult: false, genres: [] } } }) };
+      }
+      return realFetch(url, opts);
+    };
+
+    try {
+      // 1. With a client id: ratings([1]) calls api.myanimelist.net first.
+      const result = await mal.ratings([1], console, { malClientId: 'test-client' });
+      assert.ok(malApiCalls > 0, 'MAL API called');
+      const verdict = result.get(1);
+      assert.ok(verdict, 'verdict exists');
+      assert.strictEqual(verdict.code, 'R', 'code R');
+      assert.ok(verdict.adult, 'adult (nsfw black)');
+      const cache = store.loadAnimeRatings();
+      assert.strictEqual(cache['mal:1'].source, 'malapi', 'source malapi');
+
+      // 2. Without a key: Jikan, then on a connect timeout AniList, with one Jikan attempt.
+      const result2 = await mal.ratings([2], console);
+      assert.ok(jikanCalls > 0, 'Jikan called');
+      assert.strictEqual(jikanCalls, 1, 'one Jikan attempt (no retry on connect timeout)');
+      assert.ok(anilistCalls > 0, 'AniList called');
+    } finally {
+      global.fetch = realFetch;
+    }
+  });
+
+  // ---- A16: animeMap index — cached index without v:2 triggers full rebuild, rebuilt index carries anidb ----
+  await ok('A16: animeMap index — cached index without v:2 triggers full rebuild, rebuilt index carries anidb', async () => {
+    const animeMap = require('../src/services/animeMap');
+    const store = require('../src/store');
+
+    // Stub the global fetch for the animeMap download.
+    const realFetch = global.fetch;
+    let downloadCalls = 0;
+    let headCalls = 0;
+    global.fetch = async (url, opts) => {
+      if (url.includes('raw.githubusercontent.com')) {
+        if (opts?.method === 'HEAD') {
+          headCalls++;
+          return { ok: true, status: 200, headers: { get: () => 'etag-1' } };
+        }
+        downloadCalls++;
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => 'etag-1' },
+          json: async () => [
+            { mal_id: 1, imdb_id: 'tt1', themoviedb_id: 100, anidb_id: 23, type: 'TV' },
+            { mal_id: 2, imdb_id: 'tt2', themoviedb_id: 200, anidb_id: 24, type: 'TV' },
+          ],
+        };
+      }
+      return realFetch(url, opts);
+    };
+
+    try {
+      // Seed a cached index without v:2.
+      store.saveAnimeIndex({ at: Date.now(), etag: 'etag-1', byImdb: { tt1: { mal: 1 } }, byTmdb: { 100: { mal: 1 } } });
+      // Reset the module's in-memory index so it reads from the store.
+      animeMap._setIndex(null);
+
+      const idx = await animeMap.ensureLoaded(console);
+      // The stale index triggered a full download (no ETag short-circuit).
+      assert.ok(downloadCalls > 0, 'full download happened');
+      assert.strictEqual(headCalls, 0, 'no ETag HEAD (stale ignores ETag)');
+      // The rebuilt index carries v:2 and anidb.
+      assert.strictEqual(idx.v, 2, 'v:2');
+      const rec = animeMap.lookup('tt1', 100);
+      assert.ok(rec, 'lookup works');
+      assert.strictEqual(rec.anidb, 23, 'anidb field present');
+    } finally {
+      global.fetch = realFetch;
+    }
+  });
+
   console.log(`\nAll anime-lane checks passed (${passed}).${failed ? ` FAILED: ${failed}` : ''}`);
   process.exit(failed ? 1 : 0);
 })().catch((e) => {
