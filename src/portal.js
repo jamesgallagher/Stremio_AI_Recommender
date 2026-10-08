@@ -98,9 +98,11 @@ function publicProfile(p, req) {
     engines: {
       movie: engines.resolveFor(p, 'movie').id,
       series: engines.resolveFor(p, 'series').id,
+      anime: engines.resolveFor(p, 'anime')?.id || 'off',
       requirements: {
         movie: engines.resolveFor(p, 'movie').requirements(p),
         series: engines.resolveFor(p, 'series').requirements(p),
+        anime: engines.resolveFor(p, 'anime')?.requirements(p) || { ok: true, missing: [] },
       },
     },
     // Full key values — returned only to the admin-authed portal so each key
@@ -118,6 +120,9 @@ function publicProfile(p, req) {
       groq_api_key: p.keys.groq_api_key || '',
       rpdb_api_key: p.keys.rpdb_api_key || '',
       mdblist_api_key: p.keys.mdblist_api_key || '',
+      mal_client_id: p.keys.mal_client_id || '',
+      anidb_client: p.keys.anidb_client || '',
+      anidb_clientver: p.keys.anidb_clientver || 0,
     },
     // Lookup keys are GLOBAL (Server Config) now — reflect the effective key
     // (global, with a per-profile fallback) so per-profile warnings are correct.
@@ -130,6 +135,8 @@ function publicProfile(p, req) {
       groq_api_key: !!settings.keyFor(p, 'groq_api_key'),
       rpdb_api_key: !!settings.keyFor(p, 'rpdb_api_key'),
       mdblist_api_key: !!settings.resolveMdblistKey(p).key,
+      mal_client_id: !!settings.resolveMalKey(p).key,
+      anidb_client: !!settings.resolveAnidbClient(p).client,
     },
     keys_preview: {
       tmdb_api_key: redactKey(p.keys.tmdb_api_key),
@@ -228,6 +235,11 @@ function publicProfile(p, req) {
       }
       return { ...st, job: jobOut, rebuilding: st.rebuilding || jobs.isBusy(p.id), mdblist_status };
     })(),
+    anime_status: {
+      mal: { source: settings.resolveMalKey(p).source },
+      anidb: require('./services/anidb').clientStatus(p),
+      migration: require('./anime/migration').getReport(p.id),
+    },
   };
 }
 
@@ -289,11 +301,14 @@ router.put('/profiles/:id', (req, res) => {
   if (req.body.keys) {
     // Only overwrite keys that were actually provided (non-empty)
     patch.keys = {};
-    for (const k of ['simkl_client_id', 'simkl_client_secret', 'simkl_v2_client_id', 'simkl_v2_client_secret', 'tmdb_api_key', 'groq_api_key', 'rpdb_api_key', 'mdblist_api_key']) {
+    for (const k of ['simkl_client_id', 'simkl_client_secret', 'simkl_v2_client_id', 'simkl_v2_client_secret', 'tmdb_api_key', 'groq_api_key', 'rpdb_api_key', 'mdblist_api_key', 'mal_client_id', 'anidb_client']) {
       if (req.body.keys[k]) patch.keys[k] = String(req.body.keys[k]).trim();
     }
+    if (req.body.keys.anidb_clientver !== undefined) {
+      patch.keys.anidb_clientver = req.body.keys.anidb_clientver === null ? 0 : Number(req.body.keys.anidb_clientver);
+    }
     // Explicit clear for optional keys (null -> '' disables the feature)
-    for (const k of ['rpdb_api_key', 'mdblist_api_key']) {
+    for (const k of ['rpdb_api_key', 'mdblist_api_key', 'mal_client_id', 'anidb_client']) {
       if (req.body.keys[k] === null) patch.keys[k] = '';
     }
   }
@@ -499,6 +514,85 @@ router.post('/profiles/:id/test/mdblist-user', async (req, res) => {
   } catch (err) {
     console.error(`[test] ${profile.name}/mdblist-user: FAIL — ${err.message}`);
     res.json({ ok: false, error: `MDBList user key test failed: ${err.message}` });
+  }
+});
+
+// Per-profile MyAnimeList user-key test (Advanced → API Keys). Same modes as
+// mdblist-user: {key: <draft>} tests an unsaved draft; {use_saved: true} tests
+// the stored user key server-side.
+router.post('/profiles/:id/test/mal-user', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  const { key, use_saved } = req.body || {};
+  if (key !== undefined && use_saved) {
+    return res.status(400).json({ error: 'Conflicting modes: send either {key} or {use_saved}, not both' });
+  }
+  let testKey;
+  if (use_saved) {
+    testKey = profile.keys.mal_client_id;
+    if (!testKey) return res.json({ ok: false, error: 'MyAnimeList user key not set' });
+  } else if (key !== undefined) {
+    testKey = String(key).trim();
+    if (!testKey) return res.json({ ok: false, error: 'MyAnimeList user key not set' });
+  } else {
+    testKey = profile.keys.mal_client_id;
+    if (!testKey) return res.json({ ok: false, error: 'MyAnimeList user key not set' });
+  }
+  try {
+    const res2 = await fetch('https://api.myanimelist.net/v2/anime/1?fields=rating', {
+      headers: { 'X-MAL-CLIENT-ID': testKey, 'User-Agent': USER_AGENT },
+    });
+    if (res2.ok) {
+      const data = await res2.json();
+      const rating = data?.data?.rating || 'unknown';
+      console.log(`[test] ${profile.name}/mal-user: OK — ${rating}`);
+      res.json({ ok: true, detail: `MyAnimeList key valid (Cowboy Bebop rated ${rating})` });
+    } else {
+      console.error(`[test] ${profile.name}/mal-user: FAIL — ${res2.status}`);
+      res.json({ ok: false, error: `MyAnimeList test failed (${res2.status})` });
+    }
+  } catch (err) {
+    console.error(`[test] ${profile.name}/mal-user: ERROR — ${err.message}`);
+    res.json({ ok: false, error: `MyAnimeList test failed: ${err.message}` });
+  }
+});
+
+// Per-profile AniDB client test (Advanced → API Keys). {client, clientver}
+// tests a draft pair; {use_saved: true} tests the stored pair.
+router.post('/profiles/:id/test/anidb-user', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  const { client, clientver, use_saved } = req.body || {};
+  const anidb = require('./services/anidb');
+  let testClient, testClientver;
+  if (use_saved) {
+    testClient = profile.keys.anidb_client;
+    testClientver = profile.keys.anidb_clientver || 1;
+    if (!testClient) return res.json({ ok: false, error: 'AniDB client not set' });
+  } else if (client !== undefined) {
+    testClient = String(client).trim();
+    testClientver = Number(clientver) || 1;
+    if (!testClient) return res.json({ ok: false, error: 'AniDB client not set' });
+  } else {
+    testClient = profile.keys.anidb_client;
+    testClientver = profile.keys.anidb_clientver || 1;
+    if (!testClient) return res.json({ ok: false, error: 'AniDB client not set' });
+  }
+  try {
+    const result = await anidb.testClient({ client: testClient, clientver: testClientver });
+    if (result.ok) {
+      res.json({ ok: true, detail: '✓ Client accepted' });
+    } else if (result.error === 'client') {
+      res.json({ ok: false, error: "✗ AniDB doesn't recognise this client" });
+    } else if (result.banned_until) {
+      res.json({ ok: false, error: `✗ AniDB has banned this client until ${new Date(result.banned_until).toLocaleString()}` });
+    } else if (result.cap) {
+      res.json({ ok: false, error: '✗ Daily limit reached — try tomorrow' });
+    } else {
+      res.json({ ok: false, error: `✗ ${result.error || 'test failed'}` });
+    }
+  } catch (err) {
+    res.json({ ok: false, error: `AniDB test failed: ${err.message}` });
   }
 });
 
@@ -1266,11 +1360,29 @@ router.put('/settings', (req, res) => {
 // never sends the mask as a key. Modes: {use_saved: true} resolves the saved
 // decrypted key server-side; {key: <draft>} tests an unsaved replacement
 // without persisting it. Conflicting modes are rejected.
-const SETTINGS_KEY_TESTERS = { tmdb: testTmdb, mdblist: testMdblist, rpdb: testRpdb, groq: testGroq, tvdb: testTvdb };
+async function testMal(profile) {
+  const key = profile.keys.mal_client_id;
+  if (!key) return { ok: false, error: 'MyAnimeList key not set' };
+  try {
+    const res = await fetch('https://api.myanimelist.net/v2/anime/1?fields=rating', {
+      headers: { 'X-MAL-CLIENT-ID': key, 'User-Agent': USER_AGENT },
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const rating = data?.data?.rating || 'unknown';
+      return { ok: true, detail: `MyAnimeList key valid (Cowboy Bebop rated ${rating})` };
+    }
+    return { ok: false, error: `MyAnimeList test failed (${res.status})` };
+  } catch (err) {
+    return { ok: false, error: `MyAnimeList test failed: ${err.message}` };
+  }
+}
+
+const SETTINGS_KEY_TESTERS = { tmdb: testTmdb, mdblist: testMdblist, rpdb: testRpdb, groq: testGroq, tvdb: testTvdb, mal: testMal };
 router.post('/settings/test/:service', async (req, res) => {
   const tester = SETTINGS_KEY_TESTERS[req.params.service];
   if (!tester) return res.status(400).json({ error: 'Unknown service' });
-  const field = req.params.service === 'groq' ? 'groq_api_key' : `${req.params.service}_api_key`;
+  const field = req.params.service === 'groq' ? 'groq_api_key' : req.params.service === 'mal' ? 'mal_client_id' : `${req.params.service}_api_key`;
   const { key, use_saved } = req.body || {};
   if (key !== undefined && use_saved) {
     return res.status(400).json({ error: 'Conflicting modes: send either {key} or {use_saved}, not both' });
@@ -1282,6 +1394,10 @@ router.post('/settings/test/:service', async (req, res) => {
     const s = settings.getSettings();
     testKey = s?.keys?.tvdb_api_key;
     if (!testKey) return res.json({ ok: false, error: 'TVDB key not set (optional — TV-14 age chain)' });
+  } else if (use_saved && req.params.service === 'mal') {
+    const s = settings.getSettings();
+    testKey = s?.keys?.mal_client_id;
+    if (!testKey) return res.json({ ok: false, error: 'MyAnimeList key not set' });
   } else if (key !== undefined) {
     testKey = String(key).trim();
     if (!testKey) return res.json({ ok: false, error: 'Key not set' });
@@ -1294,6 +1410,31 @@ router.post('/settings/test/:service', async (req, res) => {
     res.json(result);
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Dedicated AniDB server-key test (takes {client, clientver}).
+router.post('/settings/test/anidb', async (req, res) => {
+  const { client, clientver } = req.body || {};
+  const anidb = require('./services/anidb');
+  const c = String(client || '').trim();
+  const v = Number(clientver) || 0;
+  if (!c) return res.json({ ok: false, error: 'AniDB client not set' });
+  try {
+    const result = await anidb.testClient({ client: c, clientver: v || 1 });
+    if (result.ok) {
+      res.json({ ok: true, detail: '✓ Client accepted' });
+    } else if (result.error === 'client') {
+      res.json({ ok: false, error: "✗ AniDB doesn't recognise this client" });
+    } else if (result.banned_until) {
+      res.json({ ok: false, error: `✗ AniDB has banned this client until ${new Date(result.banned_until).toLocaleString()}` });
+    } else if (result.cap) {
+      res.json({ ok: false, error: '✗ Daily limit reached — try tomorrow' });
+    } else {
+      res.json({ ok: false, error: `✗ ${result.error || 'test failed'}` });
+    }
+  } catch (err) {
+    res.json({ ok: false, error: `AniDB test failed: ${err.message}` });
   }
 });
 

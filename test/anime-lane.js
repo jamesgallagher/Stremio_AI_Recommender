@@ -366,6 +366,73 @@ async function ok(name, fn) {
     }
   });
 
+  // ---- A9: HTTP portal — engine_anime in PUT, requirements, keys, anime_status ----
+  await ok('A9: HTTP portal — engine_anime, requirements.anime, keys, keys_set, anime_status', async () => {
+    const p = config.addProfile('AN1A-A9');
+    try {
+      // Helper: get the profile DTO from the list.
+      const getProfile = async (id) => {
+        const res = await fetch(`${BASE}/api/profiles`, { headers: { 'Content-Type': 'application/json' } });
+        const body = await res.json();
+        return body.profiles.find((x) => x.id === id);
+      };
+
+      // Default: anime engine off, requirements.anime.ok is true (no engine).
+      let prof = await getProfile(p.id);
+      assert.strictEqual(prof.engines.anime, 'off', 'engines.anime is off by default');
+      assert.deepStrictEqual(prof.engines.requirements.anime, { ok: true, missing: [] }, 'requirements.anime ok when off');
+
+      // Set engine_anime to marquee-anime.
+      let res = await fetch(`${BASE}/api/profiles/${p.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filters: { engine_anime: 'marquee-anime' } }),
+      });
+      prof = (await res.json()).profile;
+      assert.strictEqual(prof.engines.anime, 'marquee-anime', 'engines.anime is marquee-anime');
+      // requirements.anime.missing includes 'AniDB client' (no client saved).
+      assert.ok(prof.engines.requirements.anime.missing.includes('AniDB client'), 'missing includes AniDB client');
+
+      // keys shape: mal_client_id, anidb_client, anidb_clientver present.
+      assert.strictEqual(prof.keys.mal_client_id, '', 'keys.mal_client_id empty');
+      assert.strictEqual(prof.keys.anidb_client, '', 'keys.anidb_client empty');
+      assert.strictEqual(prof.keys.anidb_clientver, 0, 'keys.anidb_clientver 0');
+
+      // keys_set shape.
+      assert.strictEqual(prof.keys_set.mal_client_id, false, 'keys_set.mal_client_id false');
+      assert.strictEqual(prof.keys_set.anidb_client, false, 'keys_set.anidb_client false');
+
+      // anime_status shape.
+      assert.ok(prof.anime_status, 'anime_status present');
+      assert.strictEqual(prof.anime_status.mal.source, 'none', 'anime_status.mal.source none');
+      assert.ok(prof.anime_status.anidb, 'anime_status.anidb present');
+      assert.strictEqual(prof.anime_status.migration, null, 'migration null (no marker yet)');
+
+      // Nulls clear the MAL ID and the AniDB pair.
+      res = await fetch(`${BASE}/api/profiles/${p.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ keys: { mal_client_id: 'test-mal', anidb_client: 'test-anidb', anidb_clientver: 3 } }),
+      });
+      prof = (await res.json()).profile;
+      assert.strictEqual(prof.keys.mal_client_id, 'test-mal', 'mal_client_id set');
+      assert.strictEqual(prof.keys.anidb_client, 'test-anidb', 'anidb_client set');
+      assert.strictEqual(prof.keys.anidb_clientver, 3, 'anidb_clientver set');
+
+      res = await fetch(`${BASE}/api/profiles/${p.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ keys: { mal_client_id: null, anidb_client: null, anidb_clientver: null } }),
+      });
+      prof = (await res.json()).profile;
+      assert.strictEqual(prof.keys.mal_client_id, '', 'mal_client_id cleared');
+      assert.strictEqual(prof.keys.anidb_client, '', 'anidb_client cleared');
+      assert.strictEqual(prof.keys.anidb_clientver, 0, 'anidb_clientver cleared to 0');
+    } finally {
+      config.removeProfile(p.id);
+    }
+  });
+
   // ---- A11: AniDB parser — fixture + error body ----
   await ok('A11: AniDB parser — fixture values + error body', async () => {
     const anidb = require('../src/services/anidb');
