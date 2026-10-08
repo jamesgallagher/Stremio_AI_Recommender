@@ -400,11 +400,11 @@ function renderAnidbStatus(p) {
   const source = anidb.source === 'user' ? 'Your client' : anidb.source === 'server' ? 'Server client' : 'None — Marquee Anime can\'t build';
   let line2 = '';
   if (anidb.banned_until) {
-    line2 = `Today: ${anidb.today_count || 0} / 150 requests · Status: blocked by AniDB until ${new Date(anidb.banned_until).toLocaleString()}`;
+    line2 = `Today: ${anidb.today || 0} / 150 requests · Status: blocked by AniDB until ${new Date(anidb.banned_until).toLocaleString()}`;
   } else if (anidb.last_error) {
-    line2 = `Today: ${anidb.today_count || 0} / 150 requests · Status: last error: ${esc(anidb.last_error)}`;
+    line2 = `Today: ${anidb.today || 0} / 150 requests · Status: last error: ${esc(anidb.last_error)}`;
   } else {
-    line2 = `Today: ${anidb.today_count || 0} / 150 requests · Status: OK`;
+    line2 = `Today: ${anidb.today || 0} / 150 requests · Status: OK`;
   }
   return `<div class="muted" style="font-size:11px;margin-top:6px">Client source: <b>${source}</b></div>
     <div class="muted" style="font-size:11px;margin-top:2px">${line2}</div>`;

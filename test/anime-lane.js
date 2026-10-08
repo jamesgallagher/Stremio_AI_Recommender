@@ -483,6 +483,31 @@ async function ok(name, fn) {
     }
   });
 
+  // ---- A9c: anime_status.anidb.today counts the saved client's requests ----
+  await ok('A9c: anime_status.anidb.today counts the saved client\'s requests', async () => {
+    const anidb = require('../src/services/anidb');
+    const p = config.addProfile('AN1A-A9c');
+    try {
+      config.updateProfile(p.id, { keys: { anidb_client: 'a9c-client', anidb_clientver: 1 } });
+      anidb._resetForTests();
+      let t = Date.now();
+      anidb._setNow(() => t);
+      const xml = fs.readFileSync(path.join(__dirname, 'fixtures', 'anidb-aid23.xml'), 'utf8');
+      anidb._setFetch(async () => { t += 5000; return { status: 200, text: async () => xml }; });
+      const prof = config.getProfile(p.id);
+      await anidb.getAnime(9101, prof, console);
+      await anidb.getAnime(9102, prof, console);
+      const res = await fetch(`${BASE}/api/profiles`, { headers: { Cookie: cookieHeader(token) } });
+      const body = await res.json();
+      const dto = body.profiles.find((x) => x.id === p.id);
+      assert.strictEqual(dto.anime_status.anidb.today, 2, 'two requests counted today');
+      assert.strictEqual(dto.anime_status.anidb.source, 'user');
+    } finally {
+      anidb._resetClock();
+      config.removeProfile(p.id);
+    }
+  });
+
   // ---- A10: HTTP companion — engine_anime in GET/POST /mobile/api/settings ----
   await ok('A10: HTTP companion — engine_anime in GET/POST /mobile/api/settings', async () => {
     const p = config.addProfile('AN1A-A10');
