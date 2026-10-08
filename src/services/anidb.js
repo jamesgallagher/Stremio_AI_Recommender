@@ -15,6 +15,7 @@ const BAN_MS = 48 * 3600e3; // ban circuit: 48h
 const TIMEOUT_MS = 15000; // 15s timeout
 const BACKOFF_DELAYS = [4000, 16000, 60000]; // 4s, 16s, 60s
 const SPACING_MS = 4000; // ≥ 4000ms between any two requests
+const SPACING_MARGIN_MS = 50; // clock/timer jitter margin
 
 // Fetch seam: tests stub fetch through this.
 let fetchImpl = global.fetch;
@@ -167,12 +168,10 @@ function cachedAnime(aid) {
 // (in-memory OR persisted, so a restart can't burst).
 async function waitForSpacing(client) {
   const persisted = db.get().prepare('SELECT MAX(last_request_at) AS max_at FROM anidb_clients').get().max_at || 0;
-  const earliest = Math.max(lastRequestAt, persisted) + SPACING_MS;
+  const earliest = Math.max(lastRequestAt, persisted) + SPACING_MS + SPACING_MARGIN_MS;
   if (now() < earliest) {
     await sleep(earliest - now());
   }
-  lastRequestAt = now();
-  updateClient(client, { last_request_at: now() });
 }
 
 // One HTTP request under all the rules → { xml } | { skipped } | { transient } | { http }.
@@ -183,13 +182,13 @@ async function guardedRequest(client, clientver, aid) {
     if (row.day === sydneyDay(now()) && row.day_calls >= DAILY_CAP) return { skipped: 'cap' };
     await waitForSpacing(client);
     recordDayCall(client);                 // every attempt counts
+    const sentAt = now();
+    lastRequestAt = sentAt;
+    const pending = fetchImpl(`http://api.anidb.net:9001/httpapi?request=anime&client=${encodeURIComponent(client)}&clientver=${clientver}&protover=1&aid=${aid}`,
+      { signal: AbortSignal.timeout(TIMEOUT_MS) });
+    updateClient(client, { last_request_at: sentAt });
     let res;
-    try {
-      res = await fetchImpl(`http://api.anidb.net:9001/httpapi?request=anime&client=${encodeURIComponent(client)}&clientver=${clientver}&protover=1&aid=${aid}`,
-        { signal: AbortSignal.timeout(TIMEOUT_MS) });
-    } catch {
-      return { transient: 'timeout' };
-    }
+    try { res = await pending; } catch { return { transient: 'timeout' }; }
     if (res.status >= 500) return { transient: `http ${res.status}` };
     if (res.status !== 200) return { http: res.status };
     return { xml: await res.text() };
