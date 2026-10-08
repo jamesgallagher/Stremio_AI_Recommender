@@ -508,6 +508,29 @@ async function ok(name, fn) {
     }
   });
 
+  // ---- A9d: Server Config AniDB Test route — /settings/test/anidb ----
+  await ok('A9d: Server Config AniDB Test route — /settings/test/anidb', async () => {
+    const anidb = require('../src/services/anidb');
+    try {
+      anidb._resetForTests();
+      let t = Date.now();
+      anidb._setNow(() => t);
+      const xml = fs.readFileSync(path.join(__dirname, 'fixtures', 'anidb-aid23.xml'), 'utf8');
+      anidb._setFetch(async () => { t += 5000; return { status: 200, text: async () => xml }; });
+      const res = await fetch(`${BASE}/api/settings/test/anidb`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: cookieHeader(token) },
+        body: JSON.stringify({ client: 'a9d-client', clientver: 1 }),
+      });
+      assert.strictEqual(res.status, 200, 'HTTP 200');
+      const body = await res.json();
+      assert.strictEqual(body.ok, true, 'ok true');
+      assert.strictEqual(body.detail, 'Client accepted', 'detail Client accepted');
+    } finally {
+      anidb._resetClock();
+    }
+  });
+
   // ---- A10: HTTP companion — engine_anime in GET/POST /mobile/api/settings ----
   await ok('A10: HTTP companion — engine_anime in GET/POST /mobile/api/settings', async () => {
     const p = config.addProfile('AN1A-A10');

@@ -1359,6 +1359,21 @@ async function testMal(profile) {
   }
 }
 
+// NOTE: must be registered BEFORE /settings/test/:service (Express matches in registration order).
+// Dedicated AniDB server-key test (takes {client, clientver}).
+router.post('/settings/test/anidb', async (req, res) => {
+  const { client, clientver } = req.body || {};
+  const anidb = require('./services/anidb');
+  const c = String(client || '').trim();
+  const v = Number(clientver) || 0;
+  if (!c) return res.json({ ok: false, error: 'AniDB client not set' });
+  try {
+    res.json(await anidb.testClient({ client: c, clientver: v || 1 }));
+  } catch (err) {
+    res.json({ ok: false, error: `AniDB test failed: ${err.message}` });
+  }
+});
+
 const SETTINGS_KEY_TESTERS = { tmdb: testTmdb, mdblist: testMdblist, rpdb: testRpdb, groq: testGroq, tvdb: testTvdb, mal: testMal };
 router.post('/settings/test/:service', async (req, res) => {
   const tester = SETTINGS_KEY_TESTERS[req.params.service];
@@ -1391,20 +1406,6 @@ router.post('/settings/test/:service', async (req, res) => {
     res.json(result);
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// Dedicated AniDB server-key test (takes {client, clientver}).
-router.post('/settings/test/anidb', async (req, res) => {
-  const { client, clientver } = req.body || {};
-  const anidb = require('./services/anidb');
-  const c = String(client || '').trim();
-  const v = Number(clientver) || 0;
-  if (!c) return res.json({ ok: false, error: 'AniDB client not set' });
-  try {
-    res.json(await anidb.testClient({ client: c, clientver: v || 1 }));
-  } catch (err) {
-    res.json({ ok: false, error: `AniDB test failed: ${err.message}` });
   }
 });
 
