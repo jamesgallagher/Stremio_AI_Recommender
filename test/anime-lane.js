@@ -366,6 +366,153 @@ async function ok(name, fn) {
     }
   });
 
+  // ---- A11: AniDB parser — fixture + error body ----
+  await ok('A11: AniDB parser — fixture values + error body', async () => {
+    const anidb = require('../src/services/anidb');
+    const fs = require('fs');
+    const path = require('path');
+
+    // Parse the Cowboy Bebop fixture.
+    const xml = fs.readFileSync(path.join(__dirname, 'fixtures', 'anidb-aid23.xml'), 'utf8');
+    const parsed = anidb.parseAnime(xml);
+    assert.strictEqual(parsed.restricted, false, 'restricted false');
+    assert.strictEqual(parsed.type, 'TV Series', 'type TV Series');
+    assert.strictEqual(parsed.episodes, 26, 'episodes 26');
+    assert.strictEqual(parsed.title, 'Cowboy Bebop', 'title');
+    assert.strictEqual(parsed.rating, 8.75, 'rating 8.75');
+    assert.strictEqual(parsed.content.sex, 100, 'content.sex 100');
+    assert.strictEqual(parsed.content.violence, 200, 'content.violence 200');
+    assert.deepStrictEqual(parsed.related[0], { aid: 219, type: 'Side Story' }, 'related[0]');
+    assert.ok(parsed.similar.length > 0, 'similar non-empty');
+    assert.ok(parsed.mal.includes(1), 'mal includes 1');
+
+    // Parse the error-302 fixture.
+    const errXml = fs.readFileSync(path.join(__dirname, 'fixtures', 'anidb-error-302.xml'), 'utf8');
+    const errParsed = anidb.parseAnime(errXml);
+    assert.ok(errParsed.error, 'error body parsed');
+    assert.ok(/client/i.test(errParsed.error), 'error text mentions client');
+  });
+
+  // ---- A12: AniDB flood control — spacing, cache, repeat, cap, ban, reload ----
+  await ok('A12: AniDB flood control — spacing/cache/repeat/cap/ban/reload', async () => {
+    const anidb = require('../src/services/anidb');
+    const db = require('../src/db');
+    anidb.init();
+    anidb._resetForTests();
+
+    let t = 1000000;
+    anidb._setNow(() => t);
+    const fetchCalls = [];
+    const validXml = '<anime id="1" restricted="false"><type>TV Series</type><episodecount>10</episodecount><title xml:lang="x-jat" type="main">Test</title><permanent>8.0</permanent></anime>';
+    anidb._setFetch(async (url) => {
+      fetchCalls.push({ url, at: t });
+      return { text: async () => validXml };
+    });
+
+    const profile = { keys: { anidb_client: 'test-client', anidb_clientver: 1 } };
+    // Advance the clock by 4000ms (one spacing interval) before each request.
+    const advance = () => { t += 4000; };
+
+    // 1. Spacing: two getAnime calls for different aids start ≥ 4000 ms apart.
+    const r1 = await anidb.getAnime(1, profile, console);
+    assert.ok(r1.data, 'first request succeeded');
+    advance();
+    const r2 = await anidb.getAnime(2, profile, console);
+    assert.ok(r2.data, 'second request succeeded');
+    assert.ok(fetchCalls[1].at - fetchCalls[0].at >= 4000, 'requests ≥ 4000ms apart');
+
+    // 2. Cache: a cached aid makes no request.
+    const r3 = await anidb.getAnime(1, profile, console);
+    assert.ok(r3.cached, 'cached');
+    assert.strictEqual(fetchCalls.length, 2, 'no new request for cached aid');
+
+    // 3. Repeat guard: the same aid after an error within 24h → repeat.
+    anidb._setFetch(async (url) => {
+      fetchCalls.push({ url, at: t });
+      return { text: async () => '<error>some error</error>' };
+    });
+    advance();
+    const r4 = await anidb.getAnime(3, profile, console);
+    assert.ok(r4.error, 'error recorded');
+    const r5 = await anidb.getAnime(3, profile, console);
+    assert.strictEqual(r5.skipped, 'repeat', 'repeat guard');
+    assert.strictEqual(fetchCalls.length, 3, 'no new request for repeat');
+
+    // 4. Daily cap: the 151st request in a Sydney day → cap.
+    const day = new Date(t + 10 * 3600e3).toISOString().slice(0, 10);
+    db.get().prepare('UPDATE anidb_clients SET day = ?, day_calls = 150 WHERE client = ?').run(day, 'test-client');
+    advance();
+    const r6 = await anidb.getAnime(4, profile, console);
+    assert.strictEqual(r6.skipped, 'cap', 'daily cap');
+    assert.strictEqual(fetchCalls.length, 3, 'no new request for cap');
+
+    // 5. Ban circuit: after a banned body, banned_until ≈ now+48h; next call → banned.
+    db.get().prepare('UPDATE anidb_clients SET day_calls = 0 WHERE client = ?').run('test-client');
+    anidb._setFetch(async (url) => {
+      fetchCalls.push({ url, at: t });
+      return { text: async () => '<error>You have been banned</error>' };
+    });
+    advance();
+    const r7 = await anidb.getAnime(5, profile, console);
+    assert.strictEqual(r7.skipped, 'banned', 'banned on banned body');
+    const banRow = db.get().prepare('SELECT banned_until FROM anidb_clients WHERE client = ?').get('test-client');
+    assert.ok(banRow.banned_until - t >= 48 * 3600e3 - 1000, 'banned_until ≈ now + 48h');
+    // Next call for a different aid → banned (no request).
+    const r8 = await anidb.getAnime(6, profile, console);
+    assert.strictEqual(r8.skipped, 'banned', 'banned (no request)');
+    assert.strictEqual(fetchCalls.length, 4, 'no new request for banned');
+
+    // 6. State survives a module reload (re-require with a cleared cache).
+    const atBefore = db.get().prepare('SELECT at FROM anidb_attempts WHERE aid = 1').get().at;
+    delete require.cache[require.resolve('../src/services/anidb')];
+    const anidb2 = require('../src/services/anidb');
+    anidb2._setNow(() => t); // the fresh module has a default Date.now() clock
+    anidb2.init();
+    const r9 = await anidb2.getAnime(1, profile, console);
+    assert.ok(r9.cached, 'cached after reload');
+    const atAfter = db.get().prepare('SELECT at FROM anidb_attempts WHERE aid = 1').get().at;
+    assert.strictEqual(atBefore, atAfter, 'attempt state survives reload');
+  });
+
+  // ---- A13: AniDB testClient — success caches, second test no request, bad client ----
+  await ok('A13: AniDB testClient — success caches, second test no request, bad client', async () => {
+    const anidb = require('../src/services/anidb');
+    anidb.init();
+    anidb._resetForTests();
+
+    let t = 2000000;
+    anidb._setNow(() => t);
+    const fetchCalls = [];
+    const validXml = '<anime id="1" restricted="false"><type>TV Series</type><episodecount>10</episodecount><title xml:lang="x-jat" type="main">Test</title><permanent>8.0</permanent></anime>';
+    anidb._setFetch(async (url) => {
+      fetchCalls.push({ url, at: t });
+      return { text: async () => validXml };
+    });
+    const advance = () => { t += 4000; };
+
+    // 1. Success: caches aid 1.
+    const r1 = await anidb.testClient({ client: 'test-client', clientver: 1 });
+    assert.ok(r1.ok, 'testClient success');
+    assert.strictEqual(r1.detail, '✓ Client accepted', 'success text');
+    assert.strictEqual(fetchCalls.length, 1, 'one request');
+
+    // 2. Second test within 24h: no request, returns "checked HH:MM".
+    const r2 = await anidb.testClient({ client: 'test-client', clientver: 1 });
+    assert.ok(r2.ok, 'second test success');
+    assert.ok(r2.detail.includes('checked'), 'checked text');
+    assert.strictEqual(fetchCalls.length, 1, 'no new request for second test');
+
+    // 3. Bad client: returns ✗ AniDB doesn't recognise this client.
+    anidb._setFetch(async (url) => {
+      fetchCalls.push({ url, at: t });
+      return { text: async () => '<error code="302">client version missing or invalid</error>' };
+    });
+    advance(); // spacing for the new client
+    const r3 = await anidb.testClient({ client: 'bad-client', clientver: 1 });
+    assert.ok(!r3.ok, 'bad client not ok');
+    assert.strictEqual(r3.error, '✗ AniDB doesn\'t recognise this client', 'bad client text');
+  });
+
   console.log(`\nAll anime-lane checks passed (${passed}).${failed ? ` FAILED: ${failed}` : ''}`);
   process.exit(failed ? 1 : 0);
 })().catch((e) => {

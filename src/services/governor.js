@@ -47,6 +47,10 @@ const LIMITS = {
   jikan: { minIntervalMs: 1050, breaker: { threshold: 5, cooldownMs: 60000 } },
   anilist: { minIntervalMs: 2000, breaker: { threshold: 5, cooldownMs: 60000 } },
   groq: { minIntervalMs: 2100 },
+  // AniDB HTTP API (AN-1a): one request every 4 s, server-wide (all clients
+  // share one queue / IP). The anidb client also enforces a persisted
+  // last_request_at so a restart can't burst.
+  anidb: { minIntervalMs: 4000 },
 };
 
 const DEFAULT_BACKOFF_MS = 5000; // when a 429 carries no usable Retry-After
