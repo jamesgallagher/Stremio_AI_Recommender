@@ -90,8 +90,8 @@ async function gather(titles, log = console, deps = DEFAULT_DEPS) {
     const anidbId = lookup?.anidb;
 
     const malBand = malId != null ? malMod.cachedVerdict(malId) : null;
-    const kitsuEv = kitsuId != null ? kitsuMap.get(String(kitsuId)) : null;
-    const anilistEv = anilistId != null ? anilistMap.get(anilistId) : null;
+    const kitsuEv = kitsuId != null ? (kitsuMap.get(String(kitsuId)) || null) : null;
+    const anilistEv = anilistId != null ? (anilistMap.get(anilistId) || null) : null;
     const anidbRaw = anidbId != null ? anidbMod.cachedAnime(anidbId) : null;
     const anidbEv = anidbRaw ? { restricted: anidbRaw.restricted, content: anidbRaw.content || {} } : null;
 

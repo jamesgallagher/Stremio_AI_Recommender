@@ -13,8 +13,9 @@ const groq = require('../services/groq');
 const DEFAULT_DEPS = { evidence, groq: { animeAgeReview: groq.animeAgeReview } };
 
 // Cache version and TTL. A fresh row answers without the LLM.
-const VER = 'v1';
+let VER = 'v1';
 const TTL_MS = 90 * 86400e3; // 90 days
+function _setVer(v) { VER = v; }
 
 let ready = false;
 function init() {
@@ -177,4 +178,4 @@ async function review(profile, tier, titles, log = console, deps = DEFAULT_DEPS)
   return out;
 }
 
-module.exports = { review, VER, TTL_MS, DEFAULT_DEPS, cacheGet, cacheSet };
+module.exports = { review, VER, TTL_MS, DEFAULT_DEPS, cacheGet, cacheSet, _setVer };
