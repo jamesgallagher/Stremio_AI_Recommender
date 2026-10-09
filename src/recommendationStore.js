@@ -375,7 +375,7 @@ async function refreshStaleRatings(profileId, mdblistKey, log = console, { now =
 // TV-2 C1: the canonical order of the age chain's source labels for the
 // per-source log line (deterministic sources first, then the hard floor, then
 // the LLM). Only sources with a non-zero count are listed.
-const AGE_SOURCE_ORDER = ['csm', 'mal', 'au', 'us', 'tvdb-au', 'tvdb-us', 'kitsu', 'simkl', 'mdblist', 'tmdb-gb', 'tmdb-ie', 'tmdb-nz', 'tmdb-ca', 'tvdb-gbr', 'tvdb-irl', 'tvdb-nzl', 'tvdb-can', 'hard-floor', 'llm'];
+const AGE_SOURCE_ORDER = ['csm', 'mal', 'au', 'us', 'tvdb-au', 'tvdb-us', 'kitsu', 'simkl', 'mdblist', 'tmdb-gb', 'tmdb-ie', 'tmdb-nz', 'tmdb-ca', 'tvdb-gbr', 'tvdb-irl', 'tvdb-nzl', 'tvdb-can', 'hard-floor', 'llm', 'llm-review'];
 
 // Age-gate the pool (docs/v6-features F5). Reuses the shipped v5.2 stack:
 //   1. NSFW blacklist + anime age band (ALL profiles) via rebuild.applyAnimeGate
@@ -480,6 +480,70 @@ async function ageGatePool(profile, log = console, onProgress = () => {}, opts =
           } catch (err) {
             log.warn(`[rec] ${profile.name}: decision log (gate) failed (${err.message})`);
           }
+        }
+      }
+
+      // AGE-3b: the anime borderline review (anime lane only). After the chain
+      // has allowed a title, a second look happens for the risky ones: an LLM
+      // sees the content evidence and can only block it (never unblock).
+      // The review is a SAFETY step: it must run whether or not a decision-log build
+      // id exists (the decision-row updates below are guarded by `decisions`, which is
+      // only set when opts.animeBuildId is).
+      if (type === 'anime') {
+        try {
+          // Candidates for review = the lane's titles whose chain verdict is allow
+          // or that have no verdict (kept). Never block.
+          const candidates = survivors.filter((r) => {
+            const v = result.get(`${lanes.verdictType(type)}:${r.tmdb_id}`);
+            return !(v && v.verdict === 'block');
+          });
+          if (candidates.length) {
+            const titlesInEvidenceShape = candidates.map((c) => ({
+              key: `${lanes.verdictType(type)}:${c.tmdb_id}`,
+              tmdb_id: c.tmdb_id,
+              imdb_id: c.imdb_id,
+              title: c.title,
+              year: c.year,
+              genres: String(c.genres || '').split(',').map((s) => s.trim()).filter(Boolean),
+            }));
+            const reviewOut = await require('./anime/borderlineReview').review(profile, tier, titlesInEvidenceShape, log);
+            for (const c of candidates) {
+              const r = reviewOut.get(`${lanes.verdictType(type)}:${c.tmdb_id}`);
+              if (r && r.action === 'block') {
+                hardDrop(profile.id, 'anime', c.tmdb_id);
+                vetoed++;
+                // Store the verdict so serve-time passesAgeBand honours it.
+                try {
+                  require('./ageVerification/store').recordVerdict('anime', c.tmdb_id, tier.id, 'block', r.source, r.rating, Date.now(), { reason: r.reason, title: c.title });
+                } catch (err) {
+                  log.warn(`[rec] ${profile.name}: borderline verdict store failed (${err.message})`);
+                }
+                // Update the decision row (only when the anime build is on).
+                if (decisions) {
+                  try {
+                    decisions.update(profile.id, 'anime', opts.animeBuildId, String(c.tmdb_id), {
+                      outcome: r.source === 'llm-review' ? 'rejected_llm' : 'rejected_age',
+                      stage: r.stage,
+                      rating: r.rating,
+                      reason: r.reason,
+                    });
+                  } catch (err) {
+                    log.warn(`[rec] ${profile.name}: decision log (borderline) failed (${err.message})`);
+                  }
+                }
+              } else if (r && r.action === 'ok' && r.trigger && decisions) {
+                try {
+                  decisions.update(profile.id, 'anime', opts.animeBuildId, String(c.tmdb_id), {
+                    reason: `Borderline (${r.trigger}): reviewed OK — ${r.reason}`,
+                  });
+                } catch (err) {
+                  log.warn(`[rec] ${profile.name}: decision log (borderline) failed (${err.message})`);
+                }
+              }
+            }
+          }
+        } catch (err) {
+          log.warn(`[rec] ${profile.name}: borderline review failed (${err.message})`);
         }
       }
     }
@@ -606,6 +670,65 @@ async function stagedAgeGate(profile, stagedByType, log = console, onProgress = 
           }
         } catch (err) {
           log.warn(`[rec] ${profile.name}: decision log (gate) failed (${err.message})`);
+        }
+      }
+
+      // AGE-3b: the anime borderline review (anime lane only). After the chain
+      // has allowed a title, a second look happens for the risky ones: an LLM
+      // sees the content evidence and can only block it (never unblock).
+      if (type === 'anime' && finalCands.length) {
+        try {
+          const titlesInEvidenceShape = finalCands.map((c) => ({
+            key: `${lanes.verdictType(type)}:${c.tmdb_id}`,
+            tmdb_id: c.tmdb_id,
+            imdb_id: c.imdb_id,
+            title: c.title,
+            year: c.year,
+            genres: String(c.genres || '').split(',').map((s) => s.trim()).filter(Boolean),
+          }));
+          const reviewOut = await require('./anime/borderlineReview').review(profile, tier, titlesInEvidenceShape, log);
+          const keptAfter = [];
+          for (const c of finalCands) {
+            const r = reviewOut.get(`${lanes.verdictType(type)}:${c.tmdb_id}`);
+            if (r && r.action === 'block') {
+              vetoed++;
+              // Store the verdict so serve-time passesAgeBand honours it.
+              try {
+                require('./ageVerification/store').recordVerdict('anime', c.tmdb_id, tier.id, 'block', r.source, r.rating, Date.now(), { reason: r.reason, title: c.title });
+              } catch (err) {
+                log.warn(`[rec] ${profile.name}: borderline verdict store failed (${err.message})`);
+              }
+              // Update the decision row (only when the anime build is on).
+              if (opts.animeBuildId && decisions) {
+                try {
+                  decisions.update(profile.id, 'anime', opts.animeBuildId, String(c.tmdb_id), {
+                    outcome: r.source === 'llm-review' ? 'rejected_llm' : 'rejected_age',
+                    stage: r.stage,
+                    rating: r.rating,
+                    reason: r.reason,
+                  });
+                } catch (err) {
+                  log.warn(`[rec] ${profile.name}: decision log (borderline) failed (${err.message})`);
+                }
+              }
+              continue; // drop from the lane
+            }
+            // For action === 'ok' with a trigger and a decision build id:
+            // update the row's reason (outcome/stage/rating unchanged).
+            if (r && r.action === 'ok' && r.trigger && opts.animeBuildId && decisions) {
+              try {
+                decisions.update(profile.id, 'anime', opts.animeBuildId, String(c.tmdb_id), {
+                  reason: `Borderline (${r.trigger}): reviewed OK — ${r.reason}`,
+                });
+              } catch (err) {
+                log.warn(`[rec] ${profile.name}: decision log (borderline) failed (${err.message})`);
+              }
+            }
+            keptAfter.push(c);
+          }
+          out[type] = keptAfter;
+        } catch (err) {
+          log.warn(`[rec] ${profile.name}: borderline review failed (${err.message})`);
         }
       }
     } else {
