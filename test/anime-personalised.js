@@ -559,6 +559,45 @@ function fakeTrending(candidates, rowsOut) {
     assert.strictEqual(result3.length, 2, 'trending list returned');
   });
 
+  // ---- P19: a fallback to trending records meta mode trending (not the planned mode) ----
+  await ok('P19: personalisation produces nothing → trending pool, meta says trending with the engaged count', async () => {
+    const decisionLog = require('../src/anime/decisionLog');
+    const entries = [ladderEntry('10', 'tt10', 3, true, 'Seed1')];
+    const ladder = new Map(entries.map((e) => [e.row.tmdb_id, e]));
+    const animeMap = fakeAnimeMap({ lookupMap: new Map([['tt10:10', { anilist: 100, mal: 1 }]]), byAnilistMap: new Map(), byMalMap: new Map() });
+    const anilist = fakeAnilist({ tagsFor: () => new Map(), recommendationsFor: () => new Map(), tagSearch: () => [] });
+    const trendingCands = [{ type: 'anime', tmdb_id: '500', imdb_id: 'tt500', title: 'Trend1', rankScore: 0.9, reason: 'Trending anime' }];
+    const deps = makeDeps({ ladder, animeMap, anilist, trending: fakeTrending(trendingCands, []), listSize: 5, decisions: decisionLog });
+    const ctx = { log: { log: () => {}, warn: () => {} } };
+    const result = await personalised.build({ name: 'P19', id: 'P19' }, ctx, deps);
+    assert.strictEqual(result.length, 1, 'the trending candidate');
+    assert.strictEqual(ctx.animeMode, 'trending');
+    assert.strictEqual(ctx.animeEngaged, 1);
+    const meta = decisionLog.getMeta('P19', 'anime', ctx.animeBuildId);
+    assert.deepStrictEqual({ mode: meta.mode, engaged: meta.engaged }, { mode: 'trending', engaged: 1 });
+  });
+
+  // ---- P20: a tag-search-only pick is not labelled "Trending anime" ----
+  await ok('P20: tag-search-only personalised pick has a taste reason, not Trending anime', async () => {
+    const entries = [ladderEntry('10', 'tt10', 3, true, 'Seed1')];
+    const ladder = new Map(entries.map((e) => [e.row.tmdb_id, e]));
+    const animeMap = fakeAnimeMap({
+      lookupMap: new Map([['tt10:10', { anilist: 100, mal: 1 }]]),
+      byAnilistMap: new Map([[300, { tv: '300', imdb: 'tt300', type: 'TV' }]]),
+      byMalMap: new Map(),
+    });
+    const anilist = fakeAnilist({
+      tagsFor: () => new Map([[100, { isAdult: false, genres: ['Romance'], tags: [{ name: 'Romance', rank: 80 }] }]]),
+      recommendationsFor: () => new Map(),
+      tagSearch: () => [{ id: 300, idMal: 3, format: 'TV', genres: ['Romance'], averageScore: 80, popularity: 100, year: 2020, title: { romaji: 'TagOnly' } }],
+    });
+    const deps = makeDeps({ ladder, animeMap, anilist, trending: fakeTrending([], []), listSize: 5 });
+    const result = await personalised.build({ name: 'P20', id: 'P20' }, { log: { log: () => {}, warn: () => {} } }, deps);
+    const item = result.find((c) => c.tmdb_id === '300');
+    assert.ok(item, 'the tag-search pick is in the pool');
+    assert.strictEqual(item.reason, 'Matches the tags you watch');
+  });
+
   // ---- P11: scoring set cap ----
   await ok('P11: scoring set cap — 300 candidates → tagsFor called with at most 200 ids', async () => {
     const entries = [

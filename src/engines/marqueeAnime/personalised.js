@@ -371,7 +371,8 @@ async function build(profile, ctx, deps = DEFAULT_DEPS) {
         vote_count: null,
         popularity: c.popularity != null ? c.popularity : null,
         rankScore: c.rankScore,
-        reason: c.reason || 'Trending anime',
+        // A personalised pick with no best seed came from the tag search only.
+        reason: c.reason || 'Matches the tags you watch',
         algorithmVersion: ALGORITHM_VERSION,
       };
     } else {
@@ -416,7 +417,8 @@ async function build(profile, ctx, deps = DEFAULT_DEPS) {
       const buildId = sink.newBuildId();
       ctx.animeBuildId = buildId;
       sink.record(profile.id, 'anime', buildId, allRows);
-      sink.recordMeta(profile.id, 'anime', buildId, { mode, engaged });
+      // ctx.animeMode, not the local `mode`: a fallback to trending changes it.
+      sink.recordMeta(profile.id, 'anime', buildId, { mode: ctx.animeMode, engaged });
       sink.prune(profile.id, 'anime');
     } catch (err) {
       log.warn(`[marquee-anime] ${name}: decision log failed (${err.message})`);
