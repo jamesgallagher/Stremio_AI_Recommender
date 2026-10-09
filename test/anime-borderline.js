@@ -783,6 +783,44 @@ const title = (id, genres = []) => ({ key: `anime:${id}`, tmdb_id: String(id), i
     }
   });
 
+  // ---- BR13b: the urgent-path review runs even with NO decision-log build id ----
+  await ok('BR13b: urgent path — no animeBuildId: the review still drops the title, no decision rows touched', async () => {
+    const profileId = 'BR13b';
+    const buildId = decisionLog.newBuildId();
+    const prof = { id: profileId, name: 'BR13b', filters: { age_limit: 14 } };
+
+    seedPoolAnime(profileId, 3101, 'Anime X');
+    seedDecisionRow(profileId, buildId, 3101, 'Anime X');
+    const before = getRow(profileId, buildId, 3101);
+
+    const unstub1 = stubApplyAnimeGate(new Map());
+    const unstub2 = stubVerify(new Map([
+      ['anime:3101', { verdict: 'allow', source: 'mal', rating: 'PG-13', reason: 'MAL PG-13 (13+) is within the band' }],
+    ]));
+    const originalReview = borderlineReview.review;
+    let reviewCalls = 0;
+    borderlineReview.review = async (_profile, _tier, titles) => {
+      reviewCalls++;
+      const out = new Map();
+      for (const t of titles) out.set(t.key, { action: 'block', source: 'llm-review', stage: 'llm-borderline', rating: 'llm', reason: 'Too much nudity for this age', trigger: 'anilist:Nudity' });
+      return out;
+    };
+    try {
+      await rec.ageGatePool(prof, log, () => {}); // no opts at all
+      assert.strictEqual(reviewCalls, 1, 'review ran without a build id');
+      const db = require('../src/db');
+      const poolRow = db.get().prepare("SELECT tmdb_id FROM recommended WHERE profile_id = ? AND type = 'anime' AND tmdb_id = '3101'").get(profileId);
+      assert.strictEqual(poolRow, undefined, 'pool row dropped by the review');
+      const verdict = db.get().prepare("SELECT verdict, source FROM age_verdicts WHERE type = 'anime' AND tmdb_id = '3101'").get();
+      assert.deepStrictEqual({ v: verdict.verdict, s: verdict.source }, { v: 'block', s: 'llm-review' }, 'verdict stored for serve time');
+      assert.deepStrictEqual(getRow(profileId, buildId, 3101), before, 'decision row untouched (no build id)');
+    } finally {
+      borderlineReview.review = originalReview;
+      unstub1();
+      unstub2();
+    }
+  });
+
   // ---- BR14: untouched lanes and failures ----
   await ok('BR14: untouched lanes and failures — movie/series never reach review; review throws → lane unchanged, warn logged', async () => {
     // Movie and series never reach review.

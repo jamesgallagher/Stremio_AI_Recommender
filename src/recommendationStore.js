@@ -486,7 +486,10 @@ async function ageGatePool(profile, log = console, onProgress = () => {}, opts =
       // AGE-3b: the anime borderline review (anime lane only). After the chain
       // has allowed a title, a second look happens for the risky ones: an LLM
       // sees the content evidence and can only block it (never unblock).
-      if (type === 'anime' && opts.animeBuildId) {
+      // The review is a SAFETY step: it must run whether or not a decision-log build
+      // id exists (the decision-row updates below are guarded by `decisions`, which is
+      // only set when opts.animeBuildId is).
+      if (type === 'anime') {
         try {
           // Candidates for review = the lane's titles whose chain verdict is allow
           // or that have no verdict (kept). Never block.
