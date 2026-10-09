@@ -389,7 +389,7 @@ function malKeyRow(id, value) {
 function renderMalStatus(p) {
   const source = p.anime_status?.mal?.source;
   if (!source) return '';
-  const label = source === 'user' ? 'Your key' : source === 'server' ? 'Server key' : 'No key — using Jikan (slower)';
+  const label = source === 'user' ? 'Your key' : source === 'server' ? 'Server key' : 'No key — using Tenrai (slower)';
   return `<div class="muted" style="font-size:11px;margin-top:6px">Key source: <b>${label}</b></div>`;
 }
 

@@ -906,23 +906,25 @@ async function ok(name, fn) {
     assert.strictEqual(r3.error, "AniDB doesn't recognise this client", 'no ✗ prefix');
   });
 
-  // ---- A14: MAL API — ratings calls api.myanimelist.net first, nsfw black → adult, Jikan fast-fail ----
-  await ok('A14: MAL API — ratings calls api.myanimelist.net first, nsfw black → adult, Jikan fast-fail', async () => {
+  // ---- A14: MAL API — ratings calls api.myanimelist.net first, nsfw black → adult, Tenrai fast-fail ----
+  await ok('A14: MAL API — ratings calls api.myanimelist.net first, nsfw black → adult, Tenrai fast-fail', async () => {
     const mal = require('../src/services/mal');
     const store = require('../src/store');
 
     // Stub the global fetch.
     const realFetch = global.fetch;
     let malApiCalls = 0;
-    let jikanCalls = 0;
+    let tenraiCalls = 0;
+    let deadHostCalls = 0; // the shut-down Jikan host must never be called
     let anilistCalls = 0;
     global.fetch = async (url, opts) => {
       if (url.includes('api.myanimelist.net')) {
         malApiCalls++;
         return { status: 200, ok: true, json: async () => ({ rating: 'r', nsfw: 'black', genres: [{ name: 'Action' }] }) };
       }
-      if (url.includes('api.jikan.moe')) {
-        jikanCalls++;
+      if (url.includes('api.jikan.moe')) deadHostCalls++;
+      if (url.includes('api.tenrai.org')) {
+        tenraiCalls++;
         const err = new Error('fetch failed');
         err.cause = { code: 'UND_ERR_CONNECT_TIMEOUT' };
         throw err;
@@ -945,11 +947,49 @@ async function ok(name, fn) {
       const cache = store.loadAnimeRatings();
       assert.strictEqual(cache['mal:1'].source, 'malapi', 'source malapi');
 
-      // 2. Without a key: Jikan, then on a connect timeout AniList, with one Jikan attempt.
+      // 2. Without a key: Tenrai, then on a connect timeout AniList, with one Tenrai attempt.
       const result2 = await mal.ratings([2], console);
-      assert.ok(jikanCalls > 0, 'Jikan called');
-      assert.strictEqual(jikanCalls, 1, 'one Jikan attempt (no retry on connect timeout)');
+      assert.ok(tenraiCalls > 0, 'Tenrai called');
+      assert.strictEqual(tenraiCalls, 1, 'one Tenrai attempt (no retry on connect timeout)');
+      assert.strictEqual(deadHostCalls, 0, 'the shut-down Jikan host is never called');
       assert.ok(anilistCalls > 0, 'AniList called');
+    } finally {
+      global.fetch = realFetch;
+    }
+  });
+
+  // ---- A14b: Tenrai payloads (real Jikan-v4-shaped bodies) parse to the right MAL bands ----
+  await ok('A14b: Tenrai — URL, real payload shapes, 404, bands', async () => {
+    const mal = require('../src/services/mal');
+    const realFetch = global.fetch;
+    const urls = [];
+    const bodies = {
+      1: { rating: 'R - 17+ (violence & profanity)' },       // Cowboy Bebop
+      20: { rating: 'PG-13 - Teens 13 or older' },            // Naruto
+      10620: { rating: 'R+ - Mild Nudity' },                  // Mirai Nikki
+      777: { rating: 'Rx - Hentai' },
+    };
+    global.fetch = async (url) => {
+      urls.push(String(url));
+      const m = String(url).match(/api\.tenrai\.org\/v1\/anime\/(\d+)/);
+      if (!m) throw new Error('unexpected host ' + url);
+      const id = Number(m[1]);
+      if (id === 404) return { status: 404, ok: false, json: async () => ({}) };
+      return { status: 200, ok: true, json: async () => ({ data: bodies[id] || { rating: 'G - All Ages' } }) };
+    };
+    try {
+      const v = await mal.fetchRating(1);
+      assert.deepStrictEqual({ c: v.code, a: v.minAge, ad: v.adult, aa: v.adultish }, { c: 'R', a: 17, ad: false, aa: false }, 'Bebop R/17');
+      assert.strictEqual(urls[0], 'https://api.tenrai.org/v1/anime/1', 'exact Tenrai URL');
+      const n = await mal.fetchRating(20);
+      assert.strictEqual(n.code, 'PG-13'); assert.strictEqual(n.minAge, 13);
+      const rp = await mal.fetchRating(10620);
+      assert.strictEqual(rp.code, 'R+'); assert.strictEqual(rp.adultish, true, 'R+ is adultish');
+      const rx = await mal.fetchRating(777);
+      assert.strictEqual(rx.adult, true, 'Rx is adult');
+      const nf = await mal.fetchRating(404);
+      assert.strictEqual(nf.code, null, '404 -> unrated');
+      assert.ok(urls.every((u) => u.startsWith('https://api.tenrai.org/v1/anime/')), 'only Tenrai was called');
     } finally {
       global.fetch = realFetch;
     }

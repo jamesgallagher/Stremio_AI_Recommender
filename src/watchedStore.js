@@ -594,7 +594,10 @@ async function enrichPending(profileId, log = console, { limit = 40 } = {}) {
     const hit = animeMap.lookup(r.imdb_id, r.tmdb_id);
     if (hit?.mal) anime.set(r.simkl_id, hit.mal);
   }
-  const malVerdicts = anime.size ? await mal.ratings([...anime.values()], log) : new Map();
+  // Pass the profile's MAL client id (personal, else server) so the official MAL API answers first.
+  let malClientId = '';
+  try { malClientId = settings.resolveMalKey(require('./config').getProfile(profileId)).key; } catch { /* server key / none */ }
+  const malVerdicts = anime.size ? await mal.ratings([...anime.values()], log, { malClientId }) : new Map();
 
   let enriched = 0;
   for (const r of rows) {

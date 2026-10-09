@@ -1,4 +1,5 @@
-// MyAnimeList age classification, via Jikan (free, keyless, community-run).
+// MyAnimeList age classification: the official MAL API when a client id is set, else Tenrai
+// (a free, keyless, community-run Jikan-v4-compatible API that replaced Jikan, which shut down 1 Oct 2026).
 //
 // MAL's `rating` field is the thing Common Sense Media never was for anime: a
 // graduated age classification with essentially total coverage, because MAL is
@@ -11,19 +12,19 @@
 //     falls through to the LLM, NEVER to deletion. "No rating" is not "too
 //     old" — conflating those is what emptied the kids catalogs under CSM.
 //
-// SOURCE CHAIN (v6.26): Jikan is community-run and genuinely flaky. Per id the
-// lookup falls Jikan -> AniList (same MAL id; NSFW blacklist only, no age band)
+// SOURCE CHAIN (v6.26): Tenrai is community-run and can be flaky. Per id the
+// lookup falls MAL API -> Tenrai -> AniList (same MAL id; NSFW blacklist only, no age band)
 // -> stale cache -> unrated. So an outage degrades to, at worst, "LLM decides".
 const store = require('../store');
 const governor = require('./governor');
 const anilist = require('./anilist');
 
-const API = 'https://api.jikan.moe/v4';
+const API = 'https://api.tenrai.org/v1'; // Jikan v4 schema; NOT tenrai.app (an expired, for-sale domain)
 const USER_AGENT = 'AI-Recommender/1.0 (+https://github.com/jamesgallagher/Stremio_AI_Recommender)';
 const TTL_MS = 180 * 24 * 3600e3; // classifications are static; cache hard
-// Jikan publishes 3/s AND 60/min. 400ms satisfies the per-second limit but is
-// 150/min, which earns a 429 — caught in live testing. The per-MINUTE budget
-// is the binding one, so pace to ~54/min. Ratings cache for six months, so
+// Tenrai's default limits are unpublished (a server key raises them to 300/min). We keep the
+// conservative pace Jikan needed (~54/min): 400ms would be 150/min, which earned a 429 on
+// Jikan in live testing. Ratings cache for six months, so
 // this is a one-time cost per title, not a per-rebuild one.
 const RATE_DELAY_MS = 1100;
 const LOOKUP_CAP = 60;            // per batch, so one rebuild can't stall on a long list
@@ -57,7 +58,7 @@ function classify(rating) {
   return null;
 }
 
-// Parse a Jikan anime payload into our verdict shape.
+// Parse a Tenrai (Jikan v4 schema) anime payload into our verdict shape.
 function parseAnime(data) {
   if (!data) return null;
   const genres = [...(data.genres || []), ...(data.explicit_genres || [])]
@@ -72,7 +73,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // undici reports every connection-level failure as the opaque "fetch failed";
 // the actual reason lives on err.cause (ECONNRESET, UND_ERR_CONNECT_TIMEOUT,
 // ENOTFOUND, …). Dig it out so an outage is diagnosable from the logs.
-function jikanReason(err) {
+function fetchReason(err) {
   const cause = err && err.cause;
   if (cause && (cause.code || cause.message)) return `${err.message}: ${cause.code || cause.message}`;
   return err ? err.message : 'unknown';
@@ -122,11 +123,11 @@ async function fetchRatingMalApi(malId, clientId) {
   throw lastErr;
 }
 
-// Jikan sits behind Cloudflare and is genuinely flaky: 429s (rate) plus 5xx
+// Tenrai sits behind Cloudflare and can be flaky: 429s (rate) plus 5xx
 // gateway errors (502/503/504) come in bursts, and a torn keep-alive socket
 // surfaces as a network-level "fetch failed". All three are TRANSIENT, so we
 // retry a couple of times before giving up. Giving up still means "unrated ->
-// LLM decides", never a wrong verdict — retry just stops a Jikan hiccup from
+// LLM decides", never a wrong verdict — retry just stops a Tenrai hiccup from
 // dumping a whole seed batch to the LLM unclassified.
 const MAX_ATTEMPTS = 3;
 const RETRY_BACKOFF_MS = 3000;
@@ -136,26 +137,26 @@ async function fetchRating(malId) {
   let lastErr = null;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
-      const res = await governor.schedule('jikan', () => fetch(`${API}/anime/${encodeURIComponent(malId)}`, {
+      const res = await governor.schedule('tenrai', () => fetch(`${API}/anime/${encodeURIComponent(malId)}`, {
         headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       }));
       if (res.status === 404) return { code: null, minAge: null, adult: false, adultish: false };
       // 429 (rate) and 5xx (gateway) are transient — back off and retry.
       if (res.status === 429 || res.status >= 500) {
-        lastErr = new Error(`Jikan anime/${malId} failed (${res.status})`);
+        lastErr = new Error(`Tenrai anime/${malId} failed (${res.status})`);
         lastErr.status = res.status;
         if (attempt < MAX_ATTEMPTS) { await sleep(RETRY_BACKOFF_MS); continue; }
         throw lastErr;
       }
       if (!res.ok) {
-        const err = new Error(`Jikan anime/${malId} failed (${res.status})`);
+        const err = new Error(`Tenrai anime/${malId} failed (${res.status})`);
         err.status = res.status;
         throw err; // 4xx (not 404/429) is not transient — don't retry
       }
       return parseAnime((await res.json())?.data);
     } catch (err) {
-      // Breaker is open (Jikan is down) — don't retry, fall through to AniList now.
+      // Breaker is open (Tenrai is down) — don't retry, fall through to AniList now.
       if (err.circuitOpen) throw err;
       // Non-transient 4xx (not 404/429): don't retry.
       if (err.status && err.status < 500 && err.status !== 429) throw err;
@@ -188,7 +189,7 @@ function isDefinitiveHit(entry, now) {
 // Ratings for many MAL ids. Returns Map<malId, verdict|null>. null means
 // "unknown", which callers MUST treat as "fall through to the LLM", never as
 // a reason to drop. Lookup order per miss (AN-1a): MAL API (when a client id
-// is available) -> Jikan -> AniList (same MAL id) -> stale cache -> unrated.
+// is available) -> Tenrai -> AniList (same MAL id) -> stale cache -> unrated.
 // A rating source outage therefore degrades to, at worst, today's behaviour.
 async function ratings(malIds, log = console, { malClientId } = {}) {
   const out = new Map();
@@ -214,7 +215,7 @@ async function ratings(malIds, log = console, { malClientId } = {}) {
   const fetched = new Map(); // id -> { verdict, source } to persist
   let firstOpenLog = true;   // log the "circuit open" note once, not per title
   for (const id of queue) {
-    // AN-1a: MAL API first (when a client id is available), then Jikan, then AniList.
+    // AN-1a: MAL API first (when a client id is available), then Tenrai, then AniList.
     if (malClientId) {
       try {
         const verdict = await fetchRatingMalApi(id, malClientId);
@@ -222,35 +223,35 @@ async function ratings(malIds, log = console, { malClientId } = {}) {
         await sleep(RATE_DELAY_MS);
         continue;
       } catch (malApiErr) {
-        log.log(`[mal] ${id}: MAL API failed (${jikanReason(malApiErr)}) — falling through to Jikan`);
+        log.log(`[mal] ${id}: MAL API failed (${fetchReason(malApiErr)}) — falling through to Tenrai`);
       }
     }
     try {
       fetched.set(id, { verdict: await fetchRating(id), source: 'mal' });
     } catch (malErr) {
-      // Jikan is down/flaky. Second pass: AniList, by the same MAL id. It can
-      // still enforce the NSFW blacklist even when Jikan can't answer.
+      // Tenrai is down/flaky. Second pass: AniList, by the same MAL id. It can
+      // still enforce the NSFW blacklist even when Tenrai can't answer.
       try {
         const verdict = await anilist.fetchRating(id);
         fetched.set(id, { verdict, source: 'anilist' });
-        // Surface the real reason Jikan failed — "fetch failed" hides the cause
+        // Surface the real reason Tenrai failed — "fetch failed" hides the cause
         // (ECONNRESET, connect timeout, etc.); the breaker note tells us it's
         // down rather than a one-off. Only log per-id detail while the breaker
         // is still closed, so an outage doesn't spam one line per title.
         if (malErr.circuitOpen) {
-          if (firstOpenLog) { log.warn('[mal] Jikan circuit open — routing to AniList until it recovers'); firstOpenLog = false; }
+          if (firstOpenLog) { log.warn('[mal] Tenrai circuit open — routing to AniList until it recovers'); firstOpenLog = false; }
         } else {
-          log.log(`[mal] ${id}: Jikan failed (${jikanReason(malErr)}) — AniList answered${verdict.adult ? ' (adult-blocked)' : ''}`);
+          log.log(`[mal] ${id}: Tenrai failed (${fetchReason(malErr)}) — AniList answered${verdict.adult ? ' (adult-blocked)' : ''}`);
         }
       } catch (aniErr) {
         // Both sources down. Prefer a stale cached verdict over nothing — an
         // expired band is almost certainly still correct. Else unrated -> LLM.
         if (fallback.has(id)) {
           out.set(id, fallback.get(id));
-          log.warn(`[mal] ${id}: Jikan+AniList failed — using stale cached verdict`);
+          log.warn(`[mal] ${id}: Tenrai+AniList failed — using stale cached verdict`);
         } else {
           out.set(id, null);
-          log.warn(`[mal] lookup ${id} failed (Jikan: ${jikanReason(malErr)}; AniList: ${aniErr.message}) — treated as unrated`);
+          log.warn(`[mal] lookup ${id} failed (Tenrai: ${fetchReason(malErr)}; AniList: ${aniErr.message}) — treated as unrated`);
         }
       }
     }
@@ -300,4 +301,4 @@ function blockedForAge(verdict, limit) {
   return verdict.minAge > limit;
 }
 
-module.exports = { ratings, classify, parseAnime, cachedVerdict, isBlacklisted, blockedForAge, BANDS, LOOKUP_CAP, MAL_RATING_MAP };
+module.exports = { ratings, fetchRating, classify, parseAnime, cachedVerdict, isBlacklisted, blockedForAge, BANDS, LOOKUP_CAP, MAL_RATING_MAP };
