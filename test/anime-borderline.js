@@ -900,8 +900,8 @@ const title = (id, genres = []) => ({ key: `anime:${id}`, tmdb_id: String(id), i
       await page.locator('.tab-btn[data-tab="catalogs"]').click();
       await page.waitForTimeout(500);
 
-      // Click the preview button on the Anime row.
-      const animeRow = page.locator('.cat-item', { hasText: 'Anime' });
+      // Click the preview button on the Anime row (the AI catalog, not the trakt one).
+      const animeRow = page.locator('.cat-item', { hasText: 'Recommended for you — Anime' });
       await animeRow.locator('.cat-preview').click();
 
       // Wait until #cpvCount has text.
