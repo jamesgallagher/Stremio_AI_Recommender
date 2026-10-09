@@ -624,6 +624,138 @@ const getRow = (profileId, buildId, tmdbId) => {
     assert.strictEqual(lanes.lookupType('anime'), 'series', 'lookupType(anime) still series');
   });
 
+  // ---- AR1: MDBList age_rating is only a Common Sense age when a real review exists ----
+  await ok('AR1: commonSenseAges reviewedOnly — real review kept, TV-certification restatement dropped, cache learns it', async () => {
+    const mdblist = require('../src/services/mdblist');
+    const mdbStore = require('../src/store');
+    const realFetch = global.fetch;
+    let posts = 0;
+    // Shapes taken from the live MDBList response for Monogatari (tt1480925): commonsense false, age_rating 14, certification TV-14.
+    const batch = [
+      { ids: { imdb: 'tt9001' }, commonsense: true, age_rating: 13, certification: 'TV-14', commonsense_media: { common_sense: 13, parental_source: 1 } },
+      { ids: { imdb: 'tt9002' }, commonsense: false, age_rating: 14, certification: 'TV-14', commonsense_media: { common_sense: 14, parental_source: 2 } },
+      { ids: { imdb: 'tt9003' }, commonsense: true, age_rating: 10, certification: 'TV-PG' },
+    ];
+    global.fetch = async (url, opts) => {
+      if (String(url).includes('api.mdblist.com/imdb/show') && opts && opts.method === 'POST') {
+        posts++;
+        return { ok: true, status: 200, headers: { get: () => null }, json: async () => batch };
+      }
+      throw new Error('unexpected fetch ' + url);
+    };
+    try {
+      assert.strictEqual(mdblist.hasCommonSenseReview(batch[0]), true);
+      assert.strictEqual(mdblist.hasCommonSenseReview(batch[1]), false, 'commonsense:false is not a review');
+      assert.strictEqual(mdblist.hasCommonSenseReview({ commonsense: 12 }), true, 'a numeric value (older responses) counts');
+      assert.strictEqual(mdblist.hasCommonSenseReview(null), false);
+      const ids = ['tt9001', 'tt9002', 'tt9003'];
+      // reviewedOnly: only the real reviews.
+      const only = await mdblist.commonSenseAges('k'.repeat(32), 'series', ids, log, { reviewedOnly: true });
+      assert.deepStrictEqual([...only].sort(), [['tt9001', 13], ['tt9003', 10]], 'tt9002 (no real review) is absent');
+      assert.strictEqual(posts, 1, 'one batch request');
+      // The cache now knows which entries are real: a second reviewedOnly call makes no request.
+      const again = await mdblist.commonSenseAges('k'.repeat(32), 'series', ids, log, { reviewedOnly: true });
+      assert.deepStrictEqual([...again].sort(), [['tt9001', 13], ['tt9003', 10]]);
+      assert.strictEqual(posts, 1, 'served from the cache');
+      const cached = mdbStore.loadCsmCache();
+      assert.strictEqual(cached['show:tt9002'].real, false);
+      assert.strictEqual(cached['show:tt9001'].real, true);
+      // Default mode (movies, series, kids catalogs) is unchanged: it still returns all three ages.
+      const all = await mdblist.commonSenseAges('k'.repeat(32), 'series', ids, log);
+      assert.deepStrictEqual([...all].sort(), [['tt9001', 13], ['tt9002', 14], ['tt9003', 10]], 'default mode keeps the age_rating for every title');
+      assert.strictEqual(posts, 1, 'default mode also served from the cache');
+    } finally {
+      global.fetch = realFetch;
+    }
+  });
+
+  // ---- AR2: a cache entry from before this change (no `real` flag) is re-fetched once in reviewedOnly mode ----
+  await ok('AR2: legacy cache entry without a real flag — reviewedOnly refetches, default mode does not', async () => {
+    const mdblist = require('../src/services/mdblist');
+    const mdbStore = require('../src/store');
+    const realFetch = global.fetch;
+    let posts = 0;
+    global.fetch = async (url, opts) => {
+      posts++;
+      return { ok: true, status: 200, headers: { get: () => null }, json: async () => [{ ids: { imdb: 'tt9101' }, commonsense: false, age_rating: 14, certification: 'TV-14' }] };
+    };
+    try {
+      const c = mdbStore.loadCsmCache();
+      c['show:tt9101'] = { age: 14, at: Date.now() }; // the old shape
+      mdbStore.saveCsmCache(c);
+      const def = await mdblist.commonSenseAges('k'.repeat(32), 'series', ['tt9101'], log);
+      assert.strictEqual(def.get('tt9101'), 14, 'default mode serves the old entry');
+      assert.strictEqual(posts, 0, 'no request in default mode');
+      const rev = await mdblist.commonSenseAges('k'.repeat(32), 'series', ['tt9101'], log, { reviewedOnly: true });
+      assert.strictEqual(rev.has('tt9101'), false, 'refetched, found not to be a real review');
+      assert.strictEqual(posts, 1, 'one request to learn it');
+      assert.strictEqual(mdbStore.loadCsmCache()['show:tt9101'].real, false, 'now remembered');
+    } finally {
+      global.fetch = realFetch;
+    }
+  });
+
+  // ---- AR3: the Monogatari case through the anime chain ----
+  await ok('AR3: anime chain — no real Common Sense review → MAL R blocks (it used to be allowed by a restated TV-14)', async () => {
+    const tier = tiers.TIERS[14];
+    const titles = [title(1), title(2)];
+    // Generic csmAges would say 14 for both (the TV-14 restatement); only title 2 has a real review.
+    const csmGeneric = { tt1: 14, tt2: 13 };
+    const csmReviewed = { tt2: 13 };
+    const mk = (withReviewedSeam) => {
+      const { sources, calls } = makeSources({
+        csm: csmGeneric,
+        malBands: {
+          'anime:1': { code: 'R', minAge: 17, adult: false, adultish: false },
+          'anime:2': { code: 'PG-13', minAge: 13, adult: false, adultish: false },
+        },
+      });
+      if (withReviewedSeam) {
+        sources.csmAgesReviewed = async (_type, imdbIds) => {
+          calls.csmReviewed = (calls.csmReviewed || 0) + 1;
+          const out = new Map();
+          for (const id of imdbIds) if (csmReviewed[id] != null) out.set(id, csmReviewed[id]);
+          return out;
+        };
+      }
+      return { sources, calls };
+    };
+    // With the reviewed-only seam (production): title 1 is decided by MAL (R, 17+ > 14) -> block; title 2 by its real CSM review.
+    {
+      const { sources, calls } = mk(true);
+      const result = await chain.decide(titles, 'anime', tier, sources, log);
+      const r1 = result.get('anime:1');
+      assert.deepStrictEqual({ v: r1.verdict, s: r1.source, g: r1.rating }, { v: 'block', s: 'mal', g: 'R' });
+      const r2 = result.get('anime:2');
+      assert.deepStrictEqual({ v: r2.verdict, s: r2.source, g: r2.rating }, { v: 'allow', s: 'csm', g: '13' });
+      assert.strictEqual(calls.csmReviewed, 1);
+      assert.strictEqual(calls.csm, 0, 'the generic seam is not used for anime when the reviewed one exists');
+    }
+    // Without the seam (compat for sources that lack it): the old behaviour, CSM 14 allows title 1.
+    {
+      const { sources } = mk(false);
+      const result = await chain.decide(titles, 'anime', tier, sources, log);
+      assert.strictEqual(result.get('anime:1').source, 'csm');
+      assert.strictEqual(result.get('anime:1').verdict, 'allow');
+    }
+  });
+
+  // ---- AR4: movies/series never use the reviewed-only seam; real sources expose it ----
+  await ok('AR4: series/movie unchanged (generic csmAges); buildSources exposes csmAgesReviewed', async () => {
+    const tier = tiers.TIERS[14];
+    for (const type of ['series', 'movie']) {
+      const t = [{ key: `${type}:1`, imdb_id: 'tt1', adult: false, title: 'X', year: 2020, genres: [] }];
+      const { sources, calls } = makeSources({ csm: { tt1: 13 } });
+      sources.csmAgesReviewed = async () => { calls.csmReviewed = (calls.csmReviewed || 0) + 1; return new Map(); };
+      const result = await chain.decide(t, type, tier, sources, log);
+      assert.strictEqual(result.get(`${type}:1`).source, 'csm');
+      assert.strictEqual(calls.csmReviewed || 0, 0, `${type} never calls the reviewed-only seam`);
+    }
+    const built = require('../src/ageVerification/sources').buildSources({ id: 'x', name: 'x', filters: {}, keys: {} }, log);
+    assert.strictEqual(typeof built.csmAgesReviewed, 'function');
+    assert.strictEqual(typeof built.csmAges, 'function');
+  });
+
   // ---- AI1: anime profile tier 14 — three candidates ----
   await ok('AI1: anime profile tier 14 — three candidates', async () => {
     const profileId = 'AI1';

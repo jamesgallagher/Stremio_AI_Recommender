@@ -89,6 +89,17 @@ function parseCommonSenseAge(data) {
   return NOT_RATED;
 }
 
+// A REAL Common Sense review exists only when MDBList says so: its `commonsense` flag is true
+// (older/alternate responses carried a number there). Otherwise `age_rating` is MDBList restating
+// the title's TV certification (TV-14 -> 14), NOT a Common Sense age. Monogatari, for one, has
+// `commonsense: false` yet `age_rating: 14` (and MAL rates it R, 17+).
+function hasCommonSenseReview(data) {
+  if (!data) return false;
+  if (data.commonsense === true) return true;
+  return typeof data.commonsense === 'number'
+    || (typeof data.commonsense === 'string' && data.commonsense.trim() !== '');
+}
+
 async function fetchJson(url) {
   // Extract the apikey from the URL for the governor's per-credential partitioning
   const match = url.match(/apikey=([^&]+)/);
@@ -99,21 +110,26 @@ async function fetchJson(url) {
 // Returns the Common Sense age (number) or null if CSM has not rated it.
 // Throws on transport/auth errors so callers can distinguish "not rated"
 // (drop the title) from "lookup broken" (fail the rebuild, keep old list).
-async function commonSenseAge(apiKey, type, imdbId) {
+async function commonSenseInfo(apiKey, type, imdbId) {
   const mediaType = type === 'series' ? 'show' : 'movie';
+  const read = (data) => ({ age: parseCommonSenseAge(data), real: hasCommonSenseReview(data) });
   try {
     const data = await fetchJson(
       `https://api.mdblist.com/imdb/${mediaType}/${encodeURIComponent(imdbId)}?apikey=${encodeURIComponent(apiKey)}`
     );
-    return parseCommonSenseAge(data);
+    return read(data);
   } catch (err) {
     if (err.status && err.status !== 404) throw err; // auth/rate-limit/etc.
     // 404 on the modern endpoint or older deployments: try the legacy API
     const data = await fetchJson(
       `https://mdblist.com/api/?apikey=${encodeURIComponent(apiKey)}&i=${encodeURIComponent(imdbId)}`
     );
-    return parseCommonSenseAge(data);
+    return read(data);
   }
+}
+
+async function commonSenseAge(apiKey, type, imdbId) {
+  return (await commonSenseInfo(apiKey, type, imdbId)).age;
 }
 
 // Look up many titles cheaply, in three tiers (kids-mode refills can gate
@@ -125,7 +141,11 @@ async function commonSenseAge(apiKey, type, imdbId) {
 //    (endpoint variant without CSM fields) rather than mass-dropping titles.
 // 3. Per-title lookups for whatever is left. Transport/auth errors here still
 //    abort — an unverifiable list must not be served (strict, fail-closed).
-async function commonSenseAges(apiKey, type, imdbIds, log = console) {
+//
+// `reviewedOnly` (the anime chain): return an age ONLY for titles with a real Common Sense review
+// (hasCommonSenseReview). Others are simply absent, so the chain moves on to better evidence. Cache
+// entries record `real`; an older entry without it is re-fetched once in this mode.
+async function commonSenseAges(apiKey, type, imdbIds, log = console, { reviewedOnly = false } = {}) {
   const results = new Map();
   const now = Date.now();
   const prefix = type === 'series' ? 'show' : 'movie';
@@ -133,19 +153,26 @@ async function commonSenseAges(apiKey, type, imdbIds, log = console) {
   const misses = [];
   for (const id of imdbIds) {
     const entry = cache[`${prefix}:${id}`];
-    if (entry && now - entry.at < CSM_TTL_MS) results.set(id, entry.age);
-    else misses.push(id);
+    const fresh = entry && now - entry.at < CSM_TTL_MS;
+    if (fresh && reviewedOnly && typeof entry.real === 'boolean') {
+      if (entry.real) results.set(id, entry.age);
+    } else if (fresh && !reviewedOnly) {
+      results.set(id, entry.age);
+    } else {
+      misses.push(id);
+    }
   }
   if (!misses.length) return results;
 
   const fetched = new Map();
+  const realOf = new Map();
   try {
     for (let i = 0; i < misses.length; i += BATCH_SIZE) {
       const chunk = misses.slice(i, i + BATCH_SIZE);
       const infoMap = await mediaInfoBatch(apiKey, type, chunk);
       for (const id of chunk) {
         const info = infoMap.get(id);
-        if (info) fetched.set(id, parseCommonSenseAge(info));
+        if (info) { fetched.set(id, parseCommonSenseAge(info)); realOf.set(id, hasCommonSenseReview(info)); }
       }
     }
     if (misses.length >= 5 && fetched.size && [...fetched.values()].every((v) => v === NOT_RATED)) {
@@ -156,10 +183,12 @@ async function commonSenseAges(apiKey, type, imdbIds, log = console) {
       log.warn(`[csm] batch carried no Common Sense data — sample response fields: ${sample ? Object.keys(sample).join(', ') : '(none)'}`);
       log.warn('[csm] sampling a few titles individually to confirm (capped — a parse bug must not burn the daily quota)');
       fetched.clear();
+      realOf.clear();
     }
   } catch (err) {
     log.warn(`[csm] batch lookup failed (${err.message}) — falling back to per-title lookups`);
     fetched.clear();
+    realOf.clear();
   }
 
   // Cap the per-title fallback. Uncapped, one parse/field regression turns a
@@ -176,7 +205,9 @@ async function commonSenseAges(apiKey, type, imdbIds, log = console) {
     while (queue.length) {
       const id = queue.shift();
       try {
-        fetched.set(id, await commonSenseAge(apiKey, type, id));
+        const info = await commonSenseInfo(apiKey, type, id);
+        fetched.set(id, info.age);
+        realOf.set(id, info.real);
       } catch (err) {
         log.error(`[mdblist] lookup ${id} failed: ${err.message}`);
         throw err; // abort — an unverifiable list must not be served
@@ -192,8 +223,9 @@ async function commonSenseAges(apiKey, type, imdbIds, log = console) {
     if (now - entry.at >= CSM_TTL_MS) delete merged[key];
   }
   for (const [id, age] of fetched) {
-    merged[`${prefix}:${id}`] = { age, at: now };
-    results.set(id, age);
+    const real = realOf.get(id) === true;
+    merged[`${prefix}:${id}`] = { age, at: now, real };
+    if (!reviewedOnly || real) results.set(id, age);
   }
   store.saveCsmCache(merged);
   return results;
@@ -363,7 +395,9 @@ async function testKey(apiKey) {
 
 module.exports = {
   commonSenseAge,
+  commonSenseInfo,
   commonSenseAges,
+  hasCommonSenseReview,
   parseCommonSenseAge,
   listItemsPage,
   mediaInfoBatch,

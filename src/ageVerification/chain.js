@@ -96,7 +96,10 @@ async function decide(titles, type, tier, sources, log = console) {
 
   // Step 1: Common Sense age (≤ csmMaxAge allow, ≥ csmMaxAge+1 block).
   if (undecided.length) {
-    const csm = await safe(sources.csmAges, base, undecided.map((t) => t.imdb_id), log, 'csm');
+    // Anime: MDBList's age_rating is often just the TV certification restated (commonsense:false),
+    // so the anime chain uses the reviewed-only seam when the sources provide one.
+    const csmSeam = isAnime && sources.csmAgesReviewed ? sources.csmAgesReviewed : sources.csmAges;
+    const csm = await safe(csmSeam, base, undecided.map((t) => t.imdb_id), log, 'csm');
     const next = [];
     for (const t of undecided) {
       const age = csm.get(t.imdb_id);
