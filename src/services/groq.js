@@ -299,6 +299,74 @@ async function generateCandidates(type, opts = {}, log = console) {
   return titles;
 }
 
+// AGE-3b: the anime borderline review prompt. The first line is the tier's
+// wording ({kind} → anime); then the instruction; then one block per title
+// (id, title (year), genres, MAL band, Kitsu rating, content tags, AniDB
+// content, the trigger). Lines whose data is missing are omitted.
+function buildAnimeReviewPrompt(tier, items) {
+  const wording = tier.llm.wording.replace('{kind}', 'anime');
+  const blocks = items.map((it) => {
+    const lines = [`id: ${it.id}`];
+    lines.push(`${it.title}${it.year ? ` (${it.year})` : ''}`);
+    if (it.genres && it.genres.length) lines.push(`Genres: ${it.genres.join(', ')}`);
+    if (it.mal && it.mal.code) lines.push(`MAL ${it.mal.code}${it.mal.minAge != null ? ` (${it.mal.minAge}+)` : ''}`);
+    if (it.kitsu && it.kitsu.rating) lines.push(`Kitsu ${it.kitsu.rating}: ${it.kitsu.guide || ''}`);
+    if (it.tags && it.tags.length) lines.push(`Tags: ${it.tags.map((t) => `${t.name} ${t.rank}%`).join(', ')}`);
+    if (it.anidb && it.anidb.content) {
+      const content = Object.entries(it.anidb.content).filter(([, v]) => v != null && v > 0);
+      if (content.length) lines.push(`AniDB: ${content.map(([k, v]) => `${k} ${v}`).join(', ')}`);
+    }
+    if (it.trigger) lines.push(`Flagged because: ${it.trigger}`);
+    return lines.join('\n');
+  });
+
+  return `${wording}
+
+Each title below was already allowed by rating sources but shows content that may be unsuitable. You may only **reject** a title if the evidence shows content beyond that standard. Judge by the evidence, not the title's reputation. Reply with a JSON array of {"id":"…","ok":true|false,"reason":"…"} — reason at most 20 words, required when ok is false.
+
+${blocks.join('\n\n')}`;
+}
+
+// AGE-3b: the anime borderline LLM review. `items` = [{ id, title, year,
+// genres, mal, kitsu, tags:[{name,rank}], anidb:{…}, trigger }]. Returns
+// Map<id, { ok, reason }>: ok === true → {ok:true, reason}; anything else →
+// {ok:false, reason}; the reason is trimmed and cut to 20 words; an id the
+// model omitted is absent. Throws when the whole chain fails (the caller
+// decides). Runs exactly like ageGate: llm.chat with the reviewer system and
+// a validator that drops hallucinated ids and requires verdicts for ≥ 60% of
+// the items (else the chain falls to the next model).
+async function animeAgeReview(tier, items, log = console) {
+  if (!items.length) return new Map();
+  const prompt = buildAnimeReviewPrompt(tier, items);
+  const validIds = new Set(items.map((it) => it.id));
+  const validate = (text) => {
+    const arr = extractArray(text);
+    const out = new Map();
+    for (const x of arr) {
+      if (!x || typeof x.id !== 'string') continue;
+      if (!validIds.has(x.id)) continue; // hallucination guard
+      if (out.has(x.id)) continue; // keep first
+      out.set(x.id, x);
+    }
+    const minVerdicts = Math.ceil(items.length * 0.6);
+    if (out.size < minVerdicts) throw new Error(`only ${out.size}/${items.length} verdicts`);
+    return out;
+  };
+  const results = await llm.chat(
+    settings.llmChain(), [{ role: 'user', content: prompt }],
+    { temperature: 0, system: REVIEWER_SYSTEM, validate }, log,
+  );
+  const out = new Map();
+  for (const [id, x] of results) {
+    const ok = x.ok === true;
+    let reason = x.reason != null ? String(x.reason).trim() : '';
+    const words = reason.split(/\s+/).filter(Boolean);
+    if (words.length > 20) reason = words.slice(0, 20).join(' ');
+    out.set(id, { ok, reason });
+  }
+  return out;
+}
+
 module.exports = {
   ageGate,
   buildAgePrompt,
@@ -307,4 +375,6 @@ module.exports = {
   buildGeneratePrompt,
   parseTitles,
   generateCandidates,
+  animeAgeReview,
+  buildAnimeReviewPrompt,
 };
