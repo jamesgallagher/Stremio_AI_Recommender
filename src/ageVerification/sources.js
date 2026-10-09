@@ -10,6 +10,9 @@ const groq = require('../services/groq');
 const simkl = require('../services/simkl');
 const governor = require('../services/governor');
 const store = require('../store');
+const animeMap = require('../services/animeMap');
+const mal = require('../services/mal');
+const kitsu = require('../services/kitsu');
 
 const TMDB_API = 'https://api.themoviedb.org/3';
 const COUNTRIES = ['AU', 'US', 'GB', 'IE', 'NZ', 'CA'];
@@ -157,9 +160,55 @@ async function llmGate(type, tier, titles, log = console) {
   return out;
 }
 
+// Anime only: MAL bands for a batch of chain titles. Each title is looked up
+// in the anime map (imdb_id + the tmdb id off the key), the MAL id resolved,
+// and ONE mal.ratings call fetches the bands (cheap — cached MAL verdicts).
+// This mirrors rebuild.applyAnimeGate (including the ensureLoaded + the
+// resolveMalKey client id). No MAL id → no entry (the chain's step 2 skips it).
+async function malBands(profile, titles, log = console) {
+  const out = new Map();
+  await animeMap.ensureLoaded(log);
+  const byKey = new Map(); // key -> malId
+  const malIds = new Set();
+  for (const t of titles) {
+    const tmdbId = t.key.split(':')[1];
+    const hit = animeMap.lookup(t.imdb_id, tmdbId);
+    if (hit?.mal) { byKey.set(t.key, hit.mal); malIds.add(hit.mal); }
+  }
+  if (!malIds.size) return out;
+  const verdicts = await mal.ratings([...malIds], log, { malClientId: settings.resolveMalKey(profile).key });
+  for (const [key, malId] of byKey) {
+    const band = verdicts.get(malId);
+    if (band) out.set(key, band);
+  }
+  return out;
+}
+
+// Anime only: Kitsu age ratings for a batch of chain titles. Same anime-map
+// lookup as malBands; the Kitsu service maps the MAL ids to { rating, guide }.
+async function kitsuRatings(profile, titles, log = console) {
+  const out = new Map();
+  await animeMap.ensureLoaded(log);
+  const byKey = new Map(); // key -> malId
+  const malIds = new Set();
+  for (const t of titles) {
+    const tmdbId = t.key.split(':')[1];
+    const hit = animeMap.lookup(t.imdb_id, tmdbId);
+    if (hit?.mal) { byKey.set(t.key, hit.mal); malIds.add(hit.mal); }
+  }
+  if (!malIds.size) return out;
+  const ratings = await kitsu.ageRatings([...malIds], log);
+  for (const [key, malId] of byKey) {
+    const r = ratings.get(String(malId));
+    if (r) out.set(key, r);
+  }
+  return out;
+}
+
 // Build the full source set for a profile. `profile` carries the Simkl
 // connection (for simklCerts, when a real source lands). The chain's `decide`
-// takes this object as its `sources` argument.
+// takes this object as its `sources` argument. The malBands/kitsuRatings seams
+// exist for every profile but only the anime chain calls them.
 function buildSources(profile, log = console) {
   const mdbKey = () => settings.resolveMdblistKey(profile).key;
   return {
@@ -175,6 +224,8 @@ function buildSources(profile, log = console) {
       return key ? mdblist.mediaCerts(key, type, imdbIds, log) : Promise.resolve(new Map());
     },
     llmGate: (type, tier, titles) => llmGate(type, tier, titles, log),
+    malBands: (type, titles) => malBands(profile, titles, log),
+    kitsuRatings: (type, titles) => kitsuRatings(profile, titles, log),
   };
 }
 
