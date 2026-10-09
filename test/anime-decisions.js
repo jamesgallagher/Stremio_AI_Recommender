@@ -290,6 +290,28 @@ async function ok(name, fn) {
     assert.ok(warns.some((m) => m.includes('decision log failed')), 'warn logged');
   });
 
+  // ---- D6b: newBuildId throwing is also contained ----
+  await ok('D6b: logging never fails a build — newBuildId throws, build still returns', async () => {
+    const trending = require('../src/engines/marqueeAnime/trending');
+    const deps = {
+      simklList: () => [{ mal: 1, title: 'Show A', year: 2020, ratings: { mal: { rating: 7, votes: 10 } } }],
+      anilistList: () => [],
+      animeMap: {
+        ensureLoaded: async () => {},
+        byMal: (id) => (id === 1 ? { tv: '1000', imdb: 'tt1000', type: 'TV' } : null),
+        byAnilist: () => null,
+      },
+      listSize: () => 10,
+      tier: () => null,
+      tvMeta: async () => new Map(),
+      decisions: { newBuildId: () => { throw new Error('id boom'); }, record: () => {}, prune: () => {} },
+    };
+    const warns = [];
+    const cands = await trending.build({ name: 'D6b', id: 'D6b' }, { log: { log: () => {}, warn: (m) => warns.push(m) } }, deps);
+    assert.strictEqual(cands.length, 1, 'candidates still returned');
+    assert.ok(warns.some((m) => m.includes('decision log failed')), 'warn logged');
+  });
+
   // ---- D7: no sink = no-op ----
   await ok('D7: no sink = no-op — build works, lane_decisions empty', async () => {
     const trending = require('../src/engines/marqueeAnime/trending');

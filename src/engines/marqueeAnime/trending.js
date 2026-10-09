@@ -28,7 +28,6 @@ async function build(profile, ctx, deps = DEFAULT_DEPS) {
   const name = (profile && (profile.name || profile.id)) || 'profile';
   const sink = deps.decisions || null;
   const decisionRows = new Map();
-  const buildId = sink ? sink.newBuildId() : null;
 
   // 1. Load the anime id map (the reverse lookups the entries are mapped onto).
   await deps.animeMap.ensureLoaded(log);
@@ -292,6 +291,7 @@ async function build(profile, ctx, deps = DEFAULT_DEPS) {
       });
     }
     try {
+      const buildId = sink.newBuildId();
       sink.record(profile.id, 'anime', buildId, [...decisionRows.values()]);
       sink.prune(profile.id, 'anime');
     } catch (err) {
