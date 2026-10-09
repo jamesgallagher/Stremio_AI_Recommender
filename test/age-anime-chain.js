@@ -756,6 +756,30 @@ const getRow = (profileId, buildId, tmdbId) => {
     assert.strictEqual(typeof built.csmAges, 'function');
   });
 
+  // ---- AR5: the one-time purge of restated 'csm' anime verdicts ----
+  await ok('AR5: purgeRestatedCsmVerdicts — drops anime csm verdicts once; movie/series/other sources untouched; idempotent', async () => {
+    const migration = require('../src/anime/migration');
+    const db = require('../src/db');
+    store.init();
+    const c = db.get();
+    const now = Date.now();
+    store.recordVerdict('anime', '9501', 'tv14', 'allow', 'csm', '14', now);
+    store.recordVerdict('anime', '9502', 'tv14', 'block', 'csm', '15', now);
+    store.recordVerdict('anime', '9503', 'tv14', 'allow', 'mal', 'PG-13', now);
+    store.recordVerdict('anime', '9504', 'tv14', 'block', 'llm-review', 'llm', now);
+    store.recordVerdict('series', '9501', 'tv14', 'allow', 'csm', '14', now);
+    store.recordVerdict('movie', '9505', 'tv14', 'allow', 'csm', '12', now);
+    const r1 = migration.purgeRestatedCsmVerdicts(log);
+    assert.deepStrictEqual({ skipped: r1.skipped, removed: r1.removed }, { skipped: false, removed: 2 });
+    const left = c.prepare('SELECT type, tmdb_id, source FROM age_verdicts WHERE tmdb_id IN (\'9501\',\'9502\',\'9503\',\'9504\',\'9505\') ORDER BY type, tmdb_id').all().map((x) => x.type + ':' + x.tmdb_id + ':' + x.source);
+    assert.deepStrictEqual(left, ['anime:9503:mal', 'anime:9504:llm-review', 'movie:9505:csm', 'series:9501:csm']);
+    // A new anime csm verdict recorded after the purge is kept: the purge runs once.
+    store.recordVerdict('anime', '9506', 'tv14', 'allow', 'csm', '13', now);
+    const r2 = migration.purgeRestatedCsmVerdicts(log);
+    assert.deepStrictEqual({ skipped: r2.skipped, removed: r2.removed }, { skipped: true, removed: 0 });
+    assert.ok(c.prepare("SELECT 1 FROM age_verdicts WHERE type = 'anime' AND tmdb_id = '9506'").get(), 'a later verdict survives');
+  });
+
   // ---- AI1: anime profile tier 14 — three candidates ----
   await ok('AI1: anime profile tier 14 — three candidates', async () => {
     const profileId = 'AI1';
