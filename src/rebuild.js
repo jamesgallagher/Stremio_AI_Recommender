@@ -193,7 +193,7 @@ function tmdbIdOf(item) {
 //
 // Survivors carry the MAL band forward as `_certification`, so the LLM judges
 // on a real classification instead of guessing at one.
-async function applyAnimeGate(metas, profile, log = console) {
+async function applyAnimeGate(metas, profile, log = console, onDrop = null) {
   if (!metas.length) return metas;
   await animeMap.ensureLoaded(log);
 
@@ -220,11 +220,13 @@ async function applyAnimeGate(metas, profile, log = console) {
     if (mal.isBlacklisted(v)) {
       log.log(`[anime] "${m.name}" is adult-rated (${v.code || 'flagged'}) — permanently blocked`);
       blocked++;
+      if (onDrop) try { onDrop(m, { outcome: 'rejected_age', stage: 'nsfw', rating: 'mal:' + (v.code || 'flagged'), reason: 'Adult-rated (permanently blocked)' }); } catch {}
       continue;
     }
     if (mal.blockedForAge(v, tier ? tier.malMaxAge : 0)) {
       log.log(`[anime] "${m.name}" rated ${v.code} (${v.minAge}+) > limit — dropped`);
       aged++;
+      if (onDrop) try { onDrop(m, { outcome: 'rejected_age', stage: 'mal', rating: 'mal:' + v.code, reason: 'MAL ' + v.code + ' (' + v.minAge + '+) is above the ' + (tier ? tier.label : 'age') + ' band' }); } catch {}
       continue;
     }
     if (v?.code) m._certification = v.code; // evidence for the LLM

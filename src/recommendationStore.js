@@ -471,7 +471,7 @@ async function ageGatePool(profile, log = console, onProgress = () => {}) {
 // operates on the in-memory staged candidates instead of the live pool.
 // Returns { movie: [...], series: [...], dropped, vetoed } — the filtered
 // candidates with age_classification/certification set in memory.
-async function stagedAgeGate(profile, stagedByType, log = console, onProgress = () => {}) {
+async function stagedAgeGate(profile, stagedByType, log = console, onProgress = () => {}, opts = {}) {
   const rebuild = require('./rebuild');
   const limit = profile.filters?.age_limit || 0;
   onProgress(0, 'Age-gating the staged candidates…');
@@ -484,9 +484,23 @@ async function stagedAgeGate(profile, stagedByType, log = console, onProgress = 
     const cands = stagedByType[type] || [];
     if (!cands.length) continue;
 
+    const isAnimeGate = type === 'anime' && opts.animeBuildId;
+    let decisions = null;
+    if (isAnimeGate) {
+      try { decisions = require('./anime/decisionLog'); } catch {}
+    }
+
     // 1. NSFW + anime band (pure, in memory).
     const metas = cands.map((c) => ({ id: c.imdb_id || c.tmdb_id, _tmdb_id: c.tmdb_id, name: c.title, _rtype: type }));
-    const kept = await rebuild.applyAnimeGate(metas, profile, log);
+    let kept;
+    if (isAnimeGate && decisions) {
+      const onDrop = (m, info) => {
+        decisions.update(profile.id, 'anime', opts.animeBuildId, String(m._tmdb_id), info);
+      };
+      kept = await rebuild.applyAnimeGate(metas, profile, log, onDrop);
+    } else {
+      kept = await rebuild.applyAnimeGate(metas, profile, log);
+    }
     const keptKeys = new Set(kept.map((m) => key(m._rtype, m._tmdb_id)));
     const keptCands = cands.filter((c) => keptKeys.has(key(type, c.tmdb_id)));
     for (const m of kept) {
@@ -521,6 +535,32 @@ async function stagedAgeGate(profile, stagedByType, log = console, onProgress = 
         finalCands.push(c);
       }
       out[type] = finalCands;
+
+      // Anime gate logging (step 2: chain verdicts).
+      if (isAnimeGate && decisions) {
+        try {
+          for (const c of keptCands) {
+            const v = result.get(`${lanes.lookupType(type)}:${c.tmdb_id}`);
+            if (!v) continue;
+            if (v.verdict === 'block') {
+              decisions.update(profile.id, 'anime', opts.animeBuildId, String(c.tmdb_id), {
+                outcome: v.source === 'llm' ? 'rejected_llm' : 'rejected_age',
+                stage: v.source === 'llm' ? 'llm-last-resort' : v.source,
+                rating: v.source === 'llm' ? 'llm' : v.source + ':' + v.rating,
+                reason: v.source === 'llm' ? 'The LLM judged it unsuitable for this age' : v.source + ' rated ' + v.rating + ': above the ' + tier.label + ' limit',
+              });
+            } else if (v.verdict === 'allow') {
+              decisions.update(profile.id, 'anime', opts.animeBuildId, String(c.tmdb_id), {
+                stage: v.source,
+                rating: v.source === 'llm' ? 'llm' : v.source + ':' + v.rating,
+                reason: 'Allowed',
+              });
+            }
+          }
+        } catch (err) {
+          log.warn(`[rec] ${profile.name}: decision log (gate) failed (${err.message})`);
+        }
+      }
     } else {
       out[type] = keptCands;
     }
@@ -735,7 +775,7 @@ async function stagedBuildPool(profile, log = console, onProgress = () => {}, { 
   }
 
   // Age-gate the staged candidates in memory.
-  const ageResult = await stagedAgeGate(profile, stagedByType, log, (pct, label) => onProgress(80 + pct * 0.1, label));
+  const ageResult = await stagedAgeGate(profile, stagedByType, log, (pct, label) => onProgress(80 + pct * 0.1, label), { animeBuildId: ctx.animeBuildId });
   stagedByType.movie = ageResult.movie;
   stagedByType.series = ageResult.series;
   stagedByType.anime = ageResult.anime;

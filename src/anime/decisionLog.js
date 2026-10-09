@@ -175,4 +175,27 @@ function list(profileId, lane, opts = {}) {
   return { rows, total };
 }
 
-module.exports = { init, newBuildId, record, prune, builds, counts, list };
+// rating column convention: for gate rows, rating holds the decision as {source}:{rating}:
+// mal:PG-13, csm:12, au:M, hard-floor:adult, llm (no rating part for the LLM).
+// The list source column from 2a stays the *list* source (simkl+anilist).
+function update(profileId, lane, buildId, itemKey, patch) {
+  init();
+  const conn = db.get();
+  const allowed = new Set(['outcome', 'stage', 'rating', 'reason']);
+  const sets = [];
+  const params = [];
+  for (const [k, v] of Object.entries(patch)) {
+    if (!allowed.has(k)) continue;
+    if (k === 'outcome') {
+      if (!VALID_OUTCOMES.has(v)) throw new Error(`outcome must be one of selected, rejected_age, rejected_llm, filtered (got ${v})`);
+    }
+    sets.push(`${k} = ?`);
+    params.push(v);
+  }
+  if (!sets.length) return false;
+  params.push(profileId, lane, buildId, itemKey);
+  const result = conn.prepare(`UPDATE lane_decisions SET ${sets.join(', ')} WHERE profile_id = ? AND lane = ? AND build_id = ? AND item_key = ?`).run(...params);
+  return result.changes > 0;
+}
+
+module.exports = { init, newBuildId, record, prune, builds, counts, list, update };
