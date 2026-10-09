@@ -147,9 +147,9 @@ async function ok(name, fn) {
     seedRow(profileId, buildId, 3001, 'Anime D');
 
     const unstub1 = stubApplyAnimeGate(new Map());
-    // lanes.lookupType('anime') = 'series', so the key is series:<tmdb_id>.
+    // lanes.verdictType('anime') = 'anime', so the key is anime:<tmdb_id>.
     const verdictMap = new Map([
-      ['series:3001', { verdict: 'block', source: 'csm', rating: '12' }],
+      ['anime:3001', { verdict: 'block', source: 'csm', rating: '12' }],
     ]);
     const unstub2 = stubVerify(verdictMap);
     try {
@@ -180,7 +180,7 @@ async function ok(name, fn) {
 
     const unstub1 = stubApplyAnimeGate(new Map());
     const verdictMap = new Map([
-      ['series:4001', { verdict: 'block', source: 'llm', rating: 'no' }],
+      ['anime:4001', { verdict: 'block', source: 'llm', rating: 'no' }],
     ]);
     const unstub2 = stubVerify(verdictMap);
     try {
@@ -211,7 +211,7 @@ async function ok(name, fn) {
 
     const unstub1 = stubApplyAnimeGate(new Map());
     const verdictMap = new Map([
-      ['series:5001', { verdict: 'allow', source: 'au', rating: 'PG' }],
+      ['anime:5001', { verdict: 'allow', source: 'au', rating: 'PG' }],
     ]);
     const unstub2 = stubVerify(verdictMap);
     try {
@@ -273,7 +273,7 @@ async function ok(name, fn) {
       ['7001', { outcome: 'rejected_age', stage: 'mal', rating: 'mal:R', reason: 'MAL R (17+) is above the TV-14 band' }],
     ]));
     const unstub2 = stubVerify(new Map([
-      ['series:7002', { verdict: 'block', source: 'csm', rating: '12' }],
+      ['anime:7002', { verdict: 'block', source: 'csm', rating: '12' }],
     ]));
     try {
       const makeStaged = () => ({
@@ -334,7 +334,7 @@ async function ok(name, fn) {
     // No step 1 drops; step 2 will trigger the update.
     const unstub1 = stubApplyAnimeGate(new Map());
     const unstub2 = stubVerify(new Map([
-      ['series:9001', { verdict: 'block', source: 'csm', rating: '12' }],
+      ['anime:9001', { verdict: 'block', source: 'csm', rating: '12' }],
     ]));
 
     // Make decisionLog.update throw.

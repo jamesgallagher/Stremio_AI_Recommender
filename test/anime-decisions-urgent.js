@@ -134,11 +134,11 @@ async function ok(name, fn) {
     seedDecisionRow(profileId, buildId, 3004, 'Anime G');
 
     const unstub1 = stubApplyAnimeGate(new Map());
-    // lanes.lookupType('anime') = 'series', so the key is series:<tmdb_id>.
+    // lanes.verdictType('anime') = 'anime', so the key is anime:<tmdb_id>.
     const verdictMap = new Map([
-      ['series:3001', { verdict: 'block', source: 'csm', rating: '12' }],
-      ['series:3002', { verdict: 'allow', source: 'au', rating: 'PG' }],
-      ['series:3003', { verdict: 'block', source: 'llm', rating: 'no' }],
+      ['anime:3001', { verdict: 'block', source: 'csm', rating: '12' }],
+      ['anime:3002', { verdict: 'allow', source: 'au', rating: 'PG' }],
+      ['anime:3003', { verdict: 'block', source: 'llm', rating: 'no' }],
       // 3004: no verdict (unknown)
     ]);
     const unstub2 = stubVerify(verdictMap);
@@ -255,7 +255,7 @@ async function ok(name, fn) {
     ]);
     const unstub1 = stubApplyAnimeGate(dropKeys);
     const unstub2 = stubVerify(new Map([
-      ['series:7002', { verdict: 'block', source: 'csm', rating: '12' }],
+      ['anime:7002', { verdict: 'block', source: 'csm', rating: '12' }],
     ]));
     try {
       seed();

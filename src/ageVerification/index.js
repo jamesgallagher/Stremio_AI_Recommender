@@ -31,8 +31,11 @@ async function verify(titles, type, tier, sources, log = console) {
   for (const t of titles) {
     const v = cached.get(t.key.split(':')[1]);
     if (v) {
-      // (2) answered from cache (source/rating as stored).
-      result.set(t.key, { verdict: v.verdict, source: v.source, rating: v.rating });
+      // (2) answered from cache (source/rating as stored; reason only for anime —
+      // movie/series carry no reason, matching the chain-decided path).
+      const entry = { verdict: v.verdict, source: v.source, rating: v.rating };
+      if (type === 'anime') entry.reason = v.reason;
+      result.set(t.key, entry);
     } else {
       misses.push(t);
     }
@@ -44,7 +47,8 @@ async function verify(titles, type, tier, sources, log = console) {
       result.set(key, v);
       // (4) record the new definitive verdicts (unknown is never stored, A5).
       if (v.verdict === 'allow' || v.verdict === 'block') {
-        verdictStore.recordVerdict(type, key.split(':')[1], tier.id, v.verdict, v.source, v.rating);
+        const title = titles.find((t) => t.key === key)?.title;
+        verdictStore.recordVerdict(type, key.split(':')[1], tier.id, v.verdict, v.source, v.rating, now, { reason: v.reason, title });
       }
     }
   }

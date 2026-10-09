@@ -50,6 +50,9 @@ const LIMITS = {
   // MyAnimeList API v2 (AN-1a): the first source for anime age ratings when a
   // client id is available. Paced at 1 req/s with a breaker.
   mal: { minIntervalMs: 1000, breaker: { threshold: 5, cooldownMs: 60000 } },
+  // Kitsu edge API (AGE-3a): anime age ratings (G/PG/R/R18). Paced at 1 req/s
+  // with a breaker.
+  kitsu: { minIntervalMs: 1000, breaker: { threshold: 5, cooldownMs: 60000 } },
 };
 
 const DEFAULT_BACKOFF_MS = 5000; // when a 429 carries no usable Retry-After
