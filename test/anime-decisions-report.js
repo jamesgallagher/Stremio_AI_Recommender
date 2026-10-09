@@ -411,6 +411,86 @@ function seedTwoBuilds(name) {
       await context.close();
     });
 
+    // ---- B8: the panel's Rebuild recommendations shows its progress IN the panel, and keeps the result ----
+    await ok('B8: Rebuild recommendations — progress and result are shown in the panel', async () => {
+      const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, colorScheme: 'dark' });
+      await context.addCookies([adminCookie]);
+      const page = await context.newPage();
+      page.on('pageerror', (e) => pageErrors.push(e.message));
+      let polls = 0;
+      const steps = [
+        { state: 'running', pct: 10, label: 'Reading history' },
+        { state: 'running', pct: 40, label: 'Age-gating the pool' },
+        { state: 'running', pct: 75, label: 'Reviewing borderline titles' },
+        { state: 'done', pct: 100, result: { stored: 25, seeds: 12 } },
+      ];
+      await page.route('**/api/profiles/*/recommend/build', (r) => r.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ started: true }) }));
+      await page.route('**/api/profiles/*/job', (r) => {
+        polls++;
+        r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ job: steps[Math.min(polls - 1, 3)] }) });
+      });
+      await openAdvanced(page, mainP.id);
+      await page.waitForSelector('.ab-panel .ab-head', { timeout: 10000 });
+      await page.locator('.ab-panel [data-act="ab-rebuild"]').click();
+      const seen = new Set();
+      for (let i = 0; i < 16; i++) {
+        seen.add(await page.locator('.ab-panel [data-tres="ab"]').innerText().catch(() => ''));
+        await page.waitForTimeout(400);
+      }
+      const all = [...seen].join(' | ');
+      assert.ok(all.includes('Reading history — 10%'), 'shows 10%: ' + all);
+      assert.ok(all.includes('Age-gating the pool — 40%'), 'shows 40%: ' + all);
+      assert.ok(all.includes('Reviewing borderline titles — 75%'), 'shows 75%: ' + all);
+      const final = await page.locator('.ab-panel [data-tres="ab"]').innerText();
+      assert.ok(final.includes('25 recommendations from 12 watched seed(s)'), 'result stays after the report reloads: ' + final);
+      assert.ok(await page.locator('.ab-panel [data-act="ab-rebuild"]').isEnabled(), 'button usable again');
+      await page.locator('.sec-box:has(.ab-panel)').first().screenshot({ path: path.join(screenshotDir, 'anime-report-b8.png') });
+      await context.close();
+    });
+
+    // ---- B9: button labels say what they do; "Refresh extra catalogs" shows its progress and result ----
+    await ok('B9: labels — Refresh extra catalogs / Rebuild recommendations; Refresh shows progress', async () => {
+      const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, colorScheme: 'dark' });
+      await context.addCookies([adminCookie]);
+      const page = await context.newPage();
+      page.on('pageerror', (e) => pageErrors.push(e.message));
+      let polls = 0;
+      const steps = [
+        { state: 'queued' },
+        { state: 'running', pct: 40 },
+        { state: 'running', pct: 80 },
+        { state: 'done', pct: 100, result: { 'trakt-anime-teen-series': { ok: true, count: 30 } } },
+      ];
+      await page.route('**/api/profiles/*/rebuild', (r) => r.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ started: true }) }));
+      await page.route('**/api/profiles/*/job', (r) => {
+        polls++;
+        r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ job: steps[Math.min(polls - 1, 3)] }) });
+      });
+      await openAdvanced(page, mainP.id);
+      await page.waitForSelector('.ab-panel .ab-head', { timeout: 10000 });
+      const refreshBtn = page.locator('.btn-rebuild').first();
+      assert.strictEqual((await refreshBtn.innerText()).trim(), 'Refresh extra catalogs');
+      const rebuildBtns = await page.locator('button[onclick^="buildRecs"]').allInnerTexts();
+      assert.deepStrictEqual(rebuildBtns.map((x) => x.trim()), ['Rebuild recommendations']);
+      assert.strictEqual((await page.locator('.ab-panel [data-act="ab-rebuild"]').innerText()).trim(), 'Rebuild recommendations');
+      const body = await page.locator('body').innerText();
+      assert.ok(!body.includes('Rebuild now'), 'no "Rebuild now" label left on the Advanced tab');
+      // The test profile has no Simkl connection, so the button starts disabled; enable it to drive the flow.
+      await refreshBtn.evaluate((el) => { el.disabled = false; });
+      await refreshBtn.click();
+      const seen = new Set();
+      for (let i = 0; i < 16; i++) { seen.add((await refreshBtn.innerText()).trim()); await page.waitForTimeout(400); }
+      const all = [...seen].join(' | ');
+      assert.ok(all.includes('Queued…'), 'queued: ' + all);
+      assert.ok(all.includes('Refreshing 40%'), '40%: ' + all);
+      assert.ok(all.includes('Refreshing 80%'), '80%: ' + all);
+      assert.ok(all.includes('✓ Refreshed'), 'done stays visible on the button: ' + all);
+      const resultLine = await page.locator('[data-tres="extras"]').first().innerText();
+      assert.ok(resultLine.includes('trakt-anime-teen-series: 30 titles ✓'), 'result line stays beside the button: ' + resultLine);
+      await page.locator('.sec-box:has(.btn-rebuild)').first().screenshot({ path: path.join(screenshotDir, 'anime-report-b9.png') });
+      await context.close();
+    });
+
     // ---- No page errors on any page ----
     await ok('B7: no page errors', async () => {
       assert.deepStrictEqual(pageErrors, [], 'no page errors');
