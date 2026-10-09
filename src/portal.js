@@ -1152,7 +1152,9 @@ router.get('/profiles/:id/anime/decisions', async (req, res) => {
   if (!buildRow) return res.status(404).json({ error: 'Unknown build' });
 
   const tier = require('./ageVerification').tierFor(profile.filters)?.label || null;
-  const mode = 'trending';
+  const meta = decisions.getMeta(profile.id, lane, buildId);
+  const mode = meta ? meta.mode : 'trending';
+  const engaged = meta ? meta.engaged : 0;
   const at = buildRow.at;
   const counts = decisions.counts(profile.id, lane, buildId);
 
@@ -1173,7 +1175,7 @@ router.get('/profiles/:id/anime/decisions', async (req, res) => {
     const prevBuildId = idx < builds.length - 1 ? builds[idx + 1].build_id : null;
     if (!prevBuildId) {
       return res.json({
-        builds, build_id: buildId, at, tier, mode, counts,
+        builds, build_id: buildId, at, tier, mode, engaged, counts,
         rows: [], total: 0, page: pageN, pages: 1, page_size: pageSize, no_previous: true,
       });
     }
@@ -1188,7 +1190,7 @@ router.get('/profiles/:id/anime/decisions', async (req, res) => {
     const pageClamped = Math.min(pageN, pages);
     const paged = rows.slice((pageClamped - 1) * pageSize, pageClamped * pageSize);
     return res.json({
-      builds, build_id: buildId, at, tier, mode, counts,
+      builds, build_id: buildId, at, tier, mode, engaged, counts,
       rows: paged.map((r) => shapeRow(r, r.delta)),
       total, page: pageClamped, pages, page_size: pageSize,
     });
@@ -1201,7 +1203,7 @@ router.get('/profiles/:id/anime/decisions', async (req, res) => {
   const pageClamped = Math.min(pageN, pages);
   const { rows } = decisions.list(profile.id, lane, { ...listOpts, offset: (pageClamped - 1) * pageSize });
   return res.json({
-    builds, build_id: buildId, at, tier, mode, counts,
+    builds, build_id: buildId, at, tier, mode, engaged, counts,
     rows: rows.map((r) => shapeRow(r)),
     total, page: pageClamped, pages, page_size: pageSize,
   });

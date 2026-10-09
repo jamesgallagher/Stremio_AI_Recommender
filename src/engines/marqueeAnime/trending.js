@@ -240,6 +240,13 @@ async function build(profile, ctx, deps = DEFAULT_DEPS) {
   candidates.sort((a, b) => (b.rankScore - a.rankScore) || (a.tmdb_id < b.tmdb_id ? -1 : a.tmdb_id > b.tmdb_id ? 1 : 0));
   const kept = candidates.slice(0, target);
 
+  // AN-2 hook 3: when decisionRowsOut is set, expose each candidate's position.
+  if (Array.isArray(ctx.decisionRowsOut)) {
+    for (let i = 0; i < kept.length; i++) {
+      kept[i].position = i;
+    }
+  }
+
   // Name each show from TMDB (its real show title, first-air year and poster), not the
   // per-season AniList/Simkl name. Best effort: a failed lookup keeps the source name.
   let metas = new Map();
@@ -290,13 +297,20 @@ async function build(profile, ctx, deps = DEFAULT_DEPS) {
         because: null,
       });
     }
-    try {
-      const buildId = sink.newBuildId();
-      ctx.animeBuildId = buildId;
-      sink.record(profile.id, 'anime', buildId, [...decisionRows.values()]);
-      sink.prune(profile.id, 'anime');
-    } catch (err) {
-      log.warn(`[marquee-anime] ${name}: decision log failed (${err.message})`);
+    if (Array.isArray(ctx.decisionRowsOut)) {
+      // AN-2 hook 1: caller owns the build — push the rows, skip record/prune/newBuildId.
+      ctx.decisionRowsOut.push(...decisionRows.values());
+    } else {
+      try {
+        const buildId = sink.newBuildId();
+        ctx.animeBuildId = buildId;
+        sink.record(profile.id, 'anime', buildId, [...decisionRows.values()]);
+        // AN-2 hook 2: record the build meta.
+        sink.recordMeta?.(profile.id, 'anime', buildId, { mode: ctx.animeMode || 'trending', engaged: ctx.animeEngaged || 0 });
+        sink.prune(profile.id, 'anime');
+      } catch (err) {
+        log.warn(`[marquee-anime] ${name}: decision log failed (${err.message})`);
+      }
     }
   }
 

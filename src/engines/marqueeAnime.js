@@ -1,12 +1,12 @@
-// Marquee Anime (AN-1b card 1): age-appropriate trending anime from Simkl + AniList.
+// Marquee Anime (AN-2): personalised anime from watched history + trending.
 const settings = require('../settings');
 
-const ALGORITHM_VERSION = 'marquee-anime-a1';
+const ALGORITHM_VERSION = 'marquee-anime-a2';
 
 module.exports = {
   id: 'marquee-anime',
   name: 'Marquee Anime',
-  description: 'Anime series picked from your watched anime; age-appropriate trending until you have watched five.',
+  description: 'Anime series picked from what you have watched; age-appropriate trending until you have watched five.',
   supportedTypes: ['anime'],
   capabilities: { providesRankScore: true, preResolved: true, serveOrder: 'affinity', unrestricted: false },
   requirements(profile) {
@@ -17,7 +17,7 @@ module.exports = {
     return { ok: missing.length === 0, missing };
   },
   async generate(profile, type, ctx) {
-    return require('./marqueeAnime/trending').build(profile, ctx);
+    return require('./marqueeAnime/personalised').build(profile, ctx);
   },
   ALGORITHM_VERSION,
 };

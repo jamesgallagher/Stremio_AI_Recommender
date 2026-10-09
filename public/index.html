@@ -2247,7 +2247,15 @@ function animeReportDraw(id) {
   if (!hasBuilds) {
     head = 'No anime build recorded yet — it appears after the next Marquee Anime build.';
   } else {
-    head = `Last build ${fmtAnimeDate(d.at)} · tier ${esc(d.tier || '—')} · ${d.mode === 'trending' ? 'Trending' : esc(d.mode)}`;
+    let modeText;
+    if (d.mode === 'mixed') {
+      modeText = `Mixed (${d.engaged} of 5 engaged)`;
+    } else if (d.mode === 'personalised') {
+      modeText = `Personalised (${d.engaged} engaged)`;
+    } else {
+      modeText = 'Trending';
+    }
+    head = `Last build ${fmtAnimeDate(d.at)} · tier ${esc(d.tier || '—')} · ${modeText}`;
   }
 
   // Outcome chips (hidden in diff mode and when there are no builds).

@@ -135,4 +135,79 @@ async function tagsFor(ids) {
   return out;
 }
 
-module.exports = { fetchRating, parseMedia, trendingAnime, tagsFor };
+// AN-2: community recommendations for a batch of seed AniList ids.
+// Map<seedAnilistId(number), Rec[]> where Rec = { id, idMal, format, genres,
+// averageScore, popularity, year, title, rating, isAdult }. Batches of 10 ids
+// per request (AniList rejects larger nested pages). A seed AniList doesn't
+// return is simply absent from the Map. Non-OK status throws with .status.
+const RECS_QUERY = `query($ids:[Int],$page:Int){ Page(page:$page, perPage:10){ media(id_in:$ids, type:ANIME){
+  id recommendations(sort:RATING_DESC, perPage:20){ nodes{ rating mediaRecommendation{
+    id idMal format genres averageScore popularity isAdult startDate{year} title{romaji english} } } } } } }`;
+
+async function recommendationsFor(anilistIds) {
+  const unique = [...new Set(anilistIds)];
+  const out = new Map();
+  for (let i = 0; i < unique.length; i += 10) {
+    const batch = unique.slice(i, i + 10);
+    const res = await governor.schedule('anilist', () => fetch(API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ query: RECS_QUERY, variables: { ids: batch, page: 1 } }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    }));
+    if (!res.ok) {
+      const err = new Error(`AniList recommendations batch ${Math.floor(i / 10) + 1} failed (${res.status})`);
+      err.status = res.status;
+      throw err;
+    }
+    const body = await res.json().catch(() => null);
+    const media = body?.data?.Page?.media || [];
+    for (const m of media) {
+      const recs = (m.recommendations?.nodes || [])
+        .filter((n) => n.mediaRecommendation != null && n.mediaRecommendation.isAdult !== true && n.rating > 0)
+        .map((n) => {
+          const r = n.mediaRecommendation;
+          return {
+            id: r.id,
+            idMal: r.idMal,
+            format: r.format,
+            genres: r.genres || [],
+            averageScore: r.averageScore,
+            popularity: r.popularity,
+            year: r.startDate ? r.startDate.year : null,
+            title: (r.title && (r.title.english || r.title.romaji)) || null,
+            rating: n.rating,
+            isAdult: r.isAdult === true,
+          };
+        });
+      if (recs.length) out.set(m.id, recs);
+    }
+  }
+  return out;
+}
+
+// AN-2: tag search — the media array (same node fields as trendingAnime).
+// Reuses LIST_QUERY with POPULARITY_DESC sort and tagIn. `safe` adds the
+// kid-friendly genre/tag exclusions. Non-OK status throws with .status.
+async function tagSearch({ tags, page = 1, safe = false }) {
+  const genreNotIn = safe
+    ? ['Hentai', 'Ecchi', 'Horror', 'Psychological', 'Thriller']
+    : ['Hentai'];
+  const tagNotIn = safe ? ['Nudity', 'Gore', 'Suicide', 'Torture'] : [];
+  const variables = { page, sort: ['POPULARITY_DESC'], tagIn: tags, genreNotIn, tagNotIn };
+  const res = await governor.schedule('anilist', () => fetch(API, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ query: LIST_QUERY, variables }),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  }));
+  if (!res.ok) {
+    const err = new Error(`AniList tag search page ${page} failed (${res.status})`);
+    err.status = res.status;
+    throw err;
+  }
+  const body = await res.json().catch(() => null);
+  return body?.data?.Page?.media || [];
+}
+
+module.exports = { fetchRating, parseMedia, trendingAnime, tagsFor, recommendationsFor, tagSearch };
