@@ -292,6 +292,7 @@ async function build(profile, ctx, deps = DEFAULT_DEPS) {
     }
     try {
       const buildId = sink.newBuildId();
+      ctx.animeBuildId = buildId;
       sink.record(profile.id, 'anime', buildId, [...decisionRows.values()]);
       sink.prune(profile.id, 'anime');
     } catch (err) {
