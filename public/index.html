@@ -1039,7 +1039,7 @@ function catOn(p, c) {
 // so we append "— Movies"/"— Series" ourselves from def.type. This is what makes
 // the two "Watch Later" and two "Recommended for you" rows read distinctly here
 // after the old metadata subtext was removed — a label derived from data.
-function catTypeLabel(t) { return t === 'series' ? 'Series' : 'Movies'; }
+function catTypeLabel(t) { return t === 'series' ? 'Series' : (t === 'anime' ? 'Anime' : 'Movies'); }
 
 // Restriction shown on line 2 (display only — enforcement is server-side).
 function catRestrict(c) {
