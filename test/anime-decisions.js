@@ -150,6 +150,12 @@ async function ok(name, fn) {
     assert.strictEqual(otherBuilds[0].build_id, otherId);
   });
 
+  // ---- D4b: newBuildId is strictly increasing even within one millisecond ----
+  await ok('D4b: newBuildId strictly increasing across a tight loop', async () => {
+    const ids = Array.from({ length: 200 }, () => Number(decisionLog.newBuildId()));
+    for (let i = 1; i < ids.length; i++) assert.ok(ids[i] > ids[i - 1], `id ${i} (${ids[i]}) must exceed id ${i - 1} (${ids[i - 1]})`);
+  });
+
   // ---- D5: engine hooks ----
   await ok('D5: engine hooks — stages, source, TMDB naming, return value', async () => {
     const trending = require('../src/engines/marqueeAnime/trending');

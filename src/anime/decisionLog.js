@@ -34,13 +34,13 @@ function init() {
   ready = true;
 }
 
-// Never equal to the previous id returned in this process (if equal, add 1),
-// so two builds in the same millisecond differ.
+// Strictly increasing within this process: never equal to or below the previous
+// id, even for many calls in the same millisecond (prune/list order by it).
 function newBuildId() {
-  let id = String(Date.now());
-  if (id === lastBuildId) id = String(Number(id) + 1);
-  lastBuildId = id;
-  return id;
+  let n = Date.now();
+  if (lastBuildId !== null && n <= lastBuildId) n = lastBuildId + 1;
+  lastBuildId = n;
+  return String(n);
 }
 
 const VALID_OUTCOMES = new Set(['selected', 'rejected_age', 'rejected_llm', 'filtered']);
