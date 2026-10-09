@@ -10,6 +10,7 @@ const DEFAULT_DEPS = {
   listSize: (p) => require('../../recommendationStore').listSizeFor(p),
   tier: (p) => require('../../ageVerification').tierFor(p.filters || {}),
   tvMeta: (apiKey, ids, log) => require('../marqueeTv/meta').ensureTvMeta(apiKey, ids, { log }),
+  decisions: require('../../anime/decisionLog'),
 };
 
 const isShowType = (t) => t === 'TV' || t === 'ONA';
@@ -25,6 +26,9 @@ const simklMalOf = (item) => {
 async function build(profile, ctx, deps = DEFAULT_DEPS) {
   const log = ctx.log || console;
   const name = (profile && (profile.name || profile.id)) || 'profile';
+  const sink = deps.decisions || null;
+  const decisionRows = new Map();
+  const buildId = sink ? sink.newBuildId() : null;
 
   // 1. Load the anime id map (the reverse lookups the entries are mapped onto).
   await deps.animeMap.ensureLoaded(log);
@@ -101,7 +105,32 @@ async function build(profile, ctx, deps = DEFAULT_DEPS) {
 
   simklItems.forEach((item, i) => {
     const show = deps.animeMap.byMal(item.mal);
-    if (!show || !isShowType(show.type)) return;
+    if (!show) {
+      if (sink) {
+        decisionRows.set(`mal:${item.mal}`, {
+          item_key: `mal:${item.mal}`,
+          title: item.title ?? null,
+          stage: 'no-tt',
+          outcome: 'filtered',
+          source: 'simkl',
+          reason: 'No TMDB show + IMDb id in the anime map',
+        });
+      }
+      return;
+    }
+    if (!isShowType(show.type)) {
+      if (sink) {
+        decisionRows.set(show.tv, {
+          item_key: show.tv,
+          title: item.title ?? null,
+          stage: 'format',
+          outcome: 'filtered',
+          source: 'simkl',
+          reason: `Format ${show.type} is not TV or ONA`,
+        });
+      }
+      return;
+    }
     const rec = record(show);
     better(rec, 'simklPos', i);
     const mal = simklMalOf(item);
@@ -112,7 +141,32 @@ async function build(profile, ctx, deps = DEFAULT_DEPS) {
 
   anilistItems.forEach((media, i) => {
     const show = deps.animeMap.byAnilist(media.id) || deps.animeMap.byMal(media.idMal);
-    if (!show || !isShowType(show.type)) return;
+    if (!show) {
+      if (sink) {
+        decisionRows.set(`anilist:${media.id}`, {
+          item_key: `anilist:${media.id}`,
+          title: (media.title && (media.title.english || media.title.romaji)) ?? null,
+          stage: 'no-tt',
+          outcome: 'filtered',
+          source: 'anilist',
+          reason: 'No TMDB show + IMDb id in the anime map',
+        });
+      }
+      return;
+    }
+    if (!isShowType(show.type)) {
+      if (sink) {
+        decisionRows.set(show.tv, {
+          item_key: show.tv,
+          title: (media.title && (media.title.english || media.title.romaji)) ?? null,
+          stage: 'format',
+          outcome: 'filtered',
+          source: 'anilist',
+          reason: `Format ${show.type} is not TV or ONA`,
+        });
+      }
+      return;
+    }
     const rec = record(show);
     better(rec, 'aniPos', i);
     applyAni(rec, media);
@@ -120,7 +174,32 @@ async function build(profile, ctx, deps = DEFAULT_DEPS) {
 
   kidsItems.forEach((media, i) => {
     const show = deps.animeMap.byAnilist(media.id) || deps.animeMap.byMal(media.idMal);
-    if (!show || !isShowType(show.type)) return;
+    if (!show) {
+      if (sink) {
+        decisionRows.set(`anilist:${media.id}`, {
+          item_key: `anilist:${media.id}`,
+          title: (media.title && (media.title.english || media.title.romaji)) ?? null,
+          stage: 'no-tt',
+          outcome: 'filtered',
+          source: 'kids',
+          reason: 'No TMDB show + IMDb id in the anime map',
+        });
+      }
+      return;
+    }
+    if (!isShowType(show.type)) {
+      if (sink) {
+        decisionRows.set(show.tv, {
+          item_key: show.tv,
+          title: (media.title && (media.title.english || media.title.romaji)) ?? null,
+          stage: 'format',
+          outcome: 'filtered',
+          source: 'kids',
+          reason: `Format ${show.type} is not TV or ONA`,
+        });
+      }
+      return;
+    }
     const rec = record(show);
     better(rec, 'kidsPos', i);
     applyAni(rec, media);
@@ -173,6 +252,51 @@ async function build(profile, ctx, deps = DEFAULT_DEPS) {
     if (m.title) c.title = m.title;
     if (m.year) c.year = m.year;
     if (m.poster) c.poster = m.poster;
+  }
+
+  // 7. Decision log: pool-cap (cut by the pool target) and engine (kept,
+  //    final title after TMDB naming).
+  if (sink) {
+    const sourceOf = (rec) => {
+      const sources = [];
+      if (rec.simklPos != null) sources.push('simkl');
+      if (rec.aniPos != null) sources.push('anilist');
+      if (rec.kidsPos != null) sources.push('kids');
+      return sources.join('+');
+    };
+    for (const c of candidates.slice(target)) {
+      const rec = shows.get(c.tmdb_id);
+      decisionRows.set(c.tmdb_id, {
+        item_key: c.tmdb_id,
+        title: c.title,
+        stage: 'pool-cap',
+        outcome: 'filtered',
+        source: rec ? sourceOf(rec) : null,
+        reason: `Below the pool cut-off (${target})`,
+      });
+    }
+    for (const c of kept) {
+      const rec = shows.get(c.tmdb_id);
+      decisionRows.set(c.tmdb_id, {
+        item_key: c.tmdb_id,
+        title: c.title,
+        year: c.year,
+        poster: c.poster,
+        imdb_id: c.imdb_id,
+        mal_rating: rec ? rec.simklMal : null,
+        stage: 'engine',
+        outcome: 'selected',
+        source: rec ? sourceOf(rec) : null,
+        reason: c.reason,
+        because: null,
+      });
+    }
+    try {
+      sink.record(profile.id, 'anime', buildId, [...decisionRows.values()]);
+      sink.prune(profile.id, 'anime');
+    } catch (err) {
+      log.warn(`[marquee-anime] ${name}: decision log failed (${err.message})`);
+    }
   }
 
   // 8. Stats.
