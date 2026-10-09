@@ -13,6 +13,8 @@ const store = require('../src/ageVerification/store');
 const ageVerify = require('../src/ageVerification');
 const lanes = require('../src/lanes');
 const kitsu = require('../src/services/kitsu');
+// The Kitsu lane paces real requests 1 s apart; the tests stub fetch, so do not wait for it.
+require('../src/services/governor').LIMITS.kitsu.minIntervalMs = 0;
 const decisionLog = require('../src/anime/decisionLog');
 const rebuild = require('../src/rebuild');
 const rec = require('../src/recommendationStore');
