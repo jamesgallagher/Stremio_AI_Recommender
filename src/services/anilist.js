@@ -26,6 +26,10 @@ const LIST_QUERY = `query($page:Int,$sort:[MediaSort],$tagIn:[String],$genreNotI
     }
   }
 }`;
+// AGE-3b: content evidence for the borderline review — adult flag, genres and
+// the ranked content tags for a batch of AniList ids (id_in, perPage 50).
+const TAGS_QUERY = `query($ids:[Int],$page:Int){ Page(page:$page, perPage:50){ media(id_in:$ids, type:ANIME){
+  id isAdult genres tags{ name rank isMediaSpoiler } } } }`;
 const LISTS = {
   trending: { sort: ['TRENDING_DESC'] },
   // Kid-friendly: popular, the AniList 'Kids' demographic tag; never these genres or content tags.
@@ -97,4 +101,38 @@ async function trendingAnime({ list, page }) {
   return body?.data?.Page?.media || [];
 }
 
-module.exports = { fetchRating, parseMedia, trendingAnime };
+// AGE-3b: content evidence for a batch of AniList ids. Returns
+// Map<anilistId(number), { isAdult, genres, tags: [{ name, rank }] }>. Batches
+// of 50 ids per request (id_in, perPage 50) through the 'anilist' governor lane
+// with the same headers/timeout as trendingAnime. Drops tags with
+// isMediaSpoiler === true; missing ids are absent. A non-OK status throws with
+// `.status` (no retry — the caller treats it as "no evidence").
+async function tagsFor(ids) {
+  const unique = [...new Set(ids)];
+  const out = new Map();
+  for (let i = 0; i < unique.length; i += 50) {
+    const batch = unique.slice(i, i + 50);
+    const res = await governor.schedule('anilist', () => fetch(API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ query: TAGS_QUERY, variables: { ids: batch, page: 1 } }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    }));
+    if (!res.ok) {
+      const err = new Error(`AniList tags batch ${Math.floor(i / 50) + 1} failed (${res.status})`);
+      err.status = res.status;
+      throw err;
+    }
+    const body = await res.json().catch(() => null);
+    const media = body?.data?.Page?.media || [];
+    for (const m of media) {
+      const tags = (m.tags || [])
+        .filter((t) => t.isMediaSpoiler !== true)
+        .map((t) => ({ name: t.name, rank: t.rank }));
+      out.set(m.id, { isAdult: m.isAdult === true, genres: m.genres || [], tags });
+    }
+  }
+  return out;
+}
+
+module.exports = { fetchRating, parseMedia, trendingAnime, tagsFor };
