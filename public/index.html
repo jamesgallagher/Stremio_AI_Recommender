@@ -890,12 +890,13 @@ function render(profiles) {
         <div class="sec-title">Recommendations</div>
         <div class="sec-box">
           <div class="row">
-            <button class="ghost btn-rebuild" onclick="rebuildNow('${p.id}', this)" ${p.simkl_connected && !p.status.rebuilding ? '' : 'disabled'}>${p.status.rebuilding ? 'Rebuilding…' : 'Rebuild now'}</button>
-            <span class="muted" style="font-size:11px">Re-runs the extra catalogs (and the pool if watched history moved).</span>
+            <button class="ghost btn-rebuild" onclick="rebuildNow('${p.id}', this)" ${p.simkl_connected && !p.status.rebuilding ? '' : 'disabled'}>${p.status.rebuilding ? 'Refreshing…' : 'Refresh extra catalogs'}</button>
+            <span class="muted" style="font-size:11px">Refreshes the extra catalogs (Watch Later and the curated lists). To rebuild the recommendations themselves, use <b>Rebuild recommendations</b> below.</span>
+            <span class="tres" data-tres="extras"></span>
           </div>
           <label style="margin-top:14px">Recommendation pool <span class="muted">— built from Simkl watched history (TMDB recommendations, recency-weighted)</span></label>
           <div class="row">
-            <button class="ghost" onclick="buildRecs('${p.id}', this)" title="Build the recommendation pool from watched history">Build</button>
+            <button class="ghost" onclick="buildRecs('${p.id}', this)" title="Rebuild the recommendation pool from watched history">Rebuild recommendations</button>
             <button class="ghost" onclick="viewRecs('${p.id}', this)">View</button>
             <button class="ghost" onclick="resetRecs('${p.id}', this)" title="Wipe the pool and your 'don't recommend' flags">Reset</button>
           </div>
@@ -2002,7 +2003,7 @@ async function disconnectSimkl(id) {
 }
 
 // Poll a profile's job progress (1.5s) until it finishes, calling onUpdate with
-// each snapshot. Shared by Build (recs) and Rebuild now (extras).
+// each snapshot. Shared by Rebuild recommendations (recs) and Refresh extra catalogs (extras).
 async function trackJob(id, onUpdate) {
   const deadline = Date.now() + 20 * 60e3;
   while (Date.now() < deadline) {
@@ -2113,31 +2114,43 @@ async function suppressRec(id, type, tmdbId, btn) {
 }
 
 async function rebuildNow(id, btn) {
-  // 202 + queue: the rebuild runs on the global job queue (one at a time) and
-  // reports progress. Poll /job for the percentage; the button shows it live.
+  // 202 + queue: the extras refresh runs on the global job queue (one at a time) and
+  // reports progress. Poll /job for the percentage; the button shows it live, and the
+  // outcome stays on screen in the line beside it (a toast alone vanishes in seconds).
+  const out = document.querySelector(`[data-id="${id}"] [data-tres="extras"]`);
+  const say = (text, cls) => { if (out) { out.textContent = text; out.className = 'tres' + (cls ? ' ' + cls : ''); } };
   btn.disabled = true;
-  btn.textContent = 'Rebuilding…';
+  btn.textContent = 'Refreshing…';
+  say('');
   try {
     await api(`/profiles/${id}/rebuild`, { method: 'POST' }); // 202: enqueued
     const job = await trackJob(id, j => {
       if (!j) return;
-      btn.textContent = j.state === 'queued' ? 'Queued…' : `Rebuilding ${j.pct || 0}%`;
+      btn.textContent = j.state === 'queued' ? 'Queued…' : `Refreshing ${j.pct || 0}%`;
     });
-    if (job && job.state === 'error') { toast('Rebuild failed: ' + (job.error || '')); btn.textContent = '✗ Failed'; }
-    else {
+    if (job && job.state === 'error') {
+      toast('Refresh failed: ' + (job.error || '')); btn.textContent = '✗ Failed';
+      say(' ✗ ' + (job.error || 'refresh failed'), 'err');
+    } else {
       const results = job && job.result;
+      let line = ' ✓ Done';
+      let anyFailed = false;
       if (results && typeof results === 'object' && !results.skipped) {
         const parts = Object.entries(results).filter(([, r]) => r && typeof r === 'object' && 'ok' in r)
-          .map(([t, r]) => `${t}: ${r.ok ? r.count + ' titles ✓' : '✗ ' + r.error}`);
-        if (parts.length) toast(parts.join(' · '));
+          .map(([t, r]) => { if (!r.ok) anyFailed = true; return `${t}: ${r.ok ? r.count + ' titles ✓' : '✗ ' + r.error}`; });
+        if (parts.length) { toast(parts.join(' · ')); line = ' ' + parts.join(' · '); }
+        else line = ' ✓ Nothing to refresh';
       }
-      btn.textContent = '✓ Rebuilt';
+      btn.textContent = '✓ Refreshed';
+      say(line + ' — ' + new Date().toLocaleTimeString('en-AU', { hour: '2-digit', minute: '2-digit' }), anyFailed ? 'err' : 'ok');
     }
   } catch (err) {
-    toast('Rebuild failed: ' + err.message);
+    toast('Refresh failed: ' + err.message);
     btn.textContent = '✗ Failed';
+    say(' ✗ ' + err.message, 'err');
   }
-  pollStatus(); // refresh the badge from server state — non-destructive
+  // Leave the result on the button for a few seconds before the status poll resets its label.
+  setTimeout(pollStatus, 4000);
 }
 
 function copyText(t) { navigator.clipboard.writeText(t).then(() => toast('Copied')); }
@@ -2291,7 +2304,7 @@ function animeReportDraw(id) {
     ${searchTablePager}
     <div style="display:flex;gap:8px;margin-top:10px">
       <button class="ghost mini" data-act="ab-diff" aria-pressed="${st.diff ? 'true' : 'false'}">${st.diff ? 'Back to the latest build' : 'Compare with previous build'}</button>
-      <button class="ghost mini" data-act="ab-rebuild">Rebuild pool now</button></div>
+      <button class="ghost mini" data-act="ab-rebuild">Rebuild recommendations</button></div>
     <span class="tres" data-tres="ab"></span>`;
 
   animeReportBind(panel, id);
@@ -2372,16 +2385,33 @@ function animeReportClick(id, e) {
   }
 }
 
-// Rebuild pool now: call the existing buildRecs (its progress writes to the
-// Recommendations panel's .tres) and reload the report when the job finishes.
+// Rebuild recommendations: the same pool build as the Recommendations "Rebuild recommendations" button, but its progress
+// is shown HERE (in the panel, next to the button the user pressed), not in the Recommendations
+// box far above. When the job finishes the report reloads and the result line stays under it.
 async function animeReportRebuild(id, btn) {
+  const panel = document.querySelector(`.card[data-id="${id}"] .ab-panel`);
+  const say = (text, cls) => {
+    const o = panel && panel.querySelector('[data-tres="ab"]');
+    if (o) { o.textContent = text; o.className = 'tres' + (cls ? ' ' + cls : ''); }
+  };
   btn.disabled = true;
+  say(' ⟳ starting…');
+  let msg = '';
+  let cls = 'ok';
   try {
-    await buildRecs(id, btn);
-    animeReportLoad(id);
-  } finally {
-    btn.disabled = false;
-  }
+    await api(`/profiles/${id}/recommend/build`, { method: 'POST' }); // 202 — runs on the queue
+    const job = await trackJob(id, (j) => say(jobLabel(j) || ' ⟳ starting…'));
+    if (job && job.state === 'error') { msg = ' ✗ ' + (job.error || 'build failed'); cls = 'err'; }
+    else {
+      const r = job && job.result;
+      msg = r
+        ? (r.skipped ? ' — ' + r.reason : ` ✓ ${r.stored} recommendations from ${r.seeds} watched seed(s)`)
+        : ' ✓ recommendation pool rebuilt';
+    }
+  } catch (e) { msg = ' ✗ ' + e.message; cls = 'err'; }
+  await animeReportLoad(id, { quiet: true }); // redraws the panel with the new build
+  say(msg, cls);
+  pollStatus();
 }
 
 // `9 Oct 14:02` — d Mon HH:mm, en-AU local time.
@@ -2732,8 +2762,8 @@ async function pollStatus() {
     if (rb) {
       rb.disabled = !(p.simkl_connected && !p.status.rebuilding);
       const j = p.status.job;
-      rb.textContent = !p.status.rebuilding ? 'Rebuild now'
-        : (j && j.state === 'queued' ? 'Queued…' : `Rebuilding ${(j && j.pct) || 0}%`);
+      rb.textContent = !p.status.rebuilding ? 'Refresh extra catalogs'
+        : (j && j.state === 'queued' ? 'Queued…' : `Refreshing ${(j && j.pct) || 0}%`);
     }
     // Update the MDBList status/result fragment in place (shared renderer).
     const mdblistEl = card.querySelector(`#mdblist-status-${SELECTED}`);
