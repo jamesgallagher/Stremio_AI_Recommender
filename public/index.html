@@ -2321,7 +2321,10 @@ function animeReportRowHtml(r, st) {
   const mal = r.mal_rating != null ? `MAL ${Number(r.mal_rating).toFixed(1)}` : 'MAL —';
   const decision = r.rating ? esc(r.rating) : '—';
   let reason = esc(r.reason || '');
-  if (r.because) reason += ` because: ${esc(r.because)}`;
+  // Where the title was found. A pick's reason already says "because you watched X", so only add this
+  // when the reason does not already name the source (e.g. a rejected title: why it was rejected, then
+  // which watched title it was recommended from).
+  if (r.because && !String(r.reason || '').includes(r.because)) reason += ` · recommended from: ${esc(r.because)}`;
   const badgeClass = r.outcome === 'selected' ? 'badge ok' : (r.outcome === 'rejected_age' || r.outcome === 'rejected_llm') ? 'badge err' : 'badge';
   const badgeText = { selected: 'Selected', rejected_age: 'Rejected · age', rejected_llm: 'Rejected · LLM', filtered: 'Filtered' }[r.outcome] || r.outcome;
   return `<div class="tr-row">
