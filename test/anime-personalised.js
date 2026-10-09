@@ -1002,6 +1002,10 @@ function fakeTrending(candidates, rowsOut) {
   }
 
   console.log(`\nAll personalised anime checks passed (${passed}).${failed ? ` FAILED: ${failed}` : ''}`);
+  // P17 starts the real HTTP server; exiting while its sockets are still closing aborts Node on Windows
+  // ("Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)", exit 127), which stops the npm test chain.
+  // Let the handles drain first.
+  await new Promise((r) => setTimeout(r, 1000));
   process.exit(failed ? 1 : 0);
 })().catch((e) => {
   console.error('Fatal:', e);
