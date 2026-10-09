@@ -384,7 +384,7 @@ const AGE_SOURCE_ORDER = ['csm', 'au', 'us', 'tvdb-au', 'tvdb-us', 'simkl', 'mdb
 //   2. LLM ACB pass (age-limited profiles only) — remove-only, per type.
 // Failures are deleted from the pool (re-evaluated on the next build, not a
 // permanent user rejection). TMDB `adult` porn was already dropped at build.
-async function ageGatePool(profile, log = console, onProgress = () => {}) {
+async function ageGatePool(profile, log = console, onProgress = () => {}, opts = {}) {
   init();
   const rebuild = require('./rebuild');   // lazy — heavy module, avoids load-order surprises
   const groq = require('./services/groq');
@@ -393,9 +393,31 @@ async function ageGatePool(profile, log = console, onProgress = () => {}) {
   const limit = profile.filters?.age_limit || 0;
   onProgress(0, 'Age-gating the pool…');
 
+  // AN-1b 2b-2: the urgent path records the same age-gate decision rows as the
+  // staged path (stagedAgeGate) — only when the anime lane ran (opts.animeBuildId
+  // is set). Logging must never fail a build.
+  let decisions = null;
+  if (opts.animeBuildId) {
+    try { decisions = require('./anime/decisionLog'); } catch {}
+  }
+
   // 1. NSFW + anime band. Shape candidates as the metas applyAnimeGate expects.
   const metas = rows.map((r) => ({ id: r.imdb_id || r.tmdb_id, _tmdb_id: r.tmdb_id, name: r.title, _rtype: r.type }));
-  const kept = await rebuild.applyAnimeGate(metas, profile, log);
+  let kept;
+  if (decisions) {
+    const onDrop = (m, info) => {
+      if (m._rtype === 'anime') {
+        try {
+          decisions.update(profile.id, 'anime', opts.animeBuildId, String(m._tmdb_id), info);
+        } catch (err) {
+          log.warn(`[rec] ${profile.name}: decision log (gate) failed (${err.message})`);
+        }
+      }
+    };
+    kept = await rebuild.applyAnimeGate(metas, profile, log, onDrop);
+  } else {
+    kept = await rebuild.applyAnimeGate(metas, profile, log);
+  }
   const keptKeys = new Set(kept.map((m) => key(m._rtype, m._tmdb_id)));
   for (const m of kept) if (m._certification) setAgeClassification(profile.id, m._rtype, m._tmdb_id, m._certification);
   let dropped = 0;
@@ -435,6 +457,27 @@ async function ageGatePool(profile, log = console, onProgress = () => {}) {
           // stored source from verify(), so cache hits count by their stored source.
           decidedBySource.set(v.source, (decidedBySource.get(v.source) || 0) + 1);
           if (v.verdict === 'block') blockedBySource.set(v.source, (blockedBySource.get(v.source) || 0) + 1);
+        }
+        // AN-1b 2b-2: record the same chain-verdict rows as stagedAgeGate (anime only).
+        if (type === 'anime' && decisions) {
+          try {
+            if (v.verdict === 'block') {
+              decisions.update(profile.id, 'anime', opts.animeBuildId, String(tmdbId), {
+                outcome: v.source === 'llm' ? 'rejected_llm' : 'rejected_age',
+                stage: v.source === 'llm' ? 'llm-last-resort' : v.source,
+                rating: v.source === 'llm' ? 'llm' : v.source + ':' + v.rating,
+                reason: v.source === 'llm' ? 'The LLM judged it unsuitable for this age' : v.source + ' rated ' + v.rating + ': above the ' + tier.label + ' limit',
+              });
+            } else if (v.verdict === 'allow') {
+              decisions.update(profile.id, 'anime', opts.animeBuildId, String(tmdbId), {
+                stage: v.source,
+                rating: v.source === 'llm' ? 'llm' : v.source + ':' + v.rating,
+                reason: 'Allowed',
+              });
+            }
+          } catch (err) {
+            log.warn(`[rec] ${profile.name}: decision log (gate) failed (${err.message})`);
+          }
         }
       }
     }
@@ -983,7 +1026,7 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
     const reason = !ranAny
       ? `engine not ready — missing ${[...new Set(missing)].join(', ') || 'requirements'}`
       : 'no watched titles to seed from';
-    const skipped = { skipped: true, reason, engines: engineIds, movie: m, series: sr };
+    const skipped = { skipped: true, reason, engines: engineIds, movie: m, series: sr, animeBuildId: ctx.animeBuildId };
     if (animeEngine) skipped.anime = results.anime;
     return skipped;
   }
@@ -1024,6 +1067,7 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
     engines: engineIds, // which engine produced each type (SC-03)
     movie: m,           // per-type detail (engine id, stored, or {skipped,missing})
     series: sr,
+    animeBuildId: ctx.animeBuildId, // AN-1b 2b-2: undefined when the anime lane didn't run
   };
   if (animeEngine) result.anime = results.anime;
   return result;
@@ -1437,7 +1481,7 @@ async function buildPool(profile, log = console, onProgress = () => {}, opts = {
   // serve-time band re-check is only a lowered-limit net (unrated → kept, no LLM),
   // so this is the real gate. (An engine with 0 seeds stores nothing → no-op.)
   const stored = (r.movie?.stored || 0) + (r.series?.stored || 0);
-  if (!r.skipped || stored > 0) await ageGatePool(profile, log, (pct, label) => onProgress(85 + pct * 0.15, label)); // 85–100%
+  if (!r.skipped || stored > 0) await ageGatePool(profile, log, (pct, label) => onProgress(85 + pct * 0.15, label), { animeBuildId: r.animeBuildId }); // 85–100%
   return r;
 }
 
