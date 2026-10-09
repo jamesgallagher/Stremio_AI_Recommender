@@ -36,9 +36,32 @@ function getReport(profileId) {
   return row ? JSON.parse(row.report) : null;
 }
 
+// One-time clean-up (7.51.5): before the anime chain counted Common Sense only for REAL reviews, an
+// anime title whose MDBList age_rating was just its TV certification restated (commonsense:false)
+// was recorded as a 'csm' verdict. Verdicts are cached for 30 days, so those would linger and keep
+// shadowing MAL (Monogatari, MAL R, was allowed this way). Drop the anime 'csm' verdicts once; the
+// next build re-judges them with the reviewed-only seam. movie/series verdicts are not touched.
+// Idempotent through a marker row.
+const PURGE_NAME = 'age_verdicts_csm_reviewed_only';
+function purgeRestatedCsmVerdicts(log = console) {
+  init();
+  const conn = db.get();
+  conn.exec('CREATE TABLE IF NOT EXISTS anime_maintenance (name TEXT PRIMARY KEY, done_at INTEGER NOT NULL, detail TEXT);');
+  if (conn.prepare('SELECT 1 FROM anime_maintenance WHERE name = ?').get(PURGE_NAME)) return { skipped: true, removed: 0 };
+  let removed = 0;
+  if (hasTable('age_verdicts')) {
+    removed = Number(conn.prepare("DELETE FROM age_verdicts WHERE type = 'anime' AND source = 'csm'").run().changes || 0);
+  }
+  conn.prepare('INSERT INTO anime_maintenance (name, done_at, detail) VALUES (?, ?, ?)').run(PURGE_NAME, Date.now(), JSON.stringify({ removed }));
+  log.log(`[anime] dropped ${removed} cached anime Common Sense verdict(s) so they are re-judged on real reviews only`);
+  return { skipped: false, removed };
+}
+
 async function runAll(log = console) {
   init();
   const conn = db.get();
+  try { purgeRestatedCsmVerdicts(log); }
+  catch (err) { log.log(`[anime] verdict clean-up failed — ${err.message}`); }
   const profiles = config.listProfiles();
 
   for (const profile of profiles) {
@@ -102,4 +125,4 @@ async function runAll(log = console) {
   }
 }
 
-module.exports = { runAll, getReport };
+module.exports = { runAll, getReport, purgeRestatedCsmVerdicts };
