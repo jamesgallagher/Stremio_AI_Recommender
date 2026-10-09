@@ -30,6 +30,15 @@ function init() {
       PRIMARY KEY (profile_id, lane, build_id, item_key)
     );
     CREATE INDEX IF NOT EXISTS lane_decisions_build ON lane_decisions(profile_id, lane, build_id, outcome);
+    CREATE TABLE IF NOT EXISTS lane_build_meta (
+      profile_id TEXT,
+      lane       TEXT,
+      build_id   TEXT,
+      mode       TEXT,
+      engaged    INTEGER,
+      at         INTEGER,
+      PRIMARY KEY (profile_id, lane, build_id)
+    );
   `);
   ready = true;
 }
@@ -91,11 +100,23 @@ function record(profileId, lane, buildId, rows) {
 
 // Delete rows of every build except the keep newest build_ids for that
 // profile + lane (newest = greatest CAST(build_id AS INTEGER)).
+// AN-2: also deletes the meta rows of every build it deletes.
 function prune(profileId, lane, keep = 3) {
   init();
   const conn = db.get();
   conn.prepare(`
     DELETE FROM lane_decisions
+    WHERE profile_id = ? AND lane = ?
+      AND build_id NOT IN (
+        SELECT build_id FROM lane_decisions
+        WHERE profile_id = ? AND lane = ?
+        GROUP BY build_id
+        ORDER BY CAST(build_id AS INTEGER) DESC
+        LIMIT ?
+      )
+  `).run(profileId, lane, profileId, lane, keep);
+  conn.prepare(`
+    DELETE FROM lane_build_meta
     WHERE profile_id = ? AND lane = ?
       AND build_id NOT IN (
         SELECT build_id FROM lane_decisions
@@ -242,4 +263,29 @@ function diff(profileId, lane, buildId, prevBuildId) {
   return { added, removed };
 }
 
-module.exports = { init, newBuildId, record, prune, builds, counts, list, update, diff };
+// AN-2: build meta — the mode and engaged count for a build.
+const VALID_MODES = new Set(['trending', 'mixed', 'personalised']);
+
+function recordMeta(profileId, lane, buildId, { mode, engaged }) {
+  init();
+  if (!VALID_MODES.has(mode)) {
+    throw new Error(`mode must be one of trending, mixed, personalised (got ${mode})`);
+  }
+  const conn = db.get();
+  conn.prepare(`
+    INSERT OR REPLACE INTO lane_build_meta
+      (profile_id, lane, build_id, mode, engaged, at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(profileId, lane, buildId, mode, engaged, Date.now());
+}
+
+function getMeta(profileId, lane, buildId) {
+  init();
+  const conn = db.get();
+  const row = conn.prepare(
+    'SELECT mode, engaged FROM lane_build_meta WHERE profile_id = ? AND lane = ? AND build_id = ?'
+  ).get(profileId, lane, buildId);
+  return row ? { mode: row.mode, engaged: row.engaged } : null;
+}
+
+module.exports = { init, newBuildId, record, prune, builds, counts, list, update, diff, recordMeta, getMeta };
