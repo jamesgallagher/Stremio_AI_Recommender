@@ -145,6 +145,32 @@ const profile = (id) => ({ id, name: 'Test ' + id, filters: { engine_anime: 'on'
     assert.deepStrictEqual(calls.map((c) => c.aid), [1, 2, 3, 4, 5]);
   });
 
+  // W11: a rejected client name stops the run at once (no hammering AniDB every tick).
+  await ok('W11 client error stops the run', async () => {
+    const pool = [1, 2, 3, 4].map((n) => ({ tmdb_id: n, imdb_id: 'tt' + n }));
+    const map = { tt1: { anidb: 1 }, tt2: { anidb: 2 }, tt3: { anidb: 3 }, tt4: { anidb: 4 } };
+    const { calls, deps } = mkDeps({ pool, map, results: { 1: { error: 'client' } } });
+    const r = await warmUp(profile('w11'), { deps });
+    assert.strictEqual(r.stopped, 'client');
+    assert.deepStrictEqual(calls.map((c) => c.aid), [1], 'only one call was made');
+    assert.strictEqual(r.fetched, 0);
+  });
+
+  // W12: three consecutive failures stop the run; a success in between resets the count.
+  await ok('W12 three consecutive errors stop the run', async () => {
+    const pool = [1, 2, 3, 4, 5, 6].map((n) => ({ tmdb_id: n, imdb_id: 'tt' + n }));
+    const map = { tt1: { anidb: 1 }, tt2: { anidb: 2 }, tt3: { anidb: 3 }, tt4: { anidb: 4 }, tt5: { anidb: 5 }, tt6: { anidb: 6 } };
+    let m = mkDeps({ pool, map, results: { 1: { error: 'timeout' }, 2: { error: 'timeout' }, 3: { error: 'timeout' } } });
+    let r = await warmUp(profile('w12a'), { deps: m.deps });
+    assert.strictEqual(r.stopped, 'errors');
+    assert.deepStrictEqual(m.calls.map((c) => c.aid), [1, 2, 3], 'stopped after the third failure');
+    // error, success, error, error: the success resets the run, so it does NOT stop.
+    m = mkDeps({ pool, map, results: { 1: { error: 'timeout' }, 3: { error: 'timeout' }, 4: { error: 'timeout' } } });
+    r = await warmUp(profile('w12b'), { deps: m.deps });
+    assert.strictEqual(r.stopped, null);
+    assert.deepStrictEqual(m.calls.map((c) => c.aid), [1, 2, 3, 4, 5, 6]);
+  });
+
   // W6: off / no client.
   await ok('W6 off / no client', async () => {
     const pool = [{ tmdb_id: 1, imdb_id: 'tt1' }];

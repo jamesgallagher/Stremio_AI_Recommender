@@ -74,21 +74,29 @@ async function warmUp(profile, { log = console, deps = DEFAULT_DEPS } = {}) {
     let budget = Math.min(WARM_PER_TICK, headroom);
 
     // 6. Walk pending in order, one at a time
+    let consecutiveErrors = 0;
     for (const aid of pendingAids) {
       if (budget <= 0) break;
       const r = await anidbMod.getAnime(aid, profile, log);
       if (r.cached) {
         result.cached++;
         result.pending--;
+        consecutiveErrors = 0;
       } else if (r.data) {
         result.fetched++;
         result.pending--;
         budget--;
+        consecutiveErrors = 0;
       } else if (r.skipped === 'repeat') {
         // tried within 24h — leave pending, no budget used
       } else if (r.error) {
         budget--;
-        // failed lookup — leave pending, continue
+        // A rejected client name will fail every time: stop now, do not hammer AniDB
+        // with a bad client every tick. Three failures in a row mean AniDB is down
+        // or unhappy: stop and try again next tick.
+        if (r.error === 'client') { result.stopped = 'client'; break; }
+        if (++consecutiveErrors >= 3) { result.stopped = 'errors'; break; }
+        // otherwise a single failed lookup — leave pending, continue
       } else if (r.skipped) {
         result.stopped = r.skipped;
         break;
