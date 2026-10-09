@@ -112,10 +112,29 @@ async function ageRatings(malIds, log = console) {
   return out;
 }
 
+// AGE-3b: cache-only ratings — no network. For the borderline review's
+// evidence gather, where an outbound call per title is exactly the latency we
+// refused to accept. Returns Map<malId(string), { rating, guide }> — only ids
+// with a rating within its TTL are present (ids without a rating are absent).
+function cached(malIds) {
+  init();
+  const out = new Map();
+  const now = Date.now();
+  const conn = db.get();
+  for (const id of new Set(malIds)) {
+    const key = String(id);
+    const row = conn.prepare('SELECT rating, guide, at FROM kitsu_ratings WHERE mal_id = ?').get(key);
+    if (!row || !row.rating) continue;
+    if (now - row.at > RATING_TTL_MS) continue;
+    out.set(key, { rating: row.rating, guide: row.guide });
+  }
+  return out;
+}
+
 // Test seam: clear the cache table.
 function _reset() {
   init();
   db.get().exec('DELETE FROM kitsu_ratings;');
 }
 
-module.exports = { ageRatings, _setFetch, _reset };
+module.exports = { ageRatings, cached, _setFetch, _reset };
