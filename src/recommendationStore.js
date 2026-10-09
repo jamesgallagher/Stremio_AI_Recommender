@@ -375,7 +375,7 @@ async function refreshStaleRatings(profileId, mdblistKey, log = console, { now =
 // TV-2 C1: the canonical order of the age chain's source labels for the
 // per-source log line (deterministic sources first, then the hard floor, then
 // the LLM). Only sources with a non-zero count are listed.
-const AGE_SOURCE_ORDER = ['csm', 'au', 'us', 'tvdb-au', 'tvdb-us', 'simkl', 'mdblist', 'tmdb-gb', 'tmdb-ie', 'tmdb-nz', 'tmdb-ca', 'tvdb-gbr', 'tvdb-irl', 'tvdb-nzl', 'tvdb-can', 'hard-floor', 'llm'];
+const AGE_SOURCE_ORDER = ['csm', 'mal', 'au', 'us', 'tvdb-au', 'tvdb-us', 'kitsu', 'simkl', 'mdblist', 'tmdb-gb', 'tmdb-ie', 'tmdb-nz', 'tmdb-ca', 'tvdb-gbr', 'tvdb-irl', 'tvdb-nzl', 'tvdb-can', 'hard-floor', 'llm'];
 
 // Age-gate the pool (docs/v6-features F5). Reuses the shipped v5.2 stack:
 //   1. NSFW blacklist + anime age band (ALL profiles) via rebuild.applyAnimeGate
@@ -438,15 +438,17 @@ async function ageGatePool(profile, log = console, onProgress = () => {}, opts =
       const survivors = getRecommended(profile.id, { type, limit: 100000 });
       if (!survivors.length) continue;
       const titles = survivors.map((r) => ({
-        key: `${lanes.lookupType(type)}:${r.tmdb_id}`,
+        key: `${lanes.verdictType(type)}:${r.tmdb_id}`,
         imdb_id: r.imdb_id,
         adult: r.adult || false,
         title: r.title,
         year: r.year,
-        genres: r.primary_genre ? [r.primary_genre] : [],
+        // Anime candidates carry their full genre list (a comma string); movie/
+        // series keep the single primary_genre form.
+        genres: type === 'anime' ? String(r.genres || '').split(',').map((s) => s.trim()).filter(Boolean) : (r.primary_genre ? [r.primary_genre] : []),
         certification: r.certification || r.age_classification,
       }));
-      const result = await ageVerify.verify(titles, lanes.lookupType(type), tier, sources, log);
+      const result = await ageVerify.verify(titles, lanes.verdictType(type), tier, sources, log);
       for (const [k, v] of result) {
         const tmdbId = k.split(':')[1];
         if (v.verdict === 'block') { hardDrop(profile.id, type, tmdbId); vetoed++; }
@@ -466,13 +468,13 @@ async function ageGatePool(profile, log = console, onProgress = () => {}, opts =
                 outcome: v.source === 'llm' ? 'rejected_llm' : 'rejected_age',
                 stage: v.source === 'llm' ? 'llm-last-resort' : v.source,
                 rating: v.source === 'llm' ? 'llm' : v.source + ':' + v.rating,
-                reason: v.source === 'llm' ? 'The LLM judged it unsuitable for this age' : v.source + ' rated ' + v.rating + ': above the ' + tier.label + ' limit',
+                reason: v.reason || (v.source === 'llm' ? 'The LLM judged it unsuitable for this age' : v.source + ' rated ' + v.rating + ': above the ' + tier.label + ' limit'),
               });
             } else if (v.verdict === 'allow') {
               decisions.update(profile.id, 'anime', opts.animeBuildId, String(tmdbId), {
                 stage: v.source,
                 rating: v.source === 'llm' ? 'llm' : v.source + ':' + v.rating,
-                reason: 'Allowed',
+                reason: v.reason || 'Allowed',
               });
             }
           } catch (err) {
@@ -559,18 +561,20 @@ async function stagedAgeGate(profile, stagedByType, log = console, onProgress = 
       onProgress(50, 'Age-checking the staged candidates…');
       const sources = require('./ageVerification/sources').buildSources(profile, log);
       const titles = keptCands.map((c) => ({
-        key: `${lanes.lookupType(type)}:${c.tmdb_id}`,
+        key: `${lanes.verdictType(type)}:${c.tmdb_id}`,
         imdb_id: c.imdb_id,
         adult: c.adult || false,
         title: c.title,
         year: c.year,
-        genres: c.primary_genre ? [c.primary_genre] : [],
+        // Anime candidates carry their full genre list (a comma string); movie/
+        // series keep the single primary_genre form.
+        genres: type === 'anime' ? String(c.genres || '').split(',').map((s) => s.trim()).filter(Boolean) : (c.primary_genre ? [c.primary_genre] : []),
         certification: c.certification || c.age_classification,
       }));
-      const result = await ageVerify.verify(titles, lanes.lookupType(type), tier, sources, log);
+      const result = await ageVerify.verify(titles, lanes.verdictType(type), tier, sources, log);
       const finalCands = [];
       for (const c of keptCands) {
-        const v = result.get(`${lanes.lookupType(type)}:${c.tmdb_id}`);
+        const v = result.get(`${lanes.verdictType(type)}:${c.tmdb_id}`);
         if (v && v.verdict === 'block') { vetoed++; continue; }
         if (v && (v.verdict === 'allow' || v.verdict === 'block')) {
           c.certification = `${v.source}:${v.rating || ''}`;
@@ -583,20 +587,20 @@ async function stagedAgeGate(profile, stagedByType, log = console, onProgress = 
       if (isAnimeGate && decisions) {
         try {
           for (const c of keptCands) {
-            const v = result.get(`${lanes.lookupType(type)}:${c.tmdb_id}`);
+            const v = result.get(`${lanes.verdictType(type)}:${c.tmdb_id}`);
             if (!v) continue;
             if (v.verdict === 'block') {
               decisions.update(profile.id, 'anime', opts.animeBuildId, String(c.tmdb_id), {
                 outcome: v.source === 'llm' ? 'rejected_llm' : 'rejected_age',
                 stage: v.source === 'llm' ? 'llm-last-resort' : v.source,
                 rating: v.source === 'llm' ? 'llm' : v.source + ':' + v.rating,
-                reason: v.source === 'llm' ? 'The LLM judged it unsuitable for this age' : v.source + ' rated ' + v.rating + ': above the ' + tier.label + ' limit',
+                reason: v.reason || (v.source === 'llm' ? 'The LLM judged it unsuitable for this age' : v.source + ' rated ' + v.rating + ': above the ' + tier.label + ' limit'),
               });
             } else if (v.verdict === 'allow') {
               decisions.update(profile.id, 'anime', opts.animeBuildId, String(c.tmdb_id), {
                 stage: v.source,
                 rating: v.source === 'llm' ? 'llm' : v.source + ':' + v.rating,
-                reason: 'Allowed',
+                reason: v.reason || 'Allowed',
               });
             }
           }
@@ -1111,7 +1115,7 @@ function passesAgeBand(row, filters = {}) {
   if (!tier) return true;                           // no limit: unchanged
   // 1. A stored verdict for THIS tier wins.
   if (row.type && row.tmdb_id) {
-    const v = require('./ageVerification/store').getVerdict(lanes.lookupType(row.type), row.tmdb_id, tier.id);
+    const v = require('./ageVerification/store').getVerdict(lanes.verdictType(row.type), row.tmdb_id, tier.id);
     if (v) return v.verdict === 'allow';
   }
   // 2. No verdict: judge the row's OWN stored classification against the tier (no network).

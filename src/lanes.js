@@ -11,8 +11,12 @@ function itemType(lane) { return ITEM_TYPE[lane] || null; }
 // The type TMDB, MDBList, the age chain and age_verdicts see for a lane (anime
 // titles are TV shows to all of them).
 function lookupType(lane) { return lane === 'anime' ? 'series' : lane; }
+// The type the age chain, the age_verdicts store and the verdict keys use.
+// Anime verdicts are stored as type='anime' (their own lane), so the two lanes
+// can't contaminate each other; movie/series keep their own type.
+function verdictType(lane) { return lane === 'anime' ? 'anime' : lane; }
 // dont_recommend types that suppress a lane's row. A title rejected from a
 // Stremio catalog arrives as its ITEM type ('series'), so the anime lane honours both.
 function dnrTypes(lane) { return lane === 'anime' ? ['anime', 'series'] : [lane]; }
 
-module.exports = { LANES, isLane, itemType, lookupType, dnrTypes };
+module.exports = { LANES, isLane, itemType, lookupType, verdictType, dnrTypes };
