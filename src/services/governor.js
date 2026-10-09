@@ -28,8 +28,8 @@
 //   simkl_get   ~8/s    (cap 10 GET/s)
 //   simkl_post  <1/s    (HARD 1 POST/s write cap — suspension risk if exceeded)
 //   mdblist     ~4/s    (free tier ~1000/day; dayCalls tracked for visibility)
-//   jikan       ~57/min (cap 60/min, also 3/s burst) — MAL age lookups
-//   anilist     ~30/min — AniList fallback when Jikan is down (cap 90/min, but
+//   tenrai      ~57/min (default limits unpublished; Jikan's were 60/min) — MAL age lookups
+//   anilist     ~30/min — AniList fallback when Tenrai is down (cap 90/min, but
 //               they degrade it to 30/min under load; pace to the low ceiling)
 //   groq        ~28/min (cap ~30 RPM) — honours Retry-After on 429
 const LIMITS = {
@@ -44,7 +44,7 @@ const LIMITS = {
   // TVDB v4 (AGE-1): country certifications for the TV-14 chain. Free tier is
   // ~5 req/s — pace just under it.
   tvdb: { minIntervalMs: 200 },
-  jikan: { minIntervalMs: 1050, breaker: { threshold: 5, cooldownMs: 60000 } },
+  tenrai: { minIntervalMs: 1050, breaker: { threshold: 5, cooldownMs: 60000 } },
   anilist: { minIntervalMs: 2000, breaker: { threshold: 5, cooldownMs: 60000 } },
   groq: { minIntervalMs: 2100 },
   // MyAnimeList API v2 (AN-1a): the first source for anime age ratings when a
@@ -83,7 +83,7 @@ function stateFor(service, keyFingerprint) {
 // N times in a row — connection errors or 5xx, i.e. "it's down", NOT 429 which
 // is just rate — the breaker OPENS for a cooldown and schedule() fails fast
 // without calling the network or consuming a slot. This stops us from pounding a
-// dead endpoint (Jikan behind Cloudflare drops connections under sustained
+// dead endpoint (Tenrai/Jikan behind Cloudflare drop connections under sustained
 // retries, which keeps both it and us down) and makes the run fall straight
 // through to the fallback. After the cooldown the next call is a half-open
 // probe: success closes the breaker, failure re-opens it.

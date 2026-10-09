@@ -53,7 +53,7 @@ router.get('/me', (req, res) => {
 
 // Rate-governor snapshot: per-service call totals, today's count vs any daily
 // cap, and current throttle/backoff state. Observability for the heavy paths
-// (Simkl 1-POST/s write cap, TMDB build volume, Jikan 60/min) — GET /api/governor.
+// (Simkl 1-POST/s write cap, TMDB build volume, Tenrai ~60/min) — GET /api/governor.
 // Uses publicStats() which never exposes raw keys or fingerprints.
 router.get('/governor', (req, res) => {
   res.json({ stats: require('./services/governor').publicStats() });

@@ -1,7 +1,7 @@
-// AniList fallback for anime adult signals when MAL/Jikan is down (v6.26).
+// AniList fallback for anime adult signals when MAL/Tenrai is down (v6.26).
 //
 // Queried by the SAME MAL id (`idMal`) the anime map already hands us, so it
-// slots in directly behind Jikan with no new id mapping — see mal.ratings.
+// slots in directly behind Tenrai with no new id mapping — see mal.ratings.
 //
 // WHAT ANILIST CAN AND CANNOT TELL US — do not confuse the two:
 //   * isAdult / a Hentai|Erotica genre -> the terminal NSFW blacklist. Reliable,

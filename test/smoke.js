@@ -6608,23 +6608,23 @@ async function httpTests() {
     console.log('  ✓ jobs: afterActive queues behind a running job (a–d)');
   }
 
-  // Circuit breaker: a service that opts in (jikan) trips after N failures and
+  // Circuit breaker: a service that opts in (tenrai) trips after N failures and
   // then fails fast without touching the network; a service without a breaker
-  // (tmdb) never opens. This is what stops us pounding a down Jikan.
+  // (tmdb) never opens. This is what stops us pounding a down Tenrai.
   {
     const gov = require('../src/services/governor');
     gov._reset();
-    for (let i = 0; i < 5; i++) gov.noteOutcome('jikan', false); // threshold = 5
-    assert.strictEqual(gov.isOpen('jikan'), true);
+    for (let i = 0; i < 5; i++) gov.noteOutcome('tenrai', false); // threshold = 5
+    assert.strictEqual(gov.isOpen('tenrai'), true);
     let called = false;
     await assert.rejects(
-      () => gov.schedule('jikan', () => { called = true; return { status: 200 }; }),
+      () => gov.schedule('tenrai', () => { called = true; return { status: 200 }; }),
       (e) => e.circuitOpen === true,
     );
     assert.strictEqual(called, false); // fn never ran while open
     // A success (half-open probe) closes it again.
-    gov.noteOutcome('jikan', true);
-    assert.strictEqual(gov.isOpen('jikan'), false);
+    gov.noteOutcome('tenrai', true);
+    assert.strictEqual(gov.isOpen('tenrai'), false);
     // A breaker-less service is immune no matter how many failures.
     for (let i = 0; i < 20; i++) gov.noteOutcome('tmdb', false);
     assert.strictEqual(gov.isOpen('tmdb'), false);

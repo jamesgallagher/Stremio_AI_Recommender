@@ -66,7 +66,7 @@ function fakeRes() {
 }
 
 // A fresh EMPTY, non-stale anime index keeps rebuild.applyAnimeGate offline (no
-// Jikan/AniList reach-out) and treats every fixture title as non-anime, so the
+// Tenrai/AniList reach-out) and treats every fixture title as non-anime, so the
 // band step is a clean pass and the LLM verdict cache is the only age authority.
 function offlineAnimeMap() {
   animeMap._setIndex({ at: Date.now(), etag: 'itest', byImdb: {}, byTmdb: {} });
