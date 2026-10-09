@@ -870,6 +870,9 @@ function fakeTrending(candidates, rowsOut) {
   // ---- Browser PB1-PB2 (only with --browser) ----
   if (process.argv.includes('--browser')) {
     const { chromium } = require('playwright');
+    const { provisionAdmin, cookieHeader, attachCookie } = require('./helpers/admin-session');
+    const { token } = provisionAdmin();
+    const restore = attachCookie(BASE, cookieHeader(token));
     const browser = await chromium.launch({ headless: true });
     const screenshotDir = require('path').join(process.env.DATA_DIR, 'screenshots');
     if (!require('fs').existsSync(screenshotDir)) require('fs').mkdirSync(screenshotDir);
@@ -955,6 +958,7 @@ function fakeTrending(candidates, rowsOut) {
       assert.deepStrictEqual(pageErrors, [], 'no page errors');
     });
 
+    restore();
     await browser.close();
   }
 
