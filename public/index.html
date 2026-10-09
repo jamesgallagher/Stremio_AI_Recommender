@@ -904,6 +904,12 @@ function render(profiles) {
           <div class="recs-panel diag" style="display:none;margin-top:10px"></div>
         </div>
 
+        ${p.filters.engine_anime !== 'off' ? `
+        <div class="sec-title">Anime build report</div>
+        <div class="sec-box"><div class="ab-panel" data-ab="${p.id}">
+          <span class="muted">Loading…</span>
+        </div></div>` : ''}
+
         <div class="sec-title">Watch history</div>
         <div class="sec-box">
           <div class="row">
@@ -951,6 +957,7 @@ function activateTab(card, name, { silent = false } = {}) {
   card.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
   card.querySelectorAll('.tab-panel').forEach(pn => pn.classList.toggle('active', pn.dataset.tab === name));
   if (!silent && name === 'advanced') checkSimklStatus(card.dataset.id);
+  if (name === 'advanced') animeReportOpen(card.dataset.id);
   if (name === 'trainer') trainerOpen(card.dataset.id);
   if (name === 'scrobble') scrobbleUnmatchedOpen(card.dataset.id);
 }
@@ -2187,6 +2194,193 @@ function scrobbleUnmatchedOpen(id) {
     }).join('');
     el.innerHTML = `<details><summary>Simkl couldn't match: ${items.length} film${items.length === 1 ? '' : 's'} — retried weekly</summary>${rows}</details>`;
   }).catch(() => { el.innerHTML = ''; });
+}
+
+// AN-1b card 3 — the Anime build report panel (Advanced tab). Read-only: shows
+// why each anime was picked or dropped by the trending engine (lane_decisions).
+// Rendered only for profiles whose anime engine is on. Reuses the Ratings tab's
+// row/pager markup and event style (.tr-row/.tr-cell/.tr-thumb/.tr-pager/
+// .tr-chips/.tr-chip/.tr-search). Lazy-loaded the first time the Advanced tab is
+// shown, and again after a rebuild.
+const ANIME_REPORT = {};
+function animeReportState(id) {
+  let st = ANIME_REPORT[id];
+  if (!st) {
+    st = { outcome: 'selected', q: '', page: 1, diff: false, data: null };
+    ANIME_REPORT[id] = st;
+  }
+  return st;
+}
+
+function animeReportOpen(id) {
+  animeReportLoad(id);
+}
+
+async function animeReportLoad(id, { quiet = false } = {}) {
+  const st = animeReportState(id);
+  const panel = document.querySelector(`.card[data-id="${id}"] .ab-panel`);
+  if (!panel) return;
+  if (!quiet) panel.innerHTML = '<span class="muted">Loading…</span>';
+  const qs = new URLSearchParams();
+  if (st.outcome) qs.set('outcome', st.outcome);
+  if (st.q) qs.set('q', st.q);
+  qs.set('page', String(st.page));
+  if (st.diff) qs.set('diff', '1');
+  try {
+    const d = await api(`/profiles/${id}/anime/decisions?${qs.toString()}`);
+    st.data = d;
+    animeReportDraw(id);
+  } catch (e) {
+    panel.innerHTML = `<span class="tres err">Couldn't load the report: ${esc(e.message)}</span>`;
+  }
+}
+
+function animeReportDraw(id) {
+  const st = animeReportState(id);
+  const panel = document.querySelector(`.card[data-id="${id}"] .ab-panel`);
+  if (!panel || !st.data) return;
+  const d = st.data;
+  const hasBuilds = d.build_id !== null;
+
+  // Header line.
+  let head;
+  if (!hasBuilds) {
+    head = 'No anime build recorded yet — it appears after the next Marquee Anime build.';
+  } else {
+    head = `Last build ${fmtAnimeDate(d.at)} · tier ${esc(d.tier || '—')} · ${d.mode === 'trending' ? 'Trending' : esc(d.mode)}`;
+  }
+
+  // Outcome chips (hidden in diff mode and when there are no builds).
+  const chipsHtml = (hasBuilds && !st.diff) ? `
+    <div class="tr-chips ab-outcomes">
+      <button class="tr-chip" data-outcome="selected" aria-pressed="${st.outcome === 'selected'}">Selected ${d.counts?.selected || 0}</button>
+      <button class="tr-chip" data-outcome="rejected_age" aria-pressed="${st.outcome === 'rejected_age'}">Rejected · age rating ${d.counts?.rejected_age || 0}</button>
+      <button class="tr-chip" data-outcome="rejected_llm" aria-pressed="${st.outcome === 'rejected_llm'}">Rejected · LLM ${d.counts?.rejected_llm || 0}</button>
+      <button class="tr-chip" data-outcome="filtered" aria-pressed="${st.outcome === 'filtered'}">Filtered ${d.counts?.filtered || 0}</button>
+    </div>` : '';
+
+  // Search + table + pager (hidden when there are no builds).
+  let searchTablePager = '';
+  if (hasBuilds) {
+    const rows = d.rows || [];
+    const rowsHtml = d.no_previous
+      ? '<div class="muted">No earlier build to compare with.</div>'
+      : (rows.length ? rows.map((r) => animeReportRowHtml(r, st)).join('') : '<div class="muted">No titles in this view.</div>');
+    const pages = d.pages || 1;
+    searchTablePager = `
+    <div class="tr-search-row"><input type="text" class="tr-search" data-nodirty placeholder="Search titles…" value="${esc(st.q)}"></div>
+    <div class="tr-table">${rowsHtml}</div>
+    <div class="tr-pager">
+      <button class="ghost mini" data-act="ab-prev" ${st.page <= 1 ? 'disabled' : ''}>Prev</button>
+      <span class="muted">Page ${d.page} of ${pages}</span>
+      <button class="ghost mini" data-act="ab-next" ${st.page >= pages ? 'disabled' : ''}>Next</button>
+    </div>`;
+  }
+
+  panel.innerHTML = `
+    <div class="muted ab-head" style="font-size:12px">${head}</div>
+    ${chipsHtml}
+    ${searchTablePager}
+    <div style="display:flex;gap:8px;margin-top:10px">
+      <button class="ghost mini" data-act="ab-diff" aria-pressed="${st.diff ? 'true' : 'false'}">${st.diff ? 'Back to the latest build' : 'Compare with previous build'}</button>
+      <button class="ghost mini" data-act="ab-rebuild">Rebuild pool now</button></div>
+    <span class="tres" data-tres="ab"></span>`;
+
+  animeReportBind(panel, id);
+}
+
+// One .tr-row per decision, five .tr-cells (thumb+title, MAL, decision, reason,
+// badge). In diff mode each row gets a leading + (ok) or − (err) marker.
+function animeReportRowHtml(r, st) {
+  const thumb = r.poster
+    ? `<img class="tr-thumb" src="${esc(r.poster)}" alt="">`
+    : '<span class="tr-thumb"></span>';
+  const title = `${esc(r.title || '?')} <span class="muted">(${r.year != null ? esc(r.year) : '?'})</span>`;
+  const delta = st.diff ? `<span style="color:${r.delta === '+' ? 'var(--ok)' : 'var(--err)'};font-weight:600">${r.delta}</span> ` : '';
+  const mal = r.mal_rating != null ? `MAL ${Number(r.mal_rating).toFixed(1)}` : 'MAL —';
+  const decision = r.rating ? esc(r.rating) : '—';
+  let reason = esc(r.reason || '');
+  if (r.because) reason += ` because: ${esc(r.because)}`;
+  const badgeClass = r.outcome === 'selected' ? 'badge ok' : (r.outcome === 'rejected_age' || r.outcome === 'rejected_llm') ? 'badge err' : 'badge';
+  const badgeText = { selected: 'Selected', rejected_age: 'Rejected · age', rejected_llm: 'Rejected · LLM', filtered: 'Filtered' }[r.outcome] || r.outcome;
+  return `<div class="tr-row">
+    <div class="tr-cell tr-title">${thumb}<span class="tr-tt">${delta}${title}</span></div>
+    <div class="tr-cell">${mal}</div>
+    <div class="tr-cell">${decision}</div>
+    <div class="tr-cell">${reason}</div>
+    <div class="tr-cell"><span class="${badgeClass}">${badgeText}</span></div>
+  </div>`;
+}
+
+// One delegated listener pair per panel, attached once (data-bound flag).
+function animeReportBind(panel, id) {
+  if (panel.dataset.bound) return;
+  panel.dataset.bound = '1';
+  panel.addEventListener('click', (e) => animeReportClick(id, e));
+  panel.addEventListener('input', (e) => {
+    if (!e.target.matches('.tr-search')) return;
+    const v = e.target.value;
+    clearTimeout(panel._searchT);
+    panel._searchT = setTimeout(() => {
+      const st = animeReportState(id);
+      st.q = v;
+      st.page = 1;
+      animeReportLoad(id);
+    }, 300);
+  });
+}
+
+function animeReportClick(id, e) {
+  const st = animeReportState(id);
+  const panel = e.target.closest('.ab-panel');
+  if (!panel) return;
+  // Outcome chip.
+  const chip = e.target.closest('.tr-chip[data-outcome]');
+  if (chip) {
+    st.outcome = chip.dataset.outcome;
+    st.page = 1;
+    animeReportLoad(id);
+    return;
+  }
+  const btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+  switch (btn.dataset.act) {
+    case 'ab-prev':
+      st.page = st.page - 1;
+      animeReportLoad(id);
+      break;
+    case 'ab-next':
+      st.page = st.page + 1;
+      animeReportLoad(id);
+      break;
+    case 'ab-diff':
+      st.diff = !st.diff;
+      st.page = 1;
+      animeReportLoad(id);
+      break;
+    case 'ab-rebuild':
+      animeReportRebuild(id, btn);
+      break;
+  }
+}
+
+// Rebuild pool now: call the existing buildRecs (its progress writes to the
+// Recommendations panel's .tres) and reload the report when the job finishes.
+async function animeReportRebuild(id, btn) {
+  btn.disabled = true;
+  try {
+    await buildRecs(id, btn);
+    animeReportLoad(id);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// `9 Oct 14:02` — d Mon HH:mm, en-AU local time.
+function fmtAnimeDate(at) {
+  const d = new Date(at);
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  return `${d.getDate()} ${months[d.getMonth()]} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
 async function trainerLoad(id, { quiet = false } = {}) {

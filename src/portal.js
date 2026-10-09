@@ -1120,6 +1120,93 @@ router.post('/profiles/:id/trainer/unwatched', async (req, res) => {
   }
 });
 
+// AN-1b card 3 — the anime decision report read API. Read-only: shows why each
+// anime was picked or dropped by the trending engine (lane_decisions). The whole
+// router is admin-guarded (requireAdminApi). Only profiles whose anime engine is
+// on get a report; a profile with the engine off (or unset) is a 404.
+router.get('/profiles/:id/anime/decisions', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  if (!profile.filters || !profile.filters.engine_anime || profile.filters.engine_anime === 'off') {
+    return res.status(404).json({ error: 'Anime engine is off' });
+  }
+  const decisions = require('./anime/decisionLog');
+  const lane = 'anime';
+  const { build, outcome, q, page, diff } = req.query || {};
+  const pageSize = 25;
+  const pageN = Math.max(1, parseInt(page, 10) || 1);
+
+  const builds = decisions.builds(profile.id, lane);
+  if (!builds.length) {
+    return res.json({
+      builds: [], build_id: null,
+      counts: { selected: 0, rejected_age: 0, rejected_llm: 0, filtered: 0 },
+      rows: [], total: 0, page: 1, pages: 1,
+    });
+  }
+
+  // Resolve the build id (default: the newest build).
+  let buildId = build;
+  if (!buildId) buildId = builds[0].build_id;
+  const buildRow = builds.find((b) => b.build_id === buildId);
+  if (!buildRow) return res.status(404).json({ error: 'Unknown build' });
+
+  const tier = require('./ageVerification').tierFor(profile.filters)?.label || null;
+  const mode = 'trending';
+  const at = buildRow.at;
+  const counts = decisions.counts(profile.id, lane, buildId);
+
+  const shapeRow = (r, delta) => {
+    const out = {
+      item_key: r.item_key, imdb_id: r.imdb_id, title: r.title, year: r.year,
+      poster: r.poster, mal_rating: r.mal_rating, stage: r.stage, outcome: r.outcome,
+      source: r.source, rating: r.rating, reason: r.reason, because: r.because,
+    };
+    if (delta != null) out.delta = delta;
+    return out;
+  };
+
+  if (diff === '1' || diff === 1) {
+    // Diff mode: compare buildId with the build just before it. `q` still
+    // filters on title; `outcome` is ignored. No previous build → no_previous.
+    const idx = builds.findIndex((b) => b.build_id === buildId);
+    const prevBuildId = idx < builds.length - 1 ? builds[idx + 1].build_id : null;
+    if (!prevBuildId) {
+      return res.json({
+        builds, build_id: buildId, at, tier, mode, counts,
+        rows: [], total: 0, page: pageN, pages: 1, page_size: pageSize, no_previous: true,
+      });
+    }
+    const { added, removed } = decisions.diff(profile.id, lane, buildId, prevBuildId);
+    let rows = added.map((r) => ({ ...r, delta: '+' })).concat(removed.map((r) => ({ ...r, delta: '-' })));
+    if (q) {
+      const ql = String(q).toLowerCase();
+      rows = rows.filter((r) => (r.title || '').toLowerCase().includes(ql));
+    }
+    const total = rows.length;
+    const pages = Math.max(1, Math.ceil(total / pageSize));
+    const pageClamped = Math.min(pageN, pages);
+    const paged = rows.slice((pageClamped - 1) * pageSize, pageClamped * pageSize);
+    return res.json({
+      builds, build_id: buildId, at, tier, mode, counts,
+      rows: paged.map((r) => shapeRow(r, r.delta)),
+      total, page: pageClamped, pages, page_size: pageSize,
+    });
+  }
+
+  // Normal mode: one page of decisionLog.list (outcome order + title ascending).
+  const listOpts = { build: buildId, outcome: outcome || undefined, q: q || undefined, limit: pageSize, offset: 0 };
+  const { total } = decisions.list(profile.id, lane, listOpts);
+  const pages = Math.max(1, Math.ceil(total / pageSize));
+  const pageClamped = Math.min(pageN, pages);
+  const { rows } = decisions.list(profile.id, lane, { ...listOpts, offset: (pageClamped - 1) * pageSize });
+  return res.json({
+    builds, build_id: buildId, at, tier, mode, counts,
+    rows: rows.map((r) => shapeRow(r)),
+    total, page: pageClamped, pages, page_size: pageSize,
+  });
+});
+
 // MW-04 — remove a title from the profile's Simkl plan-to-watch list (the ✕ on a
 // Watch Later preview cell). Plain list management, NOT a suppression: it writes
 // nothing to dont_recommend, so the title stays eligible for AI recs and other

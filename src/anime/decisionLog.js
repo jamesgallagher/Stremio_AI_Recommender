@@ -198,4 +198,48 @@ function update(profileId, lane, buildId, itemKey, patch) {
   return result.changes > 0;
 }
 
-module.exports = { init, newBuildId, record, prune, builds, counts, list, update };
+// AN-1b card 3: compare two builds' selected sets. `added` = rows of buildId
+// with outcome selected whose item_key is not selected in prevBuildId; `removed`
+// = rows of prevBuildId with outcome selected whose item_key is not selected in
+// buildId. Each is an array of full rows, ordered by title ascending. Synchronous.
+// A build id with no rows (or null) is treated as empty.
+function diff(profileId, lane, buildId, prevBuildId) {
+  init();
+  const conn = db.get();
+  const selectedKeys = (bid) => {
+    if (!bid) return new Set();
+    const rows = conn.prepare(`
+      SELECT item_key FROM lane_decisions
+      WHERE profile_id = ? AND lane = ? AND build_id = ? AND outcome = 'selected'
+    `).all(profileId, lane, bid);
+    return new Set(rows.map((r) => r.item_key));
+  };
+  const byTitle = (a, b) => {
+    const ta = a.title || '';
+    const tb = b.title || '';
+    return ta < tb ? -1 : (ta > tb ? 1 : 0);
+  };
+  const newSel = selectedKeys(buildId);
+  const prevSel = selectedKeys(prevBuildId);
+  const added = [];
+  if (buildId) {
+    const rows = conn.prepare(`
+      SELECT * FROM lane_decisions
+      WHERE profile_id = ? AND lane = ? AND build_id = ? AND outcome = 'selected'
+    `).all(profileId, lane, buildId);
+    for (const r of rows) if (!prevSel.has(r.item_key)) added.push(r);
+  }
+  const removed = [];
+  if (prevBuildId) {
+    const rows = conn.prepare(`
+      SELECT * FROM lane_decisions
+      WHERE profile_id = ? AND lane = ? AND build_id = ? AND outcome = 'selected'
+    `).all(profileId, lane, prevBuildId);
+    for (const r of rows) if (!newSel.has(r.item_key)) removed.push(r);
+  }
+  added.sort(byTitle);
+  removed.sort(byTitle);
+  return { added, removed };
+}
+
+module.exports = { init, newBuildId, record, prune, builds, counts, list, update, diff };
