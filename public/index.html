@@ -2424,10 +2424,18 @@ function fmtAnimeDate(at) {
   return `${d.getDate()} ${months[d.getMonth()]} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
+// AN-3: check if the profile's Marquee Anime engine is on.
+function animeEngineOn(id) {
+  const p = PROFILES.find(x => x.id === id);
+  return !!(p && p.filters && p.filters.engine_anime && p.filters.engine_anime !== 'off');
+}
+
 async function trainerLoad(id, { quiet = false } = {}) {
   const st = trainerState(id);
   const panel = document.querySelector(`.card[data-id="${id}"] .trainer-panel`);
   if (!panel) return;
+  // AN-3: engine switched off while on the Anime tab → fall back to Films.
+  if (st.type === 'anime' && !animeEngineOn(id)) st.type = 'movie';
   if (!quiet) panel.innerHTML = '<span class="muted">loading…</span>';
   try {
     const d = await api(`/profiles/${id}/trainer?type=${st.type}&view=${st.view}&q=${encodeURIComponent(st.q)}&page=${st.page}&page_size=25`);
@@ -2455,7 +2463,7 @@ async function trainerRefreshMeta(id) {
     st.data.counts = d.counts;
     st.data.training = d.training;
     const chips = panel.querySelector('.tr-chips.tr-views');
-    if (chips) chips.innerHTML = TrainerUI.chipsHtml(d.counts, st.view, { hideUnfinished: st.type === 'series' });
+    if (chips) chips.innerHTML = TrainerUI.chipsHtml(d.counts, st.view, { hideUnfinished: st.type === 'series' || st.type === 'anime' });
     const slot = panel.querySelector('.tr-banner-slot');
     if (slot) slot.innerHTML = TrainerUI.bannerHtml(d.training, Date.now(), { rebuilding: st.rebuilding });
   } catch (e) { /* quiet — leave the rows alone */ }
@@ -2465,23 +2473,29 @@ function trainerDraw(id) {
   const st = trainerState(id);
   const panel = document.querySelector(`.card[data-id="${id}"] .trainer-panel`);
   if (!panel || !st.data) return;
+  // AN-3: engine switched off while on the Anime tab → fall back to Films.
+  if (st.type === 'anime' && !animeEngineOn(id)) st.type = 'movie';
   const p = PROFILES.find(x => x.id === id);
   const d = st.data;
   const canRate = !!(p && p.simkl_connected);
   const now = Date.now();
+  const emptyText = st.type === 'series' ? 'No shows in this view yet.' : st.type === 'anime' ? 'No anime in this view yet.' : 'No films in this view yet.';
   const rows = d.items.length
     ? d.items.map(item => TrainerUI.rowHtml(item, { canRate, now })).join('')
-    : `<div class="muted">${st.type === 'series' ? 'No shows in this view yet.' : 'No films in this view yet.'}</div>`;
+    : `<div class="muted">${emptyText}</div>`;
   const pages = Math.max(1, Math.ceil(d.total / d.pageSize));
-  // TV-R §5: the Films | Shows toggle (per-profile state st.type, default movie).
-  const typeToggle = `<div class="tr-chips tr-type"><button class="tr-chip" data-type="movie" aria-pressed="${st.type === 'movie'}">Films</button><button class="tr-chip" data-type="series" aria-pressed="${st.type === 'series'}">Shows</button></div>`;
+  // AN-3: the Films | Shows | Anime toggle (per-profile state st.type, default
+  // movie). The Anime button appears only when the profile's Marquee Anime is on.
+  const animeBtn = animeEngineOn(id) ? `<button class="tr-chip" data-type="anime" aria-pressed="${st.type === 'anime'}">Anime</button>` : '';
+  const typeToggle = `<div class="tr-chips tr-type"><button class="tr-chip" data-type="movie" aria-pressed="${st.type === 'movie'}">Films</button><button class="tr-chip" data-type="series" aria-pressed="${st.type === 'series'}">Shows</button>${animeBtn}</div>`;
+  const noun = st.type === 'series' ? 'shows' : st.type === 'anime' ? 'anime' : 'films';
   panel.innerHTML = `${typeToggle}<div class="tr-banner-slot">${TrainerUI.bannerHtml(d.training, now, { rebuilding: st.rebuilding })}</div>
-    <div class="tr-chips tr-views">${TrainerUI.chipsHtml(d.counts, st.view, { hideUnfinished: st.type === 'series' })}</div>
+    <div class="tr-chips tr-views">${TrainerUI.chipsHtml(d.counts, st.view, { hideUnfinished: st.type === 'series' || st.type === 'anime' })}</div>
     <div class="tr-search-row"><input type="text" class="tr-search" data-nodirty placeholder="Search titles…" value="${esc(st.q)}" title="${esc(TrainerUI.TIPS.search)}"></div>
     <div class="tr-table">${rows}</div>
     <div class="tr-pager">
       <button class="ghost mini" data-act="prev" title="${esc(TrainerUI.TIPS.prev)}" ${st.page <= 1 ? 'disabled' : ''}>Prev</button>
-      <span class="muted">${TrainerUI.pagerText(d.page, d.pageSize, d.total)}</span>
+      <span class="muted">${TrainerUI.pagerText(d.page, d.pageSize, d.total, noun)}</span>
       <button class="ghost mini" data-act="next" title="${esc(TrainerUI.TIPS.next)}" ${st.page >= pages ? 'disabled' : ''}>Next</button>
     </div>`;
   trainerBind(panel, id);

@@ -24,6 +24,10 @@
     quick: { items: [], page: 0, handled: new Set(), current: 0, counts: null, training: null, left: 0, counted: new Set(), advanceT: null },
   };
 
+  function animeEngineOn() {
+    return !!(st.settings && st.settings.filters && st.settings.filters.engine_anime && st.settings.filters.engine_anime !== 'off');
+  }
+
   const queue = T.createRateQueue({
     send: (key, rating, o) => postRate(key, rating, o),
     delayMs: 800,
@@ -87,6 +91,7 @@
   // Series engine is not Marquee TV) ----
   function drawNotice() {
     if (!st.settings) { els.notice.innerHTML = ''; return; }
+    if (st.mode === 'list' && st.type === 'anime') { els.notice.innerHTML = ''; return; }
     const filters = st.settings.filters || {};
     const engines = st.settings.engines || {};
     let engineName, fullText;
@@ -143,6 +148,7 @@
 
   // ---- List mode ----
   async function loadList() {
+    if (st.type === 'anime' && !animeEngineOn()) st.type = 'movie';
     els.list.innerHTML = '<span class="muted">Loading…</span>';
     try {
       const d = await api('/trainer?type=' + st.type + '&view=' + st.view + '&q=' + encodeURIComponent(st.q) + '&page=' + st.page + '&page_size=25');
@@ -161,22 +167,26 @@
     const d = st.data;
     if (!d) return;
     const now = Date.now();
+    const emptyText = st.type === 'series' ? 'No shows in this view yet.' : st.type === 'anime' ? 'No anime in this view yet.' : 'No films in this view yet.';
     const rows = d.items.length
       ? d.items.map((item) => T.rowHtml(item, { canRate: st.canRate, now })).join('')
-      : '<div class="muted">' + (st.type === 'series' ? 'No shows in this view yet.' : 'No films in this view yet.') + '</div>';
+      : '<div class="muted">' + emptyText + '</div>';
     const pages = Math.max(1, Math.ceil(d.total / d.pageSize));
     // TV-R §5: the Films | Shows toggle (list mode only — quick stays films).
+    const animeBtn = animeEngineOn() ? '<button class="seg' + (st.type === 'anime' ? ' active' : '') + '" data-type="anime">Anime</button>' : '';
     const typeToggle = '<div class="segmented trainer-type" role="tablist" aria-label="Ratings type">'
       + '<button class="seg' + (st.type === 'movie' ? ' active' : '') + '" data-type="movie">Films</button>'
       + '<button class="seg' + (st.type === 'series' ? ' active' : '') + '" data-type="series">Shows</button>'
+      + animeBtn
       + '</div>';
+    const noun = st.type === 'series' ? 'shows' : st.type === 'anime' ? 'anime' : 'films';
     els.list.innerHTML = typeToggle
-      + '<div class="tr-chips">' + T.chipsHtml(d.counts, st.view, { hideUnfinished: st.type === 'series' }) + '</div>'
+      + '<div class="tr-chips">' + T.chipsHtml(d.counts, st.view, { hideUnfinished: st.type === 'series' || st.type === 'anime' }) + '</div>'
       + '<div class="tr-search-row"><input type="search" class="tr-search" placeholder="Search titles…" value="' + esc(st.q) + '"></div>'
       + '<div class="tr-table">' + rows + '</div>'
       + '<div class="tr-pager">'
       + '<button class="ghost mini" data-act="prev"' + (st.page <= 1 ? ' disabled' : '') + '>Prev</button>'
-      + '<span class="muted">' + T.pagerText(d.page, d.pageSize, d.total) + '</span>'
+      + '<span class="muted">' + T.pagerText(d.page, d.pageSize, d.total, noun) + '</span>'
       + '<button class="ghost mini" data-act="next"' + (st.page >= pages ? ' disabled' : '') + '>Next</button>'
       + '</div>';
     els.banner.innerHTML = T.bannerHtml(d.training, now, { rebuilding: st.rebuilding });
@@ -191,7 +201,7 @@
       st.data.counts = d.counts;
       st.data.training = d.training;
       const chips = els.list.querySelector('.tr-chips');
-      if (chips) chips.innerHTML = T.chipsHtml(d.counts, st.view, { hideUnfinished: st.type === 'series' });
+      if (chips) chips.innerHTML = T.chipsHtml(d.counts, st.view, { hideUnfinished: st.type === 'series' || st.type === 'anime' });
       els.banner.innerHTML = T.bannerHtml(d.training, Date.now(), { rebuilding: st.rebuilding });
     } catch (e) { /* quiet — leave the rows alone */ }
   }

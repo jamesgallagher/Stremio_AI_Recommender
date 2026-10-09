@@ -241,8 +241,8 @@ TrainerUI.bannerHtml = (training, now, { rebuilding = false } = {}) => {
   return `<div class="tr-banner">${text} <button class="ghost mini" data-act="rebuild" title="${TrainerUI.esc(TrainerUI.TIPS.rebuild)}">Rebuild now</button></div>`;
 };
 
-TrainerUI.pagerText = (page, pageSize, total) =>
-  `Page ${page} of ${Math.max(1, Math.ceil(total / pageSize))} · ${total} films`;
+TrainerUI.pagerText = (page, pageSize, total, noun = 'films') =>
+  `Page ${page} of ${Math.max(1, Math.ceil(total / pageSize))} · ${total} ${noun}`;
 
 // Per-title rating queue (U5): pushes within delayMs collapse to one send with
 // the latest value; at most one send in flight per key; a newer value that
