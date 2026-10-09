@@ -402,9 +402,9 @@ const title = (id, genres = []) => ({ key: `anime:${id}`, tmdb_id: String(id), i
   });
 
   // ---- BR8: cap ----
-  await ok('BR8: cap — 50 triggered titles → LLM sees 40 (two chunks of 20), the other 10 follow the failure rule', async () => {
+  await ok('BR8: cap — 150 triggered titles → LLM sees 120 (six chunks of 20), the other 30 follow the failure rule', async () => {
     const tier = tiers.TIERS[14];
-    const titles = Array.from({ length: 50 }, (_, i) => title(i + 200));
+    const titles = Array.from({ length: 150 }, (_, i) => title(i + 200));
 
     const fakeEvidence = {
       gather: async (ts) => {
@@ -427,18 +427,18 @@ const title = (id, genres = []) => ({ key: `anime:${id}`, tmdb_id: String(id), i
 
     const result = await borderlineReview.review(profile, tier, titles, log, { evidence: fakeEvidence, groq: fakeGroq });
 
-    // Two chunks of 20.
-    assert.strictEqual(llmCalls.length, 2, 'two LLM calls');
-    assert.strictEqual(llmCalls[0].length, 20, 'first chunk 20');
-    assert.strictEqual(llmCalls[1].length, 20, 'second chunk 20');
+    // Six chunks of 20 (the cap is 120).
+    assert.strictEqual(borderlineReview.REVIEW_CAP, 120, 'cap is 120');
+    assert.strictEqual(llmCalls.length, 6, 'six LLM calls');
+    for (const c of llmCalls) assert.strictEqual(c.length, 20, 'each chunk 20');
 
-    // The first 40 are ok.
-    for (let i = 200; i <= 239; i++) {
+    // The first 120 are ok.
+    for (let i = 200; i <= 319; i++) {
       const r = result.get(`anime:${i}`);
       assert.strictEqual(r.action, 'ok', `title ${i} ok`);
     }
-    // The other 10 follow the failure rule (tier 14 → kept).
-    for (let i = 240; i <= 249; i++) {
+    // The other 30 follow the failure rule (tier 14 → kept).
+    for (let i = 320; i <= 349; i++) {
       const r = result.get(`anime:${i}`);
       assert.strictEqual(r.action, 'ok', `title ${i} kept (failure rule)`);
       assert.strictEqual(r.reason, 'Review unavailable — kept');

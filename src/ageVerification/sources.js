@@ -213,6 +213,11 @@ function buildSources(profile, log = console) {
   const mdbKey = () => settings.resolveMdblistKey(profile).key;
   return {
     tmdbRatings: (type, titles) => tmdbRatings(profile, type, titles, log),
+    // Anime only (the chain prefers it): a Common Sense age only where a real review exists.
+    csmAgesReviewed: (type, imdbIds) => {
+      const key = mdbKey();
+      return key ? mdblist.commonSenseAges(key, type, imdbIds, log, { reviewedOnly: true }) : Promise.resolve(new Map());
+    },
     csmAges: (type, imdbIds) => {
       const key = mdbKey();
       return key ? mdblist.commonSenseAges(key, type, imdbIds, log) : Promise.resolve(new Map());

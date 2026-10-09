@@ -10,6 +10,10 @@ const db = require('../db');
 const evidence = require('./evidence');
 const groq = require('../services/groq');
 
+// Titles reviewed per build (chunks of 20). For a 14+ profile nearly every teen anime is MAL PG-13,
+// which triggers the review, so the cap must cover a whole pool (results are cached for 90 days).
+const REVIEW_CAP = 120;
+
 const DEFAULT_DEPS = { evidence, groq: { animeAgeReview: groq.animeAgeReview } };
 
 // Cache version and TTL. A fresh row answers without the LLM.
@@ -122,7 +126,7 @@ async function review(profile, tier, titles, log = console, deps = DEFAULT_DEPS)
   }
 
   // 5. LLM — at most 40 per call (chunks of 20).
-  const CAP = 40;
+  const CAP = REVIEW_CAP;
   if (triggered.length) {
     const toReview = triggered.slice(0, CAP);
     const beyondCap = triggered.slice(CAP);
@@ -178,4 +182,4 @@ async function review(profile, tier, titles, log = console, deps = DEFAULT_DEPS)
   return out;
 }
 
-module.exports = { review, VER, TTL_MS, DEFAULT_DEPS, cacheGet, cacheSet, _setVer };
+module.exports = { review, REVIEW_CAP, VER, TTL_MS, DEFAULT_DEPS, cacheGet, cacheSet, _setVer };
