@@ -354,6 +354,12 @@ async function ok(name, fn) {
       tier: () => null,
       tvMeta: async () => new Map(),
     };
+    // The movie/series engines also run in this build; with a fake TMDB key they would make hundreds of
+    // REAL TMDB calls (each a 401). Answer TMDB instantly instead (everything else is untouched).
+    const realFetch = global.fetch;
+    global.fetch = (url, opts) => (String(url).includes('api.themoviedb.org')
+      ? Promise.resolve({ ok: false, status: 401, json: async () => ({}), text: async () => '' })
+      : realFetch(url, opts));
     try {
       settings.updateSettings({ keys: { tmdb_api_key: 'test-tmdb-key' } });
       const p = config.addProfile('AN1B-T7');
@@ -376,6 +382,7 @@ async function ok(name, fn) {
       config.removeProfile(p.id);
     } finally {
       trending.build = realBuild;
+      global.fetch = realFetch;
     }
   });
 

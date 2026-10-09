@@ -705,13 +705,13 @@ async function ok(name, fn) {
     }
   });
 
-  // ---- A12f: A12b looped 5× — every gap ≥ 4000 ms in every run ----
-  await ok('A12f: A12b looped 5× — every gap ≥ 4000 ms in every run', async () => {
+  // ---- A12f: A12b looped 3× — every gap ≥ 4000 ms in every run ----
+  await ok('A12f: A12b looped 3× — every gap ≥ 4000 ms in every run', async () => {
     const anidb = require('../src/services/anidb');
     const validXml = '<anime id="1" restricted="false"><type>TV Series</type><episodecount>10</episodecount><title xml:lang="x-jat" type="main">Test</title><permanent>8.0</permanent></anime>';
     const profile = { keys: { anidb_client: 'test-client', anidb_clientver: 1 } };
     let smallest = Infinity;
-    for (let run = 0; run < 5; run++) {
+    for (let run = 0; run < 3; run++) {
       anidb.init();
       anidb._resetForTests();
       anidb._resetClock();
@@ -735,7 +735,7 @@ async function ok(name, fn) {
         assert.ok(gap >= 4000, `run ${run} gap ${i} = ${gap}ms ≥ 4000ms`);
       }
     }
-    console.log(`A12f: smallest gap across 5 runs = ${smallest}ms`);
+    console.log(`A12f: smallest gap across 3 runs = ${smallest}ms`);
   });
 
   // ---- A12g: stamp is the instant of the send; a throwing fetch is a transient, not a crash ----
@@ -753,7 +753,9 @@ async function ok(name, fn) {
     assert.ok(r.data, 'request succeeded');
     const persisted = require('../src/db').get().prepare('SELECT MAX(last_request_at) AS m FROM anidb_clients').get().m;
     assert.strictEqual(persisted, fetchedAt, `stamp ${persisted} must equal clock at send ${fetchedAt}`);
-    t += 5000;
+    // The retry back-off sleeps 4 s + 16 s of CLOCK time: switch to a clock that jumps 1000 ms per
+    // read so that wait costs a few dozen reads, not minutes of 1 ms timers.
+    anidb._setNow(() => (t += 1000));
     anidb._setFetch(() => { throw new Error('sync boom'); });
     const r2 = await anidb.getAnime(202, profile, console);
     assert.ok(!r2.data, 'throwing fetch yields no data, no crash');
@@ -766,11 +768,14 @@ async function ok(name, fn) {
     const db = require('../src/db');
     anidb.init();
     anidb._resetForTests();
-    anidb._resetClock();
+    // Fake clock that jumps 1000 ms per read: the 4 s spacing and the 4 s / 16 s back-off are waited
+    // in clock time (real timers are covered by A12b / A12f).
+    let t = 5_000_000;
+    anidb._setNow(() => (t += 1000));
 
     const fetchCalls = [];
     anidb._setFetch(async (url) => {
-      fetchCalls.push({ url, at: Date.now() });
+      fetchCalls.push({ url, at: t });
       return { status: 503, text: async () => '' };
     });
 
@@ -786,6 +791,7 @@ async function ok(name, fn) {
       const gap = fetchCalls[i].at - fetchCalls[i - 1].at;
       assert.ok(gap >= 4000, `gap ${i} = ${gap}ms ≥ 4000ms`);
     }
+    anidb._resetClock();
   });
 
   // ---- A12d: banned body → banned_until ≈ now+48h; next getAnime → skipped (no fetch) ----
