@@ -331,6 +331,9 @@ async function tick() {
           console.warn(`[ai-schedule] ${profile.name}: consider failed — ${err.message}`)
         );
       }
+      // AGE-3c: drip-feed AniDB lookups for this profile's anime pool (a no-op unless Marquee Anime is on).
+      try { await require('./anime/anidbWarmup').warmUp(profile); }
+      catch (err) { console.warn(`[anidb] ${profile.name}: warm-up failed — ${err.message}`); }
       // v6 decay: retire persistently-shown-but-ignored recommendations. Cheap
       // local SQL scan. Opt-in per profile (v6.37) — decayWindowMsFor returns
       // null when the profile has title decay off, so we skip it entirely.
