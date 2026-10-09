@@ -971,13 +971,14 @@ function fakeTrending(candidates, rowsOut) {
       config.removeProfile(p3.id);
     });
 
-    // PB2: because text visible on a personalised row
-    await ok('PB2: because text visible on a personalised row', async () => {
+    // PB2: pick shows its reason; a rejected title shows why, then recommended from
+    await ok('PB2: pick shows its reason; a rejected title shows why, then recommended from', async () => {
       const p = config.addProfile('AN2-PB2');
       config.updateProfile(p.id, { filters: { engine_anime: 'marquee-anime' } });
       const bid = decisionLog.newBuildId();
       decisionLog.record(p.id, 'anime', bid, [
         { item_key: 'C', stage: 'engine', outcome: 'selected', title: 'Cowboy Bebop', because: 'Cowboy Bebop', reason: 'because you watched Cowboy Bebop' },
+        { item_key: 'D', stage: 'mal', outcome: 'rejected_age', title: 'Death Note', because: 'Blue Lock', rating: 'mal:R', reason: 'MAL R (17+) is above the TV-14 (14+, AU M) band' },
       ]);
       decisionLog.recordMeta(p.id, 'anime', bid, { mode: 'personalised', engaged: 5 });
 
@@ -987,8 +988,19 @@ function fakeTrending(candidates, rowsOut) {
       page.on('pageerror', (e) => pageErrors.push(e.message));
       await openAdvanced(page, p.id);
       await page.waitForSelector('.ab-panel .ab-head', { timeout: 10000 });
+      // A pick: its reason already names the watched title, so the source is not repeated.
       const rowText = await page.locator('.ab-panel .tr-table .tr-row').first().innerText();
-      assert.ok(rowText.includes('because: Cowboy Bebop'), `row shows because: ${rowText}`);
+      assert.ok(rowText.includes('because you watched Cowboy Bebop'), `pick shows its reason: ${rowText}`);
+      assert.ok(!rowText.includes('recommended from'), `no duplicate source on a pick: ${rowText}`);
+      assert.ok(!rowText.includes('because:'), `old wording gone: ${rowText}`);
+      // A rejected title: why it was rejected, then where it was recommended from.
+      await page.locator('.ab-panel .tr-chip[data-outcome="rejected_age"]').click();
+      await page.waitForFunction(() => /Death Note/.test(document.querySelector('.ab-panel .tr-table')?.innerText || ''), null, { timeout: 10000 });
+      const rejText = await page.locator('.ab-panel .tr-table .tr-row').first().innerText();
+      assert.ok(rejText.includes('MAL R (17+) is above the TV-14 (14+, AU M) band'), `reason shown: ${rejText}`);
+      assert.ok(rejText.includes('recommended from: Blue Lock'), `source shown: ${rejText}`);
+      assert.ok(!rejText.includes('because'), `no because wording on the rejected row: ${rejText}`);
+      await page.locator('.sec-box:has(.ab-panel)').first().screenshot({ path: require('path').join(process.env.DATA_DIR, 'screenshots', 'anime-recommended-from.png') });
       await context.close();
       config.removeProfile(p.id);
     });
