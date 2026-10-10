@@ -49,6 +49,12 @@ async function build(profile, ctx, deps = DEFAULT_DEPS) {
   const log = ctx.log || console;
   const name = (profile && (profile.name || profile.id)) || 'profile';
 
+  // AN-4: bench override — force trending-only (the baseline comparison).
+  if (ctx.animeMode === 'trending') {
+    ctx.animeEngaged = 0;
+    return deps.trending.build(profile, ctx, deps.trendingDeps);
+  }
+
   // 1. History and mode.
   await deps.animeMap.ensureLoaded(log);
   const ladder = await deps.ladder(profile.id);
