@@ -37,13 +37,15 @@ const fs = require('fs');
 const REPO_ROOT = path.join(__dirname, '..');
 const USAGE =
   'Usage: node --experimental-sqlite scripts/bench-engines.js <profileName>\n'
-  + '  [--type movie|series] [--holdout 10] [--engines marquee,marquee-tv] [--no-cache] [--json] [--keep]\n'
+  + '  [--type movie|series|anime] [--holdout 10] [--engines marquee,marquee-tv] [--no-cache] [--json] [--keep]\n'
   + "  [--serve-opts '<json>']\n"
   + "  [--marquee-config '<json>']\n"
   + 'Expect several minutes per profile on a cold cache (Marquee\'s LLM fit dominates).\n'
-  + '  --type: movie (default) or series. A series run holds out the most recently STARTED\n'
+  + '  --type: movie (default), series, or anime. A series run holds out the most recently STARTED\n'
   + '  shows that reached at least Engaged (real first-episode timestamps only) and defaults to\n'
-  + "  the Marquee TV baseline engine unless --engines is given.\n"
+  + "  the Marquee TV baseline engine unless --engines is given. An anime run holds out the most\n"
+  + '  recently STARTED anime shows that reached at least Engaged and defaults to both Marquee Anime\n'
+  + '  (personalised) and the Trending-only baseline unless --engines is given.\n'
   + "  --serve-opts: a JSON object of serve-config overrides (snake_case, e.g. '{\"window_factor\":4}')\n"
   + "  --marquee-config: a JSON object of Marquee config sections (e.g. '{\"agreement\":{\"genre_blend\":0}}'),\n"
   + '  merged section-wise into the SNAPSHOT\'s settings.json only — the live settings are never written.';
@@ -93,10 +95,13 @@ async function main() {
   if (a.help) { console.log(USAGE); return; }
   if (!a.profile) { console.error('profileName is required'); console.error(USAGE); process.exit(2); }
   if (!Number.isFinite(a.holdout) || a.holdout < 1) { console.error('--holdout must be a positive integer'); process.exit(2); }
-  if (a.type !== 'movie' && a.type !== 'series') { console.error('--type must be movie or series'); process.exit(2); }
+  if (a.type !== 'movie' && a.type !== 'series' && a.type !== 'anime') { console.error('--type must be movie, series, or anime'); process.exit(2); }
   // The series baseline is Marquee TV — default the engine set to
   // ['marquee-tv'] for a series run unless --engines was given explicitly.
   if (a.type === 'series' && !a.enginesSet) a.engines = ['marquee-tv'];
+  // AN-4: the anime baseline compares Marquee Anime (personalised) against
+  // the Trending-only baseline.
+  if (a.type === 'anime' && !a.enginesSet) a.engines = ['marquee-anime', 'marquee-anime-trending'];
 
   const liveDir = process.env.DATA_DIR || path.join(REPO_ROOT, 'data');
   const bench = require('../src/bench/engineBench');
@@ -129,8 +134,11 @@ async function main() {
   }
 
   // Unknown-engine check: exit 1 with a clear message.
+  // AN-4: marquee-anime-trending is a bench-only label (maps to marquee-anime
+  // with a ctx override), not a registered engine — skip the check for it.
   const known = engines.list().map((e) => e.id);
   for (const id of a.engines) {
+    if (id === 'marquee-anime-trending') continue;
     if (!known.includes(id)) {
       console.error(`bench-engines: unknown engine ${id} (known: ${known.join(', ')})`);
       process.exit(1);
@@ -148,6 +156,7 @@ async function main() {
         selectServe: rs.selectServe, selectServeFor: rs.selectServeFor, filterServable: rs.filterServable,
         listSizeFor: rs.listSizeFor,
         serveCalibration: require('../src/serveCalibration'),
+        animeMap: require('../src/services/animeMap'),
         log: quiet, noCache: a.noCache,
         // m2: could each held-out film be served at all under this profile's
         // filters? Cached deep meta first; a read-only TMDB fetch (≤ holdout
@@ -182,6 +191,11 @@ async function main() {
     db.close(); // release the bench DB before we remove the dir
   }
 
+  // AN-4: print the engine-mode note above the table (which mode the lane
+  // actually used for the personalised run).
+  if (results.type === 'anime' && results.animeMode) {
+    console.log('Anime mode (personalised run): ' + results.animeMode);
+  }
   console.log(bench.renderTable(results));
   // §6: Marquee serve-strategy comparison (round-robin vs calibrated vs pure
   // score) on the same pool — printed as a second table under the main one.
