@@ -465,9 +465,9 @@ async function ageGatePool(profile, log = console, onProgress = () => {}, opts =
           try {
             if (v.verdict === 'block') {
               decisions.update(profile.id, 'anime', opts.animeBuildId, String(tmdbId), {
-                outcome: v.source === 'llm' ? 'rejected_llm' : 'rejected_age',
-                stage: v.source === 'llm' ? 'llm-last-resort' : v.source,
-                rating: v.source === 'llm' ? 'llm' : v.source + ':' + v.rating,
+                outcome: (v.source === 'llm' || v.source === 'llm-review') ? 'rejected_llm' : 'rejected_age',
+                stage: (v.source === 'llm' || v.source === 'llm-review') ? 'llm-last-resort' : v.source,
+                rating: (v.source === 'llm' || v.source === 'llm-review') ? 'llm' : v.source + ':' + v.rating,
                 reason: v.reason || (v.source === 'llm' ? 'The LLM judged it unsuitable for this age' : v.source + ' rated ' + v.rating + ': above the ' + tier.label + ' limit'),
               });
             } else if (v.verdict === 'allow') {
@@ -655,9 +655,9 @@ async function stagedAgeGate(profile, stagedByType, log = console, onProgress = 
             if (!v) continue;
             if (v.verdict === 'block') {
               decisions.update(profile.id, 'anime', opts.animeBuildId, String(c.tmdb_id), {
-                outcome: v.source === 'llm' ? 'rejected_llm' : 'rejected_age',
-                stage: v.source === 'llm' ? 'llm-last-resort' : v.source,
-                rating: v.source === 'llm' ? 'llm' : v.source + ':' + v.rating,
+                outcome: (v.source === 'llm' || v.source === 'llm-review') ? 'rejected_llm' : 'rejected_age',
+                stage: (v.source === 'llm' || v.source === 'llm-review') ? 'llm-last-resort' : v.source,
+                rating: (v.source === 'llm' || v.source === 'llm-review') ? 'llm' : v.source + ':' + v.rating,
                 reason: v.reason || (v.source === 'llm' ? 'The LLM judged it unsuitable for this age' : v.source + ' rated ' + v.rating + ': above the ' + tier.label + ' limit'),
               });
             } else if (v.verdict === 'allow') {
