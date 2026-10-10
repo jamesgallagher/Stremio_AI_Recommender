@@ -1465,11 +1465,11 @@ async function main() {
     res = await trainer.rate(profile, { type: 'movie', tmdb_id: '1' }, undefined, deps);
     assert.deepStrictEqual(res, { ok: false, reason: 'bad-rating' });
     // series is supported (TV-R §2): this profile has no series_progress rows,
-    // so the ref is not-in-history (the old not-supported is gone); 'anime' → bad-type.
+    // so the ref is not-in-history (the old not-supported is gone); 'anime' → anime-off (engine off).
     res = await trainer.rate(profile, { type: 'series', tmdb_id: '1' }, 5, deps);
     assert.deepStrictEqual(res, { ok: false, reason: 'not-in-history' });
     res = await trainer.rate(profile, { type: 'anime', tmdb_id: '1' }, 5, deps);
-    assert.deepStrictEqual(res, { ok: false, reason: 'bad-type' });
+    assert.deepStrictEqual(res, { ok: false, reason: 'anime-off' });
     // not-in-history: a ref that belongs to ANOTHER profile's history.
     const other = { id: 'p-r11-other', name: 'O', keys: { simkl_client_id: 'c' }, simkl_auth: { access_token: 't' } };
     watchedStore.upsertMany(other.id, [

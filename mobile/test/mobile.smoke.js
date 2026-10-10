@@ -1050,7 +1050,7 @@ async function unitTests() {
 
   await ok('settings: toCompanionFilters exposes the editable filters (incl. title decay), never the age gate', () => {
     const out = handlers.toCompanionFilters({ min_rating: 6, vote_count_floor: 1000, min_year: 2010, excluded_genres: ['Horror'], list_size: 20, title_decay_enabled: true, title_decay_days: 30, age_limit: 8, engine_movie: 'marquee', engine_series: 'marquee-tv' });
-    assert.deepStrictEqual(Object.keys(out).sort(), ['excluded_genres', 'list_size', 'min_rating', 'min_year', 'title_decay_days', 'title_decay_enabled', 'vote_count_floor']);
+    assert.deepStrictEqual(Object.keys(out).sort(), ['engine_anime', 'excluded_genres', 'list_size', 'min_rating', 'min_year', 'title_decay_days', 'title_decay_enabled', 'vote_count_floor']);
     assert.ok(!('age_limit' in out), 'age gate never exposed');
     assert.strictEqual(out.title_decay_enabled, true);
     assert.strictEqual(out.title_decay_days, 30);

@@ -31,6 +31,8 @@ const metaStore = require('./engines/shared/metaStore');
 const markWatchedMod = require('./markWatched');
 const settings = require('./settings');
 const db = require('./db');
+const animeHistory = require('./anime/history');
+const animeMap = require('./services/animeMap');
 
 // The filter views (spec §6).
 const VIEWS = ['all', 'unrated', 'rated', 'loved', 'ignored', 'unfinished'];
@@ -56,13 +58,19 @@ function mergeDeps(deps) {
   return { ...defaultDeps, ...(deps || {}) };
 }
 
-// 'movie' and 'series' are ok; anything else → bad-type. Shows are rated per
+// 'movie', 'series' and 'anime' are ok; anything else → bad-type. Shows are rated per
 // SHOW (Q9), never per episode; the series source is series_progress rows with
 // kind 'show' (R4: anime is out of scope).
 function resolveType(type) {
   const t = type || 'movie';
-  if (t === 'movie' || t === 'series') return { ok: true, type: t };
+  if (t === 'movie' || t === 'series' || t === 'anime') return { ok: true, type: t };
   return { ok: false, reason: 'bad-type' };
+}
+
+// AN-3: the anime gate — every entry point checks it first.
+function animeGate(profile) {
+  const ea = profile && profile.filters && profile.filters.engine_anime;
+  return ea && ea !== 'off';
 }
 
 // The shared status mapper (M6). A thrown Simkl error is mapped to 502 by the
@@ -71,7 +79,8 @@ function httpStatus(result) {
   if (result && result.ok) return 200;
   const reason = result && result.reason;
   if (reason === 'not-in-history') return 404;
-  if (['bad-type', 'not-supported', 'bad-rating', 'bad-value', 'bad-view', 'no-simkl', 'no-id'].includes(reason)) return 400;
+  if (['bad-type', 'not-supported', 'bad-rating', 'bad-value', 'bad-view', 'no-simkl', 'no-id', 'anime-off'].includes(reason)) return 400;
+  if (reason === 'simkl-rejected') return 422;
   return 422;
 }
 
@@ -182,12 +191,14 @@ function resolveWatchedRow(profileId, type, ref, watchedStore) {
 // The series source (spec §2): watchedStore.getSeriesProgress(kind 'show'),
 // deduplicated by tmdb_id keeping the row with the newest last_watched_at.
 // Rows without a tmdb_id are skipped (R4: kind 'show' only — anime is out of
-// scope). Returns { rows, unresolved }.
+// scope). AN-3: detected anime rows are excluded (they belong to the anime
+// source). Returns { rows, unresolved }.
 function seriesSource(profileId, watchedStore) {
   const rows = watchedStore.getSeriesProgress(profileId, { kind: 'show' });
   const byTmdb = new Map();
   let unresolved = 0;
   for (const r of rows) {
+    if (animeHistory.isAnimeProgressRow(r)) continue; // AN-3: detected anime → the anime source
     const tmdbId = r.tmdb_id != null ? String(r.tmdb_id) : null;
     if (!tmdbId) { unresolved += 1; continue; }
     const existing = byTmdb.get(tmdbId);
@@ -199,12 +210,69 @@ function seriesSource(profileId, watchedStore) {
   return { rows: [...byTmdb.values()], unresolved };
 }
 
+// AN-3: the anime source — every series_progress row (all kinds) the anime
+// detector flags (kind 'anime', or a 'show' row the detector flags), deduplicated
+// by tmdb_id keeping the newest last_watched_at. Rows without a tmdb_id are
+// skipped (counted as unresolved). Callers must await animeMap.ensureLoaded()
+// first. Returns { rows, unresolved }.
+function animeSource(profileId, watchedStore) {
+  const rows = watchedStore.getSeriesProgress(profileId); // all kinds
+  const byTmdb = new Map();
+  let unresolved = 0;
+  for (const r of rows) {
+    if (!animeHistory.isAnimeProgressRow(r)) continue;
+    const tmdbId = r.tmdb_id != null ? String(r.tmdb_id) : null;
+    if (!tmdbId) { unresolved += 1; continue; }
+    const existing = byTmdb.get(tmdbId);
+    if (!existing
+      || (r.last_watched_at != null && (existing.last_watched_at == null || r.last_watched_at > existing.last_watched_at))) {
+      byTmdb.set(tmdbId, r);
+    }
+  }
+  return { rows: [...byTmdb.values()], unresolved };
+}
+
+// AN-3: Simkl "not found" rejection — a response object with not_found.shows
+// or not_found.movies non-empty means Simkl rejected the title.
+function simklRejected(res) {
+  if (!res || typeof res !== 'object') return false;
+  const nf = res.not_found;
+  if (!nf || typeof nf !== 'object') return false;
+  if (Array.isArray(nf.shows) && nf.shows.length > 0) return true;
+  if (Array.isArray(nf.movies) && nf.movies.length > 0) return true;
+  return false;
+}
+
 // Resolve a ref against THIS profile's series source (spec §2), same rules as
 // resolveWatchedRow: simkl_id → tmdb_id → imdb_id, each compared as normalized
 // strings. Returns the row or null.
 function resolveSeriesRow(profileId, ref, watchedStore) {
   if (!ref || typeof ref !== 'object') return null;
   const { rows } = seriesSource(profileId, watchedStore);
+  const byTmdb = new Map();
+  for (const r of rows) byTmdb.set(String(r.tmdb_id), r);
+  if (ref.simkl_id != null) {
+    const r = rows.find((x) => x.simkl_id != null && String(x.simkl_id) === String(ref.simkl_id));
+    const tmdbId = r && r.tmdb_id != null ? String(r.tmdb_id) : null;
+    if (tmdbId) return byTmdb.get(tmdbId) || null;
+  }
+  if (ref.tmdb_id != null && ref.tmdb_id !== '') {
+    return byTmdb.get(String(ref.tmdb_id)) || null;
+  }
+  if (ref.imdb_id) {
+    const r = rows.find((x) => x.imdb_id === ref.imdb_id);
+    const tmdbId = r && r.tmdb_id != null ? String(r.tmdb_id) : null;
+    return tmdbId ? byTmdb.get(tmdbId) : null;
+  }
+  return null;
+}
+
+// AN-3: resolve a ref against THIS profile's anime source, same rules as
+// resolveSeriesRow: simkl_id → tmdb_id → imdb_id, each compared as normalized
+// strings. Returns the row or null.
+function resolveAnimeRow(profileId, ref, watchedStore) {
+  if (!ref || typeof ref !== 'object') return null;
+  const { rows } = animeSource(profileId, watchedStore);
   const byTmdb = new Map();
   for (const r of rows) byTmdb.set(String(r.tmdb_id), r);
   if (ref.simkl_id != null) {
@@ -271,12 +339,16 @@ function resolveUnfinishedRow(profileId, type, ref, D) {
 // series DTO, views all/unrated/rated/loved/ignored (unfinished → bad-view),
 // counts.unfinished = 0, order last_watched_at DESC (ties by title), and the
 // case-insensitive title search.
-async function listSeriesHistory(D, profile, { view, q, page, pageSize }) {
+async function listSeriesHistory(D, profile, { view, q, page, pageSize, sourceFn } = {}) {
   const type = 'series';
   if (view === 'unfinished') return { ok: false, reason: 'bad-view' };
   const ratings = D.tasteFeedback.getRatingsMap(profile.id, type);
   const ignored = D.tasteFeedback.ignoredSet(profile.id, type);
-  const { rows, unresolved } = seriesSource(profile.id, D.watchedStore);
+  // AN-3: load the anime detector so the source can classify. A failure must
+  // not fail the action — carry on with the detector off.
+  try { await animeMap.ensureLoaded(); } catch { /* detector off — carry on */ }
+  const src = sourceFn || seriesSource;
+  const { rows, unresolved } = src(profile.id, D.watchedStore);
   const items = [];
   for (const row of rows) {
     const item = toSeriesItem(row, { ratings, ignored, meta: null });
@@ -357,11 +429,15 @@ async function listHistory(profile, { type: typeIn, view = 'all', q = null, page
   const t = resolveType(typeIn);
   if (!t.ok) return { ok: false, reason: t.reason };
   const type = t.type;
+  // AN-3: the anime gate — every entry point checks it first.
+  if (type === 'anime' && !animeGate(profile)) return { ok: false, reason: 'anime-off' };
   const v = view || 'all';
   if (!VIEWS.includes(v)) return { ok: false, reason: 'bad-view' };
   const ps = Math.min(100, Math.max(1, Math.floor(Number(pageSize)) || 25));
   const pg = Math.max(1, Math.floor(Number(page)) || 1);
 
+  // AN-3: anime uses the same list as series, but with the anime source.
+  if (type === 'anime') return listSeriesHistory(D, profile, { view: v, q, page: pg, pageSize: ps, sourceFn: animeSource });
   if (type === 'series') return listSeriesHistory(D, profile, { view: v, q, page: pg, pageSize: ps });
 
   const ratings = D.tasteFeedback.getRatingsMap(profile.id, type);
@@ -497,36 +573,53 @@ async function rate(profile, ref, rating, deps = {}) {
   const t = resolveType(ref && ref.type);
   if (!t.ok) return { ok: false, reason: t.reason };
   const type = t.type;
+  // AN-3: the anime gate — every entry point checks it first.
+  if (type === 'anime' && !animeGate(profile)) return { ok: false, reason: 'anime-off' };
   // `null` clears the rating; an omitted rating (undefined) is a bad value,
   // not a clear — clearing must be explicit.
   if (rating === undefined || (rating != null && (!Number.isInteger(rating) || rating < 1 || rating > 10))) {
     return { ok: false, reason: 'bad-rating' };
   }
   if (!hasSimkl(profile)) return { ok: false, reason: 'no-simkl' };
-  const row = type === 'series'
-    ? resolveSeriesRow(profile.id, ref, D.watchedStore)
-    : resolveWatchedRow(profile.id, type, ref, D.watchedStore);
+  // AN-3: load the anime detector so the source can classify. A failure must
+  // not fail the action — carry on with the detector off.
+  if (type === 'series' || type === 'anime') {
+    try { await animeMap.ensureLoaded(); } catch { /* detector off — carry on */ }
+  }
+  // AN-3: an anime is stored and rated as a series (the show's TMDB id), so the
+  // Simkl body and the local row use type 'series'.
+  const storageType = type === 'anime' ? 'series' : type;
+  const row = type === 'anime'
+    ? resolveAnimeRow(profile.id, ref, D.watchedStore)
+    : type === 'series'
+      ? resolveSeriesRow(profile.id, ref, D.watchedStore)
+      : resolveWatchedRow(profile.id, type, ref, D.watchedStore);
   if (!row) return { ok: false, reason: 'not-in-history' };
   // F4 no-op: same value (both null counts too) → no Simkl call, no change.
-  const current = D.tasteFeedback.getRating(profile.id, type, row.tmdb_id);
+  const current = D.tasteFeedback.getRating(profile.id, storageType, row.tmdb_id);
   if (current === rating) {
-    return { ok: true, item: buildItem(D, profile, type, row), unchanged: true };
+    return { ok: true, item: buildItem(D, profile, storageType, row), unchanged: true };
   }
   // M7: every Simkl write goes through the governed simkl_post lane.
+  let simklRes;
   if (rating == null) {
-    await D.simkl.removeRatings(profile, [{ type, simkl_id: row.simkl_id, imdb_id: row.imdb_id, tmdb_id: row.tmdb_id }]);
+    simklRes = await D.simkl.removeRatings(profile, [{ type: storageType, simkl_id: row.simkl_id, imdb_id: row.imdb_id, tmdb_id: row.tmdb_id }]);
   } else {
-    await D.simkl.setRatings(profile, [{ type, simkl_id: row.simkl_id, imdb_id: row.imdb_id, tmdb_id: row.tmdb_id, rating }]);
+    simklRes = await D.simkl.setRatings(profile, [{ type: storageType, simkl_id: row.simkl_id, imdb_id: row.imdb_id, tmdb_id: row.tmdb_id, rating }]);
+  }
+  // AN-3: Simkl "not found" is a failure (anime only) — write nothing local.
+  if (type === 'anime' && simklRejected(simklRes)) {
+    return { ok: false, reason: 'simkl-rejected' };
   }
   const now = D.now();
   if (rating == null) {
-    D.tasteFeedback.deleteRating(profile.id, type, row.tmdb_id);
+    D.tasteFeedback.deleteRating(profile.id, storageType, row.tmdb_id);
   } else {
-    D.tasteFeedback.upsertRating(profile.id, { type, tmdb_id: row.tmdb_id, imdb_id: row.imdb_id, simkl_id: row.simkl_id, rating, rated_at: new Date(now).toISOString() });
+    D.tasteFeedback.upsertRating(profile.id, { type: storageType, tmdb_id: row.tmdb_id, imdb_id: row.imdb_id, simkl_id: row.simkl_id, rating, rated_at: new Date(now).toISOString() });
   }
   D.tasteFeedback.recordChange(profile.id, now);
-  D.log.log(`[trainer] ${profile.name}: rated ${type} tmdb:${row.tmdb_id} → ${rating == null ? 'cleared' : rating}`);
-  return { ok: true, item: buildItem(D, profile, type, row), unchanged: false };
+  D.log.log(`[trainer] ${profile.name}: rated ${storageType} tmdb:${row.tmdb_id} → ${rating == null ? 'cleared' : rating}`);
+  return { ok: true, item: buildItem(D, profile, storageType, row), unchanged: false };
 }
 
 // setIgnored — ignore/un-ignore a title (local only — M2: never calls Simkl,
@@ -537,10 +630,21 @@ async function setIgnored(profile, ref, ignored, deps = {}) {
   const t = resolveType(ref && ref.type);
   if (!t.ok) return { ok: false, reason: t.reason };
   const type = t.type;
+  // AN-3: the anime gate — every entry point checks it first.
+  if (type === 'anime' && !animeGate(profile)) return { ok: false, reason: 'anime-off' };
   if (typeof ignored !== 'boolean') return { ok: false, reason: 'bad-value' };
+  // AN-3: load the anime detector so the source can classify. A failure must
+  // not fail the action — carry on with the detector off.
+  if (type === 'series' || type === 'anime') {
+    try { await animeMap.ensureLoaded(); } catch { /* detector off — carry on */ }
+  }
+  // AN-3: an anime is stored as a series (the show's TMDB id).
+  const storageType = type === 'anime' ? 'series' : type;
   let row;
   let status = 'watched';
-  if (type === 'series') {
+  if (type === 'anime') {
+    row = resolveAnimeRow(profile.id, ref, D.watchedStore);
+  } else if (type === 'series') {
     row = resolveSeriesRow(profile.id, ref, D.watchedStore);
   } else {
     row = resolveWatchedRow(profile.id, type, ref, D.watchedStore);
@@ -552,10 +656,10 @@ async function setIgnored(profile, ref, ignored, deps = {}) {
   if (!row) return { ok: false, reason: 'not-in-history' };
   const tmdbId = String(row.tmdb_id);
   const now = D.now();
-  const changed = D.tasteFeedback.setIgnored(profile.id, { type, tmdb_id: tmdbId, simkl_id: row.simkl_id, imdb_id: row.imdb_id }, ignored, now);
+  const changed = D.tasteFeedback.setIgnored(profile.id, { type: storageType, tmdb_id: tmdbId, simkl_id: row.simkl_id, imdb_id: row.imdb_id }, ignored, now);
   if (changed) D.tasteFeedback.recordChange(profile.id, now);
   D.log.log(`[trainer] ${profile.name}: ${ignored ? 'ignored' : 'un-ignored'} ${type} tmdb:${tmdbId}`);
-  return { ok: true, item: buildItem(D, profile, type, row, status), unchanged: !changed };
+  return { ok: true, item: buildItem(D, profile, storageType, row, status), unchanged: !changed };
 }
 
 // markFinished — mark an unfinished (abandoned) film finished. Delegates to the
@@ -566,7 +670,9 @@ async function markFinished(profile, ref, deps = {}) {
   const t = resolveType(ref && ref.type);
   if (!t.ok) return { ok: false, reason: t.reason };
   const type = t.type;
-  if (type === 'series') return { ok: false, reason: 'not-supported' };
+  // AN-3: the anime gate — every entry point checks it first.
+  if (type === 'anime' && !animeGate(profile)) return { ok: false, reason: 'anime-off' };
+  if (type === 'series' || type === 'anime') return { ok: false, reason: 'not-supported' };
   const row = resolveUnfinishedRow(profile.id, type, ref, D);
   if (!row) return { ok: false, reason: 'not-in-history' };
   const meta = row.tmdb_id != null ? D.metaGet(type, row.tmdb_id) : null;
@@ -590,7 +696,9 @@ async function markUnwatched(profile, ref, deps = {}) {
   const t = resolveType(ref && ref.type);
   if (!t.ok) return { ok: false, reason: t.reason };
   const type = t.type;
-  if (type === 'series') return { ok: false, reason: 'not-supported' };
+  // AN-3: the anime gate — every entry point checks it first.
+  if (type === 'anime' && !animeGate(profile)) return { ok: false, reason: 'anime-off' };
+  if (type === 'series' || type === 'anime') return { ok: false, reason: 'not-supported' };
   if (!hasSimkl(profile)) return { ok: false, reason: 'no-simkl' };
   const row = resolveWatchedRow(profile.id, type, ref, D.watchedStore);
   if (!row) return { ok: false, reason: 'not-in-history' };
@@ -638,4 +746,5 @@ module.exports = {
   httpStatus,
   resolveType,
   hasSimkl,
+  animeSource,
 };

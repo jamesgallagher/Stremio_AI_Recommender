@@ -540,7 +540,7 @@ async function ok(name, fn) {
       let body = await res.json();
       assert.strictEqual(body.engines.anime.id, 'off', 'engines.anime.id is off');
       assert.deepStrictEqual(body.engines.requirements.anime, { ok: true, missing: [] }, 'requirements.anime ok when off');
-      assert.strictEqual('engine_anime' in body.filters, false, 'engine_anime never in filters');
+      assert.strictEqual('engine_anime' in body.filters, true, 'engine_anime in the companion filters');
 
       // POST: set engine_anime to marquee-anime.
       res = await fetch(`${BASE}/mobile/api/settings`, {

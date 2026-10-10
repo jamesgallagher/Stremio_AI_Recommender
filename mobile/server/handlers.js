@@ -14,14 +14,14 @@ const markWatched = require('../../src/markWatched');
 const trainer = require('../../src/trainer');
 const catalogServe = require('../../src/catalogServe');
 
-const TYPES = ['movie', 'series'];
+const TYPES = ['movie', 'series', 'anime'];
 
 // Filters the Companion is allowed to READ and WRITE. The age gate
 // (filters.age_limit) is deliberately ABSENT — it is never returned, never
 // rendered, and never writable through the phone (it stays a backend-only
 // control). The server still USES the profile's age limit internally for the
 // vetted-only "entire list" view; it just never leaves the server.
-const COMPANION_FILTERS = ['min_rating', 'vote_count_floor', 'min_year', 'excluded_genres', 'list_size', 'title_decay_enabled', 'title_decay_days'];
+const COMPANION_FILTERS = ['min_rating', 'vote_count_floor', 'min_year', 'excluded_genres', 'list_size', 'title_decay_enabled', 'title_decay_days', 'engine_anime'];
 const SEARCH_LIMIT = 10;
 const SEARCH_LIMIT_MAX = 12; // search does 1 + N detail calls — keep it light
 
@@ -64,7 +64,7 @@ async function searchHandler(req, res) {
 async function watchlistHandler(req, res) {
   const body = req.body || {};
   const { type, tmdb_id, imdb_id, title, year } = body;
-  if (!TYPES.includes(type)) return res.status(400).json({ error: 'type must be movie or series' });
+  if (!TYPES.includes(type)) return res.status(400).json({ error: 'type must be movie, series or anime' });
   if (tmdb_id == null && !imdb_id) return res.status(400).json({ error: 'tmdb_id or imdb_id is required' });
   if (!req.profile.simkl_auth?.access_token) {
     return res.status(400).json({ error: 'Simkl is not connected — connect it in the portal first' });
@@ -87,7 +87,7 @@ async function watchlistHandler(req, res) {
 async function watchlistRemoveHandler(req, res) {
   const body = req.body || {};
   const { type, tmdb_id, imdb_id, title } = body;
-  if (!TYPES.includes(type)) return res.status(400).json({ error: 'type must be movie or series' });
+  if (!TYPES.includes(type)) return res.status(400).json({ error: 'type must be movie, series or anime' });
   if (tmdb_id == null && !imdb_id) return res.status(400).json({ error: 'tmdb_id or imdb_id is required' });
   if (!req.profile.simkl_auth?.access_token) {
     return res.status(400).json({ error: 'Simkl is not connected — connect it in the portal first' });
@@ -175,7 +175,7 @@ function recommendationsHandler(req, res) {
 async function suppressHandler(req, res) {
   const body = req.body || {};
   const { type, tmdb_id, imdb_id, title } = body;
-  if (!TYPES.includes(type)) return res.status(400).json({ error: 'type must be movie or series' });
+  if (!TYPES.includes(type)) return res.status(400).json({ error: 'type must be movie, series or anime' });
   if (tmdb_id == null && !imdb_id) return res.status(400).json({ error: 'tmdb_id or imdb_id is required' });
   const result = await dontRecommend.suppress(req.profile, { type, imdbId: imdb_id, tmdbId: tmdb_id, title }, console);
   if (!result.ok) return res.status(result.reason === 'bad-type' ? 400 : 422).json({ error: `could not remove (${result.reason})` });
@@ -190,7 +190,7 @@ async function suppressHandler(req, res) {
 async function watchedHandler(req, res) {
   const body = req.body || {};
   const { type, tmdb_id, imdb_id, title } = body;
-  if (!TYPES.includes(type)) return res.status(400).json({ error: 'type must be movie or series' });
+  if (!TYPES.includes(type)) return res.status(400).json({ error: 'type must be movie, series or anime' });
   if (tmdb_id == null && !imdb_id) return res.status(400).json({ error: 'tmdb_id or imdb_id is required' });
   if (!req.profile.simkl_auth?.access_token) {
     return res.status(400).json({ error: 'Simkl is not connected — connect it in the portal first' });
@@ -208,7 +208,7 @@ async function watchedHandler(req, res) {
 function unsuppressHandler(req, res) {
   const body = req.body || {};
   const { type, tmdb_id } = body;
-  if (!TYPES.includes(type)) return res.status(400).json({ error: 'type must be movie or series' });
+  if (!TYPES.includes(type)) return res.status(400).json({ error: 'type must be movie, series or anime' });
   if (tmdb_id == null) return res.status(400).json({ error: 'tmdb_id is required' });
   const restored = recommendationStore.removeDontRecommend(req.profile.id, type, tmdb_id);
   res.json({ ok: true, restored });
