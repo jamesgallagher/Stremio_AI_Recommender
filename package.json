@@ -1,11 +1,11 @@
 {
   "name": "ai-recommender",
-  "version": "7.52.0-beta",
+  "version": "7.53.0-beta",
   "description": "Self-hosted Stremio/Nuvio AI recommendation addon — Simkl + TMDB recommendations + custom/Groq LLM, per-family-profile",
   "main": "src/server.js",
   "scripts": {
     "start": "node --experimental-sqlite src/server.js",
-    "test": "node --experimental-sqlite test/smoke.js && node --experimental-sqlite test/integration.js && node --experimental-sqlite mobile/test/mobile.smoke.js && node --experimental-sqlite test/shared-login.js && node --experimental-sqlite test/engines-marquee-only.js && node --experimental-sqlite test/anime-lane.js && node --experimental-sqlite test/anime-trending.js && node --experimental-sqlite test/anime-decisions.js && node --experimental-sqlite test/anime-decisions-gate.js && node --experimental-sqlite test/anime-decisions-urgent.js && node --experimental-sqlite test/anime-decisions-report.js && node --experimental-sqlite test/age-anime-chain.js && node --experimental-sqlite test/anime-borderline.js && node --experimental-sqlite test/anidb-warmup.js && node --experimental-sqlite test/anime-personalised.js && node --experimental-sqlite test/anime-ratings.js && node --experimental-sqlite test/simkl.lifecycle.js && node --experimental-sqlite test/mdblist-user-keys.js",
+    "test": "node --experimental-sqlite test/smoke.js && node --experimental-sqlite test/integration.js && node --experimental-sqlite mobile/test/mobile.smoke.js && node --experimental-sqlite test/shared-login.js && node --experimental-sqlite test/engines-marquee-only.js && node --experimental-sqlite test/anime-lane.js && node --experimental-sqlite test/anime-trending.js && node --experimental-sqlite test/anime-decisions.js && node --experimental-sqlite test/anime-decisions-gate.js && node --experimental-sqlite test/anime-decisions-urgent.js && node --experimental-sqlite test/anime-decisions-report.js && node --experimental-sqlite test/age-anime-chain.js && node --experimental-sqlite test/anime-borderline.js && node --experimental-sqlite test/anidb-warmup.js && node --experimental-sqlite test/anime-personalised.js && node --experimental-sqlite test/anime-ratings.js && node --experimental-sqlite test/filter-gate.js && node --experimental-sqlite test/simkl.lifecycle.js && node --experimental-sqlite test/mdblist-user-keys.js",
     "test:simkl": "node --experimental-sqlite test/simkl.lifecycle.js",
     "test:simkl:browser": "node --experimental-sqlite test/simkl.lifecycle.js --browser",
     "test:integration": "node --experimental-sqlite test/integration.js",

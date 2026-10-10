@@ -367,6 +367,85 @@ async function animeAgeReview(tier, items, log = console) {
   return out;
 }
 
+// FG-1: titleFacts — ask the LLM for specific facts about a batch of titles.
+// `titles` is an array of { title, type, needs } where needs is the set of fact
+// names to fetch (e.g. ['genres', 'year', 'rating']). Returns an array aligned
+// with `titles`: each entry is { genres?, year?, rating? } or null (the model
+// omitted the title or the answer was unparseable).
+//
+// Uses the same endpoint/plumbing as ageGate (llm.chat with settings.llmChain()).
+// Strict JSON out; any title the model omits or any unparseable answer is
+// simply left missing. The prompt says: answer only if you know it, otherwise
+// omit the title; never guess.
+async function titleFacts(type, titles, needs, log = console) {
+  if (!titles.length) return [];
+  const kind = type === 'series' ? 'TV series' : 'movies';
+  const needList = needs.join(', ');
+  const lines = titles.map((t) => JSON.stringify({ title: t.title, type: t.type })).join('\n');
+
+  const prompt = `For each ${kind} below, answer ONLY the facts requested (${needList}).
+Answer only if you know it; otherwise omit that title. Never guess.
+
+Titles (one JSON object per line):
+${lines}
+
+Return a JSON array with one object PER title (or omit titles you cannot answer), each with:
+- "title": the title, copied verbatim
+- "genres": array of genre names (only if requested)
+- "year": release year as a number (only if requested)
+- "rating": IMDb rating as a number 0-10 (only if requested)
+Output ONLY the JSON array, no prose.
+Example: [{"title":"Inception","genres":["Sci-Fi","Thriller"],"year":2010,"rating":8.8}]`;
+
+  const validTitles = new Set(titles.map((t) => t.title));
+  const validate = (text) => {
+    const cleaned = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim();
+    let parsed;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch (err) {
+      const a = cleaned.indexOf('[');
+      const b = cleaned.lastIndexOf(']');
+      if (a === -1 || b <= a) throw err;
+      parsed = JSON.parse(cleaned.slice(a, b + 1));
+    }
+    if (!Array.isArray(parsed)) throw new Error('LLM did not return a JSON array');
+    // Validate: drop hallucinated titles, keep first occurrence.
+    const seen = new Set();
+    const out = [];
+    for (const x of parsed) {
+      if (!x || typeof x.title !== 'string') continue;
+      if (!validTitles.has(x.title)) continue;
+      if (seen.has(x.title)) continue;
+      seen.add(x.title);
+      out.push(x);
+    }
+    return out;
+  };
+
+  try {
+    const results = await llm.chat(
+      settings.llmChain(), [{ role: 'user', content: prompt }],
+      { temperature: 0, system: 'You are a film and television database. Reply with raw JSON only.', validate }, log,
+    );
+    // Align results with the input titles (null for omitted titles).
+    const byTitle = new Map(results.map((r) => [r.title, r]));
+    return titles.map((t) => {
+      const r = byTitle.get(t.title);
+      if (!r) return null;
+      const out = {};
+      if (needs.includes('genres') && Array.isArray(r.genres)) out.genres = r.genres;
+      if (needs.includes('year') && r.year != null) out.year = r.year;
+      if (needs.includes('rating') && r.rating != null) out.rating = r.rating;
+      return Object.keys(out).length ? out : null;
+    });
+  } catch (err) {
+    // The whole LLM chain failed: return null for every title.
+    log.warn(`[llm] titleFacts batch failed (${err.message})`);
+    return titles.map(() => null);
+  }
+}
+
 module.exports = {
   ageGate,
   buildAgePrompt,
@@ -377,4 +456,5 @@ module.exports = {
   generateCandidates,
   animeAgeReview,
   buildAnimeReviewPrompt,
+  titleFacts,
 };
