@@ -1,6 +1,8 @@
 // Optional extra catalogs, toggleable per profile in the portal's Catalogs
 // section (the two AI catalogs are always on and are not defined here).
-// Two sources:
+// `profile_filters: true` means the profile's filters (rating floor, release
+// year, vote floor, excluded genres) are applied via the Filter Gate before
+// the age gate. Two sources:
 // - source 'simkl_plantowatch' (Watch Later, v6): mirrors the profile's Simkl
 //   plan-to-watch list (movies + shows + anime). Default ON (default_on),
 //   requires Simkl. Served in the user's own order; watched titles are KEPT
@@ -35,8 +37,8 @@ const EXTRA_CATALOGS = [
   // listItemsPage splits by type, so both catalogs share the single slug
   // 'popular'. (The site groups it as movies/popular + shows/popular pages, but
   // the API slug is just 'popular'.) Unfiltered.
-  { id: 'mdb-popular-movies', type: 'movie', name: 'Popular Movies', source: 'mdblist', user: 'official', slug: 'popular', min_imdb: 0 },
-  { id: 'mdb-popular-series', type: 'series', name: 'Popular Series', source: 'mdblist', user: 'official', slug: 'popular', min_imdb: 0 },
+  { id: 'mdb-popular-movies', type: 'movie', name: 'Popular Movies', source: 'mdblist', user: 'official', slug: 'popular', min_imdb: 0, profile_filters: true },
+  { id: 'mdb-popular-series', type: 'series', name: 'Popular Series', source: 'mdblist', user: 'official', slug: 'popular', min_imdb: 0, profile_filters: true },
   // Genre lists — rating-gated at 6.0, imdbpopular order.
   { id: 'mdb-comedy-movies', type: 'movie', name: 'Comedy Movies', source: 'mdblist', user: 'hdlists', slug: 'comedy-movies-2001-2020', min_imdb: 6, sort: 'imdbpopular' },
   { id: 'mdb-action-movies', type: 'movie', name: 'Action Movies', source: 'mdblist', user: 'hdlists', slug: 'latest-hd-action-movies-from-1980-to-today', min_imdb: 6, sort: 'imdbpopular' },
@@ -51,13 +53,13 @@ const EXTRA_CATALOGS = [
   // (CB-1: no per-catalog target). age_band 12 is applied ALWAYS (even on adult
   // profiles), so the row is trustworthy on its own; effective gate =
   // min(age_band, profile.age_limit) when the profile is limited.
-  { id: 'mdb-kids-movies', type: 'movie', name: 'Trending Kids Movies', source: 'mdblist', user: 'tvgeniekodi', slug: 'trending-kids-movies', min_imdb: 6, sort: 'tmdbpopular', age_band: 12 },
-  { id: 'mdb-kids-series', type: 'series', name: 'Trending Kids TV', source: 'mdblist', user: 'tvgeniekodi', slug: 'trending-kids-tv-shows', min_imdb: 6, sort: 'tmdbpopular', age_band: 12 },
+  { id: 'mdb-kids-movies', type: 'movie', name: 'Trending Kids Movies', source: 'mdblist', user: 'tvgeniekodi', slug: 'trending-kids-movies', min_imdb: 6, sort: 'tmdbpopular', age_band: 12, profile_filters: true },
+  { id: 'mdb-kids-series', type: 'series', name: 'Trending Kids TV', source: 'mdblist', user: 'tvgeniekodi', slug: 'trending-kids-tv-shows', min_imdb: 6, sort: 'tmdbpopular', age_band: 12, profile_filters: true },
   // Anime TV-14 — snoak/trending-anime-shows on MDBList (v6 decision, not the
   // doc's AniList). min_profile_age 14 HIDES it below the band; age_band 14
   // GATES it always (→ the TV-14 tier). ID kept for manifest stability. Sized
   // by the profile's list-size setting (CB-1: no per-catalog target).
-  { id: 'trakt-anime-teen-series', type: 'series', name: 'Anime TV-14', source: 'mdblist', user: 'snoak', slug: 'trending-anime-shows', min_imdb: 6, sort: 'tmdbpopular', min_profile_age: 14, age_band: 14 },
+  { id: 'trakt-anime-teen-series', type: 'series', name: 'Anime TV-14', source: 'mdblist', user: 'snoak', slug: 'trending-anime-shows', min_imdb: 6, sort: 'tmdbpopular', min_profile_age: 14, age_band: 14, profile_filters: true },
 ];
 
 const byId = new Map(EXTRA_CATALOGS.map((d) => [d.id, d]));

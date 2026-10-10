@@ -35,6 +35,7 @@ const tmdb = require('./services/tmdb');
 const mdblist = require('./services/mdblist');
 const animeMap = require('./services/animeMap');
 const mal = require('./services/mal');
+const filterGate = require('./filterGate');
 
 const STALE_MS = (parseInt(process.env.STALE_HOURS, 10) || 24) * 3600e3;
 const BACKOFF_MS = (parseInt(process.env.BACKOFF_MINUTES, 10) || 30) * 60e3;
@@ -500,6 +501,33 @@ async function fetchExtraPage(key, def, page, seen, log) {
   return { metas, items };
 }
 
+// B5: the filter gate helper — maps metas to candidates, runs checkMany,
+// drops bad ones, and updates the stats object. Returns the kept metas.
+async function applyFilterGate(profile, def, metas, stats, log) {
+  const candidates = metas.map((m) => ({
+    key: m._tmdb_id != null ? String(m._tmdb_id) : m.id,
+    tmdb_id: m._tmdb_id != null ? String(m._tmdb_id) : null,
+    imdb_id: m.id,
+    title: m.name,
+    year: m.releaseInfo ? parseInt(m.releaseInfo, 10) || null : null,
+    imdbRating: m.imdbRating != null ? parseFloat(m.imdbRating) || null : null,
+  }));
+  const verdicts = await filterGate.checkMany(profile, def.type, candidates, { log });
+  const kept = [];
+  for (const m of metas) {
+    const k = m._tmdb_id != null ? String(m._tmdb_id) : m.id;
+    const v = verdicts.get(k);
+    if (v && v.verdict === 'bad') {
+      stats.removed++;
+      if (v.reason) stats.reasons[v.reason] = (stats.reasons[v.reason] || 0) + 1;
+      continue;
+    }
+    kept.push(m);
+  }
+  stats.checked += metas.length;
+  return kept;
+}
+
 async function buildExtraCatalog(profile, def, log = console) {
   if (def.source === 'simkl_plantowatch') {
     return cleanMetas(await applyExtraAgeGate(profile, def, await buildWatchlistCatalog(profile, def, log), log));
@@ -529,13 +557,20 @@ async function buildExtraCatalog(profile, def, log = console) {
   };
   let eligibleCount = 0;
   let page = 0;
+  // FG-1: filter gate stats (counts only, no titles or ids).
+  const filterStats = { removed: 0, checked: 0, reasons: { genre: 0, recency: 0, votes: 0, rating: 0, no_data: 0 } };
 
   // Page until 2×listSize ELIGIBLE candidates are collected (or MAX_EXTRA_PAGES).
   // ALL titles (including ineligible) stay in the cache.
   while (page < MAX_EXTRA_PAGES && eligibleCount < target) {
     const { metas: pageMetas, items } = await fetchExtraPage(key, def, page, seen, log);
     if (!items.length) break;
-    for (const m of pageMetas) {
+    // FG-1: run the filter gate on this page before counting eligibility.
+    let filteredMetas = pageMetas;
+    if (def.profile_filters) {
+      filteredMetas = await applyFilterGate(profile, def, pageMetas, filterStats, log);
+    }
+    for (const m of filteredMetas) {
       collected.push(m);
       if (isEligible(m)) eligibleCount++;
     }
@@ -555,11 +590,23 @@ async function buildExtraCatalog(profile, def, log = console) {
     const { metas: pageMetas, items } = await fetchExtraPage(key, def, page, seen, log);
     if (!items.length) break;
     if (pageMetas.length) {
-      const aged = await applyExtraAgeGate(profile, def, pageMetas, log);
+      // FG-1: run the filter gate before the age gate.
+      let gatedMetas = pageMetas;
+      if (def.profile_filters) {
+        gatedMetas = await applyFilterGate(profile, def, pageMetas, filterStats, log);
+      }
+      const aged = await applyExtraAgeGate(profile, def, gatedMetas, log);
       result.push(...aged);
       postAgeEligible = result.filter(isEligible).length;
     }
     page++;
+  }
+
+  // FG-1: log the filter gate summary (counts only, no titles or ids).
+  // B5: M is the number of titles the gate checked (sum of all pages), not collected.length + removed.
+  if (def.profile_filters && filterStats.removed > 0) {
+    const r = filterStats.reasons;
+    log.log(`[extra] ${profile.name}/${def.id}: filter gate removed ${filterStats.removed} of ${filterStats.checked} (genre ${r.genre}, recency ${r.recency}, votes ${r.votes}, rating ${r.rating}, no_data ${r.no_data})`);
   }
 
   // Randomize so the daily list looks fresh instead of serving the same fixed
