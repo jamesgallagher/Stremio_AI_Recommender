@@ -368,36 +368,69 @@ async function animeAgeReview(tier, items, log = console) {
 }
 
 // FG-1: titleFacts — ask the LLM for specific facts about a batch of titles.
-// `titles` is an array of { title, type, needs } where needs is the set of fact
-// names to fetch (e.g. ['genres', 'year', 'rating']). Returns an array aligned
-// with `titles`: each entry is { genres?, year?, rating? } or null (the model
-// omitted the title or the answer was unparseable).
+// `titles` is an array of { title, type, needs, year?, imdb_id? } where `needs`
+// is the per-title set of fact names to fetch (e.g. ['genres', 'year', 'rating']).
+// Returns an array aligned with `titles` BY INDEX: each entry is
+// { genres?, year?, rating? } or null (the model omitted the title or the
+// answer was unparseable).
+//
+// B3: each title carries its own `needs` (not a shared list). The prompt sends
+// `imdb_id` and `year` with each title to disambiguate remakes/same-name titles.
+// The model echoes the `id` back; results are matched by that id (falling back
+// to index position). `votes` is never asked (the LLM can't answer it sensibly).
 //
 // Uses the same endpoint/plumbing as ageGate (llm.chat with settings.llmChain()).
 // Strict JSON out; any title the model omits or any unparseable answer is
 // simply left missing. The prompt says: answer only if you know it, otherwise
 // omit the title; never guess.
-async function titleFacts(type, titles, needs, log = console) {
+// FG-1: titleFacts — ask the LLM for specific facts about a batch of titles.
+// `titles` is an array of { title, type, needs, year?, imdb_id? } where `needs`
+// is the per-title set of fact names to fetch (e.g. ['genres', 'year', 'rating']).
+// Returns an array aligned with `titles` BY INDEX: each entry is
+// { genres?, year?, rating? } or null (the model omitted the title or the
+// answer was unparseable).
+//
+// B3: each title carries its own `needs` (not a shared list). The prompt sends
+// `imdb_id` and `year` with each title to disambiguate remakes/same-name titles.
+// The model echoes the `id` back; results are matched by that id (falling back
+// to index position). `votes` is never asked (the LLM can't answer it sensibly).
+//
+// Uses the same endpoint/plumbing as ageGate (llm.chat with settings.llmChain()).
+// Strict JSON out; any title the model omits or any unparseable answer is
+// simply left missing. The prompt says: answer only if you know it, otherwise
+// omit the title; never guess.
+async function titleFacts(type, titles, log = console) {
   if (!titles.length) return [];
   const kind = type === 'series' ? 'TV series' : 'movies';
-  const needList = needs.join(', ');
-  const lines = titles.map((t) => JSON.stringify({ title: t.title, type: t.type })).join('\n');
+  const allNeeds = new Set();
+  for (const t of titles) for (const n of t.needs || []) allNeeds.add(n);
+  const needList = [...allNeeds].join(', ');
 
-  const prompt = `For each ${kind} below, answer ONLY the facts requested (${needList}).
+  // Each line carries the id (imdb_id), title, year (when known), and the
+  // per-title needs. The model echoes the id back.
+  const lines = titles.map((t) => JSON.stringify({
+    id: t.imdb_id || t.title,
+    title: t.title,
+    year: t.year != null ? t.year : undefined,
+    needs: t.needs,
+  })).join('\n');
+
+  const prompt = `For each ${kind} below, answer ONLY the facts listed in its "needs" field.
 Answer only if you know it; otherwise omit that title. Never guess.
 
 Titles (one JSON object per line):
 ${lines}
 
-Return a JSON array with one object PER title (or omit titles you cannot answer), each with:
-- "title": the title, copied verbatim
-- "genres": array of genre names (only if requested)
-- "year": release year as a number (only if requested)
-- "rating": IMDb rating as a number 0-10 (only if requested)
+Return a JSON array with one object PER title you can answer (omit titles you cannot), each with:
+- "id": the id, copied verbatim from the input
+- "genres": array of genre names (only if in that title's needs)
+- "year": release year as a number (only if in that title's needs)
+- "rating": IMDb rating as a number 0-10 (only if in that title's needs)
 Output ONLY the JSON array, no prose.
-Example: [{"title":"Inception","genres":["Sci-Fi","Thriller"],"year":2010,"rating":8.8}]`;
+Example: [{"id":"tt123","genres":["Sci-Fi","Thriller"],"year":2010,"rating":8.8}]`;
 
-  const validTitles = new Set(titles.map((t) => t.title));
+  // Valid ids: the set of ids we sent (imdb_id or title as fallback).
+  const validIds = new Set(titles.map((t) => t.imdb_id || t.title));
   const validate = (text) => {
     const cleaned = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim();
     let parsed;
@@ -410,14 +443,14 @@ Example: [{"title":"Inception","genres":["Sci-Fi","Thriller"],"year":2010,"ratin
       parsed = JSON.parse(cleaned.slice(a, b + 1));
     }
     if (!Array.isArray(parsed)) throw new Error('LLM did not return a JSON array');
-    // Validate: drop hallucinated titles, keep first occurrence.
+    // Validate: drop hallucinated ids, keep first occurrence.
     const seen = new Set();
     const out = [];
     for (const x of parsed) {
-      if (!x || typeof x.title !== 'string') continue;
-      if (!validTitles.has(x.title)) continue;
-      if (seen.has(x.title)) continue;
-      seen.add(x.title);
+      if (!x || typeof x.id !== 'string') continue;
+      if (!validIds.has(x.id)) continue;
+      if (seen.has(x.id)) continue;
+      seen.add(x.id);
       out.push(x);
     }
     return out;
@@ -428,12 +461,13 @@ Example: [{"title":"Inception","genres":["Sci-Fi","Thriller"],"year":2010,"ratin
       settings.llmChain(), [{ role: 'user', content: prompt }],
       { temperature: 0, system: 'You are a film and television database. Reply with raw JSON only.', validate }, log,
     );
-    // Align results with the input titles (null for omitted titles).
-    const byTitle = new Map(results.map((r) => [r.title, r]));
+    // Align results with the input titles BY ID (the model echoes the id back).
+    const byId = new Map(results.map((r) => [r.id, r]));
     return titles.map((t) => {
-      const r = byTitle.get(t.title);
+      const r = byId.get(t.imdb_id || t.title);
       if (!r) return null;
       const out = {};
+      const needs = t.needs || [];
       if (needs.includes('genres') && Array.isArray(r.genres)) out.genres = r.genres;
       if (needs.includes('year') && r.year != null) out.year = r.year;
       if (needs.includes('rating') && r.rating != null) out.rating = r.rating;

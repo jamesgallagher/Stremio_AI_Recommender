@@ -501,6 +501,33 @@ async function fetchExtraPage(key, def, page, seen, log) {
   return { metas, items };
 }
 
+// B5: the filter gate helper — maps metas to candidates, runs checkMany,
+// drops bad ones, and updates the stats object. Returns the kept metas.
+async function applyFilterGate(profile, def, metas, stats, log) {
+  const candidates = metas.map((m) => ({
+    key: m._tmdb_id != null ? String(m._tmdb_id) : m.id,
+    tmdb_id: m._tmdb_id != null ? String(m._tmdb_id) : null,
+    imdb_id: m.id,
+    title: m.name,
+    year: m.releaseInfo ? parseInt(m.releaseInfo, 10) || null : null,
+    imdbRating: m.imdbRating != null ? parseFloat(m.imdbRating) || null : null,
+  }));
+  const verdicts = await filterGate.checkMany(profile, def.type, candidates, { log });
+  const kept = [];
+  for (const m of metas) {
+    const k = m._tmdb_id != null ? String(m._tmdb_id) : m.id;
+    const v = verdicts.get(k);
+    if (v && v.verdict === 'bad') {
+      stats.removed++;
+      if (v.reason) stats.reasons[v.reason] = (stats.reasons[v.reason] || 0) + 1;
+      continue;
+    }
+    kept.push(m);
+  }
+  stats.checked += metas.length;
+  return kept;
+}
+
 async function buildExtraCatalog(profile, def, log = console) {
   if (def.source === 'simkl_plantowatch') {
     return cleanMetas(await applyExtraAgeGate(profile, def, await buildWatchlistCatalog(profile, def, log), log));
@@ -531,8 +558,7 @@ async function buildExtraCatalog(profile, def, log = console) {
   let eligibleCount = 0;
   let page = 0;
   // FG-1: filter gate stats (counts only, no titles or ids).
-  const filterStats = { genre: 0, recency: 0, votes: 0, rating: 0, no_data: 0 };
-  let filterRemoved = 0;
+  const filterStats = { removed: 0, checked: 0, reasons: { genre: 0, recency: 0, votes: 0, rating: 0, no_data: 0 } };
 
   // Page until 2×listSize ELIGIBLE candidates are collected (or MAX_EXTRA_PAGES).
   // ALL titles (including ineligible) stay in the cache.
@@ -542,26 +568,7 @@ async function buildExtraCatalog(profile, def, log = console) {
     // FG-1: run the filter gate on this page before counting eligibility.
     let filteredMetas = pageMetas;
     if (def.profile_filters) {
-      const candidates = pageMetas.map((m) => ({
-        key: m._tmdb_id != null ? String(m._tmdb_id) : m.id,
-        tmdb_id: m._tmdb_id != null ? String(m._tmdb_id) : null,
-        imdb_id: m.id,
-        title: m.name,
-        year: m.releaseInfo ? parseInt(m.releaseInfo, 10) || null : null,
-        imdbRating: m.imdbRating != null ? parseFloat(m.imdbRating) || null : null,
-      }));
-      const verdicts = await filterGate.checkMany(profile, def.type, candidates, { log });
-      filteredMetas = [];
-      for (const m of pageMetas) {
-        const k = m._tmdb_id != null ? String(m._tmdb_id) : m.id;
-        const v = verdicts.get(k);
-        if (v && v.verdict === 'bad') {
-          filterRemoved++;
-          if (v.reason) filterStats[v.reason] = (filterStats[v.reason] || 0) + 1;
-          continue;
-        }
-        filteredMetas.push(m);
-      }
+      filteredMetas = await applyFilterGate(profile, def, pageMetas, filterStats, log);
     }
     for (const m of filteredMetas) {
       collected.push(m);
@@ -586,26 +593,7 @@ async function buildExtraCatalog(profile, def, log = console) {
       // FG-1: run the filter gate before the age gate.
       let gatedMetas = pageMetas;
       if (def.profile_filters) {
-        const candidates = pageMetas.map((m) => ({
-          key: m._tmdb_id != null ? String(m._tmdb_id) : m.id,
-          tmdb_id: m._tmdb_id != null ? String(m._tmdb_id) : null,
-          imdb_id: m.id,
-          title: m.name,
-          year: m.releaseInfo ? parseInt(m.releaseInfo, 10) || null : null,
-          imdbRating: m.imdbRating != null ? parseFloat(m.imdbRating) || null : null,
-        }));
-        const verdicts = await filterGate.checkMany(profile, def.type, candidates, { log });
-        gatedMetas = [];
-        for (const m of pageMetas) {
-          const k = m._tmdb_id != null ? String(m._tmdb_id) : m.id;
-          const v = verdicts.get(k);
-          if (v && v.verdict === 'bad') {
-            filterRemoved++;
-            if (v.reason) filterStats[v.reason] = (filterStats[v.reason] || 0) + 1;
-            continue;
-          }
-          gatedMetas.push(m);
-        }
+        gatedMetas = await applyFilterGate(profile, def, pageMetas, filterStats, log);
       }
       const aged = await applyExtraAgeGate(profile, def, gatedMetas, log);
       result.push(...aged);
@@ -615,8 +603,10 @@ async function buildExtraCatalog(profile, def, log = console) {
   }
 
   // FG-1: log the filter gate summary (counts only, no titles or ids).
-  if (def.profile_filters && filterRemoved > 0) {
-    log.log(`[extra] ${profile.name}/${def.id}: filter gate removed ${filterRemoved} of ${collected.length + filterRemoved} (genre ${filterStats.genre}, recency ${filterStats.recency}, votes ${filterStats.votes}, rating ${filterStats.rating}, no_data ${filterStats.no_data})`);
+  // B5: M is the number of titles the gate checked (sum of all pages), not collected.length + removed.
+  if (def.profile_filters && filterStats.removed > 0) {
+    const r = filterStats.reasons;
+    log.log(`[extra] ${profile.name}/${def.id}: filter gate removed ${filterStats.removed} of ${filterStats.checked} (genre ${r.genre}, recency ${r.recency}, votes ${r.votes}, rating ${r.rating}, no_data ${r.no_data})`);
   }
 
   // Randomize so the daily list looks fresh instead of serving the same fixed
