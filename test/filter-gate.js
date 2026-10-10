@@ -650,60 +650,94 @@ async function testFG8() {
 
 // ============================================================================
 // FG9: wiring — drive buildExtraCatalog (T2 rewrite)
+//
+// FG9a keeps the pure checkMany unit cases. FG9b-FG9d drive the real
+// buildExtraCatalog (the I8 pattern: stub mdblist.listItemsPage /
+// mdblist.mediaInfoBatch / metaStore.getMany / metaStore.enrich on the module
+// objects; buildExtraCatalog calls them through the module object).
 // ============================================================================
-async function testFG9() {
-  const rebuild = require('../src/rebuild');
-  const catalogs = require('../src/catalogs');
-  const settings = require('../src/settings');
 
-  // A profile with filters: excluded_genres Horror, min_rating 7, min_year 2010.
+// A list-page item in the shape fetchExtraPage expects: imdb_id, ids (imdb +
+// tmdb), title, release_year, an IMDb rating in ratings (so fetchExtraPage
+// fills imdbRating), and a poster (so the batch enrich is skipped). `_genres`
+// is internal — it feeds the metaStore stub, not the list page.
+function makeItem(imdbId, tmdbId, title, genres, rating, year) {
+  return {
+    imdb_id: imdbId,
+    ids: { imdb: imdbId, tmdb: tmdbId },
+    title,
+    release_year: year,
+    ratings: [{ source: 'imdb', value: rating }],
+    poster: 'http://example.com/p.jpg',
+    _genres: genres,
+  };
+}
+
+// The metaStore.getMany stub data: tmdb id -> deep-meta (genres/year/votes/rating).
+function metaDataFor(items) {
+  const map = new Map();
+  for (const it of items) {
+    map.set(String(it.ids.tmdb), {
+      genres: it._genres,
+      year: it.release_year,
+      vote_count: 1000,
+      vote_average: it.ratings[0].value,
+    });
+  }
+  return map;
+}
+
+// Shared wiring harness: stubs the MDBList fetchers, the TMDB meta store, and
+// (optionally) the age chain's verify on the module objects, so a real
+// buildExtraCatalog run exercises the filter gate -> age gate wiring. Every
+// stub is restored by the caller's finally.
+function wiringHarness({ page0, page1, metaStoreData, verifyStub }) {
+  const mdblist = require('../src/services/mdblist');
+  const metaStore = require('../src/engines/shared/metaStore');
+  const ageVerify = require('../src/ageVerification');
+  const animeMap = require('../src/services/animeMap');
+  const origList = mdblist.listItemsPage;
+  const origMediaInfo = mdblist.mediaInfoBatch;
+  const origCachedImdb = mdblist.cachedImdbRatings;
+  const origGetMany = metaStore.getMany;
+  const origEnrich = metaStore.enrich;
+  const origVerify = ageVerify.verify;
+  const listCalls = [];
+  let getManyCalls = 0;
+  let cachedImdbCalls = 0;
+  mdblist.listItemsPage = async (key, user, slug, type, { offset }) => {
+    listCalls.push(offset);
+    return offset === 0 ? page0 : offset === 50 ? page1 : [];
+  };
+  mdblist.mediaInfoBatch = async () => new Map();
+  mdblist.cachedImdbRatings = async () => { cachedImdbCalls++; return new Map(); };
+  metaStore.getMany = () => { getManyCalls++; return metaStoreData; };
+  metaStore.enrich = async () => null;
+  if (verifyStub) ageVerify.verify = verifyStub;
+  // Keep the anime detector offline (no Tenrai/AniList reach-out).
+  animeMap._setIndex({ at: Date.now(), etag: 'itest', byImdb: {}, byTmdb: {} });
+  return {
+    listCalls,
+    getManyCalls: () => getManyCalls,
+    cachedImdbCalls: () => cachedImdbCalls,
+    restore() {
+      mdblist.listItemsPage = origList;
+      mdblist.mediaInfoBatch = origMediaInfo;
+      mdblist.cachedImdbRatings = origCachedImdb;
+      metaStore.getMany = origGetMany;
+      metaStore.enrich = origEnrich;
+      ageVerify.verify = origVerify;
+    },
+  };
+}
+
+// FG9a: filter gate unit cases (checkMany directly).
+async function testFG9a() {
   const profile = {
-    id: 'fg9-profile',
-    name: 'FG9',
+    id: 'fg9a-profile',
+    name: 'FG9A',
     filters: { excluded_genres: ['Horror'], min_rating: 7, min_year: 2010 },
-    simkl: { key: 'test-simkl' },
-    tmdb: { key: 'test-tmdb' },
-    mdblist: { key: 'test-mdblist' },
   };
-
-  // A catalog definition with profile_filters: true.
-  const def = {
-    id: 'mdb-popular-movies',
-    type: 'movie',
-    source: 'mdblist',
-    mdblist_list: 'popular-movies',
-    profile_filters: true,
-  };
-
-  // Fake MDBList page: mixed titles.
-  // tt1: Horror (removed by genre)
-  // tt2: 6.2 rated (removed by rating)
-  // tt3: 2005 (removed by recency)
-  // tt4: good
-  // tt5: good
-  const fakePage = {
-    items: [
-      { id: 'tt1', title: 'Horror Film', release_year: '2020', imdbRating: '8.5' },
-      { id: 'tt2', title: 'Low Rated', release_year: '2020', imdbRating: '6.2' },
-      { id: 'tt3', title: 'Old Film', release_year: '2005', imdbRating: '8.0' },
-      { id: 'tt4', title: 'Good Film', release_year: '2020', imdbRating: '8.5' },
-      { id: 'tt5', title: 'Great Film', release_year: '2015', imdbRating: '9.0' },
-    ],
-  };
-
-  // Fake fetchExtraPage: returns the fake page on page 0, empty on page 1+.
-  const origFetch = rebuild._fetchExtraPage;
-  // We need to monkey-patch fetchExtraPage. Since it's internal, we use a
-  // different approach: inject the deps into checkMany via the profile.
-  // Actually, buildExtraCatalog calls fetchExtraPage directly. We need to
-  // intercept it. Let's use a wrapper approach.
-
-  // Since fetchExtraPage is a module-internal function, we can't easily mock it.
-  // Instead, we test the wiring by calling checkMany directly on the metas
-  // that buildExtraCatalog would produce, and verify the filter gate logic.
-  // The card says "copy how test/integration.js around line 6100 drives it".
-  // For this test, we verify the core wiring: checkMany removes the right titles.
-
   const candidates = [
     { key: 'tt1', tmdb_id: '1', imdb_id: 'tt1', title: 'Horror Film', year: 2020, imdbRating: 8.5 },
     { key: 'tt2', tmdb_id: '2', imdb_id: 'tt2', title: 'Low Rated', year: 2020, imdbRating: 6.2 },
@@ -711,7 +745,6 @@ async function testFG9() {
     { key: 'tt4', tmdb_id: '4', imdb_id: 'tt4', title: 'Good Film', year: 2020, imdbRating: 8.5 },
     { key: 'tt5', tmdb_id: '5', imdb_id: 'tt5', title: 'Great Film', year: 2015, imdbRating: 9.0 },
   ];
-
   const deps = {
     metaStore: {
       getMany: () => new Map([
@@ -729,7 +762,6 @@ async function testFG9() {
     now: () => Date.now(),
     log: quiet,
   };
-
   const results = await checkMany(profile, 'movie', candidates, deps);
   assert.strictEqual(results.get('tt1').verdict, 'bad');
   assert.strictEqual(results.get('tt1').reason, 'genre');
@@ -740,124 +772,337 @@ async function testFG9() {
   assert.strictEqual(results.get('tt4').verdict, 'good');
   assert.strictEqual(results.get('tt5').verdict, 'good');
 
-  // A genre-list catalog (no profile_filters) is unchanged: nothing removed.
-  const genreDef = { ...def, id: 'mdb-horror-movies', profile_filters: false };
-  // With profile_filters: false, the filter gate is never called.
-  // We verify by checking that checkMany is not invoked (the wiring in
-  // rebuild.js only calls it when def.profile_filters is true).
-  // This is verified by the code structure: the `if (def.profile_filters)` guard.
-
-  // A profile with no active filters gives output identical to no filter gate.
-  const noFilterProfile = { id: 'fg9-nofilter', name: 'NoFilter', filters: { vote_count_floor: 0 }, simkl: { key: 'test-simkl' }, tmdb: { key: 'test-tmdb' }, mdblist: { key: 'test-mdblist' } };
+  // A no-filter profile (vote_count_floor: 0, nothing else) gives all good.
+  const noFilterProfile = { id: 'fg9a-nofilter', name: 'NoFilter', filters: { vote_count_floor: 0 } };
   const results2 = await checkMany(noFilterProfile, 'movie', candidates, deps);
-  // With vote_count_floor: 0, needs is empty => all good.
   for (const c of candidates) {
     assert.strictEqual(results2.get(c.key).verdict, 'good', `no-filter profile: ${c.key} should be good`);
   }
 }
 
-// ============================================================================
-// FG10: age gate untouched (T3 rewrite)
-// ============================================================================
-async function testFG10() {
-  // The age gate runs AFTER the filter gate. A title removed by the filter
-  // gate never reaches the age gate. This test verifies the ordering:
-  // the filter gate removes a title, and the age gate is only asked about
-  // the titles the filter gate kept.
-  const profile = makeProfile({ excluded_genres: ['Horror'] });
-  const candidates = [
-    { key: 'tt1', tmdb_id: '1', imdb_id: 'tt1', title: 'Horror Film', year: 2020, imdbRating: 8.5 },
-    { key: 'tt2', tmdb_id: '2', imdb_id: 'tt2', title: 'Drama Film', year: 2020, imdbRating: 8.5 },
-  ];
+// FG9b: removal + paging — drive buildExtraCatalog. Page 0 has 50 items, 30 of
+// which fail the filters; page 1 has more good ones; listSize is small enough
+// that page 0 alone cannot fill 2 x listSize eligible.
+async function testFG9b() {
+  const rebuild = require('../src/rebuild');
+  const page0 = [];
+  const page1 = [];
+  const failing = new Set();
+  const good = new Set();
+  let tmdb = 100;
+  for (let i = 0; i < 10; i++) {
+    const imdb = `tt${tmdb}`;
+    page0.push(makeItem(imdb, tmdb, `Horror ${i}`, ['Horror'], 8.5, 2020));
+    failing.add(imdb); tmdb++;
+  }
+  for (let i = 0; i < 10; i++) {
+    const imdb = `tt${tmdb}`;
+    page0.push(makeItem(imdb, tmdb, `Low Rated ${i}`, ['Drama'], 6.5, 2020));
+    failing.add(imdb); tmdb++;
+  }
+  for (let i = 0; i < 10; i++) {
+    const imdb = `tt${tmdb}`;
+    page0.push(makeItem(imdb, tmdb, `Old Film ${i}`, ['Drama'], 8.5, 2005));
+    failing.add(imdb); tmdb++;
+  }
+  for (let i = 0; i < 20; i++) {
+    const imdb = `tt${tmdb}`;
+    page0.push(makeItem(imdb, tmdb, `Good ${i}`, ['Comedy'], 8.5, 2020));
+    good.add(imdb); tmdb++;
+  }
+  for (let i = 0; i < 10; i++) {
+    const imdb = `tt${tmdb}`;
+    page1.push(makeItem(imdb, tmdb, `Good P1 ${i}`, ['Comedy'], 8.5, 2020));
+    good.add(imdb); tmdb++;
+  }
 
-  const deps = {
-    metaStore: {
-      getMany: () => new Map([
-        ['1', { vote_average: 8.5, genres: ['Horror'], year: 2020, vote_count: 1000 }],
-        ['2', { vote_average: 8.5, genres: ['Drama'], year: 2020, vote_count: 1000 }],
-      ]),
-      enrich: async () => null,
-    },
-    mdblist: { cachedImdbRatings: async () => new Map(), mediaInfoBatch: async () => new Map() },
-    groq: { titleFacts: async () => [] },
-    animeMap: { isAnime: () => false, ensureLoaded: async () => {} },
-    now: () => Date.now(),
-    log: quiet,
+  const profile = {
+    id: 'fg9b-profile',
+    name: 'FG9B',
+    filters: { excluded_genres: ['Horror'], min_rating: 7, min_year: 2010, vote_count_floor: 0, list_size: 15 },
+    keys: { mdblist_api_key: 'test-mdb', tmdb_api_key: 'test-tmdb' },
   };
+  const def = { type: 'movie', id: 'fg9b-def', name: 'T', source: 'mdblist', user: 'u', slug: 's', sort: null, min_imdb: 0, profile_filters: true };
 
-  const results = await checkMany(profile, 'movie', candidates, deps);
-  // The horror title is removed by the filter gate.
-  assert.strictEqual(results.get('tt1').verdict, 'bad');
-  assert.strictEqual(results.get('tt1').reason, 'genre');
-  // The drama title passes the filter gate (the age gate would handle it separately).
-  assert.strictEqual(results.get('tt2').verdict, 'good');
+  const h = wiringHarness({ page0, page1, metaStoreData: metaDataFor([...page0, ...page1]) });
+  const lines = [];
+  const log = { log: (m) => lines.push(m), warn: () => {}, error: () => {} };
+  try {
+    const built = await rebuild.buildExtraCatalog(profile, def, log);
+    const ids = built.map((m) => m.id);
+    for (const f of failing) assert.ok(!ids.includes(f), `failing title ${f} should be removed`);
+    for (const g of good) assert.ok(ids.includes(g), `good title ${g} should be present`);
+    // Paging continued past the removed titles (offset 50 was requested).
+    assert.ok(h.listCalls.includes(50), `listItemsPage should be called for offset 50 (got ${JSON.stringify(h.listCalls)})`);
+    // The log line's M is the total number of titles the gate checked across
+    // both pages (50 + 10 = 60), not collected + removed.
+    const filterLine = lines.find((l) => l.includes('filter gate removed'));
+    assert.ok(filterLine, `filter gate log line should be present (lines: ${JSON.stringify(lines)})`);
+    assert.ok(filterLine.includes('removed 30 of 60'), `log line M should be 60 (got: ${filterLine})`);
+  } finally {
+    h.restore();
+  }
+}
 
-  // Verify: the age gate (applyExtraAgeGate) is called in rebuild.js AFTER
-  // the filter gate. The filter gate drops tt1, so the age gate only sees tt2.
-  // This is verified by the code structure in rebuild.js:
-  //   filteredMetas = await applyFilterGate(...)  // drops tt1
-  //   result = await applyExtraAgeGate(profile, def, collected, log)  // only sees tt2
-  // The age gate is untouched: it still removes what it removed before.
+// FG9c: not applied elsewhere — a genre-list def (no profile_filters) returns
+// the failing titles untouched, and Watch Later (simkl_plantowatch) never
+// calls the filter gate. Both are verified by spying on filterGate.checkMany.
+async function testFG9c() {
+  const rebuild = require('../src/rebuild');
+  const filterGate = require('../src/filterGate');
+  const simkl = require('../src/services/simkl');
+  const tmdb = require('../src/services/tmdb');
+
+  // Same profile + pages as FG9b, but the def has no profile_filters.
+  const page0 = [];
+  const page1 = [];
+  const failing = new Set();
+  let tmdbId = 200;
+  for (let i = 0; i < 5; i++) {
+    const imdb = `tt${tmdbId}`;
+    page0.push(makeItem(imdb, tmdbId, `Horror ${i}`, ['Horror'], 8.5, 2020));
+    failing.add(imdb); tmdbId++;
+  }
+  for (let i = 0; i < 5; i++) {
+    const imdb = `tt${tmdbId}`;
+    page0.push(makeItem(imdb, tmdbId, `Low Rated ${i}`, ['Drama'], 6.5, 2020));
+    failing.add(imdb); tmdbId++;
+  }
+  for (let i = 0; i < 10; i++) {
+    const imdb = `tt${tmdbId}`;
+    page0.push(makeItem(imdb, tmdbId, `Good ${i}`, ['Comedy'], 8.5, 2020));
+    tmdbId++;
+  }
+
+  const profile = {
+    id: 'fg9c-profile',
+    name: 'FG9C',
+    filters: { excluded_genres: ['Horror'], min_rating: 7, min_year: 2010, vote_count_floor: 0, list_size: 15 },
+    keys: { mdblist_api_key: 'test-mdb', tmdb_api_key: 'test-tmdb' },
+  };
+  // A genre-list style def: no profile_filters.
+  const genreDef = { type: 'movie', id: 'fg9c-genre', name: 'T', source: 'mdblist', user: 'u', slug: 's', sort: null, min_imdb: 0 };
+
+  const h = wiringHarness({ page0, page1, metaStoreData: metaDataFor(page0) });
+  const origCheckMany = filterGate.checkMany;
+  let checkManyCalls = 0;
+  filterGate.checkMany = (...args) => { checkManyCalls++; return origCheckMany(...args); };
+  try {
+    // (a) Genre-list def: the failing titles are untouched (not removed).
+    const built = await rebuild.buildExtraCatalog(profile, genreDef, quiet);
+    const ids = built.map((m) => m.id);
+    for (const f of failing) assert.ok(ids.includes(f), `genre-list def: failing title ${f} should be kept (untouched)`);
+    assert.strictEqual(checkManyCalls, 0, `genre-list def: checkMany should not be called (got ${checkManyCalls})`);
+
+    // (b) Watch Later: never calls the filter gate.
+    checkManyCalls = 0;
+    const wlProfile = { ...profile, id: 'fg9c-wl', simkl_auth: { access_token: 'test-token' } };
+    const wlDef = { type: 'movie', id: 'fg9c-watch-later', name: 'Watch Later', source: 'simkl_plantowatch', dedupe_watched: false };
+    const origGetPTW = simkl.getPlanToWatch;
+    const origMetaByTmdb = tmdb.metaByTmdbId;
+    simkl.getPlanToWatch = async () => [
+      { imdb_id: 'tt900', tmdb_id: '900', title: 'WL One', year: 2020 },
+      { imdb_id: 'tt901', tmdb_id: '901', title: 'WL Two', year: 2021 },
+    ];
+    tmdb.metaByTmdbId = async (_k, type, id) => ({ id: `tt${id}`, type, name: `WL ${id}`, poster: null, description: '', releaseInfo: '2020', _tmdb_id: id });
+    try {
+      const wlBuilt = await rebuild.buildExtraCatalog(wlProfile, wlDef, quiet);
+      assert.ok(wlBuilt.length >= 2, `Watch Later: built ${wlBuilt.length} titles`);
+      assert.strictEqual(checkManyCalls, 0, `Watch Later: checkMany should not be called (got ${checkManyCalls})`);
+    } finally {
+      simkl.getPlanToWatch = origGetPTW;
+      tmdb.metaByTmdbId = origMetaByTmdb;
+    }
+  } finally {
+    filterGate.checkMany = origCheckMany;
+    h.restore();
+  }
+}
+
+// FG9d: no filters = identical — a flagged def with vote_count_floor:0 and
+// nothing else set produces the same output as the same def without the flag,
+// and the stubbed metaStore / cachedImdbRatings are called zero times.
+async function testFG9d() {
+  const rebuild = require('../src/rebuild');
+  const page0 = [];
+  let tmdbId = 300;
+  for (let i = 0; i < 10; i++) {
+    const imdb = `tt${tmdbId}`;
+    page0.push(makeItem(imdb, tmdbId, `Item ${i}`, ['Drama'], 8.5, 2020));
+    tmdbId++;
+  }
+
+  const profile = {
+    id: 'fg9d-profile',
+    name: 'FG9D',
+    filters: { vote_count_floor: 0 },
+    keys: { mdblist_api_key: 'test-mdb', tmdb_api_key: 'test-tmdb' },
+  };
+  const baseDef = { type: 'movie', id: 'fg9d-def', name: 'T', source: 'mdblist', user: 'u', slug: 's', sort: null, min_imdb: 0 };
+  const flaggedDef = { ...baseDef, profile_filters: true };
+  const unflaggedDef = { ...baseDef, profile_filters: false };
+
+  const h = wiringHarness({ page0, page1: [], metaStoreData: metaDataFor(page0) });
+  const origRandom = Math.random;
+  Math.random = () => 0.5; // deterministic shuffle for both runs
+  try {
+    const builtFlagged = await rebuild.buildExtraCatalog(profile, flaggedDef, quiet);
+    const builtUnflagged = await rebuild.buildExtraCatalog(profile, unflaggedDef, quiet);
+    const idsFlagged = builtFlagged.map((m) => m.id);
+    const idsUnflagged = builtUnflagged.map((m) => m.id);
+    assert.deepStrictEqual(idsFlagged, idsUnflagged, 'flagged and unflagged outputs should be identical (in order)');
+    assert.strictEqual(h.getManyCalls(), 0, `metaStore.getMany should be called 0 times (got ${h.getManyCalls()})`);
+    assert.strictEqual(h.cachedImdbCalls(), 0, `mdblist.cachedImdbRatings should be called 0 times (got ${h.cachedImdbCalls()})`);
+  } finally {
+    Math.random = origRandom;
+    h.restore();
+  }
 }
 
 // ============================================================================
-// FG11: log line (T4 rewrite)
+// FG10: age gate untouched (T3 rewrite) — drive buildExtraCatalog.
+// The filter gate (excluded_genres) runs first and removes the horror title;
+// the age gate (age_band 12) then runs on the survivors. A title the age gate
+// blocks is still absent from the built list, and the call order is
+// checkMany before verify.
 // ============================================================================
-async function testFG11() {
-  // Capture the log calls from a real buildExtraCatalog run.
-  // We use a distinct profile id to avoid store collisions.
-  const profile = { id: 'fg11-profile', name: 'FG11', filters: { excluded_genres: ['Horror'], min_rating: 7, min_year: 2010 } };
+async function testFG10() {
+  const rebuild = require('../src/rebuild');
+  const filterGate = require('../src/filterGate');
+  const ageVerify = require('../src/ageVerification');
+  const settings = require('../src/settings');
 
-  // We test the log line format by calling the applyFilterGate helper directly
-  // (it's the one that produces the stats). The log line is produced in
-  // buildExtraCatalog after the paging loops. We verify the format here.
-  const candidates = [
-    { key: 'tt1', tmdb_id: '1', imdb_id: 'tt1', title: 'A', year: 2020, imdbRating: 8.5 },
-    { key: 'tt2', tmdb_id: '2', imdb_id: 'tt2', title: 'B', year: 2005, imdbRating: 8.0 },
-    { key: 'tt3', tmdb_id: '3', imdb_id: 'tt3', title: 'C', year: 2020, imdbRating: 5.0 },
+  const page0 = [
+    makeItem('tt1', 1, 'Horror Film', ['Horror'], 8.5, 2020),
+    makeItem('tt2', 2, 'Drama Film', ['Drama'], 8.5, 2020),
+    makeItem('tt3', 3, 'Comedy Film', ['Comedy'], 8.5, 2020),
+    makeItem('tt4', 4, 'Action Film', ['Action'], 8.5, 2020),
   ];
 
-  const deps = {
-    metaStore: {
-      getMany: () => new Map([
-        ['1', { vote_average: 8.5, genres: ['Horror'], year: 2020, vote_count: 1000 }],
-        ['2', { vote_average: 8.0, genres: ['Drama'], year: 2005, vote_count: 1000 }],
-        ['3', { vote_average: 5.0, genres: ['Comedy'], year: 2020, vote_count: 1000 }],
-      ]),
-      enrich: async () => null,
-    },
-    mdblist: { cachedImdbRatings: async () => new Map(), mediaInfoBatch: async () => new Map() },
-    groq: { titleFacts: async () => [] },
-    animeMap: { isAnime: () => false, ensureLoaded: async () => {} },
-    now: () => Date.now(),
-    log: quiet,
+  const profile = {
+    id: 'fg10-profile',
+    name: 'FG10',
+    filters: { age_limit: 12, excluded_genres: ['Horror'], vote_count_floor: 0 },
+    keys: { mdblist_api_key: 'test-mdb', tmdb_api_key: 'test-tmdb' },
+  };
+  const def = { type: 'movie', id: 'fg10-def', name: 'T', source: 'mdblist', user: 'u', slug: 's', sort: null, min_imdb: 0, profile_filters: true, age_band: 12 };
+
+  const verifyKeys = [];
+  const callLog = [];
+  const verifyStub = (titles) => {
+    callLog.push('verify');
+    for (const t of titles) verifyKeys.push(t.key);
+    const result = new Map();
+    for (const t of titles) {
+      const verdict = String(t.key.split(':')[1]) === '3' ? 'block' : 'allow';
+      result.set(t.key, { verdict, source: 'csm', rating: verdict === 'block' ? '18' : '13' });
+    }
+    return Promise.resolve(result);
   };
 
-  const results = await checkMany(profile, 'movie', candidates, deps);
-  // tt1: genre (Horror), tt2: recency (2005 < 2010), tt3: rating (5.0 < 7)
-  assert.strictEqual(results.get('tt1').reason, 'genre');
-  assert.strictEqual(results.get('tt2').reason, 'recency');
-  assert.strictEqual(results.get('tt3').reason, 'rating');
+  const origCheckMany = filterGate.checkMany;
+  filterGate.checkMany = (...args) => { callLog.push('checkMany'); return origCheckMany(...args); };
 
-  // The log line would be:
-  // "[extra] FG11/mdb-popular-movies: filter gate removed 3 of 3 (genre 1, recency 1, votes 0, rating 1, no_data 0)"
-  // We verify the format by checking the stats object that applyFilterGate produces.
-  // The denominator is the number of titles checked (3), not collected + removed.
-  const stats = { removed: 0, checked: 0, reasons: { genre: 0, recency: 0, votes: 0, rating: 0, no_data: 0 } };
-  // Simulate what applyFilterGate does:
-  stats.checked = 3;
-  stats.removed = 3;
-  stats.reasons.genre = 1;
-  stats.reasons.recency = 1;
-  stats.reasons.rating = 1;
-  // The log line:
-  const line = `[extra] ${profile.name}/mdb-popular-movies: filter gate removed ${stats.removed} of ${stats.checked} (genre ${stats.reasons.genre}, recency ${stats.reasons.recency}, votes ${stats.reasons.votes}, rating ${stats.reasons.rating}, no_data ${stats.reasons.no_data})`;
-  assert(line.includes('filter gate removed 3 of 3'));
-  assert(line.includes('genre 1, recency 1, votes 0, rating 1, no_data 0'));
-  // No titles or ids in the line.
-  assert(!line.includes('tt1'));
-  assert(!line.includes('tt2'));
-  assert(!line.includes('tt3'));
+  // The age gate's LLM tripwire (hasLlm) must pass; set a Groq key and clear it
+  // after. (settings.getSettings() may be null in this suite — updateSettings
+  // seeds from blankSettings, so it is safe.)
+  settings.updateSettings({ llm: { groq_api_key: 'itest-groq' } });
+  const h = wiringHarness({ page0, page1: [], metaStoreData: metaDataFor(page0), verifyStub });
+  try {
+    const built = await rebuild.buildExtraCatalog(profile, def, quiet);
+    const ids = built.map((m) => m.id);
+
+    // (1) verify is never given the horror title (the filter gate removed it first).
+    assert.ok(!verifyKeys.includes('movie:1'), `verify should not be given the horror title (keys: ${verifyKeys.join(', ')})`);
+    // (2) verify IS given the good titles, and the blocked title is absent.
+    assert.ok(verifyKeys.includes('movie:2'), `verify should be given tt2 (keys: ${verifyKeys.join(', ')})`);
+    assert.ok(verifyKeys.includes('movie:3'), `verify should be given tt3 (keys: ${verifyKeys.join(', ')})`);
+    assert.ok(verifyKeys.includes('movie:4'), `verify should be given tt4 (keys: ${verifyKeys.join(', ')})`);
+    assert.ok(!ids.includes('tt3'), 'blocked title tt3 should be absent from the built list');
+    assert.ok(ids.includes('tt2'), 'allowed title tt2 should be present');
+    assert.ok(ids.includes('tt4'), 'allowed title tt4 should be present');
+    // (3) order: checkMany before verify.
+    const firstCheck = callLog.indexOf('checkMany');
+    const firstVerify = callLog.indexOf('verify');
+    assert.ok(firstCheck !== -1 && firstVerify !== -1, `both checkMany and verify should be called (log: ${JSON.stringify(callLog)})`);
+    assert.ok(firstCheck < firstVerify, `checkMany should come before verify (log: ${JSON.stringify(callLog)})`);
+  } finally {
+    filterGate.checkMany = origCheckMany;
+    settings.updateSettings({ llm: { groq_api_key: '' } });
+    h.restore();
+  }
+}
+
+// ============================================================================
+// FG11: log line (T4 rewrite) — drive buildExtraCatalog with a real log
+// capture. Assert the exact filter-gate summary line, that no title or id
+// from the fixtures appears in any captured line, and that no filter-gate
+// line is logged when nothing was removed.
+// ============================================================================
+async function testFG11() {
+  const rebuild = require('../src/rebuild');
+
+  // 8 titles: 3 genre (horror), 1 recency (pre-2010), 1 rating (6.x), 3 good.
+  const page0 = [
+    makeItem('tt1', 1, 'Horror A', ['Horror'], 8.5, 2020),
+    makeItem('tt2', 2, 'Horror B', ['Horror'], 8.5, 2020),
+    makeItem('tt3', 3, 'Horror C', ['Horror'], 8.5, 2020),
+    makeItem('tt4', 4, 'Old Film', ['Drama'], 8.5, 2005),
+    makeItem('tt5', 5, 'Low A', ['Drama'], 6.5, 2020),
+    makeItem('tt6', 6, 'Good A', ['Comedy'], 8.5, 2020),
+    makeItem('tt7', 7, 'Good B', ['Comedy'], 8.5, 2020),
+    makeItem('tt8', 8, 'Good C', ['Comedy'], 8.5, 2020),
+  ];
+
+  const profile = {
+    id: 'fg11-profile',
+    name: 'FG11',
+    filters: { excluded_genres: ['Horror'], min_rating: 7, min_year: 2010, vote_count_floor: 0 },
+    keys: { mdblist_api_key: 'test-mdb', tmdb_api_key: 'test-tmdb' },
+  };
+  const def = { type: 'movie', id: 'fg11-def', name: 'T', source: 'mdblist', user: 'u', slug: 's', sort: null, min_imdb: 0, profile_filters: true };
+
+  const lines = [];
+  const log = { log: (m) => lines.push(m), warn: () => {}, error: () => {} };
+  const h = wiringHarness({ page0, page1: [], metaStoreData: metaDataFor(page0) });
+  try {
+    await rebuild.buildExtraCatalog(profile, def, log);
+    // The exact log line.
+    const expected = '[extra] FG11/fg11-def: filter gate removed 5 of 8 (genre 3, recency 1, votes 0, rating 1, no_data 0)';
+    assert.ok(lines.includes(expected), `expected log line not found. Lines: ${JSON.stringify(lines)}`);
+    // No title or imdb id from the fixtures appears in any captured line.
+    for (const line of lines) {
+      for (const it of page0) {
+        assert.ok(!line.includes(it.title), `title ${it.title} should not appear in log: ${line}`);
+        assert.ok(!line.includes(it.imdb_id), `imdb id ${it.imdb_id} should not appear in log: ${line}`);
+      }
+    }
+  } finally {
+    h.restore();
+  }
+
+  // No filter-gate line when nothing was removed.
+  const goodPage = [
+    makeItem('tt10', 10, 'Good X', ['Comedy'], 8.5, 2020),
+    makeItem('tt11', 11, 'Good Y', ['Comedy'], 8.5, 2020),
+  ];
+  const profile2 = {
+    id: 'fg11-profile2',
+    name: 'FG11',
+    filters: { excluded_genres: ['Horror'], min_rating: 7, min_year: 2010, vote_count_floor: 0 },
+    keys: { mdblist_api_key: 'test-mdb', tmdb_api_key: 'test-tmdb' },
+  };
+  const def2 = { type: 'movie', id: 'fg11-def2', name: 'T', source: 'mdblist', user: 'u', slug: 's', sort: null, min_imdb: 0, profile_filters: true };
+  const lines2 = [];
+  const log2 = { log: (m) => lines2.push(m), warn: () => {}, error: () => {} };
+  const h2 = wiringHarness({ page0: goodPage, page1: [], metaStoreData: metaDataFor(goodPage) });
+  try {
+    await rebuild.buildExtraCatalog(profile2, def2, log2);
+    const filterLines = lines2.filter((l) => l.includes('filter gate removed'));
+    assert.strictEqual(filterLines.length, 0, `no filter-gate line should be logged when nothing was removed (got ${JSON.stringify(filterLines)})`);
+  } finally {
+    h2.restore();
+  }
 }
 
 // ============================================================================
@@ -1110,7 +1355,10 @@ async function testFG14() {
   await ok('FG6 store', testFG6);
   await ok('FG7 anime exclusion', testFG7);
   await ok('FG8 parity with the engines', testFG8);
-  await ok('FG9 wiring', testFG9);
+  await ok('FG9a filter gate unit cases', testFG9a);
+  await ok('FG9b removal + paging', testFG9b);
+  await ok('FG9c not applied elsewhere', testFG9c);
+  await ok('FG9d no filters = identical', testFG9d);
   await ok('FG10 age gate untouched', testFG10);
   await ok('FG11 log line', testFG11);
   await ok('FG12 IMDb beats TMDB', testFG12);
