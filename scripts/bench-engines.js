@@ -196,6 +196,20 @@ async function main() {
   if (results.type === 'anime' && results.animeMode) {
     console.log('Anime mode (personalised run): ' + results.animeMode);
   }
+  // AN-4b: print the holdout ordering basis above the table.
+  if (results.type === 'anime' && results.targetBasis) {
+    const counts = { 'real-start': 0, 'last-watched': 0, 'id-only': 0 };
+    for (const t of results.targetBasis) counts[t.orderedBy] += 1;
+    const parts = [];
+    if (counts['real-start']) parts.push(counts['real-start'] + ' real-start');
+    if (counts['last-watched']) parts.push(counts['last-watched'] + ' last-watched');
+    if (counts['id-only']) parts.push(counts['id-only'] + ' id-only');
+    if (counts['id-only'] === results.targetBasis.length) {
+      console.log('Holdout chosen by tmdb id (no usable dates): the order is arbitrary but repeatable.');
+    } else {
+      console.log('Holdout chosen by: ' + parts.join(', '));
+    }
+  }
   console.log(bench.renderTable(results));
   // §6: Marquee serve-strategy comparison (round-robin vs calibrated vs pure
   // score) on the same pool — printed as a second table under the main one.
