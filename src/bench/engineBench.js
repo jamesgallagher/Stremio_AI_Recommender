@@ -59,6 +59,32 @@ const pickSeriesTargets = (seriesRows, holdout) => {
     .map((r) => r.tmdb_id);
 };
 
+// AN-4: the anime holdout — the most recently STARTED anime shows that
+// reached at least Engaged, using REAL (non-bulk) first-episode timestamps only
+// (first_real_at). `seriesRows` is watchedStore.getSeriesProgress (ALL kinds);
+// the anime detector (animeMap) must be loaded before calling. Returns tmdb_ids.
+// Fewer than holdout + 10 qualifying → "not enough anime history".
+const pickAnimeTargets = (seriesRows, holdout) => {
+  const { isAnimeProgressRow } = require('../anime/history');
+  const { rungOf, DEFAULTS } = require('../seriesEngagement');
+  const eligible = (row) => {
+    if (!isAnimeProgressRow(row)) return false;
+    if (row.first_real_at == null) return false; // bulk-only → no real start
+    if (row.tmdb_id == null) return false; // no dedupe key
+    const rung = rungOf(row, DEFAULTS);
+    return rung === 'engaged' || rung === 'committed' || rung === 'finished';
+  };
+  const qualifying = (seriesRows || []).filter(eligible);
+  if (qualifying.length < holdout + 10) {
+    throw new Error('not enough anime history (' + qualifying.length + ' qualifying shows, need ' + (holdout + 10) + ')');
+  }
+  // Most recently started (first_real_at DESC), take holdout.
+  return qualifying
+    .sort((a, b) => (b.first_real_at - a.first_real_at))
+    .slice(0, holdout)
+    .map((r) => r.tmdb_id);
+};
+
 // Parse a pool row's score_components (stored as a JSON string by upsertCandidates,
 // or a plain object when a test passes one) into an object, or null.
 function parseComps(sc) {
@@ -341,6 +367,38 @@ function removeSeriesHoldout(profileId, targetIds, { db, noCache = false }) {
   }
 }
 
+// AN-4: delete the ANIME holdout from the BENCH copy so it cannot leak into
+// the build. Like removeSeriesHoldout, but the pool delete uses type 'anime'
+// (the anime lane's pool type; series stays untouched) and the rating/ignore
+// deletes use type 'series' (anime ratings and ignores are stored as series —
+// see AN-3). Pure SQL on the injected db handle.
+function removeAnimeHoldout(profileId, targetIds, { db, noCache = false }) {
+  const conn = db.get();
+  const inList = targetIds.map(() => '?').join(',');
+  // Look up the targets' imdb ids from their series_progress rows BEFORE those
+  // rows are deleted, then remove the imdb-keyed pending rows too.
+  const progressImdb = conn.prepare('SELECT imdb_id FROM series_progress WHERE profile_id = ? AND tmdb_id IN (' + inList + ')').all(profileId, ...targetIds);
+  const imdbIds = progressImdb.map((r) => r.imdb_id).filter((id) => id != null && id !== '');
+  conn.prepare('DELETE FROM watched WHERE profile_id = ? AND type = ? AND tmdb_id IN (' + inList + ')').run(profileId, 'series', ...targetIds);
+  conn.prepare('DELETE FROM pending_watched WHERE profile_id = ? AND tmdb_id IN (' + inList + ')').run(profileId, ...targetIds);
+  if (imdbIds.length) {
+    const imdbInList = imdbIds.map(() => '?').join(',');
+    conn.prepare('DELETE FROM pending_watched WHERE profile_id = ? AND imdb_id IN (' + imdbInList + ')').run(profileId, ...imdbIds);
+  }
+  conn.prepare('DELETE FROM dont_recommend WHERE profile_id = ? AND tmdb_id IN (' + inList + ')').run(profileId, ...targetIds);
+  conn.prepare('DELETE FROM series_progress WHERE profile_id = ? AND tmdb_id IN (' + inList + ')').run(profileId, ...targetIds);
+  conn.prepare('DELETE FROM recommended WHERE profile_id = ? AND type = ?').run(profileId, 'anime');
+  if (tableExists(conn, 'taste_ratings')) {
+    conn.prepare("DELETE FROM taste_ratings WHERE profile_id = ? AND type = 'series' AND tmdb_id IN (" + inList + ")").run(profileId, ...targetIds);
+  }
+  if (tableExists(conn, 'taste_ignore')) {
+    conn.prepare("DELETE FROM taste_ignore WHERE profile_id = ? AND type = 'series' AND tmdb_id IN (" + inList + ")").run(profileId, ...targetIds);
+  }
+  if (noCache && tableExists(conn, 'marquee_llm_cache')) {
+    conn.prepare("DELETE FROM marquee_llm_cache WHERE profile_id = ? AND kind IN ('brief','fit','suggest')").run(profileId);
+  }
+}
+
 function tableExists(conn, name) {
   const row = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
   return !!row;
@@ -453,11 +511,13 @@ async function runBench({ profile, engineIds, holdout, type = 'movie', serveOpts
     engines, pipeline, rs, watchedStore, db, settings, selectServe,
     selectServeFor, filterServable, serveCalibration, listSizeFor = null,
     log = console, now = Date.now, noCache = false, ctxExtras = {}, reachability = null,
+    animeMap = null,
   } = deps;
   // The holdout deletors are injectable so the suite can spy on them (e.g. to
   // prove the leakage check throws when a delete is skipped).
   const removeSeriesHoldoutFn = deps.removeSeriesHoldout || removeSeriesHoldout;
   const removeHoldoutFn = deps.removeHoldout || removeHoldout;
+  const removeAnimeHoldoutFn = deps.removeAnimeHoldout || removeAnimeHoldout;
 
   let targetIds, targets;
   if (type === 'series') {
@@ -475,6 +535,30 @@ async function runBench({ profile, engineIds, holdout, type = 'movie', serveOpts
     // rows OR in the watched id sets (watched + pending_watched) — the pipeline
     // subtracts watchedIdSets, so a surviving watched row would exclude the target.
     const remainingIds = new Set(watchedStore.getSeriesProgress(profile.id, { kind: 'show' }).map((r) => r.tmdb_id));
+    for (const t of targetIds) {
+      if (remainingIds.has(t)) throw new Error('leakage: target still in series_progress: ' + t);
+    }
+    const sets = watchedStore.watchedIdSets(profile.id);
+    for (const t of targetIds) {
+      if (sets.tmdb.has(t)) throw new Error('leakage: target still in watched set: ' + t);
+    }
+  } else if (type === 'anime') {
+    // AN-4: the anime holdout. Load the detector first (a failure must not
+    // abort the bench — carry on with the detector off).
+    if (animeMap) {
+      try { await animeMap.ensureLoaded(log); }
+      catch (err) { log.warn('[bench] animeMap failed to load: ' + err.message + ' — detector off'); }
+    }
+    const seriesRows = watchedStore.getSeriesProgress(profile.id);
+    targetIds = pickAnimeTargets(seriesRows, holdout);
+    targets = targetIds.map((id) => {
+      const row = seriesRows.find((r) => r.tmdb_id === id);
+      return { tmdb_id: id, title: row ? row.title : id };
+    });
+    removeAnimeHoldoutFn(profile.id, targetIds, { db, noCache });
+    // Leakage check: no target may survive in the series progress rows OR in
+    // the watched id sets.
+    const remainingIds = new Set(watchedStore.getSeriesProgress(profile.id).map((r) => r.tmdb_id));
     for (const t of targetIds) {
       if (remainingIds.has(t)) throw new Error('leakage: target still in series_progress: ' + t);
     }
@@ -511,7 +595,15 @@ async function runBench({ profile, engineIds, holdout, type = 'movie', serveOpts
   let marqueeRows = null;   // §6: the Marquee stored rows for the serve-strategy comparison
   let marqueeEngine = null;
   for (const id of engineIds) {
-    const engine = engines.get(id);
+    // AN-4: marquee-anime-trending is a bench-only label — the same engine as
+    // marquee-anime, forced to trending-only via the ctx override.
+    let engine, engineCtxExtras = {};
+    if (type === 'anime' && id === 'marquee-anime-trending') {
+      engine = engines.get('marquee-anime');
+      engineCtxExtras = { animeMode: 'trending' };
+    } else {
+      engine = engines.get(id);
+    }
     if (!engine) {
       log.warn(`[bench] engine '${id}' not found — skipping`);
       continue;
@@ -533,16 +625,22 @@ async function runBench({ profile, engineIds, holdout, type = 'movie', serveOpts
       // m2: Marquee records where every title is lost; other engines ignore it.
       marqueeTrace: { generated: new Map(), dropped: new Map() },
       ...ctxExtras,
+      ...engineCtxExtras,
     };
     const t0 = now();
     await pipeline.runEngineBuild(profile, type, engine, ctx, () => {});
     const buildSeconds = (now() - t0) / 1000;
 
     const rows = rs.getRecommended(profile.id, { type, limit: 100000 });
-    if (id === 'marquee') { marqueeRows = rows; marqueeEngine = engine; }
-    const m = metrics(rows, targetIds, profile.filters || {}, { selectServe, stored: rows.length, buildSeconds, reachable: reachableSet });
+    if (type !== 'anime' && id === 'marquee') { marqueeRows = rows; marqueeEngine = engine; }
+    // AN-4: the anime lane uses selectServeFor (the calibrated serve path), not
+    // selectServe. Adapt it to the same signature as selectServe.
+    const serveFn = type === 'anime'
+      ? (rows_, filters_, { limit }) => selectServeFor(profile, 'anime', rows_, { limit })
+      : selectServe;
+    const m = metrics(rows, targetIds, profile.filters || {}, { selectServe: serveFn, stored: rows.length, buildSeconds, reachable: reachableSet });
     // Which targets did this engine actually hit in the top-20 served?
-    const served20 = selectServe(rows, profile.filters || {}, { limit: 20 });
+    const served20 = serveFn(rows, profile.filters || {}, { limit: 20 });
     const served20Ids = new Set(served20.map((r) => r.tmdb_id));
     const hitTargets = targetIds.filter((t) => served20Ids.has(t));
     // m2: per-target position in this engine's pool (1-based, affinity order)
@@ -585,10 +683,13 @@ function renderTable(results) {
   const pad = (s, n) => String(s).padEnd(n);
   const pct = (x) => (x == null ? 'n/a' : (x * 100).toFixed(1) + '%');
   // Card §2.4: the reachability + serve-strategy sections are movie-only — not
-  // run, and not printed, for series.
-  const isSeries = results.type === 'series';
+  // run, and not printed, for series or anime.
+  const isSeriesOrAnime = results.type === 'series' || results.type === 'anime';
+  // AN-4: anime engine labels.
+  const animeLabels = { 'marquee-anime': 'Marquee Anime (personalised)', 'marquee-anime-trending': 'Trending-only baseline' };
+  const label = (id) => (results.type === 'anime' && animeLabels[id]) || id;
   const headCells = [pad('engine', 10), pad('hit@20', 8)];
-  if (!isSeries) headCells.push(pad('hit@20r', 9));
+  if (!isSeriesOrAnime) headCells.push(pad('hit@20r', 9));
   headCells.push(pad('recall@100', 12), pad('meanRank', 10), pad('filterPass', 12), pad('trending@20', 13), pad('stored', 8), 'build(s)');
   const head = headCells.join(' ');
   const lines = [
@@ -598,8 +699,8 @@ function renderTable(results) {
   ];
   for (const [id, e] of Object.entries(results.engines)) {
     const m = e.metrics;
-    const cells = [pad(id, 10), pad(`${m.hitAt20}/${results.holdout}`, 8)];
-    if (!isSeries) cells.push(pad(m.hitAt20Reachable == null ? 'n/a' : `${m.hitAt20Reachable}/${m.reachableTargets}`, 9));
+    const cells = [pad(label(id), 10), pad(`${m.hitAt20}/${results.holdout}`, 8)];
+    if (!isSeriesOrAnime) cells.push(pad(m.hitAt20Reachable == null ? 'n/a' : `${m.hitAt20Reachable}/${m.reachableTargets}`, 9));
     cells.push(
       pad(pct(m.recallAt100), 12),
       pad(m.meanRankOfHits == null ? '—' : m.meanRankOfHits.toFixed(1), 10),
@@ -615,29 +716,30 @@ function renderTable(results) {
   for (const t of results.targets) {
     const hitters = Object.entries(results.engines)
       .filter(([, e]) => e.hitTargets.includes(t.tmdb_id))
-      .map(([id]) => id);
-    const reach = !isSeries && t.reachable === false ? `  [unreachable: ${t.unreachableReason}]` : '';
+      .map(([id]) => label(id));
+    const reach = !isSeriesOrAnime && t.reachable === false ? `  [unreachable: ${t.unreachableReason}]` : '';
     lines.push(`  ${t.title} (${t.tmdb_id}) — ${hitters.length ? hitters.join(', ') : 'none'}${reach}`);
     // m2: where each engine placed it — "#7 served", "#57", or why it was lost.
     const per = Object.entries(results.engines).map(([id, e]) => {
       const p = e.positions && e.positions[t.tmdb_id];
       if (!p) return null;
-      if (p.rank) return `${id} #${p.rank}${p.served ? ' served' : ''}`;
-      return `${id} ${p.fate || 'not in pool'}`;
+      if (p.rank) return `${label(id)} #${p.rank}${p.served ? ' served' : ''}`;
+      return `${label(id)} ${p.fate || 'not in pool'}`;
     }).filter(Boolean);
     if (per.length) lines.push(`      ${per.join(' · ')}`);
   }
   lines.push('');
-  if (!isSeries) lines.push("hit@20r = hits among the targets this profile's filters allow at all (n/a when not assessed).");
+  if (!isSeriesOrAnime) lines.push("hit@20r = hits among the targets this profile's filters allow at all (n/a when not assessed).");
   return lines.join('\n');
 }
 
 // TV-2 C3: the bench report file name. Series reports carry a -series infix
-// (bench-<profile>-series-<timestamp>.json); movie reports keep the existing
-// bench-<profile>-<timestamp>.json name. Pure so the suite can assert both.
+// (bench-<profile>-series-<timestamp>.json); anime reports carry a -anime infix;
+// movie reports keep the existing bench-<profile>-<timestamp>.json name.
+// Pure so the suite can assert all three.
 function reportFileName(profileName, type, ts) {
-  const typeSuffix = type === 'series' ? '-series' : '';
+  const typeSuffix = type === 'series' ? '-series' : (type === 'anime' ? '-anime' : '');
   return `bench-${profileName}${typeSuffix}-${ts}.json`;
 }
 
-module.exports = { pickTargets, pickSeriesTargets, metrics, renderTable, runBench, removeHoldout, removeSeriesHoldout, snapshotStore, applyMarqueeConfig, parseComps, assessReachability, serveStrategyMetrics, renderServeTable, reportFileName };
+module.exports = { pickTargets, pickSeriesTargets, pickAnimeTargets, metrics, renderTable, runBench, removeHoldout, removeSeriesHoldout, removeAnimeHoldout, snapshotStore, applyMarqueeConfig, parseComps, assessReachability, serveStrategyMetrics, renderServeTable, reportFileName };
