@@ -69,7 +69,6 @@ const pickAnimeTargets = (seriesRows, holdout) => {
   const { rungOf, DEFAULTS } = require('../seriesEngagement');
   const eligible = (row) => {
     if (!isAnimeProgressRow(row)) return false;
-    if (row.first_real_at == null) return false; // bulk-only → no real start
     if (row.tmdb_id == null) return false; // no dedupe key
     const rung = rungOf(row, DEFAULTS);
     return rung === 'engaged' || rung === 'committed' || rung === 'finished';
@@ -78,11 +77,32 @@ const pickAnimeTargets = (seriesRows, holdout) => {
   if (qualifying.length < holdout + 10) {
     throw new Error('not enough anime history (' + qualifying.length + ' qualifying shows, need ' + (holdout + 10) + ')');
   }
-  // Most recently started (first_real_at DESC), take holdout.
+  // Most recent first: first_real_at if present, else last_watched_at if present, else 0.
+  // Ties broken by tmdb_id (string ascending) for determinism.
+  const sortKey = (row) => row.first_real_at != null ? row.first_real_at : (row.last_watched_at != null ? row.last_watched_at : 0);
   return qualifying
-    .sort((a, b) => (b.first_real_at - a.first_real_at))
+    .sort((a, b) => {
+      const ka = sortKey(a), kb = sortKey(b);
+      if (kb !== ka) return kb - ka;
+      return String(a.tmdb_id).localeCompare(String(b.tmdb_id));
+    })
     .slice(0, holdout)
     .map((r) => r.tmdb_id);
+};
+
+// AN-4b: describe the ordering basis of each target (for the bench report note).
+// Returns an array of { tmdb_id, title, orderedBy } where orderedBy is
+// 'real-start' | 'last-watched' | 'id-only'.
+const describeAnimeTargets = (seriesRows, targetIds) => {
+  const rowsById = new Map((seriesRows || []).map((r) => [r.tmdb_id, r]));
+  return targetIds.map((id) => {
+    const row = rowsById.get(id);
+    let orderedBy;
+    if (row && row.first_real_at != null) orderedBy = 'real-start';
+    else if (row && row.last_watched_at != null) orderedBy = 'last-watched';
+    else orderedBy = 'id-only';
+    return { tmdb_id: id, title: row ? row.title : id, orderedBy };
+  });
 };
 
 // Parse a pool row's score_components (stored as a JSON string by upsertCandidates,
@@ -519,7 +539,7 @@ async function runBench({ profile, engineIds, holdout, type = 'movie', serveOpts
   const removeHoldoutFn = deps.removeHoldout || removeHoldout;
   const removeAnimeHoldoutFn = deps.removeAnimeHoldout || removeAnimeHoldout;
 
-  let targetIds, targets;
+  let targetIds, targets, targetBasis;
   if (type === 'series') {
     // TV-1 (plan §6): the series holdout is the most recently STARTED shows that
     // reached at least Engaged (real first-episode timestamps only). Build from
@@ -555,6 +575,7 @@ async function runBench({ profile, engineIds, holdout, type = 'movie', serveOpts
       const row = seriesRows.find((r) => r.tmdb_id === id);
       return { tmdb_id: id, title: row ? row.title : id };
     });
+    targetBasis = describeAnimeTargets(seriesRows, targetIds);
     removeAnimeHoldoutFn(profile.id, targetIds, { db, noCache });
     // Leakage check: no target may survive in the series progress rows OR in
     // the watched id sets.
@@ -591,7 +612,7 @@ async function runBench({ profile, engineIds, holdout, type = 'movie', serveOpts
   if (reach) for (const t of targets) { const r = reach.get(t.tmdb_id); if (r) { t.reachable = r.reachable; t.unreachableReason = r.reason; } }
   const reachableSet = reach ? new Set([...reach].filter(([, r]) => r.reachable).map(([id]) => id)) : null;
 
-  const results = { profile: profile.name, holdout, targets, engines: {}, type };
+  const results = { profile: profile.name, holdout, targets, engines: {}, type, targetBasis };
   let marqueeRows = null;   // §6: the Marquee stored rows for the serve-strategy comparison
   let marqueeEngine = null;
   for (const id of engineIds) {
@@ -744,4 +765,4 @@ function reportFileName(profileName, type, ts) {
   return `bench-${profileName}${typeSuffix}-${ts}.json`;
 }
 
-module.exports = { pickTargets, pickSeriesTargets, pickAnimeTargets, metrics, renderTable, runBench, removeHoldout, removeSeriesHoldout, removeAnimeHoldout, snapshotStore, applyMarqueeConfig, parseComps, assessReachability, serveStrategyMetrics, renderServeTable, reportFileName };
+module.exports = { pickTargets, pickSeriesTargets, pickAnimeTargets, describeAnimeTargets, metrics, renderTable, runBench, removeHoldout, removeSeriesHoldout, removeAnimeHoldout, snapshotStore, applyMarqueeConfig, parseComps, assessReachability, serveStrategyMetrics, renderServeTable, reportFileName };

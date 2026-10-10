@@ -43,51 +43,126 @@ function row(simkl_id, kind, imdb_id, tmdb_id, title, first_real_at, opts = {}) 
   return {
     simkl_id, kind, imdb_id, tmdb_id, title, year: 2020,
     status: 'watching', watched_eps: opts.watched_eps ?? 12, total_eps: 24, not_aired_eps: 4,
-    last_watched_at: first_real_at, first_watched_at: first_real_at,
+    last_watched_at: opts.last_watched_at != null ? opts.last_watched_at : first_real_at,
+    first_watched_at: first_real_at,
     first_real_at, last_real_at: first_real_at,
     stamps: 12, real_stamps: 12, eps_per_week: null,
   };
 }
 
+// A bulk-imported row: no first_real_at, but has last_watched_at.
+function bulkRow(simkl_id, kind, imdb_id, tmdb_id, title, last_watched_at, opts = {}) {
+  return {
+    simkl_id, kind, imdb_id, tmdb_id, title, year: 2020,
+    status: 'watching', watched_eps: opts.watched_eps ?? 12, total_eps: 24, not_aired_eps: 4,
+    last_watched_at, first_watched_at: last_watched_at,
+    first_real_at: null, last_real_at: null,
+    stamps: 12, real_stamps: 0, eps_per_week: null,
+  };
+}
+
 (async () => {
-// ── AB1: pickAnimeTargets ──
-await ok('AB1: pickAnimeTargets — only qualifying anime rows, newest first; too few throws', async () => {
+// ── AB1: pickAnimeTargets (AN-4b: bulk-imported rows now qualify) ──
+await ok('AB1: pickAnimeTargets — bulk-only rows with tmdb_id qualify, ordered by last_watched_at; mixed scale; tie by tmdb_id; too few throws', async () => {
   const DAY = 86400e3;
   const base = Date.parse('2026-06-01T00:00:00Z');
-  // 30 rows: a mix of anime (kind='anime' and detector-flagged shows),
-  // ordinary shows, bulk-only rows, rows with no tmdb_id, and rungs below engaged.
-  const rows = [
-    // 10 qualifying anime rows (kind='anime', real start, engaged+):
-    ...Array.from({ length: 10 }, (_, i) => row(100 + i, 'anime', 'ttA' + (i + 1), 'a' + (i + 1), 'Anime ' + (i + 1), base + (i + 1) * DAY)),
-    // 5 qualifying anime rows (detector-flagged shows, kind='show', real start, engaged+):
-    ...Array.from({ length: 5 }, (_, i) => row(200 + i, 'show', 'ttA' + (i + 1), 's' + (i + 1), 'Flagged ' + (i + 1), base + (100 + i) * DAY, { watched_eps: 10 })),
-    // 5 ordinary shows (kind='show', not in the anime map):
-    ...Array.from({ length: 5 }, (_, i) => row(300 + i, 'show', 'ttS' + (i + 1), 'o' + (i + 1), 'Ordinary ' + (i + 1), base + (200 + i) * DAY)),
-    // 5 bulk-only anime rows (first_real_at = null):
-    ...Array.from({ length: 5 }, (_, i) => row(400 + i, 'anime', 'ttA' + (i + 1), 'b' + (i + 1), 'Bulk ' + (i + 1), null)),
-    // 5 rows with no tmdb_id:
-    ...Array.from({ length: 5 }, (_, i) => row(500 + i, 'anime', 'ttA' + (i + 1), null, 'NoID ' + (i + 1), base + (300 + i) * DAY)),
-    // 5 anime rows with rung below engaged (watched_eps: 4 → tried):
-    ...Array.from({ length: 5 }, (_, i) => row(600 + i, 'anime', 'ttA' + (i + 1), 'low' + (i + 1), 'Low ' + (i + 1), base + (400 + i) * DAY, { watched_eps: 4 })),
-  ];
-  // 15 qualifying anime rows (10 kind='anime' + 5 detector-flagged).
-  // holdout 5 needs 5+10=15 → exactly meets the threshold.
-  const targets = bench.pickAnimeTargets(rows, 5);
-  assert.strictEqual(targets.length, 5, 'returns exactly holdout targets');
-  // The 5 most recently started qualifying anime rows:
-  // Flagged rows (base + 100..104 * DAY) are the most recent.
-  assert.deepStrictEqual(targets, ['s5', 's4', 's3', 's2', 's1'], 'most recently started anime first');
-  // Ordinary shows are never returned.
-  for (const t of targets) assert.ok(!t.startsWith('o'), 'no ordinary show: ' + t);
-  // Bulk-only, no-ID, and low-rung rows are never returned.
-  for (const t of targets) {
-    assert.ok(!t.startsWith('b'), 'no bulk-only: ' + t);
-    assert.ok(t !== null, 'no null tmdb_id');
-    assert.ok(!t.startsWith('low'), 'no low-rung: ' + t);
+
+  // Case 1: bulk-only rows (no first_real_at) with tmdb_id ARE included,
+  // ordered by last_watched_at. Rows with no tmdb_id and rows below engaged
+  // are still excluded.
+  {
+    const rows = [
+      // 3 real-start anime rows (engaged+):
+      row(100, 'anime', 'ttA1', 'a1', 'Anime 1', base + 3 * DAY),
+      row(101, 'anime', 'ttA2', 'a2', 'Anime 2', base + 2 * DAY),
+      row(102, 'anime', 'ttA3', 'a3', 'Anime 3', base + 1 * DAY),
+      // 5 bulk-only anime rows (no first_real_at, have last_watched_at):
+      bulkRow(200, 'anime', 'ttA4', 'b1', 'Bulk 1', base + 5 * DAY),
+      bulkRow(201, 'anime', 'ttA5', 'b2', 'Bulk 2', base + 4 * DAY),
+      bulkRow(202, 'anime', 'ttA6', 'b3', 'Bulk 3', base + 3 * DAY),
+      bulkRow(203, 'anime', 'ttA7', 'b4', 'Bulk 4', base + 2 * DAY),
+      bulkRow(204, 'anime', 'ttA8', 'b5', 'Bulk 5', base + 1 * DAY),
+      // 1 row with no tmdb_id (excluded):
+      row(300, 'anime', 'ttA9', null, 'NoID', base + 6 * DAY),
+      // 1 row below engaged (excluded):
+      row(301, 'anime', 'ttA10', 'low1', 'Low', base + 6 * DAY, { watched_eps: 4 }),
+      // 1 ordinary show (excluded):
+      row(302, 'show', 'ttS1', 'o1', 'Ordinary', base + 6 * DAY),
+    ];
+    // 8 qualifying (3 real-start + 5 bulk-only).
+    // holdout 3 needs 3+10=13 → throws.
+    assert.throws(() => bench.pickAnimeTargets(rows, 3), /not enough anime history \(8 qualifying shows, need 13\)/);
+    // holdout 1 needs 1+10=11 → still throws (8 < 11).
+    assert.throws(() => bench.pickAnimeTargets(rows, 1), /not enough anime history \(8 qualifying shows, need 11\)/);
   }
-  // Too few qualifying → throws.
-  const few = rows.slice(0, 10); // only 10 qualifying < 5+10
-  assert.throws(() => bench.pickAnimeTargets(few, 5), /not enough anime history/);
+
+  // Case 2: mixed fixture — real-start and last-watched-only rows sort on
+  // the common scale (both epoch ms). Bulk-only rows with a recent
+  // last_watched_at sort above real-start rows with an older first_real_at.
+  {
+    const rows = [
+      // 10 real-start anime rows (engaged+), timestamps base+1..base+10:
+      ...Array.from({ length: 10 }, (_, i) => row(100 + i, 'anime', 'ttA' + (i + 1), 'a' + (i + 1), 'Anime ' + (i + 1), base + (i + 1) * DAY)),
+      // 5 bulk-only anime rows (no first_real_at), last_watched_at base+11..base+15:
+      ...Array.from({ length: 5 }, (_, i) => bulkRow(200 + i, 'anime', 'ttA' + (10 + i), 'b' + (i + 1), 'Bulk ' + (i + 1), base + (11 + i) * DAY)),
+      // 5 ordinary shows (excluded):
+      ...Array.from({ length: 5 }, (_, i) => row(300 + i, 'show', 'ttS' + (i + 1), 'o' + (i + 1), 'Ordinary ' + (i + 1), base + (200 + i) * DAY)),
+    ];
+    // 15 qualifying (10 real-start + 5 bulk-only).
+    // holdout 5 needs 5+10=15 → exactly meets.
+    const targets = bench.pickAnimeTargets(rows, 5);
+    assert.strictEqual(targets.length, 5, 'returns exactly holdout targets');
+    // The 5 most recent: bulk rows b5..b1 (base+15..base+11) are the most recent.
+    assert.deepStrictEqual(targets, ['b5', 'b4', 'b3', 'b2', 'b1'], 'bulk-only rows with recent last_watched_at sort first');
+  }
+
+  // Case 3: equal timestamps break ties by tmdb_id (string ascending).
+  {
+    const rows = [
+      // 12 rows all with the same timestamp:
+      ...Array.from({ length: 12 }, (_, i) => bulkRow(100 + i, 'anime', 'ttA' + (i + 1), 'z' + String(i).padStart(2, '0'), 'Row ' + i, base + 5 * DAY)),
+    ];
+    // 12 qualifying. holdout 3 needs 3+10=13 → throws.
+    assert.throws(() => bench.pickAnimeTargets(rows, 3), /not enough anime history \(12 qualifying shows, need 13\)/);
+    // holdout 2 needs 2+10=12 → exactly meets.
+    const targets = bench.pickAnimeTargets(rows, 2);
+    // Tie broken by tmdb_id ascending: z00, z01.
+    assert.deepStrictEqual(targets, ['z00', 'z01'], 'tie broken by tmdb_id ascending');
+  }
+
+  // Case 4: Ciara-shaped fixture (modelled on the real data).
+  // 10 finished/no first_real_at (have tmdb_id)
+  // 9 finished/no first_real_at/no tmdb_id
+  // 3 engaged/first_real_at
+  // 1 committed/first_real_at
+  // 1 engaged/no first_real_at
+  // + 8 rows below engaged or no tmdb_id
+  {
+    const rows = [
+      // 10 finished, no first_real_at, have tmdb_id (bulk-only, engaged+):
+      ...Array.from({ length: 10 }, (_, i) => bulkRow(100 + i, 'anime', 'ttA' + (i + 1), 'c' + String(i + 1).padStart(2, '0'), 'Ciara Bulk ' + (i + 1), base + (i + 1) * DAY, { watched_eps: 24 })),
+      // 9 finished, no first_real_at, no tmdb_id (excluded — no tmdb_id):
+      ...Array.from({ length: 9 }, (_, i) => bulkRow(200 + i, 'anime', 'ttA' + (i + 1), null, 'NoID ' + (i + 1), base + (i + 1) * DAY, { watched_eps: 24 })),
+      // 3 engaged, first_real_at:
+      ...Array.from({ length: 3 }, (_, i) => row(300 + i, 'anime', 'ttA' + (i + 1), 'e' + (i + 1), 'Engaged ' + (i + 1), base + (100 + i) * DAY, { watched_eps: 12 })),
+      // 1 committed, first_real_at:
+      row(400, 'anime', 'ttA1', 'com1', 'Committed', base + 103 * DAY, { watched_eps: 18 }),
+      // 1 engaged, no first_real_at (bulk-only):
+      bulkRow(401, 'anime', 'ttA2', 'e_bulk', 'Engaged Bulk', base + 104 * DAY, { watched_eps: 12 }),
+      // 8 rows below engaged or no tmdb_id (excluded):
+      ...Array.from({ length: 3 }, (_, i) => row(500 + i, 'anime', 'ttA' + (i + 1), 's' + (i + 1), 'Sampling ' + (i + 1), base + (i + 1) * DAY, { watched_eps: 2 })),
+      ...Array.from({ length: 2 }, (_, i) => row(510 + i, 'anime', 'ttA' + (i + 1), 'tr' + (i + 1), 'Tried ' + (i + 1), base + (10 + i) * DAY, { watched_eps: 4 })),
+      ...Array.from({ length: 3 }, (_, i) => row(520 + i, 'anime', 'ttA' + (i + 1), null, 'NoID2 ' + (i + 1), base + (20 + i) * DAY, { watched_eps: 12 })),
+    ];
+    // Qualifying: 10 bulk (c01..c10) + 3 engaged (e1..e3) + 1 committed (com1) + 1 engaged bulk (e_bulk) = 15.
+    // holdout 5 needs 5+10=15 → exactly meets.
+    const targets = bench.pickAnimeTargets(rows, 5);
+    assert.strictEqual(targets.length, 5, 'Ciara shape: returns 5 targets');
+    // The 5 most recent: e_bulk (base+104*DAY), com1 (base+103*DAY), e3 (base+102*DAY), e2 (base+101*DAY), e1 (base+100*DAY).
+    assert.deepStrictEqual(targets, ['e_bulk', 'com1', 'e3', 'e2', 'e1'], 'Ciara shape: real-start rows with recent timestamps sort first');
+    // holdout 6 needs 6+10=16 → throws (15 < 16).
+    assert.throws(() => bench.pickAnimeTargets(rows, 6), /not enough anime history \(15 qualifying shows, need 16\)/);
+  }
 });
 
 // ── AB2: removeAnimeHoldout ──
@@ -433,6 +508,67 @@ await ok('AB7: series/movie unchanged — pickSeriesTargets and pickTargets stil
   // pickTargets (movie): uses watched rows, not series_progress. The fixture
   // has no movie watched rows, so it throws.
   assert.throws(() => bench.pickTargets([], 5), /not enough history/);
+});
+
+// ── AB8: describeAnimeTargets ──
+await ok('AB8: describeAnimeTargets — labels each target correctly and the counts line is right', async () => {
+  const DAY = 86400e3;
+  const base = Date.parse('2026-06-01T00:00:00Z');
+
+  // Mixed set: 2 real-start, 3 last-watched, 1 id-only.
+  {
+    const rows = [
+      row(100, 'anime', 'ttA1', 'a1', 'Anime 1', base + 3 * DAY),
+      row(101, 'anime', 'ttA2', 'a2', 'Anime 2', base + 2 * DAY),
+      bulkRow(200, 'anime', 'ttA3', 'b1', 'Bulk 1', base + 5 * DAY),
+      bulkRow(201, 'anime', 'ttA4', 'b2', 'Bulk 2', base + 4 * DAY),
+      bulkRow(202, 'anime', 'ttA5', 'b3', 'Bulk 3', base + 3 * DAY),
+      // id-only: no first_real_at, no last_watched_at (both null).
+      { simkl_id: 300, kind: 'anime', imdb_id: 'ttA6', tmdb_id: 'x1', title: 'NoDates', year: 2020,
+        status: 'watching', watched_eps: 12, total_eps: 24, not_aired_eps: 4,
+        last_watched_at: null, first_watched_at: null, first_real_at: null, last_real_at: null,
+        stamps: 12, real_stamps: 0, eps_per_week: null },
+    ];
+    const targetIds = ['a1', 'a2', 'b1', 'b2', 'b3', 'x1'];
+    const desc = bench.describeAnimeTargets(rows, targetIds);
+    assert.strictEqual(desc.length, 6, 'returns one entry per target');
+    // a1, a2 → real-start
+    assert.strictEqual(desc[0].orderedBy, 'real-start', 'a1 is real-start');
+    assert.strictEqual(desc[1].orderedBy, 'real-start', 'a2 is real-start');
+    // b1, b2, b3 → last-watched
+    assert.strictEqual(desc[2].orderedBy, 'last-watched', 'b1 is last-watched');
+    assert.strictEqual(desc[3].orderedBy, 'last-watched', 'b2 is last-watched');
+    assert.strictEqual(desc[4].orderedBy, 'last-watched', 'b3 is last-watched');
+    // x1 → id-only
+    assert.strictEqual(desc[5].orderedBy, 'id-only', 'x1 is id-only');
+    // titles are correct
+    assert.strictEqual(desc[0].title, 'Anime 1', 'a1 title');
+    assert.strictEqual(desc[5].title, 'NoDates', 'x1 title');
+    // Counts: 2 real-start, 3 last-watched, 1 id-only.
+    const counts = { 'real-start': 0, 'last-watched': 0, 'id-only': 0 };
+    for (const d of desc) counts[d.orderedBy] += 1;
+    assert.deepStrictEqual(counts, { 'real-start': 2, 'last-watched': 3, 'id-only': 1 }, 'counts');
+  }
+
+  // All id-only set.
+  {
+    const rows = [
+      { simkl_id: 100, kind: 'anime', imdb_id: 'ttA1', tmdb_id: 'x1', title: 'NoDates 1', year: 2020,
+        status: 'watching', watched_eps: 12, total_eps: 24, not_aired_eps: 4,
+        last_watched_at: null, first_watched_at: null, first_real_at: null, last_real_at: null,
+        stamps: 12, real_stamps: 0, eps_per_week: null },
+      { simkl_id: 101, kind: 'anime', imdb_id: 'ttA2', tmdb_id: 'x2', title: 'NoDates 2', year: 2020,
+        status: 'watching', watched_eps: 12, total_eps: 24, not_aired_eps: 4,
+        last_watched_at: null, first_watched_at: null, first_real_at: null, last_real_at: null,
+        stamps: 12, real_stamps: 0, eps_per_week: null },
+    ];
+    const desc = bench.describeAnimeTargets(rows, ['x1', 'x2']);
+    assert.strictEqual(desc[0].orderedBy, 'id-only', 'x1 is id-only');
+    assert.strictEqual(desc[1].orderedBy, 'id-only', 'x2 is id-only');
+    // The script's print logic: all id-only → "Holdout chosen by tmdb id..."
+    const allIdOnly = desc.every((d) => d.orderedBy === 'id-only');
+    assert.ok(allIdOnly, 'all id-only');
+  }
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
