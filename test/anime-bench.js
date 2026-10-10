@@ -361,21 +361,56 @@ await ok('AB5: baseline override — ctxExtras.animeMode=trending forces trendin
   }
 });
 
-// ── AB6: label fix ──
-await ok('AB6: label fix — llm-review gives rejected_llm; csm gives rejected_age; llm gives rejected_llm', async () => {
-  // Drive the two code paths with a stub verdict. The decision log update is
-  // called with the outcome computed from v.source. We test the logic directly.
-  const computeOutcome = (source) => (source === 'llm' || source === 'llm-review') ? 'rejected_llm' : 'rejected_age';
-  assert.strictEqual(computeOutcome('llm-review'), 'rejected_llm', 'llm-review → rejected_llm');
-  assert.strictEqual(computeOutcome('csm'), 'rejected_age', 'csm → rejected_age');
-  assert.strictEqual(computeOutcome('llm'), 'rejected_llm', 'llm → rejected_llm');
-  // Also verify the stage and rating logic.
-  const computeStage = (source) => (source === 'llm' || source === 'llm-review') ? 'llm-last-resort' : source;
-  const computeRating = (source, rating) => (source === 'llm' || source === 'llm-review') ? 'llm' : source + ':' + rating;
-  assert.strictEqual(computeStage('llm-review'), 'llm-last-resort', 'llm-review stage');
-  assert.strictEqual(computeStage('csm'), 'csm', 'csm stage');
-  assert.strictEqual(computeRating('llm-review', '14'), 'llm', 'llm-review rating');
-  assert.strictEqual(computeRating('csm', '14'), 'csm:14', 'csm rating');
+// ── AB6: label fix (calls the REAL exported function) ──
+await ok('AB6: label fix — animeBlockDecision handles llm-review, llm, and csm correctly', async () => {
+  const { animeBlockDecision } = require('../src/recommendationStore');
+  // llm-review → rejected_llm / llm-last-resort / llm / LLM reason (no v.reason).
+  {
+    const d = animeBlockDecision({ source: 'llm-review', rating: '14' }, 'TV-14');
+    assert.strictEqual(d.outcome, 'rejected_llm', 'llm-review outcome');
+    assert.strictEqual(d.stage, 'llm-last-resort', 'llm-review stage');
+    assert.strictEqual(d.rating, 'llm', 'llm-review rating');
+    assert.strictEqual(d.reason, 'The LLM judged it unsuitable for this age', 'llm-review reason (no v.reason)');
+  }
+  // llm-review with an explicit v.reason → the reason wins.
+  {
+    const d = animeBlockDecision({ source: 'llm-review', rating: '14', reason: 'Custom reason' }, 'TV-14');
+    assert.strictEqual(d.reason, 'Custom reason', 'llm-review explicit reason wins');
+  }
+  // llm → same as llm-review.
+  {
+    const d = animeBlockDecision({ source: 'llm', rating: '14' }, 'TV-14');
+    assert.strictEqual(d.outcome, 'rejected_llm', 'llm outcome');
+    assert.strictEqual(d.stage, 'llm-last-resort', 'llm stage');
+    assert.strictEqual(d.rating, 'llm', 'llm rating');
+    assert.strictEqual(d.reason, 'The LLM judged it unsuitable for this age', 'llm reason');
+  }
+  // csm → rejected_age / csm / csm:14 / csm rated 14: above the TV-14 limit.
+  {
+    const d = animeBlockDecision({ source: 'csm', rating: '14' }, 'TV-14');
+    assert.strictEqual(d.outcome, 'rejected_age', 'csm outcome');
+    assert.strictEqual(d.stage, 'csm', 'csm stage');
+    assert.strictEqual(d.rating, 'csm:14', 'csm rating');
+    assert.strictEqual(d.reason, 'csm rated 14: above the TV-14 limit', 'csm reason');
+  }
+  // csm with an explicit v.reason → the reason wins.
+  {
+    const d = animeBlockDecision({ source: 'csm', rating: '14', reason: 'Custom' }, 'TV-14');
+    assert.strictEqual(d.reason, 'Custom', 'csm explicit reason wins');
+  }
+});
+
+// ── AB6b: grep-style guard — both call sites use the helper ──
+// Crude but it fails if someone reverts one site back to the inline ternary.
+await ok('AB6b: both call sites use animeBlockDecision (no inline ternary remains)', async () => {
+  const fs = require('fs');
+  const path = require('path');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'recommendationStore.js'), 'utf8');
+  // The old inline ternary must not appear anywhere.
+  assert.ok(!src.includes("v.source === 'llm' ? 'rejected_llm'"), 'old inline ternary still present');
+  // animeBlockDecision( must appear at least twice besides its definition.
+  const count = (src.match(/animeBlockDecision\(/g) || []).length;
+  assert.ok(count >= 3, 'animeBlockDecision used at both call sites (found ' + count + ' occurrences, need ≥ 3: 1 definition + 2 call sites)');
 });
 
 // ── AB7: series/movie unchanged ──

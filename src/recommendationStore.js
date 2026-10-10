@@ -381,6 +381,20 @@ const AGE_SOURCE_ORDER = ['csm', 'mal', 'au', 'us', 'tvdb-au', 'tvdb-us', 'kitsu
 //   1. NSFW blacklist + anime age band (ALL profiles) via rebuild.applyAnimeGate
 //      — porn is dropped for everyone; anime over the band for age-limited ones.
 //      The MAL band it resolves is stored as age_classification.
+// AN-4 review 1: the anime block-verdict decision (pure). Both the ageGatePool
+// and stagedAgeGate call sites use this so the two can never disagree.
+// `v` is a block verdict `{ source, rating, reason }`; `tierLabel` is the tier
+// label (e.g. 'TV-14').
+function animeBlockDecision(v, tierLabel) {
+  const isLlm = v.source === 'llm' || v.source === 'llm-review';
+  return {
+    outcome: isLlm ? 'rejected_llm' : 'rejected_age',
+    stage: isLlm ? 'llm-last-resort' : v.source,
+    rating: isLlm ? 'llm' : v.source + ':' + v.rating,
+    reason: v.reason || (isLlm ? 'The LLM judged it unsuitable for this age' : v.source + ' rated ' + v.rating + ': above the ' + tierLabel + ' limit'),
+  };
+}
+
 //   2. LLM ACB pass (age-limited profiles only) — remove-only, per type.
 // Failures are deleted from the pool (re-evaluated on the next build, not a
 // permanent user rejection). TMDB `adult` porn was already dropped at build.
@@ -464,12 +478,7 @@ async function ageGatePool(profile, log = console, onProgress = () => {}, opts =
         if (type === 'anime' && decisions) {
           try {
             if (v.verdict === 'block') {
-              decisions.update(profile.id, 'anime', opts.animeBuildId, String(tmdbId), {
-                outcome: (v.source === 'llm' || v.source === 'llm-review') ? 'rejected_llm' : 'rejected_age',
-                stage: (v.source === 'llm' || v.source === 'llm-review') ? 'llm-last-resort' : v.source,
-                rating: (v.source === 'llm' || v.source === 'llm-review') ? 'llm' : v.source + ':' + v.rating,
-                reason: v.reason || (v.source === 'llm' ? 'The LLM judged it unsuitable for this age' : v.source + ' rated ' + v.rating + ': above the ' + tier.label + ' limit'),
-              });
+              decisions.update(profile.id, 'anime', opts.animeBuildId, String(tmdbId), animeBlockDecision(v, tier.label));
             } else if (v.verdict === 'allow') {
               decisions.update(profile.id, 'anime', opts.animeBuildId, String(tmdbId), {
                 stage: v.source,
@@ -654,12 +663,7 @@ async function stagedAgeGate(profile, stagedByType, log = console, onProgress = 
             const v = result.get(`${lanes.verdictType(type)}:${c.tmdb_id}`);
             if (!v) continue;
             if (v.verdict === 'block') {
-              decisions.update(profile.id, 'anime', opts.animeBuildId, String(c.tmdb_id), {
-                outcome: (v.source === 'llm' || v.source === 'llm-review') ? 'rejected_llm' : 'rejected_age',
-                stage: (v.source === 'llm' || v.source === 'llm-review') ? 'llm-last-resort' : v.source,
-                rating: (v.source === 'llm' || v.source === 'llm-review') ? 'llm' : v.source + ':' + v.rating,
-                reason: v.reason || (v.source === 'llm' ? 'The LLM judged it unsuitable for this age' : v.source + ' rated ' + v.rating + ': above the ' + tier.label + ' limit'),
-              });
+              decisions.update(profile.id, 'anime', opts.animeBuildId, String(c.tmdb_id), animeBlockDecision(v, tier.label));
             } else if (v.verdict === 'allow') {
               decisions.update(profile.id, 'anime', opts.animeBuildId, String(c.tmdb_id), {
                 stage: v.source,
@@ -1700,6 +1704,7 @@ module.exports = {
   recordImpressions,
   applyDecay,
   noteMetaOpen,
+  animeBlockDecision,
   SERVE_LIMIT,
   DECAY_WINDOW_MS,
   FALLOFF_GAP_MS,
