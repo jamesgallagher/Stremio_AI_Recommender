@@ -658,6 +658,8 @@ async function runBench({ profile, engineIds, holdout, type = 'movie', serveOpts
       positions[t] = { rank, served: served20Ids.has(t), fate, sources: ctx.marqueeTrace?.generated.get(t) || null };
     }
     results.engines[id] = { metrics: m, hitTargets, positions };
+    // AN-4: capture the mode the engine used (for the one-line note).
+    if (type === 'anime' && id === 'marquee-anime') results.animeMode = ctx.animeMode;
   }
 
   // §6: Marquee serve-strategy comparison (round-robin vs calibrated vs pure
