@@ -49,14 +49,32 @@ const defaultDeps = {
   settings,
   enrich: metaStore.enrich,
   metaGet: metaStore.get,
+  metaGetMany: metaStore.getMany,   // one query for a whole list (falls back to metaGet, see mergeDeps)
+  fillBudgetMs: 4000,               // max time a list request waits on TMDB lookups for missing posters/titles
   unfinishedRows,
   db,
   now: Date.now,
   log: console,
 };
 function mergeDeps(deps) {
-  return { ...defaultDeps, ...(deps || {}) };
+  const D = { ...defaultDeps, ...(deps || {}) };
+  // A caller (or test) that replaces metaGet without a bulk reader must still have its metaGet used.
+  if (deps && deps.metaGet && !deps.metaGetMany) {
+    D.metaGetMany = (type, ids) => {
+      const out = new Map();
+      for (const id of ids) { const m = deps.metaGet(type, id); if (m) out.set(String(id), m); }
+      return out;
+    };
+  }
+  return D;
 }
+
+// TMDB lookups that returned nothing (404, outage, bad id) are remembered for an hour so the same
+// rows don't use up every list request's lookup slots (metaStore.enrich deliberately doesn't cache
+// a failure, so without this the first N unresolvable rows starve the rest of the page).
+const FAILURE_RETRY_MS = 60 * 60e3;
+const lookupFailures = new Map(); // `${type}:${tmdbId}` -> retry-after (ms)
+function _resetLookupFailures() { lookupFailures.clear(); }
 
 // 'movie', 'series' and 'anime' are ok; anything else → bad-type. Shows are rated per
 // SHOW (Q9), never per episode; the series source is series_progress rows with
@@ -118,6 +136,15 @@ function toItem(row, status, { ratings, ignored, meta }) {
   };
 }
 
+// The anime DISPLAY rule, shared by the list AND every action response (rate / ignore / undo), so a row
+// can never flip back after a click: the genre is "Anime" (the pool's pseudo-genre, not TMDB's generic
+// "Animation"), and the English (TMDB en-US) title wins over Simkl's romaji one once it is known.
+function applyAnimeDisplay(item, meta) {
+  item.genre = 'Anime';
+  if (meta && meta.title) item.title = meta.title;
+  return item;
+}
+
 // The series DTO (spec §2): the same 15 keys as films, plus `progress`.
 // `loved` is computed, never stored (M3). `meta` is metaGet('series', tmdbId)
 // (the Glass metaStore Marquee TV fills); it may be absent, then those fields
@@ -152,11 +179,14 @@ function toSeriesItem(row, { ratings, ignored, meta }) {
 
 // Build the full DTO for an action's resolved row (F8: rate/setIgnored return
 // the same shape as listHistory, so the two surfaces can't drift).
-function buildItem(D, profile, type, row, status = 'watched') {
+function buildItem(D, profile, type, row, status = 'watched', { anime = false } = {}) {
   const ratings = D.tasteFeedback.getRatingsMap(profile.id, type);
   const ignored = D.tasteFeedback.ignoredSet(profile.id, type);
   const meta = row.tmdb_id != null ? D.metaGet(type, row.tmdb_id) : null;
-  if (type === 'series') return toSeriesItem(row, { ratings, ignored, meta });
+  if (type === 'series') {
+    const item = toSeriesItem(row, { ratings, ignored, meta });
+    return anime ? applyAnimeDisplay(item, meta) : item;
+  }
   return toItem(row, status, { ratings, ignored, meta });
 }
 
@@ -348,11 +378,19 @@ async function listSeriesHistory(D, profile, { view, q, page, pageSize, sourceFn
   // not fail the action — carry on with the detector off.
   try { await animeMap.ensureLoaded(); } catch { /* detector off — carry on */ }
   const src = sourceFn || seriesSource;
+  const isAnime = src === animeSource;
   const { rows, unresolved } = src(profile.id, D.watchedStore);
   const items = [];
+  // ONE query for every cached title (not one per row).
+  const cachedMeta = D.metaGetMany(type, rows.map((r) => r.tmdb_id).filter((id) => id != null).map(String));
   for (const row of rows) {
     const item = toSeriesItem(row, { ratings, ignored, meta: null });
     item._sortMs = row.last_watched_at != null ? row.last_watched_at : 0;
+    // Anime: every row IS anime ("Anime" genre, English title) — applied before the search/sort below
+    // so typing the English name finds a cached row. Uncached rows are fetched for the visible page
+    // further down. (Same rule the rate/ignore/undo responses use, so a row never flips back.)
+    if (isAnime) applyAnimeDisplay(item, cachedMeta.get(item.tmdb_id));
+    if (cachedMeta.has(item.tmdb_id)) item._hasMeta = true;
     items.push(item);
   }
   // Counts (filter chips) — over the whole universe, per view.
@@ -392,18 +430,48 @@ async function listSeriesHistory(D, profile, { view, q, page, pageSize, sourceFn
   const total = viewItems.length;
   const pageItems = viewItems.slice((page - 1) * pageSize, page * pageSize);
   // Fill poster/genre/title/year from the meta cache (no network).
+  const applyMeta = (item, meta) => {
+    if (!meta) return;
+    if (item.title == null) item.title = meta.title;
+    if (item.year == null) item.year = meta.year;
+    if (item.genre == null) item.genre = meta.primary_genre || (meta.genres && meta.genres[0]) || null;
+    if (item.poster == null) item.poster = meta.poster;
+    if (isAnime) applyAnimeDisplay(item, meta); // English title + "Anime" genre win for anime
+  };
   for (const item of pageItems) {
-    if (item.tmdb_id != null) {
-      const meta = D.metaGet(type, item.tmdb_id);
-      if (meta) {
-        if (item.title == null) item.title = meta.title;
-        if (item.year == null) item.year = meta.year;
-        if (item.genre == null) item.genre = meta.primary_genre || (meta.genres && meta.genres[0]) || null;
-        if (item.poster == null) item.poster = meta.poster;
-      }
+    if (item.tmdb_id != null) applyMeta(item, cachedMeta.get(item.tmdb_id));
+  }
+  // Rows nothing has looked up yet (anime shows are never in the Marquee TV cache) get their metadata
+  // fetched now, like films always have: at most 25 per request, in batches of 8. The result is
+  // cached permanently by the metadata store, so each title costs one TMDB call, once.
+  const apiKey = D.settings.keyFor(profile, 'tmdb_api_key');
+  if (apiKey) {
+    const nowMs = D.now();
+    if (lookupFailures.size > 5000) lookupFailures.clear();
+    const failKey = (item) => `${type}:${item.tmdb_id}`;
+    // Skip titles whose lookup recently failed, so they can't take every request's 25 slots.
+    const missing = pageItems
+      .filter((i) => i.tmdb_id != null && !i._hasMeta && !(lookupFailures.get(failKey(i)) > nowMs))
+      .slice(0, 25);
+    // The request never waits longer than the budget for TMDB: lookups still running when it runs out
+    // keep going in the background and are cached for the next load.
+    const deadline = Date.now() + D.fillBudgetMs;
+    for (let i = 0; i < missing.length; i += 8) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      const batch = missing.slice(i, i + 8);
+      const lookups = Promise.all(batch.map((item) => D.enrich(apiKey, type, item.tmdb_id, D.log, {}).catch(() => null)));
+      let timer;
+      const settled = await Promise.race([lookups, new Promise((resolve) => { timer = setTimeout(() => resolve(null), remaining); })]);
+      clearTimeout(timer);
+      if (!settled) break; // out of time
+      settled.forEach((meta, idx) => {
+        if (meta) applyMeta(batch[idx], meta);
+        else lookupFailures.set(failKey(batch[idx]), nowMs + FAILURE_RETRY_MS);
+      });
     }
   }
-  for (const item of pageItems) { delete item._sortMs; }
+  for (const item of pageItems) { delete item._sortMs; delete item._hasMeta; }
   const training = D.tasteFeedback.getTraining(profile.id);
   let rebuildDueAt = null;
   if (training.changed_at != null
@@ -598,7 +666,7 @@ async function rate(profile, ref, rating, deps = {}) {
   // F4 no-op: same value (both null counts too) → no Simkl call, no change.
   const current = D.tasteFeedback.getRating(profile.id, storageType, row.tmdb_id);
   if (current === rating) {
-    return { ok: true, item: buildItem(D, profile, storageType, row), unchanged: true };
+    return { ok: true, item: buildItem(D, profile, storageType, row, 'watched', { anime: type === 'anime' }), unchanged: true };
   }
   // M7: every Simkl write goes through the governed simkl_post lane.
   let simklRes;
@@ -619,7 +687,7 @@ async function rate(profile, ref, rating, deps = {}) {
   }
   D.tasteFeedback.recordChange(profile.id, now);
   D.log.log(`[trainer] ${profile.name}: rated ${storageType} tmdb:${row.tmdb_id} → ${rating == null ? 'cleared' : rating}`);
-  return { ok: true, item: buildItem(D, profile, storageType, row), unchanged: false };
+  return { ok: true, item: buildItem(D, profile, storageType, row, 'watched', { anime: type === 'anime' }), unchanged: false };
 }
 
 // setIgnored — ignore/un-ignore a title (local only — M2: never calls Simkl,
@@ -659,7 +727,7 @@ async function setIgnored(profile, ref, ignored, deps = {}) {
   const changed = D.tasteFeedback.setIgnored(profile.id, { type: storageType, tmdb_id: tmdbId, simkl_id: row.simkl_id, imdb_id: row.imdb_id }, ignored, now);
   if (changed) D.tasteFeedback.recordChange(profile.id, now);
   D.log.log(`[trainer] ${profile.name}: ${ignored ? 'ignored' : 'un-ignored'} ${type} tmdb:${tmdbId}`);
-  return { ok: true, item: buildItem(D, profile, storageType, row, status), unchanged: !changed };
+  return { ok: true, item: buildItem(D, profile, storageType, row, status, { anime: type === 'anime' }), unchanged: !changed };
 }
 
 // markFinished — mark an unfinished (abandoned) film finished. Delegates to the
@@ -737,6 +805,7 @@ async function markUnwatched(profile, ref, deps = {}) {
 
 module.exports = {
   VIEWS,
+  _resetLookupFailures,
   listHistory,
   rate,
   setIgnored,

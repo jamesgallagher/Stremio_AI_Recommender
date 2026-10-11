@@ -189,7 +189,7 @@ function fakeTrending() {
     const alpha = res.items[0];
     assert.deepStrictEqual(alpha, {
       key: '100', type: 'series', simkl_id: 1, tmdb_id: '100', imdb_id: 'ttA1',
-      title: 'Alpha Anime', year: 2020, genre: null, poster: null,
+      title: 'Alpha Anime', year: 2020, genre: 'Anime', poster: null,
       watched_at: new Date(3000).toISOString(),
       rating: 10, loved: true, ignored: false, status: 'watched', percent: null,
       progress: { watched_eps: 12, aired_eps: 20 },
