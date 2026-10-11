@@ -16,6 +16,9 @@ services:
       - PORT=7000
       - DATA_DIR=/data
       - EXTERNAL_URL=https://recs.example.com   # public hostname (Cloudflare Tunnel etc.) — used in install URLs
+      # - TRUST_PROXY=1         # proxy hops in front of the app (Cloudflare Tunnel = 1)
+    # The image runs as the unprivileged `node` user (uid 1000): chown -R 1000:1000 the appdata
+    # folder, or uncomment:  user: "99:100"   # nobody:users on Unraid
       # - STALE_HOURS=24        # cache staleness threshold
       # - BACKOFF_MINUTES=30    # retry backoff after a failed rebuild
       # - SECRET_KEY=change-me-to-a-long-random-string  # encrypts all stored secrets at rest (API keys, Trakt tokens, scrobble passwords)

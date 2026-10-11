@@ -126,7 +126,7 @@ function isAbandoned(row, eng, { now, watchedIds }) {
   const dur = Number(row.duration_ms);
   if (dur > 0 && !((dur * (1 - p / 100)) / 60000 > (eng.credits_min ?? 20))) return false; // credits → never abandoned
   if (row.updated_at && now - row.updated_at < (eng.grace_days ?? 7) * DAY_MS) return false;
-  if (watchedIds.tmdb.has(String(row.tmdb_id))) return false;
+  if (require('../../watchedStore').watchedTmdbFor(watchedIds, 'movie').has(String(row.tmdb_id))) return false;
   if (watchedIds.imdb.has(row.imdb_id)) return false;
   return true;
 }

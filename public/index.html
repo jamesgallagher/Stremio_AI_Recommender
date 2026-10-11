@@ -898,7 +898,6 @@ function render(profiles) {
           <div class="row">
             <button class="ghost" onclick="buildRecs('${p.id}', this)" title="Rebuild the recommendation pool from watched history">Rebuild recommendations</button>
             <button class="ghost" onclick="viewRecs('${p.id}', this)">View</button>
-            <button class="ghost" onclick="resetRecs('${p.id}', this)" title="Wipe the pool and your 'don't recommend' flags">Reset</button>
           </div>
           <span class="tres" data-tres="recs"></span>
           ${p.simkl_connected ? '' : '<div class="hint">Connect Simkl first — the pool builds from watched history.</div>'}
@@ -923,9 +922,14 @@ function render(profiles) {
 
         <div class="sec-title" style="color:var(--err)">Danger zone</div>
         <div class="sec-box danger">
-          <div class="row">
-            <span class="grow muted" style="font-size:12px">Delete removes <b>${esc(p.name)}</b> and stops their install link immediately. This cannot be undone.</span>
-            <button class="danger" onclick="delProfile('${p.id}')">Delete profile</button>
+          <div class="muted" style="font-size:12px;margin-bottom:10px">These cannot be undone. Each asks you to type a confirmation.</div>
+          <div class="row" style="align-items:flex-start">
+            <span class="grow muted" style="font-size:12px"><b style="color:var(--text)">Hard reset recommendations</b><br>Wipes <b>${esc(p.name)}</b>'s whole recommendation pool <b>and every “don't recommend” flag</b>, so titles that were rejected can come back. The pool rebuilds from watched history.<span class="tres" data-tres="recs-reset"></span></span>
+            <button class="danger" onclick="resetRecs('${p.id}', this)">Hard reset…</button>
+          </div>
+          <div class="row" style="align-items:flex-start;margin-top:12px">
+            <span class="grow muted" style="font-size:12px"><b style="color:var(--text)">Delete profile</b><br>Removes <b>${esc(p.name)}</b> and stops their install link immediately.</span>
+            <button class="danger" onclick="delProfile('${p.id}')">Delete profile…</button>
           </div>
         </div>
 
@@ -1535,11 +1539,17 @@ async function addProfile() {
   load();
 }
 
+// Typed confirmation for destructive actions: true only if the exact text is entered.
+function typedConfirm(message, expected) {
+  const got = prompt(message);
+  return got !== null && got.trim() === expected;
+}
+
 async function delProfile(id) {
   // Name read from the DOM, not interpolated into the onclick attribute —
   // keeps profile names out of inline JS entirely.
   const name = document.querySelector(`[data-id="${id}"] h2`)?.textContent || 'this profile';
-  if (!confirm(`Delete profile "${name}"? Their install link stops working immediately.`)) return;
+  if (!typedConfirm(`Delete profile "${name}"? Their install link stops working immediately.\n\nType the profile name to confirm:`, name)) return;
   try { await api('/profiles/' + id, { method: 'DELETE' }); } catch (e) { return toast('Delete failed: ' + e.message); }
   load();
 }
@@ -2091,8 +2101,8 @@ async function viewWatched(id, btn) {
 }
 
 async function resetRecs(id, btn) {
-  if (!confirm('Wipe the recommendation pool AND your "don\'t recommend" flags for this profile? The pool rebuilds from watched history on the next build.')) return;
-  const out = document.querySelector(`[data-id="${id}"] [data-tres="recs"]`);
+  if (!typedConfirm('HARD RESET: wipe this profile\'s recommendation pool AND all "don\'t recommend" flags? Titles that were rejected can come back. The pool rebuilds from watched history on the next build.\n\nType RESET to confirm:', 'RESET')) return;
+  const out = document.querySelector(`[data-id="${id}"] [data-tres="recs-reset"]`);
   btn.disabled = true; out.textContent = ' ⟳ resetting…'; out.className = 'tres';
   try {
     await api(`/profiles/${id}/recommend/reset`, { method: 'POST' });

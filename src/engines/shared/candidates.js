@@ -146,9 +146,9 @@ async function generateCandidates(profile, type, ctx, taste, cfg, {
   log = console,
 } = {}) {
   const st = cfg.strategies;
-  const watchedTmdb = ctx?.watchedIds?.tmdb || new Set();
+  const watchedStore = require('../../watchedStore');
   const dont = ctx?.dont || new Set();
-  const notExcluded = (c) => !watchedTmdb.has(c.tmdb_id) && !dont.has(key(c.type, c.tmdb_id)) && !c.adult;
+  const notExcluded = (c) => !watchedStore.watchedTmdbFor(ctx?.watchedIds, c.type).has(c.tmdb_id) && !dont.has(key(c.type, c.tmdb_id)) && !c.adult;
 
   const pool = [];
 

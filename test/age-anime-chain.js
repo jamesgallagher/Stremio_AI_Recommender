@@ -911,7 +911,7 @@ const getRow = (profileId, buildId, tmdbId) => {
   });
 
   // ---- AI4: passesAgeBand — anime block → false; series-only verdict → falls through ----
-  await ok('AI4: passesAgeBand — anime block → false; series-only verdict → falls through', async () => {
+  await ok('AI4: passesAgeBand — anime block → false; series-only verdict → unvetted (hidden)', async () => {
     const tier = tiers.TIERS[14];
     // AI4 uses its own tmdb ids (2301-2303) so it does not depend on rows
     // written by any other test.
@@ -927,9 +927,10 @@ const getRow = (profileId, buildId, tmdbId) => {
     // Series pool row with a stored series verdict allow → true.
     const row2 = { type: 'series', tmdb_id: '2302' };
     assert.strictEqual(rec.passesAgeBand(row2, { age_limit: 14 }), true, 'series allow → true');
-    // Anime pool row with the verdict stored only as series → falls through to the old rules.
+    // Anime pool row with the verdict stored only as series → no anime verdict, so it falls through to the
+    // row's own classification; with none, it is unvetted and HIDDEN (fail-closed, hardening F4).
     const row3 = { type: 'anime', tmdb_id: '2303' };
-    assert.strictEqual(rec.passesAgeBand(row3, { age_limit: 14 }), true, 'anime row with series verdict → falls through (true)');
+    assert.strictEqual(rec.passesAgeBand(row3, { age_limit: 14 }), false, 'anime row with only a series verdict → unvetted → hidden');
   });
 
   console.log(`\nAll anime age chain checks passed (${passed}).${failed ? ` FAILED: ${failed}` : ''}`);

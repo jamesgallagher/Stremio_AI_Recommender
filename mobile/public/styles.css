@@ -72,9 +72,12 @@ h1 { font-size: 22px; margin: 4px 0; }
   background: var(--card); border-bottom: 1px solid var(--border);
   padding-top: env(safe-area-inset-top);
 }
-.topbar .brand { font-weight: 700; }
+.topbar .brand { font-weight: 700; white-space: nowrap; flex-shrink: 0; }
+.topbar button { white-space: nowrap; flex-shrink: 0; }
+.topbar #logout { min-height: 40px; padding: 6px 10px; font-size: 14px; }
+@media (max-width: 400px) { .topbar { gap: 6px; padding-left: 10px; padding-right: 10px; } .topbar .brand { font-size: 15px; } }
 .topbar .spacer { flex: 1; }
-.topbar .profile { color: var(--muted); font-size: 13px; max-width: 45vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.topbar .profile { color: var(--muted); font-size: 13px; flex: 0 1 auto; min-width: 0; max-width: 45vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Settings cog sits between the profile name and Log out. */
 .icon-btn { min-height: 40px; min-width: 40px; padding: 6px 8px; font-size: 18px; line-height: 1; }
 /* AUTH-1: admins' Configure button — no room for it in the phone top bar. */
@@ -178,18 +181,25 @@ input[type=search]:focus { border-color: var(--accent); }
 .hint-remove { color: #7f1d1d; }  /* on light-red */
 .hint-save { color: #14532d; }    /* on light-green */
 .rec-body {
-  position: relative; display: flex; gap: 12px; align-items: center;
+  position: relative; display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center;
   background: var(--card); border: 1px solid var(--border); border-radius: 12px;
   padding: 8px; touch-action: pan-y; /* let vertical scroll through, capture horizontal */
 }
-.rec-poster { width: 54px; min-width: 54px; height: 81px; object-fit: cover; border-radius: 8px; background: var(--card2); }
+.rec-poster { width: 64px; min-width: 64px; height: 96px; object-fit: cover; border-radius: 8px; background: var(--card2); }
 .rec-poster.no-poster { visibility: hidden; }
 .rec-meta { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .rec-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rec-sub { color: var(--muted); font-size: 13px; }
-.rec-because { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-style: italic; }
-.rec-actions { display: flex; gap: 6px; }
-.rec-actions button { min-height: 40px; min-width: 40px; padding: 6px 10px; border-radius: 8px; font-size: 16px; }
+/* The reason is the product's differentiator — two lines instead of truncating it. */
+.rec-because { color: var(--muted); font-size: 12px; font-style: italic; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.rec-sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Actions get their own full-width row under the text, with labels, so the title and reason
+   get the whole row and the icon buttons are no longer a guessing game. */
+.rec-actions { display: flex; gap: 8px; flex: 1 1 100%; }
+.rec-actions button { flex: 1; min-height: 42px; padding: 6px 8px; border-radius: 8px; font-size: 14px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; white-space: nowrap; }
+.rec-save::after { content: 'Later'; font-size: 13px; font-weight: 600; }
+.rec-watched::after { content: 'Watched'; font-size: 13px; font-weight: 600; }
+.rec-remove::after { content: 'Not for me'; font-size: 13px; font-weight: 600; }
 .rec-save { background: var(--ok); color: #06301f; }
 .rec-save:hover { background: #2bbd86; }
 .rec-remove { background: transparent; border: 1px solid var(--border); color: var(--muted); }

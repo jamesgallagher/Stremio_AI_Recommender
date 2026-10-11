@@ -752,8 +752,15 @@
       setEls.titleDecayDaysField.hidden = !setEls.titleDecay.checked;
       setEls.catalogOnly.checked = data.catalog_only !== false;
       renderGenres(data.genres, f.excluded_genres);
+      // Settings the admin manages for this profile are shown read-only (the server also
+      // ignores them on save). The note never says why.
+      const managed = new Set(data.managed || []);
+      setEls.minRating.disabled = managed.has('min_rating');
+      setEls.recency.disabled = managed.has('min_year');
+      setEls.engineAnime.disabled = managed.has('engine_anime');
+      setEls.genres.querySelectorAll('input').forEach((i) => { i.disabled = managed.has('excluded_genres'); });
       renderCatalogs(data.catalogs);
-      setSettingsMsg('');
+      setSettingsMsg(managed.size ? 'Some settings are managed by your admin and can’t be changed here.' : '');
     } catch { setSettingsMsg('Could not load settings — try again.', 'err'); }
   }
 
@@ -823,9 +830,11 @@
     const email = els.setupEmail.value.trim();
     if (!name) return setSetupMsg('Enter your name.', 'err');
     if (!email) return setSetupMsg('Enter your email.', 'err');
+    const token = ($('setup-token').value || '').trim();
+    if (!token) return setSetupMsg('Enter the setup token from the server log.', 'err');
     els.setupSend.disabled = true; setSetupMsg('Sending…');
     try {
-      const res = await apiFetch('/setup/request', { method: 'POST', body: JSON.stringify({ name, email }) });
+      const res = await apiFetch('/setup/request', { method: 'POST', body: JSON.stringify({ name, email, token }) });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         setSetupMsg(data.error || 'Something went wrong — try again.', 'err');

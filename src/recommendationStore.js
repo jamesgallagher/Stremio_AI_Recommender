@@ -1058,7 +1058,7 @@ function clearType(profileId, type) {
 // is a superset of the old combined pool that adds only weaker, never-served
 // rows. The one observable difference is a larger stored `total` for very active
 // profiles (deeper storage per type).
-async function buildRecommendations(profile, log = console, onProgress = () => {}) {
+async function buildRecommendations(profile, log = console, onProgress = () => {}, { stampBuilt = true } = {}) {
   init();
   const s = settings.getSettings();
   const tmdbKey = s?.keys?.tmdb_api_key;
@@ -1174,7 +1174,9 @@ async function buildRecommendations(profile, log = console, onProgress = () => {
     log.warn(`[rec] ${profile.name}: rating floor ≥ ${filters.min_rating} is set but no MDBList key — the floor falls back to TMDB's rating, not the IMDb number on the poster (lower-rated titles can slip through)`);
   }
 
-  setBuiltAt(profile.id);
+  // The urgent path (buildPool) defers this until the age gate has SUCCEEDED, so a failed
+  // gate leaves the build "not done" and the next tick retries it.
+  if (stampBuilt) setBuiltAt(profile.id);
   // Trainer T2 (N8): stamp the last successful build's view of the change
   // cursor (spec §8: a successful build resets changes_since_build — the
   // reset happens inside markTrainingBuilt, only while the cursor is still
@@ -1232,10 +1234,12 @@ function certMinAge(cert) {
 // PURE: does a stored row satisfy the profile's age BAND? For an age-limited
 // profile the serve-time re-check first reads the stored verdict (no network);
 // if no verdict exists, it judges the row's own stored classification against
-// the tier (MAL band, certification stamp, or raw cert). An unrated/unknown
-// row is never "too old" (fail-open). This is the cheap cert/MAL safety net
-// selectServe and the Companion's "entire list" view share. NOT a substitute
-// for the build-time chain gate (the pool is already chain-vetted).
+// the tier (MAL band, certification stamp, or raw cert). FAIL-CLOSED: a row is
+// served to an age-limited profile only when something POSITIVELY allows it — an
+// 'allow' verdict, or a stored classification inside the band. A row nothing has
+// vetted (e.g. stored by a build whose age gate then failed) stays hidden until a
+// gate run clears it. This is the cheap cert/MAL safety net selectServe and the
+// Companion's "entire list" view share; the build-time chain gate is the authority.
 function passesAgeBand(row, filters = {}) {
   const ageVerify = require('./ageVerification');
   const tier = ageVerify.tierFor(filters);
@@ -1248,18 +1252,24 @@ function passesAgeBand(row, filters = {}) {
   // 2. No verdict: judge the row's OWN stored classification against the tier (no network).
   //    a) MAL band in age_classification: reuse certMinAge() (G 0, PG 8, PG-13 13, R 17, R+ 17)
   //       → block if minAge > tier.malMaxAge.
+  let allowed = false;                              // set by any positive classification below
   const mal = certMinAge(row.age_classification);
   if (mal !== null && mal > tier.malMaxAge) return false;
+  if (mal !== null) allowed = true;
   //    b) certification: either an AGE stamp '<source>:<rating>' or a raw cert (Marquee rows).
   const raw = row.certification ? String(row.certification) : null;
   if (raw) {
     const [src, rest] = raw.includes(':') ? raw.split(/:(.*)/s) : [null, raw];
-    if (src === 'csm') { const n = parseInt(rest, 10); if (Number.isFinite(n) && n > tier.csmMaxAge) return false; }
-    else if (src === 'llm') { if (rest === 'no') return false; }
-    else if (require('./ageVerification/ratings').classify(rest, lanes.lookupType(row.type || 'movie'), tier) === 'block') return false;
+    if (src === 'csm') { const n = parseInt(rest, 10); if (Number.isFinite(n)) { if (n > tier.csmMaxAge) return false; allowed = true; } }
+    else if (src === 'llm') { if (rest === 'no') return false; if (rest === 'ok') allowed = true; }
+    else {
+      const c = require('./ageVerification/ratings').classify(rest, lanes.lookupType(row.type || 'movie'), tier);
+      if (c === 'block') return false;
+      if (c === 'allow') allowed = true;
+    }
   }
-  // 3. Unknown stays KEPT (unchanged rule).
-  return true;
+  // 3. Nothing positively allowed it → hidden (fail-closed).
+  return allowed;
 }
 
 // Round-robin across primary_genre buckets: take the strongest remaining title
@@ -1602,7 +1612,7 @@ async function buildPool(profile, log = console, onProgress = () => {}, opts = {
       startHash: opts.startHash,
     });
   }
-  const r = await buildRecommendations(profile, log, (pct, label) => onProgress(pct * 0.85, label)); // 0–85%
+  const r = await buildRecommendations(profile, log, (pct, label) => onProgress(pct * 0.85, label), { stampBuilt: false }); // 0–85%
   // Age-gate (I1) whenever this build STORED candidates. buildRecommendations no
   // longer reports `skipped` once rows were stored (so `!r.skipped` already covers
   // the normal case), but the `stored > 0` clause is a deliberate belt-and-braces
@@ -1613,6 +1623,8 @@ async function buildPool(profile, log = console, onProgress = () => {}, opts = {
   // so this is the real gate. (An engine with 0 seeds stores nothing → no-op.)
   const stored = (r.movie?.stored || 0) + (r.series?.stored || 0);
   if (!r.skipped || stored > 0) await ageGatePool(profile, log, (pct, label) => onProgress(85 + pct * 0.15, label), { animeBuildId: r.animeBuildId }); // 85–100%
+  // Stamp the build only now that the gate has finished (it throws on failure, skipping this).
+  if (!r.skipped) setBuiltAt(profile.id);
   return r;
 }
 

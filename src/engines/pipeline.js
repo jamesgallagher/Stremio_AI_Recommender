@@ -72,7 +72,7 @@ async function runEngineBuild(profile, type, engine, ctx, onProgress = () => {},
   const filtered = cands
     .map(normalize)
     .filter((c) => c.type === type)
-    .filter((c) => !ctx.watchedIds.tmdb.has(c.tmdb_id))
+    .filter((c) => !watchedStore.watchedTmdbFor(ctx.watchedIds, c.type).has(c.tmdb_id))
     .filter((c) => !lanes.dnrTypes(c.type).some((t) => ctx.dont.has(key(t, c.tmdb_id))))
     .filter((c) => !c.adult);
 

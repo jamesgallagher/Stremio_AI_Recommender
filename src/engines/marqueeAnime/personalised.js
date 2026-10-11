@@ -193,7 +193,7 @@ async function build(profile, ctx, deps = DEFAULT_DEPS) {
       return;
     }
     // Drop: watched / dont / ignored
-    if (watched.tmdb.has(String(show.tv)) || dontKeys.has(`series:${show.tv}`) || dontKeys.has(`anime:${show.tv}`) || ignored.has(String(show.tv))) {
+    if (require('../../watchedStore').watchedTmdbFor(watched, 'series').has(String(show.tv)) || dontKeys.has(`series:${show.tv}`) || dontKeys.has(`anime:${show.tv}`) || ignored.has(String(show.tv))) {
       addFiltered(show.tv, title, 'watched', source, 'Rejected or ignored');
       return;
     }

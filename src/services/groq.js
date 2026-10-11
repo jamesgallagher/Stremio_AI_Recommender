@@ -97,7 +97,6 @@ function parseVerdicts(text, validIds) {
 }
 
 const REVIEWER_SYSTEM = 'You are a strict parental-guidance reviewer for Australian audiences. Reply with raw JSON only.';
-const CURATOR_SYSTEM = 'You are a film and television curator with broad knowledge of world cinema, TV and anime. Reply with raw JSON only.';
 
 // Run the age gate over `titles` ([{id,title,year,genres,certification,
 // overview, cacheId?}]). Returns the Set of VETOED ids (matched on `id`).
@@ -151,25 +150,41 @@ async function ageGate(type, ageLimit, titles, log = console, opts = {}) {
     return vetoed;
   }
 
-  const validIds = new Set(uncached.map((t) => t.id));
-  const prompt = tier ? buildTierAgePrompt(type, tier, uncached) : buildAgePrompt(type, ageLimit, uncached);
-  log.log(`[llm] full age-gate prompt for ${type} (${uncached.length} new, ${hits} cached):\n----- PROMPT START -----\n${prompt}\n----- PROMPT END -----`);
-  const minVerdicts = Math.ceil(uncached.length * 0.6);
-  const validate = (text) => {
-    const verdicts = parseVerdicts(text, validIds);
-    if (verdicts.size < minVerdicts) throw new Error(`only ${verdicts.size}/${uncached.length} verdicts`);
-    return verdicts;
+  // One judging round over `list`. `minFrac` = the share of the list the model must
+  // answer for the response to be accepted (a thinner one falls through the chain).
+  const judge = (list, minFrac, label) => {
+    const validIds = new Set(list.map((t) => t.id));
+    const prompt = tier ? buildTierAgePrompt(type, tier, list) : buildAgePrompt(type, ageLimit, list);
+    if (process.env.AGEGATE_DEBUG_PROMPT === '1') {
+      log.log(`[llm] full age-gate prompt for ${type} (${label}):\n----- PROMPT START -----\n${prompt}\n----- PROMPT END -----`);
+    }
+    const minVerdicts = Math.max(1, Math.ceil(list.length * minFrac));
+    const validate = (text) => {
+      const v = parseVerdicts(text, validIds);
+      if (v.size < minVerdicts) throw new Error(`only ${v.size}/${list.length} verdicts`);
+      return v;
+    };
+    return llm.chat(settings.llmChain(), [{ role: 'user', content: prompt }], { temperature: 0, system: REVIEWER_SYSTEM, validate }, log);
   };
-  const verdicts = await llm.chat(
-    settings.llmChain(), [{ role: 'user', content: prompt }],
-    { temperature: 0, system: REVIEWER_SYSTEM, validate }, log,
-  );
+  const verdicts = await judge(uncached, 0.6, `${uncached.length} new, ${hits} cached`);
+
+  // A title the model OMITTED is re-asked ONCE on its own. If it is still unanswered it
+  // gets no verdict here (not cached, so the next build judges it afresh); the chain
+  // reports it as 'unknown' and ageVerification.verify() DROPS it (fail-closed).
+  let missing = uncached.filter((t) => !verdicts.has(t.id));
+  if (missing.length) {
+    log.warn(`[llm] ${type}: age gate — ${missing.length} title(s) unanswered, re-asking once`);
+    try {
+      for (const [id, ok] of await judge(missing, 0, 're-ask')) verdicts.set(id, ok);
+    } catch (err) { log.warn(`[llm] ${type}: age-gate re-ask failed — ${err.message}`); }
+    missing = uncached.filter((t) => !verdicts.has(t.id));
+    if (missing.length) log.warn(`[llm] ${type}: age gate — ${missing.length} title(s) the model would not judge will be dropped: ${missing.map((t) => t.title).join(', ')}`);
+  }
 
   // Persist every definitive verdict (both directions — a veto is as stable as a
-  // pass, and re-judging the vetoes is most of the cost). A title the model
-  // OMITTED gets no verdict: not cached, not vetoed — kept, exactly as before.
-  // Verdicts come back keyed on the prompt `id`, so map each back to its cache
-  // key (which may be the caller's cacheId) before storing.
+  // pass, and re-judging the vetoes is most of the cost). Verdicts come back keyed
+  // on the prompt `id`, so map each back to its cache key (which may be the
+  // caller's cacheId) before storing.
   const keyById = new Map(uncached.map((t) => [t.id, keyOf(t)]));
   let changed = false;
   for (const [id, ok] of verdicts) {
@@ -185,118 +200,6 @@ async function ageGate(type, ageLimit, titles, log = console, opts = {}) {
     log.log(`[llm] ${type}: age-gate vetoed: ${names}`);
   }
   return vetoed;
-}
-
-// ---- Generation pass (v5 'ai' engine) ----
-// The reason this exists: Trakt's collaborative filtering is structurally
-// blind to age. It answers "what do people with this history watch next", and
-// for a 13-year-old anime viewer the nearest neighbours are ADULT anime
-// viewers. Filtering that output afterwards is rescue work; here age is a
-// constraint at generation time.
-//
-// Output is a SUGGESTION, never ground truth — every title is resolved against
-// TMDB, run through the deterministic filters, and vetted by a second pass
-// before anyone sees it.
-// Seeds arrive as a weighted mix of the viewer's own history for this type and
-// borrowed history from the other type (see rebuild.seedsFor). They MUST be
-// presented as separate, labelled groups: given a flat list, the model reads
-// "Haikyu" in a movie prompt as a film and starts proposing spin-offs of
-// things that aren't films. Labelled, it makes the useful jump instead —
-// anime series in, anime films out.
-function renderSeeds(seeds, type) {
-  if (!seeds.length) return '(no watch history yet — recommend well-regarded, widely-loved titles)';
-  const label = (t) => (t === 'series' ? 'TV series' : 'films');
-  const fmt = (s) => `- ${s.title}${s.year ? ` (${s.year})` : ''}`;
-  const otherType = type === 'movie' ? 'series' : 'movie';
-  const own = seeds.filter((s) => (s.type || type) === type);
-  const other = seeds.filter((s) => (s.type || type) !== type);
-
-  const parts = [];
-  if (own.length) parts.push(`Recently watched ${label(type)}:\n${own.map(fmt).join('\n')}`);
-  if (other.length) {
-    parts.push(`Recently watched ${label(otherType)} — a different format, so read these for taste (genre, tone, sensibility), not as titles to sequel or spin off:\n${other.map(fmt).join('\n')}`);
-  }
-  if (!own.length && other.length) {
-    parts.push(`This viewer has not watched many ${label(type)} yet, so infer what they would enjoy from the ${label(otherType)} above. Do not fall back on generic crowd-pleasers — their taste is already visible.`);
-  }
-  return parts.join('\n\n');
-}
-
-function buildGeneratePrompt(type, { ageLimit = 0, seeds = [], count = 50, excludedGenres = [] } = {}) {
-  const kind = type === 'series' ? 'TV series' : 'movies';
-  const seedList = renderSeeds(seeds, type);
-  // The age line has to do two jobs. Left as just "suitable for a 14-year-old",
-  // models read it as "safe for children" and return Powerpuff Girls to a
-  // shonen-anime watcher — technically compliant, useless in practice. So it
-  // states the ceiling AND that the ceiling is not the target.
-  const ageLine = ageLimit > 0
-    ? `\nHARD REQUIREMENT: every title must be suitable for a ${ageLimit}-year-old, judged against Australian classification standards (ACB). This is not a preference to balance against popularity — if a title is acclaimed or beloved but not appropriate for a ${ageLimit}-year-old, leave it out. Anime is welcome, but the same age rule applies to it: many well-known anime series are aimed at adults.
-
-The age is a CEILING, not a target. This viewer is ${ageLimit}, not a small child: recommend titles that a ${ageLimit}-year-old would actually choose, sitting near the top of what is appropriate for that age. Do NOT fall back on programmes made for young children, and do not water down the genre, tone or intensity that the watch history shows. Match their taste first, then apply the ceiling.`
-    : '';
-  const excl = excludedGenres.length
-    ? `\nDo not recommend anything in these genres: ${excludedGenres.join(', ')}.`
-    : '';
-
-  return `Recommend ${count} ${kind} for the viewer whose recent watching is shown below.
-
-Recently watched:
-${seedList}
-${ageLine}${excl}
-
-Rules:
-- Recommend real ${kind} that genuinely exist. Never invent a title.
-- Do NOT recommend anything already listed above.
-- Use the best-known English title, plus its release year.
-- Favour variety: do not fill the list with one franchise, one studio or one genre.
-
-Return a JSON array of ${count} objects, each with exactly:
-- "title": the title
-- "year": the release year as a number
-Output ONLY the JSON array, no prose.
-Example: [{"title":"Spirited Away","year":2001}]`;
-}
-
-// Parse [{title, year}] from a model response. Deduped case-insensitively;
-// entries without a usable title are dropped, a missing year is tolerated
-// (TMDB resolution can usually manage without it).
-function parseTitles(text, limit = 200) {
-  const out = [];
-  const seen = new Set();
-  for (const x of extractArray(text)) {
-    if (!x || typeof x.title !== 'string') continue;
-    const title = x.title.trim();
-    if (!title) continue;
-    const parsedYear = Number.parseInt(x.year, 10);
-    const year = Number.isFinite(parsedYear) ? parsedYear : null;
-    const key = title.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push({ title, year });
-    if (out.length >= limit) break;
-  }
-  return out;
-}
-
-// Generate candidate titles. Returns [{title, year}]. A near-empty generation
-// is treated as a FAILURE (not a thin success), so the chain falls through to
-// the next provider/model rather than shipping 4 titles. Throws when the whole
-// chain fails — kids callers treat that as fail-closed (keep the previous list).
-async function generateCandidates(type, opts = {}, log = console) {
-  const count = opts.count || 50;
-  const prompt = buildGeneratePrompt(type, { ...opts, count });
-  const minTitles = Math.ceil(count * 0.4);
-  const validate = (text) => {
-    const titles = parseTitles(text, count * 2);
-    if (titles.length < minTitles) throw new Error(`only ${titles.length}/${count} titles`);
-    return titles;
-  };
-  const titles = await llm.chat(
-    settings.llmChain(), [{ role: 'user', content: prompt }],
-    { temperature: 0.6, system: CURATOR_SYSTEM, validate }, log,
-  );
-  log.log(`[llm] ${type}: generated ${titles.length} candidate(s)${opts.ageLimit ? ` (age-aware, ${opts.ageLimit}yo)` : ''}`);
-  return titles;
 }
 
 // AGE-3b: the anime borderline review prompt. The first line is the tier's
@@ -485,9 +388,6 @@ module.exports = {
   buildAgePrompt,
   buildTierAgePrompt,
   parseVerdicts,
-  buildGeneratePrompt,
-  parseTitles,
-  generateCandidates,
   animeAgeReview,
   buildAnimeReviewPrompt,
   titleFacts,

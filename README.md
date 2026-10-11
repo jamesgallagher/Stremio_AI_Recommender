@@ -425,10 +425,23 @@ Docker tab → **Add Container** (or point a Compose stack at this repo's
 | `STALE_HOURS` | No | `24` | How old a cached list may get before a background rebuild |
 | `BACKOFF_MINUTES` | No | `30` | Wait after a failed rebuild before retrying |
 | `GROQ_MODELS` | No | built-in list | Comma-separated Groq model fallback chain (best first), e.g. `openai/gpt-oss-120b,openai/gpt-oss-20b` — override when the built-in list ages |
+| `TRUST_PROXY` | No | `1` | How many proxy hops sit in front of the app (the Cloudflare Tunnel = 1). Sets the client IP the app sees; don't set `true` — it would trust a forged `X-Forwarded-For` |
 | `SECRET_KEY` | Recommended | — | Encrypts **all** stored secrets at rest — every profile's API keys, Trakt OAuth tokens, and Auto-scrobble passwords (AES-256-GCM). Any long random string. When set, existing plaintext secrets are encrypted in place on the next start. Without it, secrets are stored in plaintext (and a scrobble password can't be saved). Keep it **out of the `/data` volume** so a leaked backup can't decrypt anything, and **back it up** — see [Encryption at rest](#encryption-at-rest). (`SCROBBLE_KEY` is still accepted as a legacy alias.) |
 
 No API keys go in the template — Trakt/TMDB/Groq keys are entered per
 profile in the web portal and stored in `/data/profiles.json`.
+
+**Permissions.** The container runs as the unprivileged `node` user (uid 1000),
+not root. The appdata folder must be writable by it: run
+`chown -R 1000:1000 /mnt/user/appdata/ai-recommender` once, or add
+`--user 99:100` (nobody:users) to the container's *Extra Parameters*. If it can't
+write, the app stops at start-up with a message saying so.
+
+**First run.** With no profiles yet, the server prints a one-time **setup token**
+in the container log (`[setup] Setup token: …`). Open `/mobile/`, enter your name,
+email and that token, and the emailed code creates the first (admin) account.
+Sign-in codes last 60 minutes, allow 5 wrong tries, and are limited to 5
+requests per email per hour.
 
 After starting: open `http://<unraid-ip>:7000/mobile/` — the Initial User
 Creation wizard appears (only when zero profiles exist). Enter a name and
@@ -456,7 +469,8 @@ manifest point somewhere Stremio clients can actually reach. Then:
 | `DATA_DIR` | `./data` | persistent storage |
 | `STALE_HOURS` | 24 | cache staleness threshold |
 | `BACKOFF_MINUTES` | 30 | retry backoff after failed rebuild |
-| `SECRET_KEY` | — | encrypts all stored secrets at rest (API keys, Trakt tokens, scrobble passwords); `SCROBBLE_KEY` accepted as alias |
+| `TRUST_PROXY` | 1 | proxy hops in front of the app |
+| `SECRET_KEY` | — | encrypts all stored secrets at rest (API keys, Trakt tokens, scrobble passwords) and keys the sign-in code hash; `SCROBBLE_KEY` accepted as a legacy alias |
 
 ## Credits
 

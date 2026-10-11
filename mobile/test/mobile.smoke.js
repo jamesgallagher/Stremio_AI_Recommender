@@ -76,7 +76,7 @@ async function unitTests() {
     const row = otpStore.newestUnusedOtp(auth.normalizeEmail(email));
     assert.strictEqual(row.profile_id, p.id);
     assert.notStrictEqual(row.code_hash, code);          // not the plaintext
-    assert.strictEqual(row.code_hash, otpStore.sha256(code)); // is its hash
+    assert.strictEqual(row.code_hash, otpStore.codeHash(code)); // is its (keyed) hash
   });
 
   await ok('otp: correct code verifies once, then is single-use', async () => {
@@ -780,7 +780,7 @@ async function unitTests() {
     assert.strictEqual(recommendationStore.passesAgeBand({ age_classification: 'R' }, adult), true);  // no limit
     assert.strictEqual(recommendationStore.passesAgeBand({ age_classification: 'R' }, kid), false);   // 17 > 9
     assert.strictEqual(recommendationStore.passesAgeBand({ age_classification: 'PG' }, kid), true);   // 8 <= 9
-    assert.strictEqual(recommendationStore.passesAgeBand({ age_classification: null }, kid), true);   // unrated -> kept
+    assert.strictEqual(recommendationStore.passesAgeBand({ age_classification: null }, kid), false);  // unrated/unvetted -> hidden (fail-closed)
   });
 
   await ok('recs: catalog view = served selection, display_count = list_size, first rows == Stremio prefix', () => {
@@ -806,6 +806,8 @@ async function unitTests() {
       mkCand({ tmdb_id: '202', imdb_id: 'tt202', title: 'Grown', affinity: 2 }),
     ]);
     recommendationStore.setAgeClassification(pid, 'movie', '202', 'R'); // 17+
+    // The age gate has judged 'Kiddo' suitable at this tier (a stored allow verdict) — kids only SERVE vetted rows.
+    require('../../src/ageVerification/store').recordVerdict('movie', '201', require('../../src/ageVerification').tierFor({ age_limit: 8 }).id, 'allow', 'au', 'PG');
     let res = fakeRes();
     handlers.recommendationsHandler({ query: { type: 'movie', view: 'all' }, profile: { id: pid, filters: {} } }, res);
     assert.strictEqual(res.body.view, 'all');
@@ -1075,11 +1077,15 @@ async function unitTests() {
     const res = fakeRes();
     handlers.settingsPostHandler({
       profile: config.getProfile(p.id),
-      body: { min_rating: 7.5, list_size: 30, catalog_only: false, age_limit: 0 }, // age_limit MUST be ignored
+      body: { min_rating: 7.5, excluded_genres: ['Horror'], list_size: 30, catalog_only: false, age_limit: 0 }, // age_limit MUST be ignored
     }, res);
     assert.strictEqual(res.body.ok, true);
     const after = config.getProfile(p.id);
-    assert.strictEqual(after.filters.min_rating, 7.5);        // written
+    // Parental controls: on an age-limited profile these are admin-managed — ignored here and
+    // reported to the UI (generically) so it shows them read-only.
+    assert.strictEqual(after.filters.min_rating, 6);          // NOT written (managed)
+    assert.deepStrictEqual(after.filters.excluded_genres, []); // NOT written (managed)
+    assert.ok(res.body.managed.includes('min_rating') && res.body.managed.includes('excluded_genres'));
     assert.strictEqual(after.filters.list_size, 30);          // written
     assert.strictEqual(after.companion.catalog_only, false);  // written
     assert.strictEqual(after.filters.age_limit, 10, 'age gate untouched by the Companion');
@@ -1092,12 +1098,12 @@ async function unitTests() {
     const res = fakeRes();
     handlers.settingsPostHandler({
       profile: config.getProfile(p.id),
-      body: { engine_movie: 'marquee', engine_series: 'marquee-tv', age_limit: 0, min_rating: 5 }, // engine + age_limit MUST be dropped; min_rating is writable
+      body: { engine_movie: 'marquee', engine_series: 'marquee-tv', age_limit: 0, list_size: 25 }, // engine + age_limit MUST be dropped; list_size is writable (min_rating is admin-managed on an age-limited profile)
     }, res);
     assert.strictEqual(res.body.ok, true);
     const after = config.getProfile(p.id);
     assert.strictEqual(after.filters.age_limit, 10, 'age gate untouched by the Companion');
-    assert.strictEqual(after.filters.min_rating, 5, 'writable filter written');
+    assert.strictEqual(after.filters.list_size, 25, 'writable filter written');
     assert.ok(!('engine_movie' in res.body.filters), 'engine not echoed back');
   });
 
@@ -1456,14 +1462,19 @@ async function httpTests() {
     assert.strictEqual(cfgRes.headers.get('cache-control'), 'no-store');
     const meRes = await fetch(`${BASE}/mobile/api/me`);
     assert.strictEqual(meRes.headers.get('cache-control'), 'no-store'); // even on the 401
-    // Static bundle is no-store too (no ETag), so a deploy is never masked by a
-    // stale cached app.js.
+    // The static bundle revalidates every time (no-cache + ETag → a cheap 304 when unchanged),
+    // so a deploy is never masked by a stale cached app.js.
     const jsRes = await fetch(`${BASE}/mobile/app.js`);
-    assert.strictEqual(jsRes.headers.get('cache-control'), 'no-store');
-    assert.strictEqual(jsRes.headers.get('etag'), null);
+    assert.strictEqual(jsRes.headers.get('cache-control'), 'no-cache');
+    assert.ok(jsRes.headers.get('etag'), 'static assets carry an ETag');
+    // (node:http, not fetch — undici adds "Cache-Control: no-cache" to a conditional fetch, forcing a 200)
+    const condStatus = await new Promise((resolve, reject) => {
+      require('http').get(`${BASE}/mobile/app.js`, { headers: { 'If-None-Match': jsRes.headers.get('etag') } }, (r) => { r.resume(); resolve(r.statusCode); }).on('error', reject);
+    });
+    assert.strictEqual(condStatus, 304, 'a conditional request is answered 304');
     const htmlRes = await fetch(`${BASE}/mobile/`);
-    assert.strictEqual(htmlRes.headers.get('cache-control'), 'no-store');
-    console.log('  ✓ shell: all /mobile responses (api + static bundle) are no-store, no etag');
+    assert.strictEqual(htmlRes.headers.get('cache-control'), 'no-cache');
+    console.log('  ✓ shell: /mobile/api is no-store; the static bundle is no-cache + ETag (revalidated, 304 when unchanged)');
   }
 
   // ---- Step 3: search + watchlist boundaries (no network) ----
@@ -1597,12 +1608,13 @@ async function httpTests() {
     // Try to disable the age gate + change a real filter + the view pref in one POST.
     const postRes = await fetch(`${BASE}/mobile/api/settings`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
-      body: JSON.stringify({ age_limit: 0, min_rating: 7.5, catalog_only: false }),
+      body: JSON.stringify({ age_limit: 0, min_rating: 7.5, list_size: 30, catalog_only: false }),
     });
     assert.strictEqual(postRes.status, 200);
     const after = config.getProfile(p.id);
     assert.strictEqual(after.filters.age_limit, 10, 'age gate is immutable over HTTP');
-    assert.strictEqual(after.filters.min_rating, 7.5);
+    assert.strictEqual(after.filters.min_rating, 6, 'min_rating is admin-managed for an age-limited profile');
+    assert.strictEqual(after.filters.list_size, 30);
     assert.strictEqual(after.companion.catalog_only, false);
     console.log('  ✓ settings: GET hides the age gate; POST writes filters/pref but the age gate is immutable');
 

@@ -1,5 +1,5 @@
 // Mobile Companion router — mounted at /mobile in src/server.js, deliberately
-// OUTSIDE the admin Basic Auth that guards /api (family members are not admins).
+// OUTSIDE the admin-only guard that protects /api and /configure (family members are not admins).
 //
 // The two /auth routes are public (they issue/verify codes). Everything else
 // sits behind requireSession, which binds the request to one profile via the
@@ -16,12 +16,10 @@ const { readCookie, setSessionCookie, clearSessionCookies, sessionFromRequest, C
 const router = express.Router();
 router.use(express.json());
 
-// Never cache ANYTHING under /mobile. The per-session API must always be fresh,
-// AND forcing fresh SPA assets (index.html/app.js/…) means a new deploy is never
-// masked by a stale cached bundle — the cause of "still broken after I deployed"
-// (the browser kept running old app.js). Static + fallback also disable
-// etag/last-modified below so there are no conditional requests at all.
-router.use((req, res, next) => {
+// The per-session API is never cached (no-store; an ETag/304 on /me once made login look
+// broken on Chromium/Brave). The SPA assets use no-cache + ETag below: always revalidated,
+// so a new deploy is never masked by a stale bundle, yet unchanged files cost a 304.
+router.use('/api', (req, res, next) => {
   res.set('Cache-Control', 'no-store');
   next();
 });
@@ -80,16 +78,17 @@ router.get('/api/setup', (req, res) => {
 });
 
 router.post('/api/setup/request', async (req, res) => {
-  const { name, email } = req.body || {};
+  const { name, email, token } = req.body || {};
   try {
-    const r = await auth.requestSetupOtp({ name, email }, { appUrl: appUrl() });
+    const r = await auth.requestSetupOtp({ name, email, token }, { appUrl: appUrl() });
     if (!r.ok) {
-      const statusMap = { BAD_NAME: 400, BAD_EMAIL: 400, SETUP_DONE: 409, RATE_LIMITED: 429 };
+      const statusMap = { BAD_NAME: 400, BAD_EMAIL: 400, SETUP_DONE: 409, BAD_TOKEN: 401, RATE_LIMITED: 429 };
       const msgMap = {
         BAD_NAME: 'Enter a name (up to 40 characters).',
         BAD_EMAIL: 'Enter a valid email address.',
         SETUP_DONE: 'Setup is already complete — sign in instead.',
-        RATE_LIMITED: 'Too many codes requested — wait 15 minutes.',
+        BAD_TOKEN: 'Wrong setup token — copy it from the server log (Unraid: the container log).',
+        RATE_LIMITED: 'Too many attempts — wait an hour.',
       };
       res.status(statusMap[r.code] || 400).json({ error: msgMap[r.code] || r.code });
       return;
@@ -173,14 +172,17 @@ router.get('/api/config', (req, res) => {
 // Trainer T4: the portal's pure Trainer helpers, served to the companion as the
 // SAME file (no fork). Public like the rest of the SPA shell — it holds no data.
 router.get('/trainer-ui.js', (req, res) => {
-  res.set('Cache-Control', 'no-store');
+  res.set('Cache-Control', 'no-cache');
   res.type('application/javascript').sendFile(path.join(__dirname, '..', '..', 'public', 'trainer-ui.js'));
 });
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 router.use(express.static(PUBLIC_DIR, {
-  etag: false,
-  lastModified: false,
-  setHeaders: (res) => res.set('Cache-Control', 'no-store'), // always serve the latest bundle
+  etag: true,
+  lastModified: true,
+  // no-cache = the browser MUST revalidate every time (a conditional request answered with a
+  // cheap 304 when nothing changed), so a deploy is never masked by a stale bundle but the
+  // JS/CSS isn't re-downloaded over the tunnel on every open.
+  setHeaders: (res) => res.set('Cache-Control', 'no-cache'),
 }));
 
 // SPA fallback: a client-side deep link (e.g. /mobile/search) has no matching
@@ -190,7 +192,7 @@ router.use((req, res, next) => {
   if (req.method !== 'GET') return next();
   if (req.path.startsWith('/api/')) return next();
   res.sendFile(path.join(PUBLIC_DIR, 'index.html'), {
-    etag: false, lastModified: false, headers: { 'Cache-Control': 'no-store' },
+    etag: true, lastModified: true, headers: { 'Cache-Control': 'no-cache' },
   });
 });
 
