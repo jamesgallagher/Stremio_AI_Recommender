@@ -1225,17 +1225,23 @@ ok('recommendationStore: decay — record → decay-out → cooldown expiry; met
 });
 
 // ---- MW-00: mark-as-watched core ----
-ok('markWatched: buildWatchedHistoryBody — movie vs whole-show shape, id preference, no watched_at / no seasons', () => {
+ok('markWatched: buildWatchedHistoryBody — movie vs whole-show shape, id preference, watched_at when given, no seasons', () => {
   const mw = require('../src/markWatched');
   const mov = mw.buildWatchedHistoryBody({ type: 'movie', imdbId: 'tt0133093', tmdbId: '603' });
   assert.deepStrictEqual(mov, { movies: [{ ids: { imdb: 'tt0133093', tmdb: '603' } }], shows: [] });
-  assert.ok(!('watched_at' in mov.movies[0]), 'no explicit date — Simkl stamps "now"');
+  assert.ok(!('watched_at' in mov.movies[0]), 'no watched_at when absent — Simkl stamps "now"');
   const ser = mw.buildWatchedHistoryBody({ type: 'series', imdbId: 'tt0944947' });
   assert.deepStrictEqual(ser, { movies: [], shows: [{ ids: { imdb: 'tt0944947' } }] });
   assert.ok(!('seasons' in ser.shows[0]), 'whole-show mark, never per-episode');
   // tmdb-only stringifies; neither id -> empty body (nothing to match on).
   assert.deepStrictEqual(mw.buildWatchedHistoryBody({ type: 'movie', tmdbId: 27205 }).movies[0].ids, { tmdb: '27205' });
   assert.deepStrictEqual(mw.buildWatchedHistoryBody({ type: 'movie' }), { movies: [], shows: [] });
+  // WD-1: watchedAt when present is added next to ids.
+  const movD = mw.buildWatchedHistoryBody({ type: 'movie', imdbId: 'tt0133093', tmdbId: '603', watchedAt: '2010-07-16T00:00:00Z' });
+  assert.strictEqual(movD.movies[0].watched_at, '2010-07-16T00:00:00Z');
+  const serD = mw.buildWatchedHistoryBody({ type: 'series', imdbId: 'tt0944947', watchedAt: '2005-03-01T00:00:00Z' });
+  assert.strictEqual(serD.shows[0].watched_at, '2005-03-01T00:00:00Z');
+  assert.ok(!('seasons' in serD.shows[0]), 'still no seasons');
 });
 
 ok('watchedStore: pending-watched unions into id sets, retired by supersession, never a timer (MW-00 I4)', () => {

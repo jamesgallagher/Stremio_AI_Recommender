@@ -618,6 +618,29 @@ async function genreAndCert(apiKey, type, tmdbId, log = console) {
   }
 }
 
+// WD-1: lean date fetch — ONE TMDB call to get the release date for a title.
+// Movies: movie/{id} → release_date. Series: tv/{id} → first_air_date.
+// Never throws; any failure returns {date:null, year:null}.
+async function releaseDateFor(apiKey, type, { imdbId = null, tmdbId = null } = {}, log = console) {
+  try {
+    let id = tmdbId;
+    if (id == null || id === '') {
+      if (!imdbId) return { date: null, year: null };
+      id = await findByImdbId(apiKey, type === 'movie' ? 'movie' : 'series', imdbId);
+    }
+    if (!id) return { date: null, year: null };
+    const endpoint = type === 'movie' ? `movie/${id}` : `tv/${id}`;
+    const data = await get(apiKey, endpoint);
+    const dateStr = type === 'movie' ? data.release_date : data.first_air_date;
+    const date = dateStr || null;
+    const year = date ? parseInt(date.slice(0, 4), 10) || null : null;
+    return { date, year };
+  } catch (err) {
+    log.warn(`[tmdb] releaseDateFor ${type} failed: ${err.message}`);
+    return { date: null, year: null };
+  }
+}
+
 module.exports = {
   GENRE_ALIASES,
   voteFloor,
@@ -648,4 +671,5 @@ module.exports = {
   seasonAppendGroups,
   buildVideos,
   fullMeta,
+  releaseDateFor,
 };

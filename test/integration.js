@@ -1341,7 +1341,7 @@ async function main() {
     // markFinished on the unfinished row → markWatched called with the row's own ids (F6.5).
     let res = await trainer.markFinished(profile, { type: 'movie', tmdb_id: '2' }, deps);
     assert.deepStrictEqual(res, { ok: true });
-    assert.deepStrictEqual(markWatchedCalls, [{ type: 'movie', imdbId: 'tt2', tmdbId: '2', title: null }]);
+    assert.deepStrictEqual(markWatchedCalls, [{ type: 'movie', imdbId: 'tt2', tmdbId: '2', title: null, year: null }]);
     assert.deepStrictEqual(tasteFeedback.getTraining(profile.id), { changed_at: 1000, changes_since_build: 1, built_changed_at: null });
     // markFinished on a WATCHED row → not-in-history (unfinished only).
     res = await trainer.markFinished(profile, { type: 'movie', tmdb_id: '1' }, deps);
