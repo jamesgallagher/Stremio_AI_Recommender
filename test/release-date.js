@@ -11,6 +11,8 @@ function ok(name, fn) { fn(); passed++; console.log(` ✓ ${name}`); }
 const asyncPending = [];
 function okAsync(name, fn) { asyncPending.push({ name, fn }); }
 
+const tmdb = require('../src/services/tmdb');
+
 // ---- R1: buildWatchedHistoryBody movie with watchedAt ----
 ok('R1: buildWatchedHistoryBody movie with watchedAt sets movies[0].watched_at', () => {
   const mw = require('../src/markWatched');
@@ -122,21 +124,24 @@ ok('R9: resolveReleaseDate fetcher throws -> null, no throw', async () => {
   assert.strictEqual(result, null);
 });
 
-// ---- R10: markWatched with stubbed simkl + resolver returning a date ----
-okAsync('R10: markWatched passes watched_at to Simkl body; result has watchedAt', async () => {
+// ---- R10: markWatched with monkey-patched tmdb.releaseDateFor ----
+okAsync('R10: markWatched passes TMDB-resolved watched_at to Simkl body; result has watchedAt', async () => {
   const simkl = require('../src/services/simkl');
   const origHist = simkl.addToHistory;
+  const origReleaseDateFor = tmdb.releaseDateFor;
   let gotBody = null;
   simkl.addToHistory = async (_profile, body) => { gotBody = body; return {}; };
+  tmdb.releaseDateFor = async () => ({ date: '2010-07-16', year: 2010 });
   try {
     const { markWatched } = require('../src/markWatched');
-    const profile = { id: 'wd1-10', name: 'Test', keys: { simkl_client_id: 'c', tmdb_api_key: 'k' }, simkl_auth: { access_token: 't' } };
-    const result = await markWatched(profile, { type: 'movie', imdbId: 'tt0133093', tmdbId: '603', title: 'Test', year: 2010 }, console);
+    const profile = { id: 'wd1-10', name: 'Test', keys: { simkl_client_id: 'c', tmdb_api_key: 'test-key' }, simkl_auth: { access_token: 't' } };
+    const result = await markWatched(profile, { type: 'movie', imdbId: 'tt0133093', tmdbId: '603', title: 'Test' }, console);
     assert.strictEqual(result.ok, true);
-    assert.ok(result.watchedAt, 'result has watchedAt');
-    assert.ok(gotBody.movies[0].watched_at, 'Simkl body has watched_at');
+    assert.strictEqual(result.watchedAt, '2010-07-16T00:00:00.000Z');
+    assert.strictEqual(gotBody.movies[0].watched_at, '2010-07-16T00:00:00.000Z');
   } finally {
     simkl.addToHistory = origHist;
+    tmdb.releaseDateFor = origReleaseDateFor;
   }
 });
 
@@ -144,43 +149,111 @@ okAsync('R10: markWatched passes watched_at to Simkl body; result has watchedAt'
 okAsync('R11: markWatched resolver throws -> Simkl body has NO watched_at, result ok:true', async () => {
   const simkl = require('../src/services/simkl');
   const origHist = simkl.addToHistory;
+  const origReleaseDateFor = tmdb.releaseDateFor;
   let gotBody = null;
   simkl.addToHistory = async (_profile, body) => { gotBody = body; return {}; };
+  tmdb.releaseDateFor = async () => { throw new Error('TMDB down'); };
   try {
     const { markWatched } = require('../src/markWatched');
-    // Force the resolver to throw by giving a profile with no TMDB key and no year
-    // Actually, to force a throw from the resolver path, we monkey-patch releaseDate
-    const releaseDate = require('../src/releaseDate');
-    const origResolve = releaseDate.resolveReleaseDate;
-    releaseDate.resolveReleaseDate = async () => { throw new Error('resolver boom'); };
-    try {
-      const profile = { id: 'wd1-11', name: 'Test', keys: { simkl_client_id: 'c', tmdb_api_key: 'k' }, simkl_auth: { access_token: 't' } };
-      const result = await markWatched(profile, { type: 'movie', imdbId: 'tt0133093', tmdbId: '603', title: 'Test' }, console);
-      assert.strictEqual(result.ok, true);
-      assert.ok(!gotBody.movies[0].watched_at, 'no watched_at in body');
-    } finally {
-      releaseDate.resolveReleaseDate = origResolve;
-    }
+    const profile = { id: 'wd1-11', name: 'Test', keys: { simkl_client_id: 'c', tmdb_api_key: 'test-key' }, simkl_auth: { access_token: 't' } };
+    const result = await markWatched(profile, { type: 'movie', imdbId: 'tt0133093', tmdbId: '603', title: 'Test' }, console);
+    assert.strictEqual(result.ok, true);
+    assert.ok(!gotBody.movies[0].watched_at, 'no watched_at in body');
   } finally {
     simkl.addToHistory = origHist;
+    tmdb.releaseDateFor = origReleaseDateFor;
   }
 });
 
-// ---- R12: markWatched type anime is accepted and body goes under shows ----
-okAsync('R12: markWatched type anime is accepted, body goes under shows', async () => {
+// ---- R12: markWatched type anime is accepted, body goes under shows, with watched_at ----
+okAsync('R12: markWatched type anime is accepted, body goes under shows with watched_at', async () => {
   const simkl = require('../src/services/simkl');
   const origHist = simkl.addToHistory;
+  const origReleaseDateFor = tmdb.releaseDateFor;
   let gotBody = null;
   simkl.addToHistory = async (_profile, body) => { gotBody = body; return {}; };
+  tmdb.releaseDateFor = async () => ({ date: '2008-01-20', year: 2008 });
   try {
     const { markWatched } = require('../src/markWatched');
-    const profile = { id: 'wd1-12', name: 'Test', keys: { simkl_client_id: 'c', tmdb_api_key: 'k' }, simkl_auth: { access_token: 't' } };
+    const profile = { id: 'wd1-12', name: 'Test', keys: { simkl_client_id: 'c', tmdb_api_key: 'test-key' }, simkl_auth: { access_token: 't' } };
     const result = await markWatched(profile, { type: 'anime', imdbId: 'tt0133093', tmdbId: '603', title: 'Test' }, console);
     assert.strictEqual(result.ok, true);
     assert.ok(gotBody.shows.length === 1, 'body goes under shows');
     assert.deepStrictEqual(gotBody.movies, []);
+    assert.strictEqual(gotBody.shows[0].watched_at, '2008-01-20T00:00:00.000Z');
   } finally {
     simkl.addToHistory = origHist;
+    tmdb.releaseDateFor = origReleaseDateFor;
+  }
+});
+
+// ---- R14: stub returns null date, no year -> no watched_at, result ok:true ----
+okAsync('R14: markWatched with null date and no year -> no watched_at, ok:true', async () => {
+  const simkl = require('../src/services/simkl');
+  const origHist = simkl.addToHistory;
+  const origReleaseDateFor = tmdb.releaseDateFor;
+  let gotBody = null;
+  simkl.addToHistory = async (_profile, body) => { gotBody = body; return {}; };
+  tmdb.releaseDateFor = async () => ({ date: null, year: null });
+  try {
+    const { markWatched } = require('../src/markWatched');
+    const profile = { id: 'wd1-14', name: 'Test', keys: { simkl_client_id: 'c', tmdb_api_key: 'test-key' }, simkl_auth: { access_token: 't' } };
+    const result = await markWatched(profile, { type: 'movie', imdbId: 'tt0133093', tmdbId: '603', title: 'Test' }, console);
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(result.watchedAt, null);
+    assert.ok(!gotBody.movies[0].watched_at, 'no watched_at in body');
+  } finally {
+    simkl.addToHistory = origHist;
+    tmdb.releaseDateFor = origReleaseDateFor;
+  }
+});
+
+// ---- R15: stub returns future date -> clamped to now ----
+okAsync('R15: markWatched with future date -> watched_at clamped to now', async () => {
+  const simkl = require('../src/services/simkl');
+  const origHist = simkl.addToHistory;
+  const origReleaseDateFor = tmdb.releaseDateFor;
+  let gotBody = null;
+  simkl.addToHistory = async (_profile, body) => { gotBody = body; return {}; };
+  tmdb.releaseDateFor = async () => ({ date: '2999-01-01', year: 2999 });
+  try {
+    const { markWatched } = require('../src/markWatched');
+    const profile = { id: 'wd1-15', name: 'Test', keys: { simkl_client_id: 'c', tmdb_api_key: 'test-key' }, simkl_auth: { access_token: 't' } };
+    const before = Date.now();
+    const result = await markWatched(profile, { type: 'movie', imdbId: 'tt0133093', tmdbId: '603', title: 'Test' }, console);
+    const after = Date.now();
+    assert.strictEqual(result.ok, true);
+    assert.ok(result.watchedAt, 'watchedAt is set');
+    const parsed = Date.parse(result.watchedAt);
+    // Clamped to now: within 5 seconds of real now.
+    assert.ok(parsed >= before - 5000 && parsed <= after + 5000, `watched_at ${result.watchedAt} should be within 5s of now`);
+    assert.ok(!result.watchedAt.startsWith('2999'), 'not 2999');
+  } finally {
+    simkl.addToHistory = origHist;
+    tmdb.releaseDateFor = origReleaseDateFor;
+  }
+});
+
+// ---- R16: useReleaseDate:false -> resolver never called, no watched_at ----
+okAsync('R16: markWatched with useReleaseDate:false -> no watched_at, resolver never called', async () => {
+  const simkl = require('../src/services/simkl');
+  const origHist = simkl.addToHistory;
+  const origReleaseDateFor = tmdb.releaseDateFor;
+  let fetchCalled = false;
+  let gotBody = null;
+  simkl.addToHistory = async (_profile, body) => { gotBody = body; return {}; };
+  tmdb.releaseDateFor = async () => { fetchCalled = true; return { date: '2010-07-16', year: 2010 }; };
+  try {
+    const { markWatched } = require('../src/markWatched');
+    const profile = { id: 'wd1-16', name: 'Test', keys: { simkl_client_id: 'c', tmdb_api_key: 'test-key' }, simkl_auth: { access_token: 't' } };
+    const result = await markWatched(profile, { type: 'movie', imdbId: 'tt0133093', tmdbId: '603', title: 'Test', useReleaseDate: false }, console);
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(result.watchedAt, null);
+    assert.ok(!gotBody.movies[0].watched_at, 'no watched_at in body');
+    assert.ok(!fetchCalled, 'tmdb.releaseDateFor was never called');
+  } finally {
+    simkl.addToHistory = origHist;
+    tmdb.releaseDateFor = origReleaseDateFor;
   }
 });
 

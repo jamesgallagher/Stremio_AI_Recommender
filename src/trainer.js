@@ -744,7 +744,7 @@ async function markFinished(profile, ref, deps = {}) {
   const row = resolveUnfinishedRow(profile.id, type, ref, D);
   if (!row) return { ok: false, reason: 'not-in-history' };
   const meta = row.tmdb_id != null ? D.metaGet(type, row.tmdb_id) : null;
-  const res = await D.markWatched(profile, { type, imdbId: row.imdb_id, tmdbId: String(row.tmdb_id), title: (meta && meta.title) || null, year: meta?.releaseInfo ? parseInt(meta.releaseInfo, 10) : null }, D.log);
+  const res = await D.markWatched(profile, { type, imdbId: row.imdb_id, tmdbId: String(row.tmdb_id), title: (meta && meta.title) || null, useReleaseDate: false }, D.log);
   if (res && res.ok === false) return { ok: false, reason: res.reason };
   const now = D.now();
   D.tasteFeedback.recordChange(profile.id, now);

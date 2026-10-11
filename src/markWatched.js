@@ -50,7 +50,12 @@ function buildWatchedHistoryBody({ type, imdbId = null, tmdbId = null, watchedAt
 //   { ok:false, reason:'bad-type'|'no-id'|'no-simkl', title }              — nothing done
 // Throws only if the Simkl write itself throws (token rejected / API error) —
 // the caller maps that to a 502.
-async function markWatched(profile, { type, imdbId = null, tmdbId = null, title = null, year = null } = {}, log = console) {
+//
+// `useReleaseDate` (default true): when false, skip the release-date lookup
+// entirely (watchedAt stays null, Simkl stamps "now"). Used by trainer
+// "mark finished" — a film the user was actually watching is a real recent
+// watch, so back-dating it to its release date would hide a genuine signal.
+async function markWatched(profile, { type, imdbId = null, tmdbId = null, title = null, year = null, useReleaseDate = true } = {}, log = console) {
   // Anime is accepted and mapped to series (fixes a latent 400: the mobile
   // handler allows anime but this function previously rejected it).
   if (type === 'anime') type = 'series';
@@ -62,11 +67,14 @@ async function markWatched(profile, { type, imdbId = null, tmdbId = null, title 
 
   // WD-1: resolve the release date. A date-lookup problem NEVER blocks the
   // mark — on failure, watchedAt stays null and Simkl stamps "now".
+  // Skipped entirely when useReleaseDate is false (trainer "mark finished").
   let watchedAt = null;
-  try {
-    watchedAt = await releaseDate.resolveReleaseDate(profile, { type, imdbId, tmdbId, year }, log);
-  } catch {
-    watchedAt = null;
+  if (useReleaseDate) {
+    try {
+      watchedAt = await releaseDate.resolveReleaseDate(profile, { type, imdbId, tmdbId, year }, log);
+    } catch {
+      watchedAt = null;
+    }
   }
 
   const body = buildWatchedHistoryBody({ type, imdbId, tmdbId, watchedAt });
