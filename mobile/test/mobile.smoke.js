@@ -638,6 +638,28 @@ async function unitTests() {
     } finally { simkl.addToHistory = origHist; wStore.deleteForProfile(pid); }
   });
 
+  // WD-1 R13: POST /api/watched with type anime returns 200 (was 400 before the fix)
+  await ok('handlers: watchedHandler accepts type anime (WD-1 R13)', async () => {
+    const wStore = require('../../src/watchedStore');
+    const tmdb = require('../../src/services/tmdb');
+    const origHist = simkl.addToHistory;
+    const origReleaseDateFor = tmdb.releaseDateFor;
+    let gotBody = null;
+    simkl.addToHistory = async (_profile, body) => { gotBody = body; return {}; };
+    tmdb.releaseDateFor = async () => ({ date: '2008-01-20', year: 2008 });
+    const pid = 'watched-anime-' + Date.now();
+    const prof = { id: pid, name: 'A', keys: { simkl_client_id: 'c', tmdb_api_key: 'k' }, simkl_auth: { access_token: 't' } };
+    try {
+      const res = fakeRes();
+      await handlers.watchedHandler({ profile: prof, body: { type: 'anime', imdb_id: 'tt1', tmdb_id: '603', title: 'Anime' } }, res);
+      assert.strictEqual(res.statusCode, 200);
+      assert.strictEqual(res.body.ok, true);
+      assert.ok(gotBody && gotBody.shows.length === 1, 'anime body goes under shows');
+      assert.deepStrictEqual(gotBody.movies, []);
+      assert.strictEqual(gotBody.shows[0].watched_at, '2008-01-20T00:00:00.000Z');
+    } finally { simkl.addToHistory = origHist; tmdb.releaseDateFor = origReleaseDateFor; wStore.deleteForProfile(pid); }
+  });
+
   await ok('handlers: trainer T1 — rate/ignore/finished/list act on the session profile only (M1/M2/M10)', async () => {
     const wStore = require('../../src/watchedStore');
     const tasteFeedback = require('../../src/tasteFeedback');
