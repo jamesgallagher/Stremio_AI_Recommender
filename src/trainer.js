@@ -348,11 +348,23 @@ async function listSeriesHistory(D, profile, { view, q, page, pageSize, sourceFn
   // not fail the action — carry on with the detector off.
   try { await animeMap.ensureLoaded(); } catch { /* detector off — carry on */ }
   const src = sourceFn || seriesSource;
+  const isAnime = src === animeSource;
   const { rows, unresolved } = src(profile.id, D.watchedStore);
   const items = [];
   for (const row of rows) {
     const item = toSeriesItem(row, { ratings, ignored, meta: null });
     item._sortMs = row.last_watched_at != null ? row.last_watched_at : 0;
+    // Every row in the anime source IS anime, so the genre column says so ("Anime", the same
+    // pseudo-genre the recommendation pool uses) rather than TMDB's generic "Animation" — and
+    // rows nothing has looked up yet no longer show a dash.
+    if (isAnime) item.genre = 'Anime';
+    // Anime: Simkl's row title is usually Japanese/romaji ("Shingeki no Kyojin"). Show the English
+    // (TMDB en-US) title instead, as soon as it is cached — before the search/sort below, so
+    // typing the English name finds it. Uncached rows are fetched for the visible page further down.
+    if (item.tmdb_id != null) {
+      const cached = D.metaGet('series', item.tmdb_id);
+      if (cached) { item._hasMeta = true; if (isAnime && cached.title) item.title = cached.title; }
+    }
     items.push(item);
   }
   // Counts (filter chips) — over the whole universe, per view.
@@ -392,18 +404,29 @@ async function listSeriesHistory(D, profile, { view, q, page, pageSize, sourceFn
   const total = viewItems.length;
   const pageItems = viewItems.slice((page - 1) * pageSize, page * pageSize);
   // Fill poster/genre/title/year from the meta cache (no network).
+  const applyMeta = (item, meta) => {
+    if (!meta) return;
+    if (item.title == null || (isAnime && meta.title)) item.title = meta.title; // anime: English title wins
+    if (item.year == null) item.year = meta.year;
+    if (item.genre == null) item.genre = meta.primary_genre || (meta.genres && meta.genres[0]) || null;
+    if (item.poster == null) item.poster = meta.poster;
+  };
   for (const item of pageItems) {
-    if (item.tmdb_id != null) {
-      const meta = D.metaGet(type, item.tmdb_id);
-      if (meta) {
-        if (item.title == null) item.title = meta.title;
-        if (item.year == null) item.year = meta.year;
-        if (item.genre == null) item.genre = meta.primary_genre || (meta.genres && meta.genres[0]) || null;
-        if (item.poster == null) item.poster = meta.poster;
-      }
+    if (item.tmdb_id != null) applyMeta(item, D.metaGet(type, item.tmdb_id));
+  }
+  // Rows nothing has looked up yet (anime shows are never in the Marquee TV cache) get their metadata
+  // fetched now, like films always have: at most 25 per request, in batches of 8. The result is
+  // cached permanently by the metadata store, so each title costs one TMDB call, once.
+  const apiKey = D.settings.keyFor(profile, 'tmdb_api_key');
+  if (apiKey) {
+    const missing = pageItems.filter((i) => i.tmdb_id != null && !i._hasMeta).slice(0, 25);
+    for (let i = 0; i < missing.length; i += 8) {
+      const batch = missing.slice(i, i + 8);
+      const metas = await Promise.all(batch.map((item) => D.enrich(apiKey, type, item.tmdb_id, D.log, {}).catch(() => null)));
+      metas.forEach((meta, idx) => applyMeta(batch[idx], meta));
     }
   }
-  for (const item of pageItems) { delete item._sortMs; }
+  for (const item of pageItems) { delete item._sortMs; delete item._hasMeta; }
   const training = D.tasteFeedback.getTraining(profile.id);
   let rebuildDueAt = null;
   if (training.changed_at != null
