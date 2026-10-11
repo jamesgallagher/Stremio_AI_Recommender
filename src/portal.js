@@ -19,6 +19,7 @@ const recommendationStore = require('./recommendationStore');
 const serveCalibration = require('./serveCalibration');
 const dontRecommend = require('./dontRecommend');
 const markWatched = require('./markWatched');
+const watchRepair = require('./watchRepair');
 const trainer = require('./trainer');
 const tasteFeedback = require('./tasteFeedback');
 const engines = require('./engines');
@@ -1253,6 +1254,49 @@ router.post('/profiles/:id/watched', async (req, res) => {
   } catch (err) {
     res.status(502).json({ error: `Could not mark watched — ${err.message}` });
   }
+});
+
+// WD-2 — repair "watched today" dates left by pre-7.55.1 mark-viewed. Admin-only
+// (the whole /api router is). Movies only; every change is logged and undoable.
+function repairProfile(req, res) {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) { res.status(404).json({ error: 'Profile not found' }); return null; }
+  if (!profile.keys.simkl_client_id || !profile.simkl_auth?.access_token) {
+    res.status(400).json({ error: 'Simkl is not connected for this profile' }); return null;
+  }
+  return profile;
+}
+const repairErr = (res, r) => res.status(r.error === 'busy' ? 409 : 400).json({ error: r.error, max: r.max });
+
+router.get('/profiles/:id/watch-repair/candidates', async (req, res) => {
+  const profile = repairProfile(req, res); if (!profile) return;
+  try { res.json(await watchRepair.findCandidates(profile, { days: req.query.days })); }
+  catch (err) { res.status(502).json({ error: `Could not scan — ${err.message}` }); }
+});
+
+router.post('/profiles/:id/watch-repair/apply', async (req, res) => {
+  const profile = repairProfile(req, res); if (!profile) return;
+  const items = Array.isArray(req.body?.items) ? req.body.items.map((i) => ({ imdb_id: i?.imdb_id || null, tmdb_id: i?.tmdb_id ?? null })) : [];
+  try {
+    const r = await watchRepair.applyRepair(profile, items);
+    if (r.error) return repairErr(res, r);
+    res.json(r);
+  } catch (err) { res.status(502).json({ error: `Repair stopped before changing anything — ${err.message}` }); }
+});
+
+router.post('/profiles/:id/watch-repair/undo', async (req, res) => {
+  const profile = repairProfile(req, res); if (!profile) return;
+  try {
+    const r = await watchRepair.undoBatch(profile, req.body?.batch);
+    if (r.error) return repairErr(res, r);
+    res.json(r);
+  } catch (err) { res.status(502).json({ error: `Undo stopped before changing anything — ${err.message}` }); }
+});
+
+router.get('/profiles/:id/watch-repair/log', (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  res.json({ rows: watchRepair.listLog(profile.id) });
 });
 
 router.post('/profiles/:id/simkl/disconnect', async (req, res) => {
