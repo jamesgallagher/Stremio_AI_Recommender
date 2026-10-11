@@ -52,7 +52,15 @@ async function verify(titles, type, tier, sources, log = console) {
       }
     }
   }
-  // (5) the merged Map (cache + newly decided).
+  // (5) FAIL-CLOSED: a title the chain could not judge (the LLM omitted it, even after
+  // the re-ask) is BLOCKED for this call. It is not recorded (step 4 only stores
+  // allow/block), so the next build judges it afresh instead of it being stuck.
+  for (const [key, v] of result) {
+    if (v.verdict === 'unknown') {
+      result.set(key, { verdict: 'block', source: 'unjudged', rating: null, reason: 'The age check could not judge this title' });
+    }
+  }
+  // (6) the merged Map (cache + newly decided).
   return result;
 }
 

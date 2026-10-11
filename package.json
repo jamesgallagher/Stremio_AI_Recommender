@@ -1,15 +1,17 @@
 {
   "name": "ai-recommender",
-  "version": "7.54.1-beta",
+  "version": "7.54.2-beta",
   "description": "Self-hosted Stremio/Nuvio AI recommendation addon — Simkl + TMDB recommendations + custom/Groq LLM, per-family-profile",
   "main": "src/server.js",
   "scripts": {
     "start": "node --experimental-sqlite src/server.js",
-    "test": "node --experimental-sqlite test/smoke.js && node --experimental-sqlite test/integration.js && node --experimental-sqlite mobile/test/mobile.smoke.js && node --experimental-sqlite test/shared-login.js && node --experimental-sqlite test/engines-marquee-only.js && node --experimental-sqlite test/anime-lane.js && node --experimental-sqlite test/anime-trending.js && node --experimental-sqlite test/anime-decisions.js && node --experimental-sqlite test/anime-decisions-gate.js && node --experimental-sqlite test/anime-decisions-urgent.js && node --experimental-sqlite test/anime-decisions-report.js && node --experimental-sqlite test/age-anime-chain.js && node --experimental-sqlite test/anime-borderline.js && node --experimental-sqlite test/anidb-warmup.js && node --experimental-sqlite test/anime-personalised.js && node --experimental-sqlite test/anime-ratings.js && node --experimental-sqlite test/anime-bench.js && node --experimental-sqlite test/filter-gate.js && node --experimental-sqlite test/simkl.lifecycle.js && node --experimental-sqlite test/mdblist-user-keys.js",
+    "test": "node --experimental-sqlite test/smoke.js && node --experimental-sqlite test/integration.js && node --experimental-sqlite mobile/test/mobile.smoke.js && node --experimental-sqlite test/shared-login.js && node --experimental-sqlite test/engines-marquee-only.js && node --experimental-sqlite test/anime-lane.js && node --experimental-sqlite test/anime-trending.js && node --experimental-sqlite test/anime-decisions.js && node --experimental-sqlite test/anime-decisions-gate.js && node --experimental-sqlite test/anime-decisions-urgent.js && node --experimental-sqlite test/anime-decisions-report.js && node --experimental-sqlite test/age-anime-chain.js && node --experimental-sqlite test/anime-borderline.js && node --experimental-sqlite test/anidb-warmup.js && node --experimental-sqlite test/anime-personalised.js && node --experimental-sqlite test/anime-ratings.js && node --experimental-sqlite test/anime-bench.js && node --experimental-sqlite test/filter-gate.js && node --experimental-sqlite test/simkl.lifecycle.js && node --experimental-sqlite test/mdblist-user-keys.js && node --experimental-sqlite test/hardening-p1.js && node --experimental-sqlite test/hardening-p2.js",
     "test:simkl": "node --experimental-sqlite test/simkl.lifecycle.js",
     "test:simkl:browser": "node --experimental-sqlite test/simkl.lifecycle.js --browser",
     "test:integration": "node --experimental-sqlite test/integration.js",
     "test:mobile": "node --experimental-sqlite mobile/test/mobile.smoke.js",
+    "test:hardening": "node --experimental-sqlite test/hardening-p1.js",
+    "test:hardening2": "node --experimental-sqlite test/hardening-p2.js",
     "test:mdblist": "node --experimental-sqlite test/mdblist-user-keys.js"
   },
   "engines": {
@@ -18,7 +20,7 @@
   "dependencies": {
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
-    "nodemailer": "^9.0.5"
+    "nodemailer": "^10.1.0"
   },
   "license": "MIT",
   "private": true

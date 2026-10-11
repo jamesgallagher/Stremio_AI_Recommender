@@ -13,7 +13,12 @@ COPY mobile ./mobile
 ENV NODE_ENV=production \
     PORT=7000 \
     DATA_DIR=/data
+# Run unprivileged. /data must be writable by uid 1000 (the image's `node` user): on Unraid
+# `chown -R 1000:1000 /mnt/user/appdata/ai-recommender`, or add `--user 99:100` (nobody:users)
+# to the container's extra parameters. The server prints a clear error if it can't write.
+RUN mkdir -p /data && chown -R node:node /data /app
 VOLUME /data
+USER node
 EXPOSE 7000
 HEALTHCHECK --interval=60s --timeout=5s CMD wget -qO- http://localhost:7000/health || exit 1
 # --experimental-sqlite: enables the built-in node:sqlite (Node 22). No native

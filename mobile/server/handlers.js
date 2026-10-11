@@ -13,6 +13,7 @@ const dontRecommend = require('../../src/dontRecommend');
 const markWatched = require('../../src/markWatched');
 const trainer = require('../../src/trainer');
 const catalogServe = require('../../src/catalogServe');
+const { gateSearchResults } = require('../../src/searchGate');
 
 const TYPES = ['movie', 'series', 'anime'];
 
@@ -22,6 +23,11 @@ const TYPES = ['movie', 'series', 'anime'];
 // control). The server still USES the profile's age limit internally for the
 // vetted-only "entire list" view; it just never leaves the server.
 const COMPANION_FILTERS = ['min_rating', 'vote_count_floor', 'min_year', 'excluded_genres', 'list_size', 'title_decay_enabled', 'title_decay_days', 'engine_anime'];
+// Settings an age-limited profile may NOT change from the phone: the child holds the
+// session, so these act as parental controls. The admin portal still edits them. They are
+// reported to the UI only as a generic "managed by your admin" list — never the age limit.
+const MANAGED_WHEN_LIMITED = ['min_rating', 'min_year', 'excluded_genres', 'engine_anime'];
+const managedFilters = (profile) => ((profile.filters?.age_limit || 0) > 0 ? MANAGED_WHEN_LIMITED : []);
 const SEARCH_LIMIT = 10;
 const SEARCH_LIMIT_MAX = 12; // search does 1 + N detail calls — keep it light
 
@@ -53,7 +59,20 @@ async function searchHandler(req, res) {
   const key = settings.keyFor(req.profile, 'tmdb_api_key'); // global-first, per-profile fallback
   if (!key) return res.status(503).json({ error: 'TMDB is not configured' });
   try {
-    const metas = await tmdb.searchTitles(key, type, q, limit);
+    const limited = (req.profile.filters?.age_limit || 0) > 0;
+    let metas = await tmdb.searchTitles(key, type, q, limited ? Math.min(limit, 10) : limit);
+    // Same age protection as the Stremio search: NSFW/anime band for all; the age chain
+    // for age-limited profiles only (never for adults). FAIL-CLOSED: a gate failure for an
+    // age-limited profile returns NO results, not unfiltered ones.
+    try {
+      metas = await gateSearchResults(req.profile, type, metas, console);
+    } catch (err) {
+      if (limited) {
+        console.warn(`[mobile] search gate failed for ${req.profile.name} (${err.message}) — returning no results (fail-closed)`);
+        return res.json({ results: [] });
+      }
+      throw err;
+    }
     res.json({ results: metas.map(toTitleDTO).filter(Boolean) });
   } catch (err) {
     res.status(502).json({ error: `Search failed — ${err.message}` });
@@ -315,6 +334,7 @@ function companionSettings(profile) {
   filters.list_size = recommendationStore.listSizeFor(profile);
   return {
     filters,
+    managed: managedFilters(profile),   // settings the phone must show read-only (admin-managed)
     catalog_only: catalogOnlyOf(profile),
     genres: Object.keys(tmdb.GENRE_ALIASES).sort(),
     catalogs: companionCatalogs(profile),
@@ -350,11 +370,12 @@ function settingsPostHandler(req, res) {
   const b = req.body || {};
   const patch = {};
   const filterPatch = {};
-  for (const k of COMPANION_FILTERS) if (b[k] !== undefined) filterPatch[k] = b[k];
+  const managed = new Set(managedFilters(req.profile));
+  for (const k of COMPANION_FILTERS) if (b[k] !== undefined && !managed.has(k)) filterPatch[k] = b[k];
   // AN-1a: the anime engine is phone-editable (Disabled | Marquee Anime). It is NOT a
   // companion filter (never returned in `filters`); config.updateProfile validates it
   // (an unknown value lands on 'off'). engine_movie/engine_series stay non-editable.
-  if (b.engine_anime !== undefined) filterPatch.engine_anime = String(b.engine_anime);
+  if (b.engine_anime !== undefined && !managed.has('engine_anime')) filterPatch.engine_anime = String(b.engine_anime);
   if (Object.keys(filterPatch).length) patch.filters = filterPatch; // age_limit can never be a key here
   if (b.catalog_only !== undefined) patch.companion = { catalog_only: !!b.catalog_only };
   if (b.catalogs && typeof b.catalogs === 'object') {

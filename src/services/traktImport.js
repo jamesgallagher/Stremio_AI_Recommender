@@ -68,7 +68,7 @@ function readEntry(buf, entry) {
   // inflateRaw stops at the deflate stream's end marker on its own.
   const data = buf.subarray(start);
   if (entry.method === 0) return data; // stored
-  if (entry.method === 8) return zlib.inflateRawSync(data);
+  if (entry.method === 8) return zlib.inflateRawSync(data, { maxOutputLength: 256 * 1024 * 1024 }) /* zip-bomb cap */;
   throw new Error(`Unsupported ZIP compression method ${entry.method} for ${entry.name}`);
 }
 

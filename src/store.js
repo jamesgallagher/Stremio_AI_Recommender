@@ -70,45 +70,6 @@ function loadCache(profileId) {
   return readJson(cacheFile(profileId), { movie: null, series: null, last_attempt_at: 0 });
 }
 
-// Atomic swap of a single catalog type (displayed + bench). Old data for the
-// other type is preserved. Never called on failure — a failed rebuild leaves
-// the previous list untouched.
-function swapCatalog(profileId, type, metas, bench = [], source, displaySize = DEFAULT_DISPLAY_SIZE) {
-  const cache = loadCache(profileId);
-  cache[type] = { metas, bench, display_size: displaySize, generated_at: Date.now(), source };
-  writeJsonAtomic(cacheFile(profileId), cache);
-}
-
-// Persist the watched-ID snapshot (per type) so the addon can prune watched
-// titles at serve time without touching Trakt in the request path.
-function saveWatched(profileId, type, sets) {
-  const cache = loadCache(profileId);
-  cache.watched = cache.watched || {};
-  cache.watched[type] = { imdb: [...sets.imdbIds], tmdb: [...sets.tmdbIds] };
-  cache.watched_synced_at = Date.now();
-  writeJsonAtomic(cacheFile(profileId), cache);
-}
-
-// Drop newly-watched titles from a catalog's displayed list AND bench, then
-// backfill the displayed list from the bench up to its display_size — free
-// promote-on-watch, no LLM. Synchronous load-filter-write, so a rebuild
-// finishing mid-refresh can't be clobbered. Returns how many displayed titles
-// were removed (for logging).
-function pruneWatched(profileId, type, imdbIds) {
-  const cache = loadCache(profileId);
-  const entry = cache[type];
-  if (!entry) return 0;
-  const displayBefore = entry.metas.length;
-  const totalBefore = displayBefore + (entry.bench?.length || 0);
-  entry.metas = entry.metas.filter((m) => !imdbIds.has(m.id));
-  entry.bench = (entry.bench || []).filter((m) => !imdbIds.has(m.id));
-  const removed = displayBefore - entry.metas.length;
-  const target = entry.display_size || DEFAULT_DISPLAY_SIZE;
-  while (entry.metas.length < target && entry.bench.length) entry.metas.push(entry.bench.shift());
-  if (entry.metas.length + entry.bench.length !== totalBefore) writeJsonAtomic(cacheFile(profileId), cache);
-  return removed;
-}
-
 // Extra (MDBList-backed) catalog cache, keyed by catalog id. Same atomic-swap
 // discipline as the AI catalogs: only called on successful builds.
 // CB-1: `meta` is an optional object with build metadata (format marker, list
@@ -120,24 +81,6 @@ function swapExtra(profileId, catalogId, metas, meta) {
   const entry = { metas, generated_at: Date.now() };
   if (meta) Object.assign(entry, meta);
   cache.extras[catalogId] = entry;
-  writeJsonAtomic(cacheFile(profileId), cache);
-}
-
-// Record the Trakt last_activities timestamps that the current watched
-// snapshot corresponds to, so the hourly refresh can skip the full watched
-// downloads when nothing changed. Also bumps watched_synced_at.
-function saveWatchedActivity(profileId, activity) {
-  const cache = loadCache(profileId);
-  cache.watched_activity = activity;
-  cache.watched_synced_at = Date.now();
-  writeJsonAtomic(cacheFile(profileId), cache);
-}
-
-// Bump watched_synced_at without touching the snapshot (change detection
-// said nothing was watched since last sync).
-function touchWatchedSync(profileId) {
-  const cache = loadCache(profileId);
-  cache.watched_synced_at = Date.now();
   writeJsonAtomic(cacheFile(profileId), cache);
 }
 
@@ -280,12 +223,7 @@ module.exports = {
   loadSettings,
   saveSettings,
   loadCache,
-  swapCatalog,
   swapExtra,
-  saveWatched,
-  pruneWatched,
-  saveWatchedActivity,
-  touchWatchedSync,
   loadCsmCache,
   saveCsmCache,
   loadImdbRatingCache,

@@ -15,6 +15,7 @@ const dontRecommend = require('./dontRecommend');
 // preview all serve the same list. The route here is a thin Stremio envelope.
 const { AI_CATALOGS: CATALOGS, applyRpdb, servedCatalog } = require('./catalogServe');
 const tmdb = require('./services/tmdb');
+const { gateSearchResults } = require('./searchGate');
 const animeMap = require('./services/animeMap');
 const cinemeta = require('./services/cinemeta');
 const { version } = require('../package.json'); // single source of truth for the addon version
@@ -192,32 +193,10 @@ async function handleSearch(profile, type, extraStr, res) {
   const kids = (profile.filters.age_limit || 0) > 0;
   try {
     let metas = await tmdb.searchTitles(settings.keyFor(profile, 'tmdb_api_key'), type, query, kids ? 10 : 20);
-    // NSFW blacklist + anime age band — runs for ADULT searches too, since the
-    // blacklist is not tied to an age limit.
-    metas = await rebuild.applyAnimeGate(metas, profile, console);
-    if (kids) {
-      // AGE-2: every positive age limit is a chain tier — the multi-source
-      // decision chain is the ONLY age gate (mandate B3: no legacy LLM age path
-      // remains). The chain's LLM step (step 5) is fail-closed.
-      const ageVerify = require('./ageVerification');
-      const tier = ageVerify.tierFor({ age_limit: profile.filters.age_limit || 0 });
-      const sources = require('./ageVerification/sources').buildSources(profile, console);
-      const titles = metas.map((m) => ({
-        key: `${type}:${m._tmdb_id}`,
-        imdb_id: m.id,
-        adult: m._adult || false,
-        title: m.name,
-        year: m.releaseInfo,
-        genres: m._genre_names || [],
-        certification: m._certification || null,
-      }));
-      const result = await ageVerify.verify(titles, type, tier, sources, console);
-      const blocked = new Set();
-      for (const [k, v] of result) {
-        if (v.verdict === 'block') blocked.add(k.split(':')[1]);
-      }
-      metas = metas.filter((m) => !blocked.has(m._tmdb_id));
-    }
+    // NSFW blacklist + anime age band for everyone; the age-verification chain for
+    // age-limited profiles only, fail-closed. Shared with the Companion search so the
+    // two surfaces can't drift (src/searchGate.js).
+    metas = await gateSearchResults(profile, type, metas, console);
     console.log(`[search] ${profile.name}/${type} "${query}": ${metas.length} result(s)${kids ? ' (age-gated)' : ''}`);
     return res.json({ metas: applyRpdb(rebuild.cleanMetas(metas), settings.keyFor(profile, 'rpdb_api_key')), cacheMaxAge: 3600 });
   } catch (err) {

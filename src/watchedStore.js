@@ -217,12 +217,34 @@ function countWatched(profileId) {
 // at those call sites, they just see a bigger set.
 function watchedIdSets(profileId) {
   init();
-  const rows = db.get().prepare('SELECT imdb_id, tmdb_id FROM watched WHERE profile_id = ?').all(profileId);
+  const rows = db.get().prepare('SELECT type, imdb_id, tmdb_id FROM watched WHERE profile_id = ?').all(profileId);
   const imdb = new Set(); const tmdb = new Set();
-  for (const r of rows) { if (r.imdb_id) imdb.add(r.imdb_id); if (r.tmdb_id) tmdb.add(r.tmdb_id); }
-  const pend = db.get().prepare('SELECT imdb_id, tmdb_id FROM pending_watched WHERE profile_id = ?').all(profileId);
-  for (const r of pend) { if (r.imdb_id) imdb.add(r.imdb_id); if (r.tmdb_id) tmdb.add(r.tmdb_id); }
-  return { imdb, tmdb };
+  // TMDB movie and TV ids are SEPARATE namespaces that overlap numerically, so the untyped
+  // `tmdb` set can exclude an unrelated title of the other type. `byType` keeps them apart
+  // (keyed by the TMDB lookup type: anime titles are TV shows to TMDB). Engines must use
+  // watchedTmdbFor(sets, type); `tmdb` stays only as a fallback for callers/fixtures that
+  // pass a bare set.
+  const byType = { movie: new Set(), series: new Set() };
+  const add = (r) => {
+    if (r.imdb_id) imdb.add(r.imdb_id);
+    if (r.tmdb_id) {
+      tmdb.add(r.tmdb_id);
+      const t = r.type === 'movie' ? 'movie' : (r.type === 'series' || r.type === 'anime' ? 'series' : null);
+      if (t) byType[t].add(r.tmdb_id); else { byType.movie.add(r.tmdb_id); byType.series.add(r.tmdb_id); } // unknown type: exclude from both (safe)
+    }
+  };
+  for (const r of rows) add(r);
+  const pend = db.get().prepare('SELECT type, imdb_id, tmdb_id FROM pending_watched WHERE profile_id = ?').all(profileId);
+  for (const r of pend) add(r);
+  return { imdb, tmdb, byType };
+}
+
+// The watched TMDB-id Set for ONE type's id namespace ('anime' → TV). Falls back to the
+// untyped set when the sets object carries no per-type split (older callers, test fixtures).
+function watchedTmdbFor(sets, type) {
+  if (!sets) return new Set();
+  const t = type === 'movie' ? 'movie' : 'series';
+  return (sets.byType && sets.byType[t]) || sets.tmdb || new Set();
 }
 
 // MW-00: record a just-marked-watched title as pending (see the table comment).
@@ -712,6 +734,7 @@ module.exports = {
   getWatched,
   countWatched,
   watchedIdSets,
+  watchedTmdbFor,
   addPendingWatched,
   clearSupersededPending,
   removeWatched,

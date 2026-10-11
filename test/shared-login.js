@@ -257,7 +257,7 @@ function makeLegacy(name, email, createdAt) {
   // ---- T13: setup verify (in-process OTP + HTTP verify) ----
   await ok('T13 setup verify: wrong code → 401; right code → 200 + Set-Cookie; admin; needed:false', async () => {
     const mailer = capturingSender();
-    const r = await auth.requestSetupOtp({ name: 'Setup Admin', email: 'setup@example.com' }, { sendMail: mailer });
+    const r = await auth.requestSetupOtp({ name: 'Setup Admin', email: 'setup@example.com', token: auth.getSetupToken() }, { sendMail: mailer });
     assert.ok(r.ok, 'requestSetupOtp ok');
     const code = mailer.last().code;
     // Wrong code → 401

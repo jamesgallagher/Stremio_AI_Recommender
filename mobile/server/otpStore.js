@@ -41,6 +41,17 @@ function init() {
 
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 
+// OTP codes are only 6 digits, so a plain SHA-256 of one is trivially reversible from a
+// leaked DB. Key the hash with the server secret (HMAC) so a DB copy alone can't recover
+// codes. Without SECRET_KEY it degrades to the plain hash. Session TOKENS stay plain
+// SHA-256: they are 256-bit random, so there is nothing to brute-force.
+const codeHash = (code) => {
+  const k = process.env.SECRET_KEY || process.env.SCROBBLE_KEY || '';
+  return k
+    ? crypto.createHmac('sha256', k).update('otp-code:' + String(code)).digest('hex')
+    : sha256(code);
+};
+
 // ---- OTP codes ----
 function insertOtp({ email, profileId, code, createdAt, expiresAt }) {
   init();
@@ -48,7 +59,7 @@ function insertOtp({ email, profileId, code, createdAt, expiresAt }) {
   db.get().prepare(`INSERT INTO mobile_otp
     (id, email, profile_id, code_hash, created_at, expires_at, used_at, attempts)
     VALUES (?, ?, ?, ?, ?, ?, NULL, 0)`)
-    .run(id, email, profileId, sha256(code), createdAt, expiresAt);
+    .run(id, email, profileId, codeHash(code), createdAt, expiresAt);
   return id;
 }
 
@@ -115,7 +126,7 @@ function pruneExpired(nowMs = Date.now()) {
 }
 
 module.exports = {
-  init, sha256,
+  init, sha256, codeHash,
   insertOtp, newestUnusedOtp, markOtpUsed, incOtpAttempts, purgeUnusedOtps,
   insertSession, sessionByToken, touchSession, deleteSession, deleteSessionsForProfile,
   pruneExpired,

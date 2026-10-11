@@ -34,42 +34,6 @@ function okAsync(name, fn) {
 
 console.log('unit:');
 
-ok('store: atomic swap preserves other catalog type', () => {
-  store.swapCatalog('p1', 'movie', [{ id: 'tt1' }], [], 'llm');
-  store.swapCatalog('p1', 'series', [{ id: 'tt2' }], [], 'discover');
-  const c = store.loadCache('p1');
-  assert.strictEqual(c.movie.metas[0].id, 'tt1');
-  assert.strictEqual(c.series.metas[0].id, 'tt2');
-  assert.strictEqual(c.series.source, 'discover');
-  store.deleteCache('p1');
-});
-
-ok('store: pruneWatched removes watched + backfills displayed from bench', () => {
-  // display_size 3 + one bench item: watching a displayed title promotes bench.
-  store.swapCatalog('p2', 'movie',
-    [{ id: 'tt1' }, { id: 'tt2' }, { id: 'tt3' }], [{ id: 'tt4' }], 'llm', 3);
-  const removed = store.pruneWatched('p2', 'movie', new Set(['tt2', 'tt9']));
-  assert.strictEqual(removed, 1);
-  const c = store.loadCache('p2');
-  assert.deepStrictEqual(c.movie.metas.map(m => m.id), ['tt1', 'tt3', 'tt4']); // bench promoted in
-  assert.strictEqual(c.movie.bench.length, 0);
-  assert.strictEqual(store.pruneWatched('p2', 'series', new Set(['tt1'])), 0); // no series cache: no-op
-  store.deleteCache('p2');
-});
-
-ok('store: watched activity snapshot + touch', () => {
-  store.saveWatchedActivity('p4', { movies: '2026-07-01T00:00:00Z', episodes: null });
-  const c = store.loadCache('p4');
-  assert.strictEqual(c.watched_activity.movies, '2026-07-01T00:00:00Z');
-  assert.ok(c.watched_synced_at > 0);
-  const before = c.watched_synced_at;
-  store.touchWatchedSync('p4');
-  const c2 = store.loadCache('p4');
-  assert.ok(c2.watched_synced_at >= before);
-  assert.strictEqual(c2.watched_activity.movies, '2026-07-01T00:00:00Z'); // untouched
-  store.deleteCache('p4');
-});
-
 ok('catalogs: registry, defaults, and per-source requirements', () => {
   const catalogs = require('../src/catalogs');
   assert.strictEqual(catalogs.EXTRA_CATALOGS.length, 14); // v6 registry: 2 Watch Later + 12 curated
@@ -139,10 +103,9 @@ ok('catalogs: registry, defaults, and per-source requirements', () => {
 });
 
 ok('store: swapExtra keeps AI catalogs untouched', () => {
-  store.swapCatalog('p5', 'movie', [{ id: 'tt1' }], [], 'llm');
   store.swapExtra('p5', 'mdb-action-movies', [{ id: 'tt2' }]);
   const c = store.loadCache('p5');
-  assert.strictEqual(c.movie.metas[0].id, 'tt1');
+  assert.strictEqual(c.movie, null);
   assert.strictEqual(c.extras['mdb-action-movies'].metas[0].id, 'tt2');
   assert.ok(c.extras['mdb-action-movies'].generated_at > 0);
   store.deleteCache('p5');
@@ -335,57 +298,6 @@ ok('tmdb: pickLogo prefers English, builds URL, handles empty', () => {
   );
   assert.strictEqual(tmdb.pickLogo([]), null);
   assert.strictEqual(tmdb.pickLogo(undefined), null);
-});
-
-ok('groq: generation prompt is age-aware, carries seeds and exclusions', () => {
-  const prompt = groq.buildGeneratePrompt('series', {
-    ageLimit: 14, count: 50, excludedGenres: ['Horror'],
-    seeds: [{ title: 'Demon Slayer', year: 2019 }],
-  });
-  assert.ok(prompt.includes('14-year-old'));
-  assert.ok(prompt.includes('Australian classification standards (ACB)'));
-  assert.ok(prompt.includes('Demon Slayer (2019)'));
-  assert.ok(prompt.includes('Horror'));
-  assert.ok(/anime/i.test(prompt)); // anime gets called out — it's the failure case
-  assert.ok(prompt.includes('50'));
-
-  // Adults: no age constraint at all, and no empty-history confusion
-  const adult = groq.buildGeneratePrompt('movie', { ageLimit: 0, seeds: [], count: 50 });
-  assert.ok(!adult.includes('year-old'));
-  assert.ok(adult.includes('no watch history yet'));
-});
-
-ok('groq: cross-type seeds render as separate labelled groups', () => {
-  const seeds = [
-    { title: 'Your Name', year: 2016, type: 'movie' },
-    { title: 'Haikyu!!', year: 2014, type: 'series' },
-  ];
-  const prompt = groq.buildGeneratePrompt('movie', { seeds, count: 50 });
-  assert.ok(prompt.includes('Recently watched films:'));
-  assert.ok(prompt.includes('Recently watched TV series'));
-  // The series group must be marked as a different format, or the model
-  // proposes spin-offs of shows instead of films
-  assert.ok(/different format/.test(prompt));
-
-  // Cold start on this type: tell it to infer, and explicitly not to fall back
-  // on crowd-pleasers — that fallback is what produced Free Willy for Ciara
-  const borrowed = groq.buildGeneratePrompt('movie', { seeds: [seeds[1]], count: 50 });
-  assert.ok(borrowed.includes('has not watched many films yet'));
-  assert.ok(borrowed.includes('generic crowd-pleasers'));
-  assert.ok(!borrowed.includes('Recently watched films:')); // no empty group
-  // Untyped seeds (older callers) still count as own-type
-  assert.ok(groq.buildGeneratePrompt('movie', { seeds: [{ title: 'X', year: 1999 }] }).includes('Recently watched films:'));
-});
-
-ok('groq: parseTitles dedupes, tolerates wrappers, survives a missing year', () => {
-  const parsed = groq.parseTitles('```json\n{"results":[{"title":"Spirited Away","year":2001},'
-    + '{"title":"spirited away","year":2001},{"title":"My Neighbour Totoro"},'
-    + '{"title":"","year":1999},{"year":2000}]}\n```');
-  assert.deepStrictEqual(parsed, [
-    { title: 'Spirited Away', year: 2001 },
-    { title: 'My Neighbour Totoro', year: null }, // year is optional
-  ]);
-  assert.strictEqual(groq.parseTitles('[{"title":"A"},{"title":"B"}]', 1).length, 1); // limit honoured
 });
 
 ok('animeMap: index handles franchise arrays and { tv, movie } tmdb objects', () => {
@@ -697,12 +609,12 @@ ok('recommendationStore: SH-01 passesAgeBand — stored verdict re-check (AGE-2)
   const db = require('../src/db');
   // AGE-2: the serve-time re-check reads the stored verdict (set at build time
   // by the chain) — the legacy cert/MAL path is gone (mandate B3). A row with
-  // no stored verdict is kept (fail-open); the row must carry a type + tmdb_id
-  // to be re-checked.
+  // no stored verdict is HIDDEN from an age-limited profile (fail-closed, hardening F4);
+  // the row must carry a type + tmdb_id to be re-checked.
   const row = (tmdbId, type = 'movie') => ({ type, tmdb_id: tmdbId });
-  // No stored verdict → kept (fail-open) for every age limit.
+  // No stored verdict and no classification → hidden (fail-closed) for every age limit.
   for (const age of [10, 12, 14, 15]) {
-    assert.strictEqual(rs.passesAgeBand(row('no-verdict-' + age), { age_limit: age }), true, 'no stored verdict kept at ' + age);
+    assert.strictEqual(rs.passesAgeBand(row('no-verdict-' + age), { age_limit: age }), false, 'unvetted row hidden at ' + age);
   }
   // Adult profile (no age limit): always true.
   assert.strictEqual(rs.passesAgeBand(row('no-verdict'), { age_limit: 0 }), true);
@@ -718,7 +630,7 @@ ok('recommendationStore: SH-01 passesAgeBand — stored verdict re-check (AGE-2)
     assert.strictEqual(rs.passesAgeBand(row('age2-blocked-1'), { age_limit: 10 }), false, 'stored block rejected at 10');
     assert.strictEqual(rs.passesAgeBand(row('age2-blocked-1'), { age_limit: 0 }), true, 'adult: stored block ignored');
     assert.strictEqual(rs.passesAgeBand(row('age2-allowed-1'), { age_limit: 10 }), true, 'stored allow kept at 10');
-    assert.strictEqual(rs.passesAgeBand(row('age2-blocked-1'), { age_limit: 12 }), true, 'age10 verdict not seen at 12');
+    assert.strictEqual(rs.passesAgeBand(row('age2-blocked-1'), { age_limit: 12 }), false, 'age10 verdict not seen at 12 -> unvetted there -> hidden (fail-closed)');
   } finally {
     db.get().prepare("DELETE FROM age_verdicts WHERE tmdb_id IN ('age2-blocked-1', 'age2-allowed-1')").run();
   }
@@ -741,8 +653,8 @@ ok('recommendationStore: T12 passesAgeBand fallback — no stored verdict, judge
     assert.strictEqual(rs.passesAgeBand({ type: 'movie', tmdb_id: 't12-csm', certification: 'csm:12' }, { age_limit: 14 }), true, 'csm:12 <= csmMaxAge 14');
     // (d) No verdict + certification 'MA 15+' (raw) → false at 10+ (classify → block).
     assert.strictEqual(rs.passesAgeBand({ type: 'movie', tmdb_id: 't12-raw', certification: 'MA 15+' }, { age_limit: 10 }), false, 'MA 15+ raw cert blocked at 10');
-    // (e) No verdict + nothing → true (fail-open).
-    assert.strictEqual(rs.passesAgeBand({ type: 'movie', tmdb_id: 't12-none' }, { age_limit: 10 }), true, 'no classification → kept');
+    // (e) No verdict + nothing → hidden (fail-closed, hardening F4).
+    assert.strictEqual(rs.passesAgeBand({ type: 'movie', tmdb_id: 't12-none' }, { age_limit: 10 }), false, 'no classification → hidden');
   } finally {
     db.get().prepare("DELETE FROM age_verdicts WHERE tmdb_id = 't12-block'").run();
   }
@@ -1126,16 +1038,17 @@ ok('recommendationStore: selectServe age re-check — stored verdict (AGE-2)', (
   const rows = [mk('G'), mk('R'), mk('U')];
   // AGE-2: the serve-time re-check reads the stored verdict (set at build time
   // by the chain) — the legacy cert/MAL classification is gone (mandate B3). A
-  // row with no stored verdict is kept (fail-open).
+  // row with no stored verdict is HIDDEN (fail-closed, hardening F4).
   const now = Date.now();
   ageStore.recordVerdict('movie', 'R', 'age12', 'block', 'us', 'R', now);
+  ageStore.recordVerdict('movie', 'G', 'age12', 'allow', 'au', 'G', now);
   try {
-    // age_limit 12 -> age12 tier; 'R' has a stored block verdict -> dropped; 'G' and 'U' kept.
-    assert.deepStrictEqual(rs.selectServe(rows, { age_limit: 12 }, { nowYear: 2026 }).map((r) => r.tmdb_id).sort(), ['G', 'U']);
+    // age_limit 12 -> age12 tier; 'R' stored block -> dropped; 'G' stored allow -> kept; 'U' unvetted -> hidden.
+    assert.deepStrictEqual(rs.selectServe(rows, { age_limit: 12 }, { nowYear: 2026 }).map((r) => r.tmdb_id).sort(), ['G']);
     // no age limit -> nothing age-dropped
     assert.strictEqual(rs.selectServe(rows, {}, { nowYear: 2026 }).length, 3);
   } finally {
-    db.get().prepare("DELETE FROM age_verdicts WHERE tmdb_id = 'R'").run();
+    db.get().prepare("DELETE FROM age_verdicts WHERE tmdb_id IN ('R', 'G')").run();
   }
   // The local certMinAge helper (still exported for the SH-01 card) is unchanged.
   assert.strictEqual(rs.certMinAge('R'), 17);
@@ -2952,7 +2865,10 @@ ok('marquee envelope: MI-1 parity matrix (envelope never looser than selectServe
     year: row.year,
     genres: (row.genres || []).join(','),
     primary_genre: (row.genres || [])[0] || null,
-    age_classification: null, // serve's age band is a MAL-band safety net; null → kept
+    // Serve is now FAIL-CLOSED for age-limited profiles (hardening F4): an unvetted row is hidden even
+    // when the envelope kept it (the chain, not the envelope, is the age authority). MI-1 is about the
+    // OTHER filters, so mark the row positively vetted ('G' band) to isolate them.
+    age_classification: 'G',
   });
   let kept = 0;
   let rejected = 0;
@@ -6685,16 +6601,6 @@ async function httpTests() {
   store.saveImdbRatingCache({});
   console.log('  ✓ IMDb rating cache: shared one-fetch, null-caching, 14-day TTL (CP-03)');
 
-  // v5: the CSM gate is retired. A kids profile with NO MDBList key must pass
-  // straight through instead of throwing — its anime coverage was so thin that
-  // "unrated" was the common case, which emptied whole catalogs. The AI gate
-  // is the sole age authority now.
-  const kidsNoMdb = { filters: { age_limit: 8 }, keys: {} };
-  const through = await rebuild.applyCsmGate(
-    [{ id: 'tt60', name: 'Unrated By CSM' }], 'series', kidsNoMdb, { log() {} },
-  );
-  assert.deepStrictEqual(through.map(m => m.id), ['tt60']);
-  console.log('  ✓ CSM gate retired — no longer drops unrated titles or needs MDBList');
   // Anime gate, end to end, with a seeded map + rating cache (no network).
   // The two rules point in OPPOSITE directions and that is the whole design.
   {

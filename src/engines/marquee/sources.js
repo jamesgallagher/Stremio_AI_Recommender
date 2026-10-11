@@ -284,7 +284,7 @@ async function gatherCandidates(profile, ctx, {
 } = {}) {
   const f = fetchers || defaultFetchers(ctx, profile, cfg, log);
   const nowYear = new Date().getFullYear();
-  const watchedTmdb = ctx.watchedIds?.tmdb || new Set();
+  const watchedTmdb = require('../../watchedStore').watchedTmdbFor(ctx.watchedIds, 'movie');
   const dont = ctx.dont || new Set();
   const pool = [];
   const srcCounts = { S1: 0, S2: 0, S3: 0, S4: 0, S5: 0, S6: 0, S7: 0, S2_reserved: 0 };

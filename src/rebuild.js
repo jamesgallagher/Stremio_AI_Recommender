@@ -139,28 +139,6 @@ function status(profile) {
   };
 }
 
-// Kids-mode gate: strict Common Sense verification via MDBList.
-// Every candidate is looked up; unrated titles are dropped, full stop.
-// Common Sense Media gate — RETIRED in v5 (2026-07-23).
-//
-// It was the primary age authority, strict by design: no CSM rating meant the
-// title was dropped. That works for mainstream Western titles and fails for
-// anime, where coverage is thin, so "unrated" was the common case rather than
-// the exception. For an anime-heavy child profile the gate wasn't strict, it
-// was absent — it emptied entire catalogs while letting nothing through, and
-// a parse bug meant it had almost certainly never worked as intended.
-//
-// The AI age gate is now the sole age authority on every surface: lists,
-// extra catalogs and search. It reads titles it recognises rather than
-// requiring a database row, which is exactly the property anime needed.
-// It stays remove-only and fail-closed.
-//
-// Kept as a pass-through for one release so any missed caller degrades to
-// "no extra filtering" rather than crashing; the AI gate still runs after it.
-async function applyCsmGate(metas) {
-  return metas;
-}
-
 // Strip internal fields before the metas are served to Stremio.
 // Strip every internal field (any `_`-prefixed key) before serving. Generic
 // rather than a fixed list so a new pipeline field can't leak by omission.
@@ -709,7 +687,6 @@ module.exports = {
   buildWatchlistCatalog,
   status,
   isRebuilding,
-  applyCsmGate,
   applyExtraAgeGate,
   effectiveAgeLimit,
   cleanMetas,

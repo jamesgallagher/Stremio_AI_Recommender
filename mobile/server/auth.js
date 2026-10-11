@@ -20,9 +20,15 @@ const OTP_TTL_MIN = 60;                        // spec: valid 1 hour, single use
 const OTP_TTL_MS = OTP_TTL_MIN * 60e3;
 const MAX_ATTEMPTS = 5;                         // wrong-code guesses before a code dies
 const MAX_REQUESTS = 5;                         // OTP requests per email per window
-const RATE_WINDOW_MS = 15 * 60e3;
+const RATE_WINDOW_MS = 60 * 60e3;               // 5 code requests per email per HOUR (James, 2026-10-11)
 const SESSION_DAYS = 30; // AUTH-1: fixed 30-day sign-in, absolute (not extended by activity)
 const SESSION_MS = SESSION_DAYS * 24 * 3600e3;
+
+// Constant-time comparison of two hex digests (same length by construction).
+const sameHash = (a, b) => {
+  const x = Buffer.from(String(a)); const y = Buffer.from(String(b));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+};
 
 const normalizeEmail = (e) => String(e || '').trim().toLowerCase();
 const generateCode = () => String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
@@ -30,6 +36,7 @@ const generateCode = () => String(crypto.randomInt(0, 1_000_000)).padStart(6, '0
 // ---- rate limiter (in-memory sliding window, keyed by email) ----
 const rate = new Map(); // email -> { count, resetAt }
 function rateLimited(email, nowMs) {
+  if (rate.size > 5000) for (const [k, v] of rate) if (nowMs > v.resetAt) rate.delete(k); // bound memory under a flood of random emails
   const e = rate.get(email);
   if (!e || nowMs > e.resetAt) { rate.set(email, { count: 1, resetAt: nowMs + RATE_WINDOW_MS }); return false; }
   if (e.count >= MAX_REQUESTS) return true;
@@ -98,7 +105,7 @@ function verifyOtp(email, code, { nowMs = Date.now() } = {}) {
   if (!row) return { ok: false, reason: 'no-code' };
   if (nowMs > row.expires_at) { otpStore.markOtpUsed(row.id, nowMs); return { ok: false, reason: 'expired' }; }
   if (row.attempts >= MAX_ATTEMPTS) { otpStore.markOtpUsed(row.id, nowMs); return { ok: false, reason: 'locked' }; }
-  if (otpStore.sha256(String(code)) !== row.code_hash) {
+  if (!sameHash(otpStore.codeHash(String(code)), row.code_hash)) {
     otpStore.incOtpAttempts(row.id);
     return { ok: false, reason: 'bad-code' };
   }
@@ -133,15 +140,33 @@ function logout(token) { if (token) otpStore.deleteSession(token); }
 // again"). The profile is created only on a verified code.
 let pendingSetup = null; // { name, email, codeHash, expiresAt, attempts }
 
-async function requestSetupOtp({ name, email }, { nowMs = Date.now(), sendMail = mail.sendOtpEmail, appUrl = '' } = {}) {
+// First-run claim protection. The wizard mails a code to whatever address the requester
+// types, which proves they own THAT mailbox, not that they are the operator — so on a
+// fresh, exposed install anyone could become admin. A one-time SETUP TOKEN, printed only
+// in the server log, proves the requester can read the container's logs.
+let setupToken = null;
+function getSetupToken() {
+  if (!setupToken) setupToken = crypto.randomBytes(12).toString('hex');
+  return setupToken;
+}
+const setupTokenFails = { count: 0, resetAt: 0 };
+const SETUP_TOKEN_MAX_FAILS = 10;
+
+async function requestSetupOtp({ name, email, token }, { nowMs = Date.now(), sendMail = mail.sendOtpEmail, appUrl = '' } = {}) {
   const nm = String(name || '').trim();
   if (nm.length < 1 || nm.length > 40) return { ok: false, code: 'BAD_NAME' };
   const em = String(email || '').trim().toLowerCase();
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) return { ok: false, code: 'BAD_EMAIL' };
   if (config.listProfiles().length > 0) return { ok: false, code: 'SETUP_DONE' };
+  if (nowMs > setupTokenFails.resetAt) { setupTokenFails.count = 0; setupTokenFails.resetAt = nowMs + 60 * 60e3; }
+  if (setupTokenFails.count >= SETUP_TOKEN_MAX_FAILS) return { ok: false, code: 'RATE_LIMITED' };
+  if (!sameHash(String(token || '').trim(), getSetupToken())) {
+    setupTokenFails.count += 1;
+    return { ok: false, code: 'BAD_TOKEN' };
+  }
   if (rateLimited(em, nowMs)) return { ok: false, code: 'RATE_LIMITED' };
   const code = generateCode();
-  pendingSetup = { name: nm, email: em, codeHash: otpStore.sha256(code), expiresAt: nowMs + OTP_TTL_MS, attempts: 0 };
+  pendingSetup = { name: nm, email: em, codeHash: otpStore.codeHash(code), expiresAt: nowMs + OTP_TTL_MS, attempts: 0 };
   console.log(`[setup] code sent for initial admin ${em}`);
   Promise.resolve(sendMail({ to: em, code, ttlMinutes: OTP_TTL_MIN, appUrl }))
     .catch((err) => console.warn(`[setup] BREVO: setup email to ${em} FAILED — ${err.message}`));
@@ -153,7 +178,7 @@ function verifySetupOtp(email, code, { nowMs = Date.now() } = {}) {
   if (!pendingSetup || pendingSetup.email !== em) return { ok: false, reason: 'no-code' };
   if (nowMs > pendingSetup.expiresAt) { pendingSetup = null; return { ok: false, reason: 'expired' }; }
   if (pendingSetup.attempts >= MAX_ATTEMPTS) { pendingSetup = null; return { ok: false, reason: 'locked' }; }
-  if (otpStore.sha256(String(code)) !== pendingSetup.codeHash) {
+  if (!sameHash(otpStore.codeHash(String(code)), pendingSetup.codeHash)) {
     pendingSetup.attempts += 1;
     return { ok: false, reason: 'bad-code' };
   }
@@ -174,7 +199,7 @@ function _resetSetup() { pendingSetup = null; } // test hook
 
 module.exports = {
   requestOtp, verifyOtp, resolveSession, resolveSessionDetail, createSession, logout,
-  requestSetupOtp, verifySetupOtp, _resetSetup,
+  requestSetupOtp, verifySetupOtp, _resetSetup, getSetupToken,
   resolveProfileByEmail, normalizeEmail, generateCode,
   OTP_TTL_MIN, MAX_ATTEMPTS, MAX_REQUESTS, RATE_WINDOW_MS, SESSION_DAYS,
   _resetRateLimits,

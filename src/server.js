@@ -8,7 +8,10 @@ const addon = require('./addon');
 const portal = require('./portal');
 const settings = require('./settings');
 
-store.ensureDirs();
+try { store.ensureDirs(); } catch (err) {
+  console.error(`[fatal] cannot write to DATA_DIR (${store.DATA_DIR}): ${err.message}\n  The container runs as a non-root user — make the appdata folder writable by uid 1000 (chown -R 1000:1000), or run the container with --user matching its owner.`);
+  process.exit(1);
+}
 config.migrateSecrets(); // encrypt plaintext secrets at rest if SECRET_KEY is set (or report state)
 
 // v6 one-time migration: seed global Server Config keys from the "James" profile
@@ -22,7 +25,19 @@ try {
 
 const app = express();
 app.disable('x-powered-by');
-app.set('trust proxy', true); // correct req.protocol/host behind Cloudflare Tunnel
+// Trust exactly the proxy hops in front of us (default 1: the Cloudflare Tunnel). `true`
+// would take the LEFT-most X-Forwarded-For entry, which a client controls. Override with
+// TRUST_PROXY (a hop count, a CIDR list, or true/false).
+const tp = process.env.TRUST_PROXY;
+app.set('trust proxy', tp === undefined || tp === '' ? 1 : (/^\d+$/.test(tp) ? parseInt(tp, 10) : (tp === 'true' ? true : (tp === 'false' ? false : tp))));
+
+// Baseline response headers on every surface (portal, companion, addon).
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  next();
+});
 
 // Request logging: all /api calls and every error response, with timestamps.
 // docker logs ai-recommender  (or the Unraid log button) shows these.
@@ -33,6 +48,8 @@ app.use((req, res, next) => {
     if (res.statusCode >= 400 || req.originalUrl.startsWith('/api') || req.originalUrl.startsWith('/mobile/api')) {
       let url = req.originalUrl;
       if (url.startsWith('/simkl/oauth2/callback')) url = '/simkl/oauth2/callback [query redacted]';
+      // The install token is a capability: never write the whole thing to the log.
+      url = url.replace(/\/addon\/([0-9a-f]{4})[0-9a-f]{28}/gi, '/addon/$1…');
       // Duration is server-side handling time (receive → response flushed to the
       // socket); it excludes tunnel transit, so a fast time here + a slow client
       // means the delay is in the network/proxy, not the app.
@@ -49,8 +66,9 @@ for (const f of ['logo.png', 'logo.svg', 'favicon.ico']) {
   app.get(`/${f}`, (req, res) => res.sendFile(path.join(PUBLIC_DIR, f)));
 }
 
-// CORS: Stremio clients fetch manifests/catalogs cross-origin
-app.use((req, res, next) => {
+// CORS: Stremio clients fetch manifests/catalogs cross-origin — the ADDON surface only. The
+// portal API and the companion are same-origin and must not be readable from other sites.
+app.use('/addon', (req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
@@ -62,7 +80,7 @@ app.use((req, res, next) => {
 app.use('/addon/:token', addon.router);
 
 // Mobile Companion app (/mobile): passwordless OTP login + per-profile views.
-// Has its own OTP session auth — deliberately NOT behind the admin Basic Auth
+// Has its own OTP session auth — deliberately NOT behind the admin-only guard
 // below (family members are not admins). See mobile/README.md.
 const mobile = require('../mobile/server/router');
 app.use('/mobile', mobile.router);
@@ -275,8 +293,16 @@ app.get('/simkl/oauth2/callback', async (req, res) => {
 });
 
 const PORT = parseInt(process.env.PORT || '7000', 10);
-app.listen(PORT, '0.0.0.0', () => {
+app.listen(PORT, '0.0.0.0', (err) => {
+  if (err) { console.error(`[fatal] cannot listen on :${PORT} — ${err.message}`); process.exit(1); }
   console.log(`AI Recommender listening on :${PORT}`);
+  // First run: the setup wizard needs this one-time token (it proves the person can read the log).
+  try {
+    if (config.listProfiles().length === 0) {
+      console.warn('[setup] FIRST RUN — no profiles exist. Open /mobile/ and create the admin account.');
+      console.warn(`[setup]   Setup token: ${require('../mobile/server/auth').getSetupToken()}`);
+    }
+  } catch (e) { /* never block boot on this */ }
   console.log(`Configure portal: http://localhost:${PORT}/configure/`);
   if (process.env.ADMIN_USER || process.env.ADMIN_PASSWORD) {
     console.log('[auth] ADMIN_USER/ADMIN_PASSWORD are no longer used — /configure uses the shared sign-in (admin profiles). You can remove them.');

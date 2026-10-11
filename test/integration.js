@@ -5905,11 +5905,11 @@ async function main() {
           assert.ok(c.opts && c.opts.tier, `opts.tier set for limit ${limit}`);
           assert.strictEqual(c.opts.tier.llm.age, tierAge, `opts.tier.llm.age for limit ${limit}`);
         }
-        // passesAgeBand: the serve-time re-check reads the stored verdict. No
-        // verdict is stored (the LLM spy vetoes nothing), so an unrated/unknown
-        // row stays kept (fail-open).
+        // passesAgeBand: the serve-time re-check reads the stored verdict. No verdict is stored
+        // here (verify is spied), so an unrated/unvetted row is HIDDEN from an age-limited
+        // profile (fail-closed, hardening F4).
         const row = { type: 'movie', tmdb_id: 'fake-movie-1', age_classification: null, certification: null };
-        assert.strictEqual(rs.passesAgeBand(row, { age_limit: limit }), true, `passesAgeBand for limit ${limit}`);
+        assert.strictEqual(rs.passesAgeBand(row, { age_limit: limit }), false, `passesAgeBand for limit ${limit}`);
       }
       // Marquee Cinema's compileEnvelope for limits 10 and 13: per-tier ceiling.
       const marquee = require('../src/engines/marquee/filters');

@@ -282,7 +282,7 @@ async function generate(profile, type, ctx, onProgress = () => {}) {
   const watchedIds = ctx.watchedIds || watchedStore.watchedIdSets(profile.id);
   const dont = ctx.dont || recommendationStore.dontRecommendKeys(profile.id);
   for (const id of [...pool.keys()]) {
-    if (progressIds.has(id) || watchedIds.tmdb.has(id) || dont.has(`series:${id}`)) pool.delete(id);
+    if (progressIds.has(id) || watchedStore.watchedTmdbFor(watchedIds, 'series').has(id) || dont.has(`series:${id}`)) pool.delete(id);
   }
 
   if (!pool.size) {
