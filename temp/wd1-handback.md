@@ -36,49 +36,59 @@ AssertionError: Expected values to be strictly equal:
 ✗ R16: markWatched with useReleaseDate:false -> no watched_at, resolver never called: Expected values to be strictly equal:
 ```
 
-## 4. Review round 1 fixes (F1-F4)
+## 4. Review round 1 fixes (F1-F4) — ACCEPTED
 
 | Fix | What | Status |
 |---|---|---|
-| **F1** | R10/R12/R13 monkey-patch `tmdb.releaseDateFor` (no network calls). Added R14 (null date → no watched_at), R15 (future date → clamped to now). No `[tmdb] releaseDateFor ... failed` noise in output. | ✅ |
-| **F2** | Rewrote `test/verify-release-date-live.js`: uses `config.listProfiles()`, `simkl.getAllItems()`, `simkl.removeFromHistory()`. Picks throwaway titles from a hard-coded candidate list. Tests overwrite behaviour on the throwaway movie (no `EXISTING_TITLE`). `--dry` flag prints the plan. Smoke-tested locally (reports "Profile not found" outside the container, as expected). | ✅ |
-| **F3** | Added `useReleaseDate` flag to `markWatched` (default `true`). `markFinished` passes `useReleaseDate: false` — trainer "mark finished" does NOT back-date. Added R16. Reverted the `year` pass-through in `src/trainer.js`. | ✅ |
-| **F4** | This hand-back updated. | ✅ |
+| **F1** | R10/R12/R13 monkey-patch `tmdb.releaseDateFor` (no network calls). Added R14, R15. | ✅ |
+| **F2** | Live check rewritten. | ✅ |
+| **F3** | `useReleaseDate` flag; trainer passes `false`. R16. | ✅ |
+| **F4** | Hand-back updated. | ✅ |
 
-## 5. Files changed (total)
+## 5. Review round 2 fixes (G1-G5)
 
-| File | Change |
-|---|---|
-| `src/releaseDate.js` | **New** — `resolveReleaseDate()` |
-| `test/release-date.js` | **New** — R1-R16 |
-| `src/services/tmdb.js` | Added `releaseDateFor()` (one lean TMDB call) |
-| `src/markWatched.js` | `buildWatchedHistoryBody` accepts `watchedAt`; `markWatched` resolves date (when `useReleaseDate`), maps anime→series, returns `watchedAt` |
-| `src/trainer.js` | Passes `useReleaseDate: false` (no back-dating) |
-| `test/smoke.js` | Updated existing assertion + added watchedAt checks |
-| `test/integration.js` | Updated markWatched args assertion (`useReleaseDate: false`) |
-| `mobile/test/mobile.smoke.js` | R13: anime type returns 200, monkey-patched tmdb |
-| `package.json` | Version 7.55.1; added `test/release-date.js` to test chain |
-| `test/verify-release-date-live.js` | **New** — live check script (not in npm test) |
+| Fix | What | Status |
+|---|---|---|
+| **G1** | Replaced `watchedStore.deleteForProfile` (BLOCKER — wipes entire local DB) with `watchedStore.removeWatched` (per-title). Comment explains why. | ✅ |
+| **G2** | Exclusion set built from ALL statuses (`completed`, `plantowatch`, `watching`, `hold`, `dropped`) for movies, shows, AND anime. Pending shim check added. | ✅ |
+| **G3** | Candidate names removed — script prints only the IMDb id (no guessed titles). | ✅ |
+| **G4** | `--selftest` flag added: fake profile + stubbed `simkl.getAllItems` (no network, no DB). Two cases: all-absent (first chosen) and plantowatch-skip (second chosen). | ✅ |
+| **G5** | Overwrite test prints `res4.watchedAt`; says "UNDETERMINED (no release date resolved)" when null. Only says UPDATED/IGNORED when `watchedAt` is non-null. | ✅ |
 
-## 6. Live check
+## 6. `--selftest` output
 
-**Still pending.** The live check requires a running server with Simkl + TMDB configured against the Unraid test profile (Siobhan). The script is at `test/verify-release-date-live.js` and supports `--dry`.
+```
+=== WD-1 Live Check: SELFTEST (fake profile, stubbed Simkl) ===
 
-**To run:**
+--- Case 1: all candidates absent ---
+  Chosen movie: tt0068646
+  Chosen series: tt0903747
+  ✓ Case 1 passed (first candidate chosen when all absent)
+--- Case 2: first movie candidate in plantowatch ---
+  Chosen movie: tt0111161
+  Chosen series: tt0903747
+  ✓ Case 2 passed (plantowatch candidate skipped)
+
+=== SELFTEST PASSED ===
+```
+
+## 7. Live check
+
+**The live run against Siobhan has NOT been done.** It requires a running server with Simkl + TMDB configured inside the container. **James or Claude will run it** via:
+
 ```
 docker exec ai_recommender node --experimental-sqlite /app/test/verify-release-date-live.js --dry
 docker exec ai_recommender node --experimental-sqlite /app/test/verify-release-date-live.js
 ```
 
-**Expected findings to report here after running:**
+Expected findings to report after running:
 1. Throwaway movie: stored `watched_at` in Simkl history (should be the movie's release date).
 2. Throwaway series: stored `watched_at` in Simkl history (should be the series' first_air_date).
 3. Overwrite test: does re-posting with `watched_at` update the date or does Simkl ignore it? (Print before/after.)
 
 These findings decide the WD-2 design.
 
-## 7. What could/couldn't be verified
+## 8. Notes
 
-- **Verified:** All R1-R16 pass; `npm test` fully green (23 suites); no `[tmdb]` noise in test output; frozen files untouched.
-- **Not verified (needs live server):** Whether Simkl actually stores the `watched_at` we send, and whether re-posting updates an existing entry's date. This is the live check above.
-- **Smoke test (local):** `node --experimental-sqlite test/verify-release-date-live.js --dry` runs without throwing (reports "Profile not found" since no Siobhan profile exists outside the container).
+- There is no per-title delete function for `series_progress` in `watchedStore.js`. The throwaway series is just marked watched (no episode progress), so no `series_progress` row should exist for it. If one does appear after the live run, it will need manual cleanup.
+- `deleteForProfile` appears in the script ONLY in explanatory comments (zero actual calls). Verified via grep.
