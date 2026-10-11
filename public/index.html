@@ -117,6 +117,14 @@
   .status-line { font-size: 12px; color: var(--muted); margin-top: 8px; }
   .diag { font-size: 12px; margin-top: 8px; background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; display: none; }
   .diag div { margin: 2px 0; }
+  /* WD-2 — Fix watch dates */
+  .wr-row { display: flex; gap: 10px; align-items: flex-start; padding: 8px 4px; border-bottom: 1px solid var(--border); cursor: pointer; }
+  .wr-row:last-child { border-bottom: 0; }
+  .wr-row input { margin-top: 3px; flex: none; width: 18px; height: 18px; }
+  .wr-row .wr-main { flex: 1; min-width: 0; }
+  .wr-row .wr-dates { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .wr-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+  .wr-ok { color: var(--ok); } .wr-bad { color: var(--err); } .wr-warn { color: var(--warn); }
   .pin { font-size: 28px; letter-spacing: 6px; font-weight: 700; color: var(--accent); }
   .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   .cols-3 { grid-template-columns: 1fr 1fr 1fr; }
@@ -918,6 +926,23 @@ function render(profiles) {
           </div>
           ${p.simkl_connected ? '' : '<div class="hint">Connect Simkl first.</div>'}
           <div class="watched-panel diag" style="display:none;margin-top:10px"></div>
+        </div>
+
+        <div class="sec-title">Fix watch dates</div>
+        <div class="sec-box">
+          <div class="muted" style="font-size:12px;margin-bottom:8px">Before v7.55.1, marking a film as viewed dated it <b>today</b>, so it looked like a recent watch to the recommender. This lists films dated recently whose release was much earlier, so you can re-date the ones you only <i>marked</i> (not really watched recently) to their release date.</div>
+          <div class="row">
+            <label for="wr-days-${p.id}" style="margin:0">Look back</label>
+            <select id="wr-days-${p.id}" data-wr-days style="width:auto">
+              <option value="30">30 days</option><option value="90" selected>90 days</option><option value="180">180 days</option><option value="365">1 year</option>
+            </select>
+            <button class="ghost" onclick="wrFind('${p.id}', this)" ${p.simkl_connected ? '' : 'disabled'}>Find films</button>
+            <button class="ghost" onclick="wrLog('${p.id}', this)">Repair log</button>
+          </div>
+          ${p.simkl_connected ? '' : '<div class="hint">Connect Simkl first.</div>'}
+          <div class="hint">Each ticked film is removed from Simkl history and added back with its release date, and its rating is put back (the rating's own date resets to today). Movies only. Films synced from Nuvio/Stremio are left alone. Every change is logged and can be undone.</div>
+          <div class="wr-panel diag" style="display:none;margin-top:10px" aria-live="polite"></div>
+          <div class="wr-logbox" style="margin-top:8px"></div>
         </div>
 
         <div class="sec-title" style="color:var(--err)">Danger zone</div>
@@ -2098,6 +2123,146 @@ async function viewWatched(id, btn) {
     const section = (list, label) => `<div style="margin-top:8px"><b>${label} (${list.length})</b>${list.map(row).join('') || '<div class="muted">none</div>'}</div>`;
     panel.innerHTML = `${section(d.movies, 'Movies')}${section(d.series, 'Series')}`;
   } catch (e) { panel.innerHTML = `<span style="color:var(--err)">${esc(e.message)}</span>`; }
+}
+
+// WD-2 — Fix watch dates (Advanced tab). Find → tick → apply in chunks of 5
+// (each film costs ~4 Simkl writes at the 1/s cap) → summary + undo.
+const WR = {};
+const WR_CHUNK = 5;
+const wrDate = (iso) => {
+  const t = iso ? Date.parse(iso) : NaN;
+  return Number.isNaN(t) ? 'unknown' : new Date(t).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' });
+};
+const wrPanel = (id) => document.querySelector(`[data-id="${id}"] .wr-panel`);
+
+async function wrFind(id, btn) {
+  const panel = wrPanel(id);
+  const days = document.querySelector(`[data-id="${id}"] [data-wr-days]`).value;
+  panel.style.display = 'block';
+  panel.innerHTML = '<span class="muted">Looking up release dates…</span>';
+  btn.disabled = true;
+  try {
+    const d = await api(`/profiles/${id}/watch-repair/candidates?days=${encodeURIComponent(days)}`);
+    WR[id] = { rows: d.rows, batches: [] };
+    wrDraw(id, d);
+  } catch (e) { panel.innerHTML = `<span class="wr-bad">${esc(e.message)}</span>`; }
+  finally { btn.disabled = false; }
+}
+
+function wrDraw(id, d) {
+  const panel = wrPanel(id);
+  const st = WR[id];
+  if (!st.rows.length) {
+    panel.innerHTML = `<div>Nothing to fix in the last ${d.days} days — no recently-dated film has a much older release date.</div>`
+      + (d.skipped_scrobbled ? `<div class="muted">${d.skipped_scrobbled} synced from Nuvio/Stremio were left alone.</div>` : '');
+    return;
+  }
+  const rows = st.rows.map((r, i) => `<label class="wr-row">
+      <input type="checkbox" data-wr-i="${i}" onchange="wrCount('${id}')" aria-label="Re-date ${esc(r.title || 'film')}">
+      <span class="wr-main"><span>${esc(r.title || '?')} <span class="muted">(${r.year || '?'})</span>${r.rating ? ` <span class="muted">· rated ${r.rating}/10, will be re-applied</span>` : ''}</span>
+      <span class="wr-dates">dated ${esc(wrDate(r.watched_at))} → release ${esc(wrDate(r.proposed))}</span></span></label>`).join('');
+  panel.innerHTML = `<div class="muted" style="margin-bottom:6px">${st.rows.length} film${st.rows.length === 1 ? '' : 's'} dated in the last ${d.days} days with a much older release${d.skipped_scrobbled ? ` · ${d.skipped_scrobbled} synced from Nuvio/Stremio skipped` : ''}. Tick the ones you only <i>marked</i> as viewed.</div>
+    <div class="wr-list" style="max-height:340px;overflow:auto">${rows}</div>
+    <div class="wr-bar">
+      <button class="ghost" onclick="wrAll('${id}', true)">Select all</button>
+      <button class="ghost" onclick="wrAll('${id}', false)">Select none</button>
+      <button data-wr-apply onclick="wrApply('${id}', this)" disabled>Re-date selected</button>
+      <span class="muted" data-wr-prog></span>
+    </div>
+    <div class="wr-result" style="margin-top:8px"></div>`;
+}
+
+function wrSelected(id) {
+  return [...document.querySelectorAll(`[data-id="${id}"] .wr-panel [data-wr-i]:checked`)].map(c => WR[id].rows[+c.dataset.wrI]);
+}
+function wrCount(id) {
+  const n = wrSelected(id).length;
+  const b = document.querySelector(`[data-id="${id}"] .wr-panel [data-wr-apply]`);
+  if (!b) return;
+  b.disabled = n === 0;
+  b.textContent = n ? `Re-date ${n} selected` : 'Re-date selected';
+}
+function wrAll(id, on) {
+  document.querySelectorAll(`[data-id="${id}"] .wr-panel [data-wr-i]`).forEach(c => { c.checked = on; });
+  wrCount(id);
+}
+
+const WR_ICON = { done: '<span class="wr-ok">✓</span>', rating_lost: '<span class="wr-warn">⚠</span>', date_mismatch: '<span class="wr-warn">⚠</span>', failed: '<span class="wr-bad">✗</span>', skipped: '<span class="muted">–</span>', undone: '<span class="wr-ok">↺</span>' };
+function wrResultHtml(results) {
+  return results.map(r => `<div style="padding:2px 0">${WR_ICON[r.status] || ''} ${esc(r.title || r.imdb_id || '?')} <span class="muted">${esc(r.status === 'done' ? `→ ${wrDate(r.new)}` : (r.detail || r.status))}</span></div>`).join('');
+}
+
+async function wrApply(id, btn) {
+  const sel = wrSelected(id);
+  if (!sel.length) return;
+  if (!confirm(`Re-date ${sel.length} film${sel.length === 1 ? '' : 's'} to their release date?\n\nEach is removed from Simkl history and added back; ratings are re-applied. This can be undone from the repair log.`)) return;
+  const panel = wrPanel(id);
+  const prog = panel.querySelector('[data-wr-prog]');
+  const out = panel.querySelector('.wr-result');
+  panel.querySelectorAll('input,button').forEach(el => { el.disabled = true; });
+  const all = [];
+  try {
+    for (let i = 0; i < sel.length; i += WR_CHUNK) {
+      const chunk = sel.slice(i, i + WR_CHUNK);
+      prog.textContent = ` ⟳ ${Math.min(i + WR_CHUNK, sel.length)} of ${sel.length}…`;
+      const r = await api(`/profiles/${id}/watch-repair/apply`, { method: 'POST', body: { items: chunk.map(c => ({ imdb_id: c.imdb_id, tmdb_id: c.tmdb_id })) } });
+      WR[id].batches.push(r.batch);
+      all.push(...r.results);
+      out.innerHTML = wrResultHtml(all);
+    }
+    const ok = all.filter(r => r.status === 'done').length;
+    prog.textContent = ` ✓ ${ok} of ${sel.length} re-dated`;
+    toast(`Re-dated ${ok} film${ok === 1 ? '' : 's'}`);
+  } catch (e) {
+    prog.textContent = '';
+    out.innerHTML = wrResultHtml(all) + `<div class="wr-bad" style="margin-top:6px">Stopped: ${esc(e.message)}. Anything listed above is kept; see the repair log to undo.</div>`;
+  }
+  if (WR[id].batches.length) {
+    const b = document.createElement('button');
+    b.className = 'ghost'; b.textContent = 'Undo this run';
+    b.onclick = () => wrUndo(id, WR[id].batches, b);
+    const bar = document.createElement('div'); bar.className = 'wr-bar'; bar.appendChild(b);
+    out.appendChild(bar);
+  }
+}
+
+async function wrUndo(id, batches, btn) {
+  if (!confirm('Put these films back to the dates they had before?')) return;
+  btn.disabled = true;
+  const all = [];
+  try {
+    for (const b of batches) {
+      const r = await api(`/profiles/${id}/watch-repair/undo`, { method: 'POST', body: { batch: b } });
+      all.push(...r.results);
+    }
+    toast(`Undid ${all.filter(r => r.status === 'undone').length} film(s)`);
+  } catch (e) { toast('Undo failed: ' + e.message); btn.disabled = false; }
+  btn.insertAdjacentHTML('afterend', `<div style="margin-top:6px">${wrResultHtml(all)}</div>`);
+}
+
+async function wrLog(id, btn) {
+  const box = document.querySelector(`[data-id="${id}"] .wr-logbox`);
+  box.innerHTML = '<span class="muted">Loading…</span>';
+  try {
+    const d = await api(`/profiles/${id}/watch-repair/log`);
+    if (!d.rows.length) { box.innerHTML = '<span class="muted">No repairs yet.</span>'; return; }
+    const byBatch = new Map();
+    for (const r of d.rows) { if (!byBatch.has(r.batch)) byBatch.set(r.batch, []); byBatch.get(r.batch).push(r); }
+    box.innerHTML = '';
+    for (const [b, rs] of byBatch) {
+      const det = document.createElement('details');
+      det.style.margin = '4px 0';
+      det.innerHTML = `<summary>${esc(new Date(+b).toLocaleString())} · ${rs.length} film${rs.length === 1 ? '' : 's'}</summary>
+        <div style="padding:4px 0 4px 12px">${rs.map(r => `<div style="padding:2px 0">${WR_ICON[r.status] || ''} ${esc(r.title || r.imdb_id || '?')} <span class="muted">${esc(wrDate(r.old_watched_at))} → ${esc(wrDate(r.new_watched_at))}${r.rating ? ` · rated ${r.rating}` : ''}${r.detail ? ` · ${esc(r.detail)}` : ''}</span></div>`).join('')}</div>`;
+      if (rs.some(r => ['done', 'rating_lost', 'date_mismatch'].includes(r.status))) {
+        const u = document.createElement('button');
+        u.className = 'ghost'; u.textContent = 'Undo this run';
+        u.onclick = () => wrUndo(id, [b], u);
+        det.appendChild(u);
+      }
+      box.appendChild(det);
+    }
+  } catch (e) { box.innerHTML = `<span class="wr-bad">${esc(e.message)}</span>`; }
 }
 
 async function resetRecs(id, btn) {
