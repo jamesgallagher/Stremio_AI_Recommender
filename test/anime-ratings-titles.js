@@ -106,6 +106,91 @@ function deps({ cache = {}, calls }) {
     watchedStore.deleteForProfile(pid);
   });
 
+  // ---- review fixes (PR #68 review) ----
+
+  await ok('ACTIONS: rate / un-rate / ignore / un-ignore on an anime row keep the English title + "Anime" genre (no flip-back)', async () => {
+    const pid = 'p-an3t-6';
+    watchedStore.upsertSeriesProgress(pid, [
+      row(1, 'anime', 'ttA1', '100', 'Shingeki no Kyojin', 3000), // cached English meta
+      row(2, 'anime', 'ttA2', '555', 'Kimetsu no Yaiba', 2000),   // not cached
+    ]);
+    const d = {
+      simkl: { setRatings: async () => ({}), removeRatings: async () => ({}) },
+      metaGet: (type, id) => (String(id) === '100' ? TMDB['100'] : null),
+      now: () => 9000, log: quiet,
+    };
+    const check = (res, title, what) => {
+      assert.strictEqual(res.ok, true, what);
+      assert.strictEqual(res.item.title, title, what + ' title');
+      assert.strictEqual(res.item.genre, 'Anime', what + ' genre');
+    };
+    check(await trainer.rate(profile(pid), { type: 'anime', tmdb_id: '100' }, 8, d), 'Attack on Titan', 'rate');
+    check(await trainer.rate(profile(pid), { type: 'anime', tmdb_id: '100' }, 8, d), 'Attack on Titan', 'rate (no-op)');
+    check(await trainer.rate(profile(pid), { type: 'anime', tmdb_id: '100' }, null, d), 'Attack on Titan', 'clear rating');
+    check(await trainer.setIgnored(profile(pid), { type: 'anime', tmdb_id: '100' }, true, d), 'Attack on Titan', 'ignore');
+    check(await trainer.setIgnored(profile(pid), { type: 'anime', tmdb_id: '100' }, false, d), 'Attack on Titan', 'un-ignore');
+    // an uncached row keeps its Simkl title (nothing to replace it with) but is still "Anime"
+    check(await trainer.rate(profile(pid), { type: 'anime', tmdb_id: '555' }, 7, d), 'Kimetsu no Yaiba', 'rate uncached');
+    watchedStore.deleteForProfile(pid);
+  });
+
+  await ok('FAILURES: titles whose lookup failed are skipped for an hour, so they cannot starve the rest of the page', async () => {
+    trainer._resetLookupFailures();
+    const pid = 'p-an3t-7'; const calls = [];
+    const rows = []; for (let i = 0; i < 40; i++) rows.push(row(i + 1, 'anime', 'ttA1', String(2000 + i), 'Anime ' + i, 10000 - i));
+    watchedStore.upsertSeriesProgress(pid, rows);
+    let nowMs = 1_000_000;
+    const d = () => ({
+      settings: { keyFor: () => 'k' }, metaGet: () => null, log: quiet, now: () => nowMs,
+      // the first 25 ids are permanent failures (404); the rest resolve
+      enrich: async (_k, _t, id) => { calls.push(String(id)); return Number(id) < 2025 ? null : { title: 'EN ' + id, poster: 'https://img/' + id, year: 2020, genres: [] }; },
+    });
+    const first = await trainer.listHistory(profile(pid), { type: 'anime', pageSize: 40 }, d());
+    assert.strictEqual(calls.length, 25, 'first request: the 25 failing rows use the slots');
+    assert.ok(first.items.slice(25).every((i) => i.poster == null), 'rows after them were not reached yet');
+    calls.length = 0;
+    const second = await trainer.listHistory(profile(pid), { type: 'anime', pageSize: 40 }, d());
+    assert.strictEqual(calls.length, 15, 'second request: failed rows skipped, the remaining 15 fetched');
+    assert.ok(!calls.some((id) => Number(id) < 2025));
+    assert.ok(second.items.slice(25).every((i) => i.poster && i.title.startsWith('EN ')), 'the rest of the page now has thumbnails + English titles');
+    // after the retry window the failed rows are tried again
+    calls.length = 0; nowMs += 61 * 60e3;
+    await trainer.listHistory(profile(pid), { type: 'anime', pageSize: 40 }, d());
+    assert.ok(calls.includes('2000'), 'failed titles are retried after an hour');
+    watchedStore.deleteForProfile(pid);
+  });
+
+  await ok('BUDGET: a slow TMDB cannot stall the list — it returns within the budget with the Simkl data', async () => {
+    trainer._resetLookupFailures();
+    const pid = 'p-an3t-8';
+    const rows = []; for (let i = 0; i < 12; i++) rows.push(row(i + 1, 'anime', 'ttA1', String(3000 + i), 'Slow ' + i, 10000 - i));
+    watchedStore.upsertSeriesProgress(pid, rows);
+    const t0 = Date.now();
+    const res = await trainer.listHistory(profile(pid), { type: 'anime', pageSize: 25 }, {
+      settings: { keyFor: () => 'k' }, metaGet: () => null, log: quiet, fillBudgetMs: 80,
+      enrich: () => new Promise(() => {}), // never settles
+    });
+    assert.ok(Date.now() - t0 < 1500, 'returned promptly, not after the hung lookups');
+    assert.strictEqual(res.items.length, 12);
+    assert.ok(res.items.every((i) => i.title.startsWith('Slow ') && i.genre === 'Anime'));
+    watchedStore.deleteForProfile(pid);
+  });
+
+  await ok('BULK READ: the cache is read with ONE query for the whole list, not one per row', async () => {
+    const pid = 'p-an3t-9';
+    const rows = []; for (let i = 0; i < 30; i++) rows.push(row(i + 1, 'anime', 'ttA1', String(4000 + i), 'Row ' + i, 10000 - i));
+    watchedStore.upsertSeriesProgress(pid, rows);
+    let many = 0; let single = 0;
+    await trainer.listHistory(profile(pid), { type: 'anime', pageSize: 30 }, {
+      settings: { keyFor: () => null }, log: quiet,
+      metaGetMany: (type, ids) => { many++; assert.strictEqual(ids.length, 30); return new Map(); },
+      metaGet: () => { single++; return null; },
+    });
+    assert.strictEqual(many, 1);
+    assert.strictEqual(single, 0);
+    watchedStore.deleteForProfile(pid);
+  });
+
   console.log(`\nAll anime ratings titles checks passed (${passed}).${failed ? ` FAILED: ${failed}` : ''}`);
   process.exit(failed ? 1 : 0);
 })();
