@@ -1304,6 +1304,14 @@ async function httpTests() {
     console.log('  ✓ regression: /mobile data routes require a session');
   }
 
+  // TD-1: /mobile/api/title-detail also requires a session (401 without cookie).
+  {
+    const res = await fetch(`${BASE}/mobile/api/title-detail?type=movie&imdb_id=tt1&tmdb_id=1`);
+    assert.strictEqual(res.status, 401);
+    assert.strictEqual((await res.json()).error, 'Not signed in');
+    console.log('  ✓ TD-1: /mobile/api/title-detail requires a session (401)');
+  }
+
   // End-to-end: issue in-process (to read the code), verify over HTTP, use the
   // cookie on /me, then logout revokes it.
   {

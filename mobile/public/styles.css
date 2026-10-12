@@ -47,6 +47,14 @@ button:disabled { opacity: .55; cursor: default; }
 button.ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); min-height: 40px; padding: 8px 12px; }
 button.ghost:hover { color: var(--text); border-color: var(--muted); }
 button.block { width: 100%; }
+/* TD-1: title detail open buttons (poster + title) — styled like text, so the
+   row looks unchanged until hovered. Overrides the global accent-button look. */
+.td-open { border: 0; background: none; padding: 0; margin: 0; min-height: 0; color: inherit; text-align: left; cursor: pointer; }
+.td-open:hover { background: none; text-decoration: underline; }
+.td-open:focus-visible { background: none; text-decoration: underline; outline: 2px solid var(--accent); }
+.rec .td-open.td-open-poster { width: 64px; min-width: 64px; height: 96px; display: inline-flex; align-items: center; justify-content: center; }
+.result .td-open.td-open-poster { width: 64px; min-width: 64px; height: 96px; display: inline-flex; align-items: center; justify-content: center; }
+.tq-card .td-open.td-open-poster { display: block; }
 
 .container { width: 100%; max-width: 720px; margin: 0 auto; padding: 16px; }
 .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
@@ -154,10 +162,6 @@ input[type=search]:focus { border-color: var(--accent); }
   padding: 20px; padding-bottom: calc(20px + env(safe-area-inset-bottom));
 }
 .sheet-close { position: absolute; top: 10px; right: 10px; min-height: 34px; padding: 4px 10px; }
-.sheet-head { display: flex; gap: 14px; margin: 4px 0 12px; }
-.sheet-poster { width: 92px; min-width: 92px; height: 138px; object-fit: cover; border-radius: 10px; background: var(--card2); }
-.sheet-head h2 { font-size: 18px; margin: 0 0 6px; }
-.sheet-synopsis { color: var(--text); font-size: 14px; line-height: 1.5; margin: 0 0 16px; }
 @media (min-width: 640px) {
   .sheet { align-items: center; }
   .sheet-panel { border-radius: 16px; }
@@ -267,6 +271,14 @@ select:focus { border-color: var(--accent); }
 .pv-nope:hover { background: var(--err); }
 .pv-cap { display: block; margin-top: 5px; line-height: 1.3;
   overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+/* TD-1: preview detail open buttons — the poster fills its .pv-poster box; the
+   caption keeps the .pv-cap 2-line clamp. */
+.pv-poster .td-open.td-open-poster { width: 100%; height: 100%; display: block; }
+/* TD-1: quick card's ⓘ details icon — a small round button in the card corner. */
+.td-info-icon { position: absolute; top: 8px; right: 8px; width: 44px; height: 44px; min-width: 0; min-height: 0;
+  padding: 0; display: flex; align-items: center; justify-content: center; border: 0; border-radius: 999px;
+  background: rgba(0,0,0,.62); color: #fff; font-size: 18px; line-height: 1; cursor: pointer; z-index: 1; }
+.td-info-icon:hover { background: rgba(0,0,0,.82); }
 .field { margin-top: 4px; }
 .field + .field { margin-top: 12px; }
 .field > label { margin-top: 0; }

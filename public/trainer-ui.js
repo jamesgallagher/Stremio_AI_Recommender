@@ -4,6 +4,15 @@
 // the rate queue takes its timer functions as parameters (createRateQueue).
 const TrainerUI = {};
 
+// TD-1: the shared title-detail component — required in Node (tests), global in
+// the browser (title-detail.js loads before this file in both /configure and /mobile).
+// Resolved lazily (not a top-level `const TitleDetail`): two <script> tags share
+// the global script scope, so a top-level `const TitleDetail` here collides with
+// title-detail.js's own `const TitleDetail` and breaks the whole page.
+function titleDetail() {
+  return (typeof require === 'function') ? require('./title-detail') : window.TitleDetail;
+}
+
 // Filter views, in chip order.
 TrainerUI.VIEWS = [['all', 'All'], ['unrated', 'Unrated'], ['rated', 'Rated'], ['loved', 'Loved ♥'], ['ignored', 'Ignored'], ['unfinished', 'Unfinished']];
 
@@ -180,6 +189,11 @@ TrainerUI.rowHtml = (item, { canRate, now }) => {
     ? `<img class="tr-thumb" src="${esc(item.poster)}" alt="">`
     : '<span class="tr-thumb"></span>';
   const title = `${esc(item.title || '?')}${item.year ? ` <span class="muted">(${esc(item.year)})</span>` : ''}`;
+  // TD-1: the poster and title are the detail-modal click targets. This row
+  // renders on both the portal Ratings tab and the mobile Ratings List.
+  const tdItem = { type: item.type, imdb_id: item.imdb_id, tmdb_id: item.tmdb_id, name: item.title || '', year: item.year || null, poster: item.poster || null };
+  const thumbBtn = titleDetail().openBtn(tdItem, thumb, 'poster');
+  const titleBtn = titleDetail().openBtn(tdItem, title, 'title');
   const genre = esc(item.genre || '—');
   const when = item.status === 'unfinished'
     ? `Stopped at ${esc(item.percent)}%`
@@ -215,7 +229,7 @@ TrainerUI.rowHtml = (item, { canRate, now }) => {
       ? `<button class="ghost mini" data-act="unignore" aria-label="Undo ignore" title="${esc(TrainerUI.TIPS.unignore)}">Unignore</button> ${isSeries ? '' : unwatchBtn()}`
       : `<button class="ghost mini tr-heart" data-act="love" aria-pressed="${item.loved ? 'true' : 'false'}" aria-label="Love" title="${esc(!canRate ? 'Connect Simkl to rate' : (item.loved ? TrainerUI.TIPS.unlove : TrainerUI.TIPS.love))}"${canRate ? '' : ' disabled'}>♥</button> <button class="ghost mini" data-act="ignore" aria-label="Ignore" title="${esc(TrainerUI.TIPS.ignore)}">Ignore</button> ${isSeries ? '' : unwatchBtn()}`;
   return `<div class="tr-row" data-key="${esc(item.key)}">
-    <div class="tr-cell tr-title">${thumb}<span class="tr-tt">${title}</span></div>
+    <div class="tr-cell tr-title">${thumbBtn}<span class="tr-tt">${titleBtn}</span></div>
     <div class="tr-cell">${genre}</div>
     <div class="tr-cell"${isSeries ? ` title="${esc(TrainerUI.TIPS.showProgress)}"` : ''}>${when}</div>
     <div class="tr-cell tr-rating">${item.status === 'unfinished' ? '—' : starsCell()}</div>

@@ -1234,6 +1234,19 @@ router.post('/profiles/:id/watchlist/remove', async (req, res) => {
 
 // MW-02 — mark a title watched from a catalog-preview cell (the eye). The one
 // backend addition this card needs; the companion already has /api/watched from
+// TD-1: title detail modal data (poster, synopsis, cast, age rating).
+router.get('/profiles/:id/title-detail', async (req, res) => {
+  const profile = config.getProfile(req.params.id);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  const { type, imdb_id, tmdb_id } = req.query;
+  if (type !== 'movie' && type !== 'series' && type !== 'anime') return res.status(400).json({ error: 'bad-type' });
+  if (!imdb_id && tmdb_id == null) return res.status(400).json({ error: 'no-id' });
+  const detail = await require('./titleDetail').getTitleDetail(profile, { type, imdbId: imdb_id, tmdbId: tmdb_id }, console);
+  if (!detail) return res.status(404).json({ error: 'no-detail' });
+  res.set('Cache-Control', 'no-store');
+  res.json(detail);
+});
+
 // MW-00. Resolves the profile from :id (admin-guarded, like the other portal
 // profile routes) and delegates to the SHARED markWatched action, so the Simkl
 // history write + pending-watched serve-prune behave identically to the companion.

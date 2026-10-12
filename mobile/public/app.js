@@ -5,6 +5,11 @@
   const API = '/mobile/api';
   const state = { authed: false, profile: null, pendingEmail: '' };
 
+  // TD-1: build the title-detail query string (session-scoped, no profile id).
+  const tdParams = (item) => 'type=' + encodeURIComponent(item.type || '')
+    + '&imdb_id=' + encodeURIComponent(item.imdb_id || '')
+    + '&tmdb_id=' + encodeURIComponent(item.tmdb_id || '');
+
   const $ = (id) => document.getElementById(id);
   const els = {
     login: $('view-login'), shell: $('shell'),
@@ -122,11 +127,8 @@
   const sEls = {
     input: $('search-input'), msg: $('search-msg'), results: $('search-results'),
     segs: document.querySelectorAll('.seg'),
-    sheet: $('detail-sheet'), poster: $('sheet-poster'), title: $('sheet-title'),
-    meta: $('sheet-meta'), syn: $('sheet-synopsis'), add: $('sheet-add'), addMsg: $('sheet-add-msg'),
   };
   const setSearchMsg = (t, kind) => { sEls.msg.textContent = t || ''; sEls.msg.className = 'msg' + (kind ? ' ' + kind : ''); };
-  const setAddMsg = (t, kind) => { sEls.addMsg.textContent = t || ''; sEls.addMsg.className = 'msg' + (kind ? ' ' + kind : ''); };
 
   async function runSearch() {
     const q = sEls.input.value.trim();
@@ -157,41 +159,32 @@
       sub.textContent = [r.year || '', r.rating ? '★ ' + r.rating : ''].filter(Boolean).join(' · ');
       meta.appendChild(h); meta.appendChild(sub);
       card.appendChild(img); card.appendChild(meta);
-      card.addEventListener('click', () => openSheet(i));
+      // TD-1: the whole result card opens the shared detail modal (poster and
+      // title are the targets; there are no per-card action buttons here). The
+      // "Add to Watch Later" footer action does what the old sheet's Add button did.
+      const item = { type: r.type, imdb_id: r.id, tmdb_id: r.tmdb_id, name: r.title || '', year: r.year || null, poster: r.poster || null };
+      card.addEventListener('click', () => TitleDetail.open(item, {
+        fetchDetail: (it) => apiFetch('/title-detail?' + tdParams(it)).then(res => res.ok ? res.json() : null).catch(() => null),
+        actions: [{ label: 'Add to Watch Later', onClick: (it, closeFn) => { addToWatchlistFromItem(it); closeFn(); } }],
+        opener: card,
+      }));
       frag.appendChild(card);
     });
     sEls.results.appendChild(frag);
   }
 
-  function openSheet(index) {
-    const r = search.results[index];
-    if (!r) return;
-    sEls.sheet.dataset.index = String(index);
-    if (r.poster) { sEls.poster.src = r.poster; sEls.poster.style.visibility = 'visible'; }
-    else { sEls.poster.removeAttribute('src'); sEls.poster.style.visibility = 'hidden'; }
-    sEls.title.textContent = r.title || 'Untitled';
-    sEls.meta.textContent = [r.type === 'series' ? 'Show' : 'Movie', r.year || '', r.rating ? '★ ' + r.rating : ''].filter(Boolean).join(' · ');
-    sEls.syn.textContent = r.synopsis || 'No synopsis available.';
-    sEls.add.disabled = false; sEls.add.textContent = '➕ Add to watchlist';
-    setAddMsg('');
-    sEls.sheet.hidden = false;
-  }
-  const closeSheet = () => { sEls.sheet.hidden = true; };
-
-  async function addToWatchlist() {
-    const r = search.results[parseInt(sEls.sheet.dataset.index, 10)];
-    if (!r) return;
-    sEls.add.disabled = true; setAddMsg('Adding…');
+  // TD-1: the detail modal's "Add to Watch Later" action — the same POST the old
+  // sheet's Add button made, with the same success/failure messages.
+  async function addToWatchlistFromItem(item) {
     try {
       const res = await apiFetch('/watchlist', {
         method: 'POST',
-        body: JSON.stringify({ type: r.type, imdb_id: r.id, tmdb_id: r.tmdb_id, title: r.title, year: r.year }),
+        body: JSON.stringify({ type: item.type, imdb_id: item.imdb_id, tmdb_id: item.tmdb_id, title: item.name, year: item.year }),
       });
       // Don't read the POST body (proxy may stall it) — act on the status.
-      if (res.ok) { sEls.add.textContent = '✓ Added to watchlist'; setAddMsg('Added to your Simkl Watch Later.', 'ok'); return; }
-      setAddMsg(res.status === 400 ? 'Connect Simkl in the portal first.' : 'Could not add — try again.', 'err');
-      sEls.add.disabled = false;
-    } catch { setAddMsg('Could not add — try again.', 'err'); sEls.add.disabled = false; }
+      if (res.ok) { setSearchMsg('Added to your Simkl Watch Later.', 'ok'); return; }
+      setSearchMsg(res.status === 400 ? 'Connect Simkl in the portal first.' : 'Could not add — try again.', 'err');
+    } catch { setSearchMsg('Could not add — try again.', 'err'); }
   }
 
   sEls.input.addEventListener('input', () => { clearTimeout(search.timer); search.timer = setTimeout(runSearch, 300); });
@@ -201,8 +194,6 @@
     sEls.input.placeholder = search.type === 'series' ? 'Search shows…' : 'Search movies…';
     runSearch();
   }));
-  sEls.add.addEventListener('click', addToWatchlist);
-  sEls.sheet.querySelectorAll('[data-close]').forEach((el) => el.addEventListener('click', closeSheet));
 
   // ---- recommendations (Step 4/5) ----
   // recs.data[type] = { view, items, display, benchExhausted } | null
@@ -298,10 +289,19 @@
     under.appendChild(hRemove); under.appendChild(hSave);
 
     const body = document.createElement('div'); body.className = 'rec-body';
+    // TD-1: the poster and title are the detail-modal click targets. A tap opens
+    // the modal; a swipe (drag) still saves/suppresses and never opens it.
+    const tdItem = { type: r.type, imdb_id: r.id, tmdb_id: r.tmdb_id, name: r.title || '', year: r.year || null, poster: r.poster || null };
     const img = document.createElement('img'); img.className = 'rec-poster'; img.loading = 'lazy'; img.alt = '';
     if (r.poster) img.src = r.poster; else img.classList.add('no-poster');
+    const posterBtn = document.createElement('button');
+    TitleDetail.markOpenBtn(posterBtn, tdItem, 'poster');
+    posterBtn.appendChild(img);
     const meta = document.createElement('div'); meta.className = 'rec-meta';
-    const title = document.createElement('div'); title.className = 'rec-title'; title.textContent = r.title || 'Untitled';
+    const title = document.createElement('button');
+    TitleDetail.markOpenBtn(title, tdItem, 'title');
+    title.classList.add('rec-title');
+    title.textContent = r.title || 'Untitled';
     const sub = document.createElement('div'); sub.className = 'rec-sub';
     sub.textContent = [r.year || '', r.genre || '', r.rating ? '★ ' + Number(r.rating).toFixed(1) : ''].filter(Boolean).join(' · ');
     meta.appendChild(title); meta.appendChild(sub);
@@ -317,7 +317,15 @@
     watchedBtn.addEventListener('click', (e) => { e.stopPropagation(); watchRec(r, row); });
     remBtn.addEventListener('click', (e) => { e.stopPropagation(); removeRec(r, row); });
     actions.appendChild(saveBtn); actions.appendChild(watchedBtn); actions.appendChild(remBtn);
-    body.appendChild(img); body.appendChild(meta); body.appendChild(actions);
+    // TD-1: a tap on the poster or title opens the detail modal; a swipe (the
+    // row._wasDrag flag set by attachSwipe) never does.
+    const openDetail = (btn) => () => {
+      if (row._wasDrag) { row._wasDrag = false; return; }
+      TitleDetail.openFromBtn(btn, (item) => apiFetch('/title-detail?' + tdParams(item)).then(res => res.ok ? res.json() : null).catch(() => null));
+    };
+    posterBtn.addEventListener('click', openDetail(posterBtn));
+    title.addEventListener('click', openDetail(title));
+    body.appendChild(posterBtn); body.appendChild(meta); body.appendChild(actions);
 
     row.appendChild(under); row.appendChild(body);
     attachSwipe(row, body, under, hRemove, hSave, r);
@@ -325,10 +333,14 @@
   }
 
   function attachSwipe(row, body, under, hRemove, hSave, r) {
-    let dragging = false, startX = 0, width = 0, action = 'none';
+    let dragging = false, startX = 0, startY = 0, startTime = 0, width = 0, action = 'none';
     body.addEventListener('pointerdown', (e) => {
+      // TD-1: record the sequence start for every pointerdown (even on the
+      // td-open buttons) so a tap-vs-drag decision is available on pointerup.
+      startX = e.clientX; startY = e.clientY; startTime = Date.now();
+      row._wasDrag = false;
       if (e.target.closest('button')) return; // buttons handle their own taps
-      dragging = true; startX = e.clientX; width = row.offsetWidth || 320; action = 'none';
+      dragging = true; width = row.offsetWidth || 320; action = 'none';
       try { body.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
     });
     body.addEventListener('pointermove', (e) => {
@@ -340,7 +352,13 @@
       hRemove.style.opacity = o.direction === 'right' ? String(o.progress) : '0';
       hSave.style.opacity = o.direction === 'left' ? String(o.progress) : '0';
     });
-    const end = () => {
+    const end = (e) => {
+      // TD-1: a swipe (not a tap) sets the flag so the td-open click handler
+      // skips opening the modal for that gesture.
+      if (startTime) {
+        if (!TitleDetail.isTap(e.clientX - startX, e.clientY - startY, Date.now() - startTime)) row._wasDrag = true;
+        startTime = 0;
+      }
       if (!dragging) return;
       dragging = false;
       body.style.transform = ''; under.style.background = ''; hRemove.style.opacity = '0'; hSave.style.opacity = '0';
@@ -619,9 +637,15 @@
     const grid = document.createElement('div'); grid.className = 'preview-grid';
     data.metas.forEach((m) => {
       const cell = document.createElement('div'); cell.className = 'pv-cell';
+      // TD-1: the poster and caption are the detail-modal click targets; the
+      // eye/✕ corner actions are unchanged.
+      const tdItem = { type: data.type, imdb_id: m.id, tmdb_id: null, name: m.name || '', year: m.releaseInfo || null, poster: m.poster || null };
       const wrap = document.createElement('div'); wrap.className = 'pv-poster';
-      if (m.poster) { const img = document.createElement('img'); img.loading = 'lazy'; img.alt = ''; img.src = m.poster; wrap.appendChild(img); }
-      else { const ph = document.createElement('div'); ph.className = 'pv-noposter'; ph.textContent = m.name || 'No poster'; wrap.appendChild(ph); }
+      const posterBtn = document.createElement('button');
+      TitleDetail.markOpenBtn(posterBtn, tdItem, 'poster');
+      if (m.poster) { const img = document.createElement('img'); img.loading = 'lazy'; img.alt = ''; img.src = m.poster; posterBtn.appendChild(img); }
+      else { const ph = document.createElement('div'); ph.className = 'pv-noposter'; ph.textContent = m.name || 'No poster'; posterBtn.appendChild(ph); }
+      wrap.appendChild(posterBtn);
       // RPDB posters already carry the rating; this numeric badge is the fallback
       // when the served meta has an imdbRating but no RPDB key (CP-03 populates it).
       if (m.imdbRating) { const r = document.createElement('span'); r.className = 'pv-rating'; r.title = 'IMDb rating'; r.textContent = '★ ' + m.imdbRating; wrap.appendChild(r); }
@@ -636,8 +660,13 @@
       nope.title = xLbl; nope.setAttribute('aria-label', xLbl + ': ' + (m.name || '')); nope.textContent = '✕';
       nope.addEventListener('click', (e) => { e.stopPropagation(); if (isWatchLater) pvRemoveFromWatchlist(m, data.type, cell); else pvNotInterested(m, data.type, cell); });
       wrap.appendChild(eye); wrap.appendChild(nope);
-      const cap = document.createElement('span'); cap.className = 'pv-cap';
+      const cap = document.createElement('button');
+      TitleDetail.markOpenBtn(cap, tdItem, 'title');
+      cap.classList.add('pv-cap');
       cap.textContent = (m.name || '') + (m.releaseInfo ? ' (' + m.releaseInfo + ')' : '');
+      const openDetail = (btn) => (e) => { e.stopPropagation(); TitleDetail.openFromBtn(btn, (item) => apiFetch('/title-detail?' + tdParams(item)).then(res => res.ok ? res.json() : null).catch(() => null)); };
+      posterBtn.addEventListener('click', openDetail(posterBtn));
+      cap.addEventListener('click', openDetail(cap));
       cell.appendChild(wrap); cell.appendChild(cap);
       grid.appendChild(cell);
     });

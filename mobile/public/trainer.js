@@ -63,6 +63,12 @@
     if (!res.ok) throw new Error((body && body.error) || ('HTTP ' + res.status));
     return body;
   }
+  // TD-1: build the title-detail query string (session-scoped, no profile id).
+  function tdParams(item) {
+    return 'type=' + encodeURIComponent(item.type || '')
+      + '&imdb_id=' + encodeURIComponent(item.imdb_id || '')
+      + '&tmdb_id=' + encodeURIComponent(item.tmdb_id || '');
+  }
   async function postRate(key, rating, o) {
     // F1: pass keepalive through to fetch (apiFetch spreads opts into fetch), so
     // a flush on page-hide can send the rating even as the page closes.
@@ -220,7 +226,7 @@
 
   function listClick(e) {
     // TV-R §5: the Films | Shows toggle — switching resets view/page/q and reloads.
-    const typeBtn = e.target.closest('button[data-type]');
+    const typeBtn = e.target.closest('button[data-type]:not(.td-open)');
     if (typeBtn) {
       st.type = typeBtn.dataset.type;
       st.view = 'all';
@@ -234,6 +240,13 @@
       st.view = chip.dataset.view;
       st.page = 1;
       loadList();
+      return;
+    }
+    // TD-1: a tap on a row's poster or title opens the shared detail modal.
+    // Checked before the action-button branch so the td-open target wins.
+    const tdOpen = e.target.closest('.td-open');
+    if (tdOpen) {
+      TitleDetail.openFromBtn(tdOpen, (item) => api('/title-detail?' + tdParams(item)).catch(() => null));
       return;
     }
     const btn = e.target.closest('button[data-act]');
@@ -470,16 +483,24 @@
       if (btn) btn.addEventListener('click', () => { st.mode = 'list'; saveMode(); drawMode(); });
       return;
     }
-    const poster = item.poster
+    // TD-1: the poster, title, and the ⓘ icon are the detail-modal click
+    // targets. A tap opens the modal; a swipe (the card._wasDrag flag set by
+    // bindSwipe) still ignores/skips/loves and never opens it.
+    const tdItem = { type: item.type, imdb_id: item.imdb_id, tmdb_id: item.key, name: item.title || '', year: item.year || null, poster: item.poster || null };
+    const posterInner = item.poster
       ? '<img class="tq-poster" src="' + esc(item.poster) + '" alt="" draggable="false">'
       : '<div class="tq-poster tq-noposter"></div>';
-    const meta = esc(item.title || '?') + (item.year ? ' <span class="muted">(' + esc(item.year) + ')</span>' : '')
+    const posterBtn = TitleDetail.openBtn(tdItem, posterInner, 'poster');
+    const titleBtn = TitleDetail.openBtn(tdItem, esc(item.title || '?') + (item.year ? ' <span class="muted">(' + esc(item.year) + ')</span>' : ''), 'title');
+    const infoBtn = '<button type="button" class="td-info-icon td-open" data-type="' + esc(item.type || '') + '" data-imdb="' + esc(item.imdb_id || '') + '" data-tmdb="' + esc(item.key || '') + '" data-name="' + esc(item.title || '') + '" data-year="' + esc(item.year || '') + '" data-poster="' + esc(item.poster || '') + '" aria-label="Details">ⓘ</button>';
+    const meta = titleBtn
       + '<br><span class="muted">' + esc(item.genre || '—') + ' · ' + T.whenText(item.watched_at, Date.now()) + '</span>';
     const stars = buildStarsHtml(item);
     const shown = st.shown.has(item.key) ? st.shown.get(item.key) : item.rating;
     els.quick.innerHTML = '<div class="tq-left">' + left + ' left to rate</div>'
       + '<div class="tq-card" data-key="' + esc(item.key) + '">'
-      + poster
+      + infoBtn
+      + posterBtn
       + '<div class="tq-meta">' + meta + '</div>'
       + stars
       + '<div class="tq-rating-text">' + T.ratingText(shown) + '</div>'
@@ -709,19 +730,22 @@
   // Card swipe: left = Ignore, right = Skip, up = Love. Never starts on the star
   // group or a button (P5).
   function bindSwipe(card, item) {
-    let dragging = false, startX = 0, startY = 0, w = 0, h = 0;
+    let dragging = false, startX = 0, startY = 0, startTime = 0, w = 0, h = 0;
     const overlayOf = () => card.querySelector('.tq-overlay');
     const resetOverlay = () => {
       const overlay = overlayOf();
       if (overlay) { overlay.style.opacity = '0'; overlay.className = 'tq-overlay'; }
     };
     card.addEventListener('pointerdown', (e) => {
-      if (e.target.closest('.tr-stars, button')) return;
+      // TD-1: record the sequence start for every pointerdown (even on the
+      // td-open buttons) so a tap-vs-drag decision is available on pointerup.
+      startX = e.clientX; startY = e.clientY; startTime = Date.now();
+      card._wasDrag = false;
+      if (e.target.closest('.tr-stars, button, .td-open')) return;
       // F2: stop the native image drag on a mouse drag (so the swipe works on
       // desktop); never for touch, so scrolling and taps keep working.
       if (e.pointerType === 'mouse') e.preventDefault();
       dragging = true;
-      startX = e.clientX; startY = e.clientY;
       w = card.offsetWidth; h = card.offsetHeight;
       try { card.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
     });
@@ -740,6 +764,12 @@
       }
     });
     const end = (e) => {
+      // TD-1: a swipe (not a tap) sets the flag so the td-open click handler
+      // skips opening the modal for that gesture.
+      if (startTime) {
+        if (!TitleDetail.isTap(e.clientX - startX, e.clientY - startY, Date.now() - startTime)) card._wasDrag = true;
+        startTime = 0;
+      }
       if (!dragging) return;
       dragging = false;
       const dx = e.clientX - startX, dy = e.clientY - startY;
@@ -762,7 +792,11 @@
       }
     };
     card.addEventListener('pointerup', end);
-    card.addEventListener('pointercancel', () => {
+    card.addEventListener('pointercancel', (e) => {
+      if (startTime) {
+        if (!TitleDetail.isTap(e.clientX - startX, e.clientY - startY, Date.now() - startTime)) card._wasDrag = true;
+        startTime = 0;
+      }
       if (!dragging) return;
       dragging = false;
       card.style.transition = 'transform 200ms';
@@ -784,6 +818,15 @@
     bindList();
     els.banner.addEventListener('click', (e) => {
       if (e.target.closest('button[data-act="rebuild"]')) doRebuild();
+    });
+    // TD-1: a tap on the quick card's poster, title, or ⓘ icon opens the shared
+    // detail modal; a swipe (card._wasDrag set by bindSwipe) never does.
+    els.quick.addEventListener('click', (e) => {
+      const tdOpen = e.target.closest('.td-open');
+      if (!tdOpen) return;
+      const card = tdOpen.closest('.tq-card');
+      if (card && card._wasDrag) { card._wasDrag = false; return; }
+      TitleDetail.openFromBtn(tdOpen, (item) => api('/title-detail?' + tdParams(item)).catch(() => null));
     });
   }
 
