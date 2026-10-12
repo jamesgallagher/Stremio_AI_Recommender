@@ -178,6 +178,7 @@ if (typeof document !== 'undefined') {
   let _prevFocus = null;
   let _opener = null;
   let _actions = null;
+  let _tdPushed = false;
 
   function _ensureDOM() {
     if (_panel) return _panel;
@@ -224,6 +225,28 @@ if (typeof document !== 'undefined') {
     return panel;
   }
 
+  function _attachRetry(panel, item, opts) {
+    const retryBtn = panel.querySelector('.td-retry');
+    if (retryBtn) {
+      retryBtn.addEventListener('click', () => {
+        panel.querySelector('.td-head').innerHTML = _extractHead(TitleDetail.renderDetailHtml(item, null, { loading: true }));
+        panel.querySelector('.td-body').innerHTML = _extractBody(TitleDetail.renderDetailHtml(item, null, { loading: true }));
+        _reqId++;
+        const retryId = _reqId;
+        opts.fetchDetail(item).then((detail) => {
+          if (retryId !== _reqId) return;
+          const html = TitleDetail.renderDetailHtml(item, detail || null, detail ? {} : { error: true });
+          panel.querySelector('.td-head').innerHTML = _extractHead(html);
+          panel.querySelector('.td-body').innerHTML = _extractBody(html);
+        }).catch(() => {
+          const errHtml = TitleDetail.renderDetailHtml(item, null, { error: true });
+          panel.querySelector('.td-head').innerHTML = _extractHead(errHtml);
+          panel.querySelector('.td-body').innerHTML = _extractBody(errHtml);
+        });
+      });
+    }
+  }
+
   TitleDetail.open = (item, opts = {}) => {
     const panel = _ensureDOM();
     _reqId++;
@@ -238,6 +261,7 @@ if (typeof document !== 'undefined') {
     closeBtn.focus();
     // History pushState (mobile Back button).
     history.pushState({ td: 1 }, '');
+    _tdPushed = true;
     // Render loading state.
     const loadingHtml = TitleDetail.renderDetailHtml(item, null, { loading: true });
     panel.querySelector('.td-head').innerHTML = _extractHead(loadingHtml);
@@ -250,6 +274,7 @@ if (typeof document !== 'undefined') {
           const errHtml = TitleDetail.renderDetailHtml(item, null, { error: true });
           panel.querySelector('.td-head').innerHTML = _extractHead(errHtml);
           panel.querySelector('.td-body').innerHTML = _extractBody(errHtml);
+          _attachRetry(panel, item, opts);
           return;
         }
         const html = TitleDetail.renderDetailHtml(item, detail, {});
@@ -283,25 +308,7 @@ if (typeof document !== 'undefined') {
         const errHtml = TitleDetail.renderDetailHtml(item, null, { error: true });
         panel.querySelector('.td-head').innerHTML = _extractHead(errHtml);
         panel.querySelector('.td-body').innerHTML = _extractBody(errHtml);
-        const retryBtn = panel.querySelector('.td-retry');
-        if (retryBtn) {
-          retryBtn.addEventListener('click', () => {
-            panel.querySelector('.td-head').innerHTML = _extractHead(TitleDetail.renderDetailHtml(item, null, { loading: true }));
-            panel.querySelector('.td-body').innerHTML = _extractBody(TitleDetail.renderDetailHtml(item, null, { loading: true }));
-            _reqId++;
-            const retryId = _reqId;
-            opts.fetchDetail(item).then((detail) => {
-              if (retryId !== _reqId) return;
-              const html = TitleDetail.renderDetailHtml(item, detail || null, detail ? {} : { error: true });
-              panel.querySelector('.td-head').innerHTML = _extractHead(html);
-              panel.querySelector('.td-body').innerHTML = _extractBody(html);
-            }).catch(() => {
-              const errHtml = TitleDetail.renderDetailHtml(item, null, { error: true });
-              panel.querySelector('.td-head').innerHTML = _extractHead(errHtml);
-              panel.querySelector('.td-body').innerHTML = _extractBody(errHtml);
-            });
-          });
-        }
+        _attachRetry(panel, item, opts);
       });
     }
   };
@@ -311,6 +318,7 @@ if (typeof document !== 'undefined') {
     const backdrop = _panel.parentElement;
     backdrop.remove();
     _panel = null;
+    _tdPushed = false;
     document.body.style.overflow = _prevOverflow || '';
     // Focus return.
     const target = (_opener && document.contains(_opener)) ? _opener : _prevFocus;
@@ -337,9 +345,26 @@ if (typeof document !== 'undefined') {
     }
   }, true); // capture phase so it fires before other handlers.
 
-  // popstate: close on Back button.
+  // Focus trap: Tab cycles within the modal.
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Tab' || !_panel) return;
+    const focusable = _panel.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }, true);
+
+  // popstate: close on Back button (flag-based, since e.state is the entry we navigate TO).
   window.addEventListener('popstate', (e) => {
-    if (_panel && e.state?.td) {
+    if (_panel && _tdPushed) {
+      _tdPushed = false;
       TitleDetail.close();
     }
   });

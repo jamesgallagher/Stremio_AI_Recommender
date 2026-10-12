@@ -164,7 +164,7 @@
       // "Add to Watch Later" footer action does what the old sheet's Add button did.
       const item = { type: r.type, imdb_id: r.id, tmdb_id: r.tmdb_id, name: r.title || '', year: r.year || null, poster: r.poster || null };
       card.addEventListener('click', () => TitleDetail.open(item, {
-        fetchDetail: (it) => apiFetch('/title-detail?' + tdParams(it)).catch(() => null),
+        fetchDetail: (it) => apiFetch('/title-detail?' + tdParams(it)).then(res => res.ok ? res.json() : null).catch(() => null),
         actions: [{ label: 'Add to Watch Later', onClick: (it, closeFn) => { addToWatchlistFromItem(it); closeFn(); } }],
         opener: card,
       }));
@@ -321,7 +321,7 @@
     // row._wasDrag flag set by attachSwipe) never does.
     const openDetail = (btn) => () => {
       if (row._wasDrag) { row._wasDrag = false; return; }
-      TitleDetail.openFromBtn(btn, (item) => apiFetch('/title-detail?' + tdParams(item)).catch(() => null));
+      TitleDetail.openFromBtn(btn, (item) => apiFetch('/title-detail?' + tdParams(item)).then(res => res.ok ? res.json() : null).catch(() => null));
     };
     posterBtn.addEventListener('click', openDetail(posterBtn));
     title.addEventListener('click', openDetail(title));
@@ -664,7 +664,7 @@
       TitleDetail.markOpenBtn(cap, tdItem, 'title');
       cap.className = 'pv-cap';
       cap.textContent = (m.name || '') + (m.releaseInfo ? ' (' + m.releaseInfo + ')' : '');
-      const openDetail = (btn) => (e) => { e.stopPropagation(); TitleDetail.openFromBtn(btn, (item) => apiFetch('/title-detail?' + tdParams(item)).catch(() => null)); };
+      const openDetail = (btn) => (e) => { e.stopPropagation(); TitleDetail.openFromBtn(btn, (item) => apiFetch('/title-detail?' + tdParams(item)).then(res => res.ok ? res.json() : null).catch(() => null)); };
       posterBtn.addEventListener('click', openDetail(posterBtn));
       cap.addEventListener('click', openDetail(cap));
       cell.appendChild(wrap); cell.appendChild(cap);
