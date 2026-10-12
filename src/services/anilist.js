@@ -210,4 +210,45 @@ async function tagSearch({ tags, page = 1, safe = false }) {
   return body?.data?.Page?.media || [];
 }
 
-module.exports = { fetchRating, parseMedia, trendingAnime, tagsFor, recommendationsFor, tagSearch };
+// TD-1: main cast for an anime title (Japanese voice actors as "actors").
+// ONE GraphQL call; returns [{name, character, photo}] or null on any failure.
+const CHARACTERS_QUERY = `query($id:Int){ Media(id:$id, type: ANIME){
+  characters(role: MAIN, sort: [ROLE, RELEVANCE], perPage: 8){
+    edges{
+      node{ name{ full } image{ medium } }
+      voiceActors(language: JAPANESE, sort: RELEVANCE){ name{ full } }
+    }
+  }
+}`;
+
+async function charactersFor(anilistId, log = console) {
+  try {
+    const res = await governor.schedule('anilist', () => fetch(API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ query: CHARACTERS_QUERY, variables: { id: Number(anilistId) } }),
+      signal: AbortSignal.timeout(3000),
+    }));
+    if (!res.ok) {
+      log.warn(`[anilist] charactersFor ${anilistId} failed (${res.status})`);
+      return null;
+    }
+    const body = await res.json().catch(() => null);
+    const edges = body?.data?.Media?.characters?.edges || [];
+    if (!edges.length) return null;
+    return edges.map((edge) => {
+      const node = edge.node || {};
+      const voiceActor = (edge.voiceActors || [])[0];
+      return {
+        name: voiceActor?.name?.full || '',
+        character: node.name?.full || '',
+        photo: node.image?.medium || null,
+      };
+    });
+  } catch (err) {
+    log.warn(`[anilist] charactersFor ${anilistId} failed: ${err.message}`);
+    return null;
+  }
+}
+
+module.exports = { fetchRating, parseMedia, trendingAnime, tagsFor, recommendationsFor, tagSearch, charactersFor };

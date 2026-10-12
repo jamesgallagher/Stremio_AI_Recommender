@@ -479,11 +479,22 @@ function trainerRebuildHandler(req, res) {
   res.status(202).json({ started: true, job: jobs.snapshot(req.profile.id) });
 }
 
+// TD-1: GET /api/title-detail?type=&imdb_id=&tmdb_id= — title detail modal data.
+async function titleDetailHandler(req, res) {
+  const { type, imdb_id, tmdb_id } = req.query;
+  if (type !== 'movie' && type !== 'series' && type !== 'anime') return res.status(400).json({ error: 'bad-type' });
+  if (!imdb_id && tmdb_id == null) return res.status(400).json({ error: 'no-id' });
+  const detail = await require('../../src/titleDetail').getTitleDetail(req.profile, { type, imdbId: imdb_id, tmdbId: tmdb_id }, console);
+  if (!detail) return res.status(404).json({ error: 'no-detail' });
+  res.json(detail);
+}
+
 module.exports = {
   toTitleDTO, searchHandler, watchlistHandler, watchlistRemoveHandler,
   toRecDTO, recommendationsHandler, suppressHandler, unsuppressHandler, watchedHandler,
   toCompanionFilters, companionCatalogs, companionSettings, settingsGetHandler, settingsPostHandler,
   catalogPreviewHandler,
   trainerHandler, trainerRateHandler, trainerIgnoreHandler, trainerFinishedHandler, trainerUnwatchedHandler, trainerRebuildHandler,
+  titleDetailHandler,
   TYPES, COMPANION_FILTERS, SEARCH_LIMIT, SEARCH_LIMIT_MAX,
 };

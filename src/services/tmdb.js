@@ -641,6 +641,59 @@ async function releaseDateFor(apiKey, type, { imdbId = null, tmdbId = null } = {
   }
 }
 
+// TD-1: ONE TMDB call for a title's detail modal data (poster, synopsis, cast,
+// certs, genres, runtime, status). Movie: movie/{id} with credits+release_dates.
+// Series: tv/{id} with credits+content_ratings. Never throws; failure -> null.
+async function titleDetail(apiKey, type, { imdbId = null, tmdbId = null } = {}, log = console) {
+  try {
+    let id = tmdbId;
+    if (id == null || id === '') {
+      if (!imdbId) return null;
+      id = await findByImdbId(apiKey, type === 'movie' ? 'movie' : 'series', imdbId);
+    }
+    if (!id) return null;
+    const isMovie = type === 'movie';
+    const data = await get(apiKey, `${isMovie ? 'movie' : 'tv'}/${id}`, {
+      language: 'en-US',
+      append_to_response: isMovie ? 'credits,release_dates' : 'credits,content_ratings',
+    });
+    const title = isMovie ? data.title : data.name;
+    const year = (isMovie ? data.release_date : data.first_air_date)?.substring(0, 4) || null;
+    const poster = data.poster_path ? `https://image.tmdb.org/t/p/w500${data.poster_path}` : null;
+    const synopsis = data.overview || '';
+    const runtime = isMovie && data.runtime ? `${data.runtime} min` : null;
+    const genres = (data.genres || []).map((g) => g.name);
+    const certs = {};
+    if (isMovie) {
+      const rd = data.release_dates?.results;
+      certs.AU = certForCountry(rd, 'AU');
+      certs.US = certForCountry(rd, 'US');
+      certs.GB = certForCountry(rd, 'GB');
+      certs.IE = certForCountry(rd, 'IE');
+      certs.NZ = certForCountry(rd, 'NZ');
+      certs.CA = certForCountry(rd, 'CA');
+    } else {
+      const cr = data.content_ratings?.results;
+      certs.AU = certForCountryTv(cr, 'AU');
+      certs.US = certForCountryTv(cr, 'US');
+      certs.GB = certForCountryTv(cr, 'GB');
+      certs.IE = certForCountryTv(cr, 'IE');
+      certs.NZ = certForCountryTv(cr, 'NZ');
+      certs.CA = certForCountryTv(cr, 'CA');
+    }
+    const cast = (data.credits?.cast || []).slice(0, 8).map((p) => ({
+      name: p.name || '',
+      character: p.character || '',
+      photo: p.profile_path ? `https://image.tmdb.org/t/p/w185${p.profile_path}` : null,
+    }));
+    const status = data.status || null;
+    return { tmdbId: String(id), title, year, poster, synopsis, runtime, genres, certs, cast, status };
+  } catch (err) {
+    log.warn(`[tmdb] titleDetail ${type} failed: ${err.message}`);
+    return null;
+  }
+}
+
 module.exports = {
   GENRE_ALIASES,
   voteFloor,
@@ -672,4 +725,5 @@ module.exports = {
   buildVideos,
   fullMeta,
   releaseDateFor,
+  titleDetail,
 };

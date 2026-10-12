@@ -100,6 +100,13 @@
   .cpv-cell .poster .cpv-watch { left: 6px; }
   .cpv-cell .poster .cpv-nope { right: 6px; }
   .cpv-cell .poster .cpv-nope:hover { background: var(--err); }
+  /* TD-1: title detail open buttons (poster + title) — styled like text, so the
+     row looks unchanged until hovered. The poster variant fills its .poster box. */
+  .td-open { border: 0; background: none; padding: 0; margin: 0; font: inherit; color: inherit; text-align: left; cursor: pointer; }
+  .td-open:hover { text-decoration: underline; }
+  .td-open:focus-visible { text-decoration: underline; outline: 2px solid var(--accent); }
+  .cpv-cell .poster .td-open.td-open-poster { width: 100%; height: 100%; display: block; }
+  .cpv-cell .td-open.td-open-title { margin-top: 5px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; line-height: 1.3; }
   .cpv-msg { padding: 30px 10px; text-align: center; color: var(--muted); font-size: 13px; }
   /* One key per line, with a show/hide eye pinned inside the input */
   .keys-list { display: flex; flex-direction: column; gap: 12px; margin-top: 4px; }
@@ -191,6 +198,11 @@
   .tr-tt { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .tr-thumb { width: 34px; height: 51px; border-radius: 6px; background: var(--card2);
     border: 1px solid var(--border); object-fit: cover; flex: 0 0 auto; }
+  /* TD-1: trainer-row detail open buttons — override the generic .tr-row button
+     border/background so the poster/title read as text (no box). */
+  .tr-row .td-open.td-open-poster { width: 34px; height: 51px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; border: 0; background: none; }
+  .tr-row .td-open.td-open-title { border: 0; background: none; color: inherit; }
+  .tr-row .td-open.td-open-poster:hover, .tr-row .td-open.td-open-title:hover { border: 0; background: none; }
   .tr-stars { display: inline-flex; gap: 2px; align-items: center; touch-action: pan-y; cursor: pointer; }
   .tr-stars.tr-previewing .tr-fill { color: var(--star); opacity: .85; }
   .tr-star-wrap { position: relative; display: inline-block; width: 22px; height: 22px; }
@@ -269,6 +281,7 @@
 </div>
 <div class="toast" id="toast"></div>
 
+<script src="title-detail.js"></script>
 <script src="trainer-ui.js"></script>
 <script>
 const $ = (s, el = document) => el.querySelector(s);
@@ -506,6 +519,18 @@ async function api(path, opts = {}) {
   }
   if (!res.ok) throw new Error(data.error || res.statusText);
   return data;
+}
+
+// TD-1: build the title-detail query string and a fetchDetail closure for a
+// profile. api() throws on non-2xx; a 404 (no detail) becomes null so the
+// component shows its error state.
+function tdParams(item) {
+  return 'type=' + encodeURIComponent(item.type || '')
+    + '&imdb_id=' + encodeURIComponent(item.imdb_id || '')
+    + '&tmdb_id=' + encodeURIComponent(item.tmdb_id || '');
+}
+function tdFetchFor(pid) {
+  return (item) => api('/profiles/' + pid + '/title-detail?' + tdParams(item)).catch(() => null);
 }
 
 function fmtAge(ms) {
@@ -1140,6 +1165,13 @@ async function openCatalogPreview(ev, pid, catalogId, title) {
     + '<div class="cpv-body" id="cpvBody"><div class="cpv-msg">Loading…</div></div></div>';
   document.body.appendChild(backdrop);
   document.addEventListener('keydown', _cpvKey);
+  // TD-1: one delegated listener on the (rebuildable) preview body — a tap on a
+  // poster or caption opens the shared detail modal for this profile. The modal's
+  // Esc (capture phase, stopPropagation) closes only the detail, not this preview.
+  document.getElementById('cpvBody').addEventListener('click', (e) => {
+    const btn = e.target.closest('.td-open');
+    if (btn) TitleDetail.openFromBtn(btn, tdFetchFor(_cpvPid));
+  });
   const x = document.querySelector('#cpvDialog .cpv-x'); if (x) x.focus();
   try {
     const data = await api('/profiles/' + pid + '/catalogs/' + encodeURIComponent(catalogId) + '/preview');
@@ -1162,13 +1194,18 @@ function _cpvRender(data) {
     return;
   }
   body.innerHTML = '<div class="cpv-grid">' + data.metas.map(m => {
-    const poster = m.poster
+    // TD-1: the poster and the caption are the detail-modal click targets. The
+    // catalog preview gives `id` (tt) per meta and `type` at response level.
+    const item = { type: data.type, imdb_id: m.id, tmdb_id: null, name: m.name || '', year: m.releaseInfo || null, poster: m.poster || null };
+    const posterInner = m.poster
       ? '<img loading="lazy" src="' + esc(m.poster) + '" alt="">'
       : '<div class="no-poster">' + esc(m.name || 'No poster') + '</div>';
+    const poster = TitleDetail.openBtn(item, posterInner, 'poster');
     const rating = m.imdbRating ? '<span class="rating" title="IMDb rating">★ ' + esc(String(m.imdbRating)) + '</span>' : '';
     const yr = m.releaseInfo ? ' <span class="yr">' + esc(String(m.releaseInfo)) + '</span>' : '';
+    const cap = TitleDetail.openBtn(item, esc(m.name || '') + yr, 'title');
     return '<div class="cpv-cell"><div class="poster">' + poster + rating + _cpvActions(data, m) + '</div>'
-      + '<span class="cap">' + esc(m.name || '') + yr + '</span></div>';
+      + cap + '</div>';
   }).join('') + '</div>';
 }
 
@@ -2700,7 +2737,7 @@ function trainerClick(id, e) {
   const panel = e.target.closest('.trainer-panel');
   // TV-R §5: the Films | Shows toggle — switching resets view/page/q and reloads.
   // (Checked before the chip handler: the toggle buttons carry the tr-chip class.)
-  const typeBtn = e.target.closest('button[data-type]');
+  const typeBtn = e.target.closest('button[data-type]:not(.td-open)');
   if (typeBtn) {
     st.type = typeBtn.dataset.type;
     st.view = 'all';
@@ -2717,6 +2754,13 @@ function trainerClick(id, e) {
     return;
   }
   if (!panel) return;
+  // TD-1: a tap on a row's poster or title opens the shared detail modal.
+  // Checked before the action-button branch so the td-open target wins.
+  const tdOpen = e.target.closest('.td-open');
+  if (tdOpen) {
+    TitleDetail.openFromBtn(tdOpen, tdFetchFor(id));
+    return;
+  }
   const btn = e.target.closest('button[data-act]');
   if (!btn) return;
   const rowEl = btn.closest('.tr-row');

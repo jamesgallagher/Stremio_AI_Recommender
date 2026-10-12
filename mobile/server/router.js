@@ -158,6 +158,7 @@ router.post('/api/trainer/rebuild', requireSession, handlers.trainerRebuildHandl
 router.get('/api/settings', requireSession, handlers.settingsGetHandler);              // Step 5: editable filters + view pref
 router.post('/api/settings', requireSession, handlers.settingsPostHandler);            // Step 5: save filters + view pref
 router.get('/api/catalogs/:catalogId/preview', requireSession, handlers.catalogPreviewHandler); // CP-02: served-titles preview (session-scoped)
+router.get('/api/title-detail', requireSession, handlers.titleDetailHandler); // TD-1: title detail modal data
 
 // ---- app config (public) ----
 // A single source for the SPA's app name/version, no session needed.
@@ -174,6 +175,12 @@ router.get('/api/config', (req, res) => {
 router.get('/trainer-ui.js', (req, res) => {
   res.set('Cache-Control', 'no-cache');
   res.type('application/javascript').sendFile(path.join(__dirname, '..', '..', 'public', 'trainer-ui.js'));
+});
+// TD-1: the shared title-detail component, served to the companion as the SAME
+// file the portal uses (no fork). Public like the rest of the SPA shell.
+router.get('/title-detail.js', (req, res) => {
+  res.set('Cache-Control', 'no-cache');
+  res.type('application/javascript').sendFile(path.join(__dirname, '..', '..', 'public', 'title-detail.js'));
 });
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 router.use(express.static(PUBLIC_DIR, {
