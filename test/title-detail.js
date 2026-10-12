@@ -184,28 +184,162 @@ okAsync('D12: no key and no cache -> null', async () => {
   assert.strictEqual(result, null);
 });
 
-// ---- D13: route validation (portal + mobile) ----
-okAsync('D13: route validation — bad type 400, no id 400, null 404, success 200', async () => {
-  // Portal route test.
+// ---- D13: real route tests (portal + mobile) ----
+okAsync('D13: portal route — bad type 400, no id 400, null 404, success 200', async () => {
   const express = require('express');
+  const { router } = require('../src/portal');
+  const config = require('../src/config');
   const app = express();
-  const config = { getProfile: () => ({ id: 'test', keys: { tmdb_api_key: 'k' } }) };
+  app.use('/portal', router);
+  const prof = config.addProfile('TD13Test');
+  config.updateProfile(prof.id, { email: 'td13@test.local', keys: { tmdb_api_key: 'test-key' } });
+  const tmdb = require('../src/services/tmdb');
+  const origTitleDetail = tmdb.titleDetail;
+  tmdb.titleDetail = async () => ({ tmdbId: '1300', title: 'Test', year: '2010', poster: null, synopsis: 'syn', runtime: '90 min', genres: ['Drama'], certs: { AU: 'M' }, cast: [{ name: 'A', character: 'B', photo: null }], status: 'Released' });
+  try {
+    const srv = app.listen(0);
+    const port = srv.address().port;
+    const base = `http://127.0.0.1:${port}/portal`;
+    // Bad type: 400
+    let res = await fetch(`${base}/profiles/${prof.id}/title-detail?type=foo`);
+    assert.strictEqual(res.status, 400);
+    let body = await res.json();
+    assert.strictEqual(body.error, 'bad-type');
+    // No id: 400
+    res = await fetch(`${base}/profiles/${prof.id}/title-detail?type=movie`);
+    assert.strictEqual(res.status, 400);
+    body = await res.json();
+    assert.strictEqual(body.error, 'no-id');
+    // Success: 200 with exact key set
+    res = await fetch(`${base}/profiles/${prof.id}/title-detail?type=movie&imdb_id=tt1300&tmdb_id=1300`);
+    assert.strictEqual(res.status, 200);
+    body = await res.json();
+    const keys = Object.keys(body).sort();
+    assert.deepStrictEqual(keys, ['cast', 'castSource', 'genres', 'imdb_id', 'poster', 'rating', 'runtime', 'synopsis', 'title', 'tmdb_id', 'type', 'year']);
+    // Unknown profile: 404
+    res = await fetch(`${base}/profiles/nonexistent/title-detail?type=movie&imdb_id=tt1&tmdb_id=1`);
+    assert.strictEqual(res.status, 404);
+    srv.close();
+  } finally {
+    tmdb.titleDetail = origTitleDetail;
+  }
+});
+
+// ---- D13b: mobile handler — bad type 400, no id 400, null 404, success 200 ----
+okAsync('D13b: mobile handler — bad type 400, no id 400, null 404, success 200', async () => {
+  const { titleDetailHandler } = require('../mobile/server/handlers');
+  const tmdb = require('../src/services/tmdb');
+  const origTitleDetail = tmdb.titleDetail;
+  tmdb.titleDetail = async () => ({ tmdbId: '1300', title: 'Test', year: '2010', poster: null, synopsis: 'syn', runtime: '90 min', genres: ['Drama'], certs: { AU: 'M' }, cast: [{ name: 'A', character: 'B', photo: null }], status: 'Released' });
+  try {
+    const fakeRes = () => {
+      const r = { status: (code) => { r.code = code; return r; }, json: (body) => { r.body = body; return r; } };
+      return r;
+    };
+    // Bad type: 400
+    let req = { query: { type: 'foo' }, profile: { id: 'p1', keys: { tmdb_api_key: 'k' } } };
+    let res = fakeRes();
+    await titleDetailHandler(req, res);
+    assert.strictEqual(res.code, 400);
+    assert.strictEqual(res.body.error, 'bad-type');
+    // No id: 400
+    req = { query: { type: 'movie' }, profile: { id: 'p1', keys: { tmdb_api_key: 'k' } } };
+    res = fakeRes();
+    await titleDetailHandler(req, res);
+    assert.strictEqual(res.code, 400);
+    assert.strictEqual(res.body.error, 'no-id');
+    // Success: 200
+    req = { query: { type: 'movie', imdb_id: 'tt1300', tmdb_id: '1300' }, profile: { id: 'p1', keys: { tmdb_api_key: 'k' } } };
+    res = fakeRes();
+    await titleDetailHandler(req, res);
+    assert.ok(res.body, 'should call res.json()');
+    const keys = Object.keys(res.body).sort();
+    assert.deepStrictEqual(keys, ['cast', 'castSource', 'genres', 'imdb_id', 'poster', 'rating', 'runtime', 'synopsis', 'title', 'tmdb_id', 'type', 'year']);
+    // Null detail: 404 (no TMDB key, different id to avoid cache)
+    req = { query: { type: 'movie', imdb_id: 'tt9999', tmdb_id: '9999' }, profile: { id: 'p1', keys: {} } };
+    res = fakeRes();
+    await titleDetailHandler(req, res);
+    assert.strictEqual(res.code, 404);
+    assert.strictEqual(res.body.error, 'no-detail');
+  } finally {
+    tmdb.titleDetail = origTitleDetail;
+  }
+});
+
+// ---- D14: CHARACTERS_QUERY brace balance (T1) ----
+ok('D14: CHARACTERS_QUERY braces are balanced', () => {
+  const { CHARACTERS_QUERY } = require('../src/services/anilist');
+  let depth = 0;
+  for (const ch of CHARACTERS_QUERY) {
+    if (ch === '{') depth++;
+    if (ch === '}') depth--;
+    assert.ok(depth >= 0, 'negative depth at position ' + CHARACTERS_QUERY.indexOf(ch));
+  }
+  assert.strictEqual(depth, 0, 'unbalanced braces (depth=' + depth + ')');
+});
+
+// ---- D15: animeLookup default wired (T2) — anime uses AniList, series never does ----
+okAsync('D15: animeLookup default — anime gets castSource anilist; series never calls AniList', async () => {
   const { getTitleDetail } = require('../src/titleDetail');
-  const origGet = require('../src/titleDetail').getTitleDetail;
-  // We test the validation logic directly since the route is thin.
-  // Bad type:
-  assert.strictEqual('movie' === 'movie', true); // sanity
-  // The route code validates: type !== movie|series|anime -> 400
-  // neither id -> 400
-  // detail null -> 404
-  // else 200 with exact key set
-  // This is verified by the integration test (D13 in the full suite).
-  // Here we just verify the key set contract:
-  const tmdbTitleDetail = async () => ({ tmdbId: '1300', title: 'Test', year: '2010', poster: null, synopsis: 'syn', runtime: '90 min', genres: ['Drama'], certs: { AU: 'M' }, cast: [{ name: 'A', character: 'B', photo: null }], status: 'Released' });
+  const animeMap = require('../src/services/animeMap');
+  // Register a fake anime index: imdb tt900 -> anilist 999
+  animeMap._setIndex({ byImdb: { tt900: { anilist: 999, mal: 1 } }, byTmdb: {}, byAnilist: {}, byMal: {} });
+  // Fake TMDB detail (returns cast from TMDB).
+  const tmdbTitleDetail = async () => ({
+    tmdbId: '900', title: 'Test Anime', year: '2020',
+    poster: null, synopsis: '', runtime: '24 min', genres: ['Animation'],
+    certs: {}, cast: [{ name: 'TMDB Actor', character: 'X', photo: null }], status: 'Released',
+  });
+  // Fake AniList characters (returns Japanese voice actors).
+  let anilistCalled = false;
+  const anilistCharacters = async (id) => {
+    anilistCalled = true;
+    assert.strictEqual(id, 999);
+    return [{ name: 'VA Actor', character: 'Y', photo: null }];
+  };
   const profile = { keys: { tmdb_api_key: 'k' } };
-  const result = await getTitleDetail(profile, { type: 'movie', imdbId: 'tt1300', tmdbId: '1300' }, console, { tmdbTitleDetail });
-  const keys = Object.keys(result).sort();
-  assert.deepStrictEqual(keys, ['cast', 'castSource', 'genres', 'imdb_id', 'poster', 'rating', 'runtime', 'synopsis', 'title', 'tmdb_id', 'type', 'year']);
+  // Anime request: should use AniList (castSource = 'anilist').
+  const animeResult = await getTitleDetail(profile, { type: 'anime', imdbId: 'tt900', tmdbId: '900' }, console, { tmdbTitleDetail, anilistCharacters });
+  assert.strictEqual(animeResult.castSource, 'anilist');
+  assert.strictEqual(animeResult.cast[0].name, 'VA Actor');
+  assert.ok(anilistCalled, 'AniList was called');
+  // Series request with same imdb (different tmdbId to avoid cache from anime): should NOT call AniList.
+  anilistCalled = false;
+  const seriesResult = await getTitleDetail(profile, { type: 'series', imdbId: 'tt900', tmdbId: '901' }, console, { tmdbTitleDetail, anilistCharacters });
+  assert.strictEqual(seriesResult.castSource, 'tmdb');
+  assert.ok(!anilistCalled, 'AniList NOT called for series');
+  animeMap._setIndex(null); // cleanup
+});
+
+// ---- D16: imdb-only second call makes zero fetches (T8) ----
+okAsync('D16: imdb-only second call makes zero fetches', async () => {
+  const { getTitleDetail } = require('../src/titleDetail');
+  let fetchCount = 0;
+  const tmdbTitleDetail = async () => { fetchCount++; return { tmdbId: '1400', title: 'ImdbOnly', year: '2010', poster: null, synopsis: '', runtime: null, genres: [], certs: {}, cast: [], status: 'Released' }; };
+  const profile = { keys: { tmdb_api_key: 'test-key' } };
+  // First call: imdb only (no tmdbId).
+  const r1 = await getTitleDetail(profile, { type: 'movie', imdbId: 'tt1400' }, console, { tmdbTitleDetail });
+  assert.strictEqual(fetchCount, 1);
+  assert.ok(r1, 'first call should succeed');
+  // Second call: same imdb only. Should hit the imdb-keyed cache.
+  const r2 = await getTitleDetail(profile, { type: 'movie', imdbId: 'tt1400' }, console, { tmdbTitleDetail });
+  assert.strictEqual(fetchCount, 1, 'second call should hit imdb cache');
+  assert.deepStrictEqual(r1, r2);
+});
+
+// ---- D17: anime and series with same tmdb id do not share cache (T8) ----
+okAsync('D17: anime and series with same tmdb id do not share cache', async () => {
+  const { getTitleDetail } = require('../src/titleDetail');
+  let fetchCount = 0;
+  const tmdbTitleDetail = async () => { fetchCount++; return { tmdbId: '1500', title: 'Shared', year: '2020', poster: null, synopsis: '', runtime: '24 min', genres: ['Animation'], certs: {}, cast: [{ name: 'A', character: 'B', photo: null }], status: 'Released' }; };
+  const profile = { keys: { tmdb_api_key: 'test-key' } };
+  // Anime request: should fetch and cache as 'anime'.
+  const r1 = await getTitleDetail(profile, { type: 'anime', imdbId: 'tt1500', tmdbId: '1500' }, console, { tmdbTitleDetail });
+  assert.strictEqual(fetchCount, 1);
+  assert.strictEqual(r1.castSource, 'tmdb'); // no animeLookup injected, so tmdb
+  // Series request with same tmdbId: should NOT hit the anime cache.
+  const r2 = await getTitleDetail(profile, { type: 'series', imdbId: 'tt1500', tmdbId: '1500' }, console, { tmdbTitleDetail });
+  assert.strictEqual(fetchCount, 2, 'series should refetch (different cache key)');
 });
 
 // ---- U1: esc escapes <>&"' ----

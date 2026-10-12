@@ -300,7 +300,7 @@
     const meta = document.createElement('div'); meta.className = 'rec-meta';
     const title = document.createElement('button');
     TitleDetail.markOpenBtn(title, tdItem, 'title');
-    title.className = 'rec-title';
+    title.classList.add('rec-title');
     title.textContent = r.title || 'Untitled';
     const sub = document.createElement('div'); sub.className = 'rec-sub';
     sub.textContent = [r.year || '', r.genre || '', r.rating ? '★ ' + Number(r.rating).toFixed(1) : ''].filter(Boolean).join(' · ');
@@ -662,7 +662,7 @@
       wrap.appendChild(eye); wrap.appendChild(nope);
       const cap = document.createElement('button');
       TitleDetail.markOpenBtn(cap, tdItem, 'title');
-      cap.className = 'pv-cap';
+      cap.classList.add('pv-cap');
       cap.textContent = (m.name || '') + (m.releaseInfo ? ' (' + m.releaseInfo + ')' : '');
       const openDetail = (btn) => (e) => { e.stopPropagation(); TitleDetail.openFromBtn(btn, (item) => apiFetch('/title-detail?' + tdParams(item)).then(res => res.ok ? res.json() : null).catch(() => null)); };
       posterBtn.addEventListener('click', openDetail(posterBtn));

@@ -18,9 +18,23 @@ function detailFile(type, tmdbId) {
   return path.join(DETAIL_DIR, `detail-${type}-${String(tmdbId).replace(/[^a-zA-Z0-9_-]/g, '')}.json`);
 }
 
+function detailFileImdb(type, imdbId) {
+  return path.join(DETAIL_DIR, `detail-imdb-${type}-${String(imdbId).replace(/[^a-zA-Z0-9_-]/g, '')}.json`);
+}
+
 function loadCache(type, tmdbId) {
   try {
     const rec = JSON.parse(fs.readFileSync(detailFile(type, tmdbId), 'utf8'));
+    if (!rec?.at || Date.now() - rec.at > (rec.ttl || TTL_7D)) return null;
+    return rec.detail;
+  } catch {
+    return null;
+  }
+}
+
+function loadCacheImdb(type, imdbId) {
+  try {
+    const rec = JSON.parse(fs.readFileSync(detailFileImdb(type, imdbId), 'utf8'));
     if (!rec?.at || Date.now() - rec.at > (rec.ttl || TTL_7D)) return null;
     return rec.detail;
   } catch {
@@ -38,6 +52,16 @@ function saveCache(type, tmdbId, detail, ttlMs) {
   } catch { /* cache write failure is non-fatal */ }
 }
 
+function saveCacheImdb(type, imdbId, detail, ttlMs) {
+  try {
+    fs.mkdirSync(DETAIL_DIR, { recursive: true });
+    const file = detailFileImdb(type, imdbId);
+    const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ at: Date.now(), ttl: ttlMs, detail }, null, 2));
+    fs.renameSync(tmp, file);
+  } catch { /* cache write failure is non-fatal */ }
+}
+
 // getTitleDetail(profile, {type, imdbId, tmdbId}, log, deps)
 //   deps: { tmdbTitleDetail, anilistCharacters, animeLookup, now, cacheDir }
 //   Defaults are the real functions. Returns the stable contract object or null.
@@ -45,7 +69,7 @@ async function getTitleDetail(profile, { type, imdbId = null, tmdbId = null } = 
   const D = {
     tmdbTitleDetail: deps.tmdbTitleDetail || tmdb.titleDetail,
     anilistCharacters: deps.anilistCharacters || anilist.charactersFor,
-    animeLookup: deps.animeLookup || null,
+    animeLookup: deps.animeLookup || require('./services/animeMap').lookup,
     now: deps.now || Date.now,
     cacheDir: deps.cacheDir || null,
   };
@@ -54,10 +78,16 @@ async function getTitleDetail(profile, { type, imdbId = null, tmdbId = null } = 
   if (type !== 'movie' && type !== 'series' && type !== 'anime') return null;
   const tmdbType = type === 'anime' ? 'series' : type;
 
-  // Cache check (only when tmdbId is known).
+  // Cache check: key by request type (movie/series/anime) so anime and series
+  // with the same tmdb id never share a cache entry. Also check the imdb-keyed
+  // cache for imdb-only requests.
   if (tmdbId != null && tmdbId !== '') {
-    const cached = loadCache(tmdbType, tmdbId);
+    const cached = loadCache(type, tmdbId);
     if (cached) return cached;
+  }
+  if (imdbId) {
+    const cachedImdb = loadCacheImdb(type, imdbId);
+    if (cachedImdb) return cachedImdb;
   }
 
   const apiKey = settings.keyFor(profile, 'tmdb_api_key');
@@ -119,12 +149,17 @@ async function getTitleDetail(profile, { type, imdbId = null, tmdbId = null } = 
   };
 
   // Cache: 7 days default, 24h for returning/in-production series.
+  // Key by request type (movie/series/anime) so anime and series with the
+  // same tmdb id never share a cache entry.
   const ttl = /returning|in production/i.test(raw.status || '') ? TTL_24H : TTL_7D;
   if (raw.tmdbId) {
-    saveCache(tmdbType, raw.tmdbId, result, ttl);
+    saveCache(type, raw.tmdbId, result, ttl);
+  }
+  if (imdbId) {
+    saveCacheImdb(type, imdbId, result, ttl);
   }
 
   return result;
 }
 
-module.exports = { getTitleDetail, detailFile, loadCache, saveCache };
+module.exports = { getTitleDetail, detailFile, detailFileImdb, loadCache, loadCacheImdb, saveCache, saveCacheImdb };

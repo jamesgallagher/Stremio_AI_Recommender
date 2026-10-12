@@ -219,6 +219,7 @@ const CHARACTERS_QUERY = `query($id:Int){ Media(id:$id, type: ANIME){
       voiceActors(language: JAPANESE, sort: RELEVANCE){ name{ full } }
     }
   }
+}
 }`;
 
 async function charactersFor(anilistId, log = console) {
@@ -251,4 +252,4 @@ async function charactersFor(anilistId, log = console) {
   }
 }
 
-module.exports = { fetchRating, parseMedia, trendingAnime, tagsFor, recommendationsFor, tagSearch, charactersFor };
+module.exports = { fetchRating, parseMedia, trendingAnime, tagsFor, recommendationsFor, tagSearch, charactersFor, CHARACTERS_QUERY };

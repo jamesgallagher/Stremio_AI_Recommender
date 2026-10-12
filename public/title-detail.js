@@ -247,6 +247,20 @@ if (typeof document !== 'undefined') {
     }
   }
 
+  function _renderActions(panel, item) {
+    const actionsDiv = panel.querySelector('.td-actions');
+    if (_actions && _actions.length) {
+      actionsDiv.innerHTML = _actions.map((a) => `<button type="button" class="td-action-btn">${TitleDetail.esc(a.label)}</button>`).join('');
+      actionsDiv.querySelectorAll('.td-action-btn').forEach((btn, i) => {
+        btn.addEventListener('click', () => {
+          _actions[i].onClick(item, () => TitleDetail.close());
+        });
+      });
+    } else {
+      actionsDiv.innerHTML = '';
+    }
+  }
+
   TitleDetail.open = (item, opts = {}) => {
     const panel = _ensureDOM();
     _reqId++;
@@ -262,6 +276,8 @@ if (typeof document !== 'undefined') {
     // History pushState (mobile Back button).
     history.pushState({ td: 1 }, '');
     _tdPushed = true;
+    // Render footer actions immediately (visible in loading/error/success).
+    _renderActions(panel, item);
     // Render loading state.
     const loadingHtml = TitleDetail.renderDetailHtml(item, null, { loading: true });
     panel.querySelector('.td-head').innerHTML = _extractHead(loadingHtml);
@@ -280,18 +296,6 @@ if (typeof document !== 'undefined') {
         const html = TitleDetail.renderDetailHtml(item, detail, {});
         panel.querySelector('.td-head').innerHTML = _extractHead(html);
         panel.querySelector('.td-body').innerHTML = _extractBody(html);
-        // Actions.
-        const actionsDiv = panel.querySelector('.td-actions');
-        if (_actions && _actions.length) {
-          actionsDiv.innerHTML = _actions.map((a) => `<button type="button" class="td-action-btn">${TitleDetail.esc(a.label)}</button>`).join('');
-          actionsDiv.querySelectorAll('.td-action-btn').forEach((btn, i) => {
-            btn.addEventListener('click', () => {
-              _actions[i].onClick(item, () => TitleDetail.close());
-            });
-          });
-        } else {
-          actionsDiv.innerHTML = '';
-        }
         // Synopsis overflow check.
         const syn = panel.querySelector('.td-syn');
         const moreBtn = panel.querySelector('.td-more');
