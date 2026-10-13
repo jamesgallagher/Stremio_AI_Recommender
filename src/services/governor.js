@@ -1,4 +1,4 @@
-// Central rate governor (v6, docs/v6-ui.md §Rate governance). Every outbound
+// Central rate governor (v6, docs/architecture.md §7). Every outbound
 // call to a rate-limited service routes through schedule(), which SPACES calls
 // to stay under each provider's limit BEFORE the provider throttles us — the
 // piece that stops a heavy weekly build from tripping a limit and, per Simkl's

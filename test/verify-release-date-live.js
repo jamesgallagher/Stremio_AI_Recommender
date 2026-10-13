@@ -24,7 +24,7 @@
 //   Second case: stubs report the first candidate present in plantowatch,
 //   proving the next candidate is chosen.
 //
-// Findings go to temp/wd1-handback.md.
+// Findings are printed to the console.
 
 const config = require('../src/config');
 const simkl = require('../src/services/simkl');
@@ -288,7 +288,7 @@ async function main() {
   }
 
   console.log('\n=== Done ===');
-  console.log('Report findings in temp/wd1-handback.md');
+  console.log('Record findings in the PR description.');
 }
 
 const assert = require('assert');

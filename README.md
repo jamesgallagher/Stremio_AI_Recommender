@@ -1,480 +1,251 @@
 # AI Recommender — Stremio/Nuvio addon
 
-Self-hosted, per-family-profile movie & series recommendations. Trakt watch
-history → Groq → TMDB resolution, served from a disk-backed cache that
-refreshes in the background (stale-while-revalidate, 24 h threshold).
+Self-hosted, per-family-profile recommendations for movies, series and (opt-in)
+anime. Each person's **Simkl** watch history drives a taste model; a local or cloud
+LLM and TMDB do the matching; and the results are served from a pre-built cache, so
+opening a catalog in Stremio/Nuvio is instant and never waits on an API.
 
-Every catalog open is instant — Stremio only ever reads the pre-computed cache.
-Rebuilds happen in the background and never purge a good list on failure.
+- **Quality over volume.** Fewer, better picks: a rating-weighted taste model, an
+  LLM fit pass, and a served genre mix calibrated to what that person actually likes.
+- **Built for a family.** Per-profile Simkl accounts and filters, a multi-source
+  **age gate** for kids' profiles (fail-closed on lists, extra catalogs and search),
+  and a phone **Companion** app.
+- **Failure = stale, never empty.** Builds run in the background, are staged and
+  verified before they replace the live list, and back off on error.
 
-> ## ⚠ v5.2.0-beta — engine choice, AI + MAL age gating, metadata service (THIS BRANCH ONLY)
->
-> Everything in this block applies to the `v3-phase1` beta branch, published
-> as `:5.2.0-beta` (also `:beta`) — the stable `:latest` image (v2.6.x) is
-> unaffected.
->
-> - **Trakt recommends, code filters, LLM guards.** The AI lists now come
->   from Trakt's own personalized `/recommendations` (collaborative filtering
->   over your entire history; watched excluded at source, watchlisted items
->   excluded so Watch Later isn't duplicated). Every profile filter — rating
->   floor, statuses (no unreleased movies, no canceled shows), genre/Anime
->   exclusions, recency, vote floor — is enforced locally and
->   deterministically. Lists are steadier day-to-day and improve as you watch.
-> - **Ratings default to Trakt's own 0–10** (60% = 6.0 floor; new-profile
->   default 6.0); IMDb via MDBList remains an option. Recency defaults to all
->   years (one-time migration relaxes existing profiles; re-tighten in the
->   portal if wanted).
-> - **v5 — pick your engine per profile.** `Trakt` (default) is the v4
->   pipeline above. `AI` generates candidates with the age limit applied UP
->   FRONT, then a second Groq pass vets the survivors — because collaborative
->   filtering is structurally blind to age: a 13-year-old anime viewer's
->   nearest neighbours are ADULT anime viewers.
-> - **v5 — Common Sense Media retired.** It was strict by design (no rating =
->   dropped), which works for mainstream Western titles and fails for anime,
->   where coverage is thin. For an anime-heavy child the gate wasn't strict,
->   it was absent. The AI age gate is now the sole age authority on lists,
->   extra catalogs AND search — remove-only and fail-closed. Titles are judged
->   one year ABOVE the limit; classification brackets are coarse.
->   **MDBList is now OPTIONAL** (curated catalogs + the IMDb rating source).
-> - **v5 — the addon serves `meta`**, so a device can run this addon plus a
->   stream addon and nothing else. Previously a third-party metadata addon was
->   required for playback, and it answered search UNFILTERED next to our gated
->   results. **Groq key is required for kids profiles and for the AI engine**;
->   adult profiles on the Trakt engine still make zero LLM calls.
-> - **v5.2 — anime is judged on data, not recall.** Titles are matched to
->   MyAnimeList via [Fribb's anime-lists](https://github.com/Fribb/anime-lists)
->   (ETag-refreshed daily), and MAL's rating (G / PG / PG-13 / R / R+ / Rx) is
->   used directly. Two rules, deliberately opposite: **any** adult signal (Rx,
->   Hentai/Erotica) is a **permanent blacklist** on every profile including
->   adults and every surface including `meta`; but a **missing** rating never
->   drops a title — it falls through to the LLM. "No rating" is not "too old".
->   The LLM safeguard still runs on everything that survives, and now receives
->   the MAL band as evidence instead of guessing at one.
-> - **v5.2 — anime episode numbering** follows Cinemeta for anime series. TMDB
->   numbers anime by broadcast season and IMDb often doesn't; stream addons key
->   off Cinemeta's ids, and a mismatch is what "nothing opens" looks like.
-> - **Search** (v4.1): the addon answers Stremio/Nuvio search. On profiles
->   with an age limit, results pass the SAME protection as the lists — the AI
->   goalkeeper — and fail CLOSED: if it can't run, search returns nothing
->   rather than unfiltered results. Adult profiles search ungated. On a kid's
->   device install only this addon and a stream addon, so nothing else answers
->   search unfiltered (v5's `meta` support is what makes that possible).
-> - **Bench + promote-on-watch**, Watch Later (Trakt watchlist) catalog,
->   "Anime" exclusion filter, curated MDBList extras, auto-scrobble, RPDB,
->   and encryption all carry over unchanged.
-> - **Anime (opt-in per profile):** Marquee Anime builds "Recommended for you - Anime".
-> - **Superseded v2 behavior notes below:** fill-to-quota LLM rounds, the
->   rolling avoid-list ("Fresh picks daily"), and generation-prompt details
->   no longer apply on this branch.
+Current version: see `package.json` (v7 line, stable on `main`).
+How it works inside: [docs/architecture.md](docs/architecture.md).
+
+## What you get
+
+| Surface | What it is |
+|---|---|
+| **Catalogs** in Stremio/Nuvio | *Recommended for you* — Movies, Series, and Anime (opt-in); *Watch Later* (your Simkl plan-to-watch); optional curated lists |
+| **Addon `meta` + search** | The addon serves its own metadata and TMDB search, age-gated for kids profiles, so a kid's device needs only this addon plus a stream addon |
+| **Configure portal** (`/configure/`) | Admin: profiles, Server Config, filters, catalogs, ratings trainer, auto-scrobble, install URL, diagnostics |
+| **Mobile Companion** (`/mobile/`) | Installable phone app for every family member: recommendations, search → Watch Later, mark watched / not interested, rate your history, personal settings — see [mobile/README.md](mobile/README.md) |
+
+### Engines
+
+Each profile has one engine per lane. Movies and Shows are mandatory; Anime is
+**off** until enabled for a profile.
+
+| Lane | Engine | Design |
+|---|---|---|
+| Movies | **Marquee Cinema** | [docs/engine-marquee](docs/engine-marquee/README.md) |
+| Series | **Marquee TV** | [docs/engine-marquee-tv](docs/engine-marquee-tv/00-design-spec.md) |
+| Anime | **Marquee Anime** | [docs/engine-marquee-tv](docs/engine-marquee-tv/00-design-spec.md) |
+
+Taste is trained from Simkl ratings, finished/abandoned engagement, and the
+**Ratings** trainer (rate, love, or ignore watches; see
+[docs/trainer](docs/trainer/00-design-spec.md)).
+
+### Extra catalogs (per profile, Catalogs tab)
+
+| Catalog | Notes |
+|---|---|
+| **Watch Later** (default on) | Mirrors the Simkl plan-to-watch list in your order; keeps watched titles you queued; hides titles not yet streamable until they are ([details](docs/watch-later-availability.md)). Needs Simkl |
+| Popular Movies / Series, Trending Kids Movies / TV, Anime TV-14 | Curated MDBList charts; Filter Gate applies the profile's filters ([details](docs/filter-gate.md)) |
+| Comedy, Action, Rom-Com, War, Horror, Thriller, Christmas | Curated genre lists, IMDb ≥ 6 |
+
+Extra catalogs need an MDBList key (personal or global). On age-limited profiles
+every catalog passes the age gate.
 
 ## Run
 
-**Docker (Unraid):**
+**Docker / Unraid** (published by CI on every push to `main`):
 
 ```bash
 docker compose up -d
 ```
 
-Images are built by GitHub Actions on every push to `main` and published to
-`ghcr.io/jamesgallagher/stremio_ai_recommender:latest` (amd64 + arm64). To pin
-a version, push a git tag (`git tag v1.0.0 && git push origin v1.0.0`) and use
-the `:1.0.0` image tag. Build locally instead with `docker compose up -d --build`
-(swap `image:` for `build:` in the compose file).
+Image: `ghcr.io/jamesgallagher/stremio_ai_recommender` (`linux/amd64`, `linux/arm64`).
+`:latest` follows `main`; a git tag `vX.Y.Z` also publishes `:X.Y.Z`, `:X.Y`, `:X`;
+prerelease tags (`vX.Y.Z-beta`) publish `:X.Y.Z-beta` and `:beta` only and can never
+move `:latest`. To build locally, swap `image:` for `build: .` in `docker-compose.yml`.
 
-Map `/data` to persistent storage (e.g. `/mnt/user/appdata/ai-recommender`) —
-it holds `profiles.json` (keys + tokens) and the recommendation caches.
+Map `/data` to persistent storage (e.g. `/mnt/user/appdata/ai-recommender`). It holds
+`profiles.json`, `settings.json`, `store.db` and the caches.
 
-**Local dev:**
+**Local dev** (Node ≥ 22):
 
 ```bash
 npm install
-npm start          # http://localhost:7000/configure/
+npm start          # http://localhost:7000/  → redirects to /configure/
+npm test
 ```
 
-## Setup (per family member)
+## First run
 
-Each profile carries its own full key set — nothing is shared.
+1. Start the container. With no profiles yet, the log prints a one-time setup token:
+   `[setup] Setup token: …`.
+2. Open `/mobile/`, enter your name, email and that token. The emailed 6-digit code
+   creates the first (admin) account. (Without SMTP configured, codes are written to
+   the container log — dev only.)
+3. Click **Configure** in the Companion's top bar to open `/configure/`.
+4. **Server Config** (top bar) — shared infrastructure, entered once:
+   - **LLM**: a custom OpenAI-compatible endpoint (tried first; the **Test** button
+     checks it can do this app's JSON tasks) and/or a **Groq** key, plus an optional
+     Groq backup key. At least one provider is required.
+   - **TMDB** key — required.
+   - Optional: **MDBList** (curated catalogs, IMDb ratings), **RPDB** (ratings on
+     posters; pre-set to RPDB's generic free key), **TVDB** (country certifications for
+     the age gate), **MyAnimeList** client id and **AniDB** client (anime age ratings).
+   - Profiles do nothing until Server Config has TMDB + one LLM provider.
+5. **Add profile** for each family member, then per profile:
+   - **Simkl**: create an app at [simkl.com/settings/developer](https://simkl.com/settings/developer),
+     enter its Client ID/Secret, and **Connect**. Two auth versions — see below.
+   - Set **Filters** (rating floor, release year, vote floor, excluded genres, list
+     size, optional age limit) and **Catalogs**.
+   - Copy the **Install** URL into Stremio/Nuvio → Addons.
+6. The first list builds within a few minutes (a "warming up" card shows until then),
+   then refreshes in the background: daily if watch history changed, weekly regardless.
 
-1. Open the portal (`/configure/`) → **Add profile**.
-2. That family member creates, under **their own accounts** (each key field in
-   the portal has a "get key" link to the right page):
-   - a Trakt API app at
-     [app.trakt.tv/settings/advanced?mode=media](https://app.trakt.tv/settings/advanced?mode=media)
-     → Client ID + Secret (redirect URI: `urn:ietf:wg:oauth:2.0:oob`, enable
-     the device code grant)
-   - a TMDB API key at [themoviedb.org/settings/api](https://www.themoviedb.org/settings/api)
-   - a Groq API key at [console.groq.com/keys](https://console.groq.com/keys)
-     (free tier). **Required for kids profiles** (age limit set) and for the
-     **AI engine**; adult profiles on the Trakt engine never call the LLM
-   - *(optional)* an MDBList API key at [mdblist.com/preferences](https://mdblist.com/preferences/)
-     (free; sign in → Preferences → API Access) — powers the curated MDBList
-     catalogs and the optional IMDb rating source
-   - RPDB (rating-on-poster artwork) works out of the box — every profile is
-     pre-set with the generic free-tier key (`t0-free-rpdb`). Optionally paste
-     a personal key from [ratingposterdb.com](https://ratingposterdb.com/) for
-     higher tiers. Applied at serve time; changes need no rebuild.
-3. Paste the keys into the profile card → **Save keys** (each has a Test button).
-4. **Connect Trakt** → enter the PIN at trakt.tv/activate while signed in as
-   that member's Trakt account. Tokens auto-refresh from then on.
-5. Set filters if wanted (min rating, recency window, genre exclusions —
-   v4 defaults: Trakt rating ≥6.0, all years, none excluded).
-6. Copy the install URL from the card into Stremio/Nuvio → Addons.
-   Two catalogs appear: **Movies recommended for you** and
-   **Series recommended for you**.
+## Simkl
 
-First list generates within a minute or two (a "warming up" card shows until
-then). After that, lists refresh in the background roughly daily.
+Simkl is the watch-history source. Each profile uses its own Simkl app and account.
 
-## Simkl (watch tracking)
-
-Simkl is the watch-history source. Each profile carries its own Simkl app
-credentials — nothing is shared across profiles. Two auth versions are
-supported per profile:
-
-- **AUTH V1** — PIN device flow (legacy). The user enters a code at
-  `simkl.com/pin` while signed in; the addon polls for the token. V1 tokens
-  are long-lived and never auto-refreshed.
-- **AUTH V2** — OAuth authorization code + PKCE (S256). The browser is
-  redirected to Simkl's consent page; Simkl redirects back to the callback
-  URI with an authorization code. The addon exchanges the code for tokens
-  server-side. V2 tokens are refreshed shortly before expiry or once after a
-  401, using the refresh-token grant.
-
-### Server app registration
-
-Create a Simkl API app at [simkl.com/settings/developer](https://simkl.com/settings/developer)
-for each family member (or one per profile). Two separate registrations are
-needed if you want both V1 and V2. For V2 choose **Server apps & services**
-(Client ID + secret). AIR's backend handles the callback and token exchange;
-the secret stays on the server. V1 is for existing legacy registrations:
-
-| Field | AUTH V1 | AUTH V2 |
+| | AUTH V2 (default for new profiles) | AUTH V1 (legacy) |
 |---|---|---|
-| Client ID | `simkl_client_id` | `simkl_v2_client_id` |
-| Client Secret | `simkl_client_secret` (optional for PIN) | `simkl_v2_client_secret` (required) |
-| Callback URI | — (PIN flow, no redirect) | `{EXTERNAL_URL}/simkl/oauth2/callback` |
-| Scope | — (PIN flow) | `media:read media:write` |
+| Flow | OAuth authorization code + PKCE (S256); tokens refresh automatically | PIN device flow at `simkl.com/pin`; long-lived tokens |
+| App type to register | **Server apps & services** | existing legacy registrations |
+| Callback URI | `{EXTERNAL_URL}/simkl/oauth2/callback` | — |
+| Scope | `media:read media:write` | — |
 
-The V2 callback URI is derived **only** from a validated HTTPS `EXTERNAL_URL`
-env var — no request-Host fallback. Without a valid HTTPS `EXTERNAL_URL`, V2
-Connect is unavailable (the portal shows a hint). The registered URI on the
-Simkl app and the URI sent to the token endpoint must match this exact string.
+- The V2 callback is built **only** from a valid HTTPS `EXTERNAL_URL` — there is no
+  Host-header fallback. Without it, V2 Connect is unavailable (the portal says so).
+  The URI registered on the Simkl app must match exactly.
+- The V2 Client Secret is never sent back to the browser; the field is replace-only.
+- The **Auth version** dropdown chooses which flow *Connect* starts; it does not
+  change the active token. **Check connection** verifies the grant live and returns a
+  state such as `connected`, `not_authorized`, `credential_mismatch`, `rate_limited`
+  or `provider_unavailable`. Only `connected` is a success badge. Reauthorising
+  keeps the existing grant until the new account is verified.
+- Simkl's API rules (activities-first sync, delta pulls, 1 POST/s) are enforced in
+  code — see [docs/architecture.md](docs/architecture.md#7-external-services-and-rate-rules).
 
-### Per-profile selector
+## Kids mode (age gate)
 
-The portal's Simkl tab has an **Auth version** dropdown (AUTH V1 / AUTH V2).
-This selects which flow **Connect** starts. It does **not** change the active
-token's version — a V1 token stays active while the user has selected V2 for
-the next connection (M3). The active token's version is shown separately in
-the status line.
+Per profile, **Limit to age** picks a tier: **10+, 12+, 14+ (TV-14), 15+**. Titles are
+judged through a chain that stops at the first source with an answer: hard floor →
+Common Sense → Australian rating → US rating → Simkl / MDBList / UK·IE·NZ·CA / TVDB →
+**LLM last**. Anime has its own chain (MyAnimeList band, Kitsu, AniDB, then the LLM).
 
-### Migration
+- Covers AI lists, every extra catalog, and **search** (Stremio and the Companion).
+  `meta` is deliberately ungated; discovery already is.
+- **Remove-only and fail-closed.** If the gate can't run, the previous list is kept
+  and search returns nothing. A title the LLM leaves unjudged is re-asked once, then
+  dropped. Age-limited profiles only serve rows something positively vetted.
+- An adult-content blacklist (Rx / Hentai / Erotica) applies to every profile on
+  every surface.
+- On age-limited profiles, rating floor, release year, excluded genres and the Anime
+  switch are **parental controls**: editable in the admin portal, read-only on the
+  phone.
 
-Existing profiles with a V1 credential or V1 token migrate idempotently to
-AUTH V1 preference. New profiles and completely unconfigured profiles default
-to AUTH V2. A V2 auth object (version 2) implies a V2 preference. The
-migration is best-effort: it binds the active V1 token to the current V1
-Client ID so a later credential change is detectable (credential mismatch is
-reported, never a user API call with a mismatched pair).
+## Auto-scrobble (Nuvio / Stremio → Simkl)
 
-### Check connection
+Optional, per profile. Mirrors a person's **Nuvio** or **Stremio** watched history
+into their Simkl account hourly, so "mark as watched" in the player reaches Simkl
+even when the app's own sync silently fails. Set it up in the **Scrobble** tab: pick
+the app, enter that person's account email + password, **Test** (Nuvio lists the
+account's profiles — pick the right one), **Save**, enable. Passwords are sealed at
+rest and refused outright if `SECRET_KEY` is unset. Any error logs a warning and
+changes nothing. Uses the apps' own undocumented sync backends
+(overridable: `NUVIO_API_URL`, `NUVIO_ANON_KEY`, `STREMIO_API_URL`).
 
-The **Check connection** button (`POST /simkl/check`) verifies the active
-grant with `/sync/activities` and `/users/settings`, refreshing V2 if needed.
-Each provider request, including response parsing, has a 10-second deadline.
-Without a token, V1 checks app readiness using a PIN probe; V2 requires OAuth.
-The button returns a structured state:
+## Configuration
 
-| State | Meaning |
-|---|---|
-| `connected` | Token valid, verified live |
-| `v1_ready_unconnected` | V1 app accepted the PIN probe; account not connected |
-| `not_authorized` | V2 credentials saved; account not yet verified via OAuth |
-| `wrong_auth_version` | V1 endpoint rejected the ID as a V2 app |
-| `client_id_rejected` | V1 Client ID rejected (HTTP 412) |
-| `credential_mismatch` | Token bound to a different Client ID than the current credential |
-| `rate_limited` | Simkl rate limit (HTTP 429) |
-| `provider_unavailable` | Simkl unreachable or returned an unexpected status |
-| `missing_configuration` | Required credential field is empty |
+All API keys are entered in the web UI (Server Config / per profile) and stored in
+`DATA_DIR`. **Nothing secret belongs in the image or the repo.** Environment variables:
 
-Only `connected` is a success badge. A stored token alone is "token stored",
-never "connected" — the passive status poll (`GET /simkl/status`) reads the
-last verification for the current grant without making a provider call.
+| Variable | Default | Purpose |
+|---|---|---|
+| `EXTERNAL_URL` | — | Public HTTPS base URL (your tunnel hostname). Used in install URLs, the manifest logo, the Simkl V2 callback and sign-in emails. **Required for real use** |
+| `SECRET_KEY` | — | Encrypts every stored secret at rest (AES-256-GCM) and keys the sign-in code hash. **Recommended.** Keep it off the `/data` volume and back it up — see below. `SCROBBLE_KEY` is a legacy alias |
+| `PORT` | `7000` | HTTP port |
+| `DATA_DIR` | `./data` (`/data` in Docker) | Persistent storage |
+| `TRUST_PROXY` | `1` | Proxy hops in front of the app (Cloudflare Tunnel = 1). A number, CIDR list, or `false`; don't use `true` |
+| `STALE_HOURS` | `24` | Cache staleness threshold |
+| `BACKOFF_MINUTES` | `30` | Wait after a failed rebuild |
+| `BREVO_SMTP_LOGIN`, `BREVO_SMTP_KEY` | — | Brevo SMTP relay credentials for sign-in codes. Unset → codes go to the log (dev only) |
+| `BREVO_SMTP_HOST`, `BREVO_SMTP_PORT` | `smtp-relay.brevo.com`, `587` | `465` = implicit TLS |
+| `MOBILE_MAIL_FROM`, `MOBILE_MAIL_FROM_NAME` | — , `AI Recommender` | Verified sender address and display name |
+| `MOBILE_INSECURE_COOKIE` | — | `1` drops the cookie `Secure` flag for bare-HTTP LAN testing only |
+| `GROQ_MODELS` | built-in | Comma-separated Groq model fallback chain, best first |
+| `GROQ_TIMEOUT_MS`, `CUSTOM_LLM_TIMEOUT_MS`, `MARQUEE_LLM_TIMEOUT_MS` | `8000`, `25000`, per-engine | LLM call timeouts |
+| `TVDB_API_KEY` | — | Fallback for the TVDB key (prefer Server Config) |
+| `MARQUEE_TRENDING_TTL_MS`, `MARQUEE_SIMKL_RECS_TTL_MS`, `IMDB_RATING_TTL_MS`, `SIMKL_CDN_BASE` | 6 h, 30 d, 14 d, Simkl CDN | Cache/endpoint tuning |
+| `AGEGATE_DEBUG_PROMPT` | — | `1` logs age-gate LLM prompts (debugging) |
 
-During reauthorization, the existing grant stays active until the new account
-is verified. A different account or unavailable identity check preserves the
-existing grant and reports failure. A first connection with no prior grant
-may retain an unverified token as "token stored". Disconnect, credential edits,
-or a newer connection attempt prevent an older attempt from replacing tokens.
-Pending connections are held in memory; after a server restart, start Connect
-again. The Configure page follows the specific connection attempt, not the
-previous account's connected status.
+`ADMIN_USER` / `ADMIN_PASSWORD` are **no longer used** — `/configure/` sits behind the
+shared email sign-in (admin profiles only). Remove them if still set.
 
-### V2 Client Secret handling (M4)
+### Encryption at rest
 
-The V2 Client Secret is **never returned to the browser**. The portal's V2
-Secret input is blank and replace-only: an untouched or empty save preserves
-the stored secret. The secret is sealed at rest (AES-256-GCM) and sent
-server-side only to Simkl's token/refresh/revoke endpoints.
+With `SECRET_KEY` set, all stored secrets (Server Config keys, per-profile keys and
+Simkl tokens, scrobble passwords) are encrypted in `profiles.json` / `settings.json`;
+existing plaintext is encrypted in place on the next start. If the files hold
+ciphertext and the key is missing or wrong, the app enters **locked mode**: it keeps
+serving cached lists, refuses all edits, and shows a red banner — so it can never
+overwrite your encrypted data. Restore the key and restart to recover. Losing the key
+means re-entering keys and reconnecting Simkl; your watch history is untouched.
 
-## Extra catalogs (curated lists)
+## Unraid
 
-Per profile, in the portal's **Catalogs** section: the two AI catalogs are
-always on; the optional catalogs below can be toggled per profile, each
-appearing as its own catalog in Stremio/Nuvio:
-
-- **Popular Movies** / **Popular Series** — the JustWatch streaming charts
-  (unfiltered, 20 titles).
-- **Trending Kids Movies** / **Trending Kids TV** — kids-focused curated
-  lists, **50 titles** each, anything below **IMDb 6** dropped. On a profile
-  with an age limit these carry the full protection stack (see below).
-- **Anime TV-14** — a public Trakt list (`snoak/trending-anime-shows`),
-  **50 titles**, anything below **IMDb 6** dropped, watched titles excluded.
-  Needs only the Trakt Client ID, not the MDBList key. The certification and
-  rating filters in that list's web URL are applied by the Trakt *website*,
-  not its API, so they are re-implemented here.
-- **Christmas / Comedy / Action / Thriller Movies** — curated lists, 20
-  titles each; anything rated below **IMDb 6** is dropped and the list is
-  paged further until 20 titles are collected.
-
-**Age-limited profiles:** every extra catalog passes the same age gate as the
-AI lists and search — the remove-only AI goalkeeper (Australian/ACB
-standards), judged one year above the limit. Fail-closed: without a Groq key,
-or if the gate errors, the catalog keeps its previous contents rather than
-publishing an unvetted list to a child.
-
-Each extra catalog's 20 titles are **shuffled on every rebuild**, so the order
-looks fresh day to day and different titles rotate into the top slots.
-
-Rules: extra catalogs **ignore watched status** (only the AI catalogs exclude
-what you've seen), refresh on the same daily cadence, are served from cache,
-and need the profile's **MDBList API key**. Newly enabled catalogs build in
-the background when you hit Save (or on first request); they show up in the
-app once it refreshes the addon manifest. To force that without removing the
-addon: **Nuvio** re-fetches every installed manifest on launch, so fully quit
-and reopen the app (browser: reload the tab); **Stremio** updates an addon
-in place when you open its install URL again and press Install — same URL,
-nothing is removed, settings and ordering are kept.
-Kids-mode age limits still apply to extra catalogs — the AI age gate
-cannot be bypassed by toggling on a chart list.
-
-## Auto scrobble (Nuvio / Stremio → Trakt)
-
-Optional, per profile. Mirrors a person's **Nuvio** or **Stremio** watched
-history into their Trakt account hourly — so "mark as watched" and plays made
-in the app reach Trakt even when the app's own Trakt session silently drops
-(a real failure mode: both apps swallow Trakt write errors, so watched titles
-drift out of Trakt and leak back into recommendations).
-
-Set it up in the profile's **Auto scrobble** section: pick the source app,
-enter that person's **account email + password**, hit **Test** (for Nuvio this
-lists the account's profiles — pick which one feeds this recommender profile),
-then **Save** and tick the enable box. The reconcile runs on the hourly tick:
-it pulls the app's watched list, diffs against what Trakt already has, and
-pushes only the missing plays using this profile's own Trakt token — so newly
-watched items disappear from recommendations within the hour.
-
-- **Per account, isolated.** Credentials are stored per profile and pushed only
-  to that profile's own Trakt token — one Nuvio login shared across profiles is
-  fine, because each binds to a specific Nuvio profile. Picking the wrong Nuvio
-  profile would mix in someone else's history, so the picker is explicit.
-- **Passwords are encrypted at rest** (AES-256-GCM) with the `SECRET_KEY`
-  env var — never plaintext, and refused entirely if that key isn't set.
-- **Fail-closed.** Any provider/Trakt error logs a warning and changes nothing.
-- **Stremio series (v1):** the last-watched episode is scrobbled — enough to
-  register the show in Trakt history and exclude it from recommendations.
-  Nuvio scrobbles full per-episode history. Stremio has no sub-profiles, so its
-  one account maps straight to the recommender profile.
-- Uses the apps' own sync backends (undocumented); overridable via
-  `NUVIO_API_URL` / `NUVIO_ANON_KEY` / `STREMIO_API_URL` if they ever change.
-
-## Encryption at rest
-
-Set `SECRET_KEY` (any long random string) and **every stored secret is encrypted
-at rest** with AES-256-GCM: all per-profile API keys, the Trakt OAuth tokens, and
-Auto-scrobble passwords. Only `profiles.json` on disk is encrypted — everything in
-the running app stays plaintext, so there's no behaviour change. The profile
-install token is deliberately left plaintext (it's a capability URL that has to be
-served and is already in your install links).
-
-- **Transparent + automatic.** On the first start after you set `SECRET_KEY`,
-  existing plaintext secrets are encrypted in place. Nothing else to do.
-- **Keep the key off `/data`.** Set it as a container environment variable, not
-  in a file on the mapped volume — that's what makes a leaked `profiles.json`
-  backup worthless without the key.
-- **Back the key up** (password manager). If you lose it, the encrypted secrets
-  can't be recovered — you'd re-enter API keys and re-authorize Trakt per profile.
-- **Locked mode (fail-safe).** If the file holds encrypted secrets but the key is
-  missing or wrong at start-up, the addon enters **locked mode**: it keeps serving
-  cached recommendations, but refuses all profile edits and shows a red banner —
-  so it can never overwrite the encrypted data. Restore the correct key and
-  restart to recover fully, with no data loss.
-
-Losing or changing the key is the one real risk — it doesn't touch your
-Nuvio/Stremio/Trakt data, but a mismatched key means re-setting up the addon's
-own keys. This is a helper addon, so worst case is re-entry, never lost history.
-
-## Kids mode (AI age gate)
-
-Per profile: tick **Limit to age** in Filters and pick a tier (5+, 6+, 8+,
-10+, 12+, 13+, 15+ — granular at the younger end). Requires that profile's
-**Groq API key**.
-
-Titles are judged **one year above** the limit (13+ is judged at 14).
-Classification brackets are coarse — a 13-year-old's material sits in the 14+
-bracket — and judging exactly at the limit rejected most age-appropriate anime
-along with the genuinely unsuitable.
-
-Every discovery surface is gated: AI lists, every extra catalog, and search.
-The gate is **remove-only** (it can veto a title, never rescue one) and
-**fail-closed** (if it can't run the previous list is kept, and search returns
-nothing). On the `AI` engine the limit is applied twice — once at generation,
-once at review.
-
-`meta` is deliberately **ungated**: every discovery surface is already gated,
-so nothing un-vetted reaches a child through us, and gating there would put an
-LLM call in front of every title open. Opening a title by direct id — from
-Continue Watching, say — is not discovery.
-
-> **Common Sense Media was retired in v5.** It was the primary authority and
-> strict by design: no CSM rating meant the title was dropped. Its anime
-> coverage is thin, so "unrated" was the common case rather than the
-> exception, and entire kids catalogs came back empty. The AI gate reads
-> titles it recognises rather than requiring a database row — exactly the
-> property anime needed. MDBList is now optional.
-
-## Behavior notes
-
-- **Cold start:** with fewer than 3 watched titles, the list comes from TMDB
-  discover ("popular picks") using the same filters — no Groq. Once history
-  exists, the next rebuild upgrades to personalized ("picked for you").
-- **De-dupe guarantee:** everything ever watched on Trakt (even one episode of
-  a show) is excluded, matched on canonical IMDb/TMDB IDs after resolution —
-  not on title text. IMDb matching is cross-type: a title Trakt logged as a
-  movie can't appear in the series catalog either. Between daily rebuilds, a
-  cheap hourly watched-set refresh prunes newly-watched titles from the served
-  list, so items you just watched disappear within the hour.
-- **"But I've watched that!" troubleshooting:** the addon can only exclude
-  what Trakt knows. If your player (Stremio/Nuvio) shows a watched tick on a
-  listed item, the tick usually comes from the app's *local* watched state —
-  the play was never scrobbled to Trakt (Trakt integration off, watched <80%,
-  or the app is signed into a different Trakt account than this profile).
-  Check with `GET /api/profiles/<id>/diagnose` (admin-authed): it fetches your
-  live Trakt watched list and flags every listed title against it. Items
-  flagged `in_trakt_watched: false` are invisible to the addon until they land
-  in Trakt history — verify at trakt.tv → your profile → History.
-- **Fresh picks daily:** each profile keeps a rolling history of recently
-  listed titles (last 150 per catalog) and asks Groq to avoid them, so the
-  daily rebuild rotates in new recommendations instead of re-serving the same
-  safe picks. Heavily filtered profiles (narrow genres + high rating + short
-  recency window) may exhaust the pool and get shorter lists — relax a filter
-  if that happens.
-- **Cheap change detection:** the hourly watched-set refresh first asks Trakt
-  `last_activities` (one tiny call) and skips the full watched-history
-  download when nothing new was watched.
-- **Fill-to-quota:** each catalog targets its profile's list size (default
-  20). The Groq path runs extra suggestion rounds (expanding the exclusion
-  list each time) and the discover path walks extra pages until the quota is
-  filled or attempts are exhausted — heavy watchers still get full lists.
-- **Title logos:** catalog metas carry the title's transparent logo (TMDB),
-  so Stremio/Nuvio can show the logo-over-backdrop treatment. Fetched in the
-  same TMDB call as the IMDb ID — no extra requests.
-- **Full prompt logging:** every Groq prompt is printed in the container
-  log between PROMPT START/END markers for troubleshooting.
-- **Failure = stale, never empty:** if Groq/TMDB/Trakt error out or return
-  too few usable titles (<5), the previous list stays live and a 30 min
-  backoff prevents API hammering.
-- **Filters are enforced**, not suggested: Groq is instructed, TMDB discover
-  is parameterized, and a final hard filter checks resolved rating, release
-  date, and genre IDs.
-
-## Unraid setup
-
-Docker tab → **Add Container** (or point a Compose stack at this repo's
-`docker-compose.yml`). Everything the template needs:
-
-**Basic**
+Docker tab → **Add Container** (or point a Compose stack at `docker-compose.yml`).
 
 | Field | Value |
 |---|---|
-| Name | `ai-recommender` |
 | Repository | `ghcr.io/jamesgallagher/stremio_ai_recommender:latest` |
-| Network type | `bridge` |
-| Restart policy | `unless-stopped` |
-| Icon URL | `https://raw.githubusercontent.com/jamesgallagher/Stremio_AI_Recommender/main/public/logo.png` |
+| Network / restart | `bridge` / `unless-stopped` |
+| Port | `7000` → `7000` (point your tunnel here) |
+| Path | `/data` → `/mnt/user/appdata/ai-recommender` (**required**; back it up) |
+| Variables | `EXTERNAL_URL`, `SECRET_KEY`, and the `BREVO_*` / `MOBILE_MAIL_FROM` set |
+| Icon | `https://raw.githubusercontent.com/jamesgallagher/Stremio_AI_Recommender/main/public/logo.png` |
 
-**Ports**
-
-| Container port | Host port | Protocol | Purpose |
-|---|---|---|---|
-| `7000` | `7000` (or any free port) | TCP | Web portal + addon endpoints — point your Cloudflare Tunnel here |
-
-**Paths**
-
-| Container path | Host path | Purpose |
-|---|---|---|
-| `/data` | `/mnt/user/appdata/ai-recommender` | **Required.** Profiles, API keys, Trakt tokens, recommendation caches. Back this up; losing it means re-entering keys and re-authorizing Trakt for every profile. |
-
-**Variables**
-
-| Variable | Required | Default | Purpose |
-|---|---|---|---|
-| `EXTERNAL_URL` | Yes (for real use) | — | Public base URL, e.g. `https://recs.yourdomain.com` (your Cloudflare Tunnel hostname). Baked into install URLs and the manifest logo. Without it, links use the LAN address you opened the portal from — Stremio clients outside your network can't reach those |
-| `PORT` | No | `7000` | Internal HTTP port — only change if you also change the container port mapping |
-| `DATA_DIR` | No | `/data` | Storage location inside the container — leave as is |
-| `STALE_HOURS` | No | `24` | How old a cached list may get before a background rebuild |
-| `BACKOFF_MINUTES` | No | `30` | Wait after a failed rebuild before retrying |
-| `GROQ_MODELS` | No | built-in list | Comma-separated Groq model fallback chain (best first), e.g. `openai/gpt-oss-120b,openai/gpt-oss-20b` — override when the built-in list ages |
-| `TRUST_PROXY` | No | `1` | How many proxy hops sit in front of the app (the Cloudflare Tunnel = 1). Sets the client IP the app sees; don't set `true` — it would trust a forged `X-Forwarded-For` |
-| `SECRET_KEY` | Recommended | — | Encrypts **all** stored secrets at rest — every profile's API keys, Trakt OAuth tokens, and Auto-scrobble passwords (AES-256-GCM). Any long random string. When set, existing plaintext secrets are encrypted in place on the next start. Without it, secrets are stored in plaintext (and a scrobble password can't be saved). Keep it **out of the `/data` volume** so a leaked backup can't decrypt anything, and **back it up** — see [Encryption at rest](#encryption-at-rest). (`SCROBBLE_KEY` is still accepted as a legacy alias.) |
-
-No API keys go in the template — Trakt/TMDB/Groq keys are entered per
-profile in the web portal and stored in `/data/profiles.json`.
-
-**Permissions.** The container runs as the unprivileged `node` user (uid 1000),
-not root. The appdata folder must be writable by it: run
-`chown -R 1000:1000 /mnt/user/appdata/ai-recommender` once, or add
-`--user 99:100` (nobody:users) to the container's *Extra Parameters*. If it can't
-write, the app stops at start-up with a message saying so.
-
-**First run.** With no profiles yet, the server prints a one-time **setup token**
-in the container log (`[setup] Setup token: …`). Open `/mobile/`, enter your name,
-email and that token, and the emailed code creates the first (admin) account.
-Sign-in codes last 60 minutes, allow 5 wrong tries, and are limited to 5
-requests per email per hour.
-
-After starting: open `http://<unraid-ip>:7000/mobile/` — the Initial User
-Creation wizard appears (only when zero profiles exist). Enter a name and
-email, verify the code, and the first admin profile is created. From then on,
-sign in at `/mobile/` with the email on your profile; the **Configure**
-button in the topbar opens the admin portal at `/configure/`.
+**Permissions.** The container runs as the unprivileged `node` user (uid 1000). Make
+the appdata folder writable: `chown -R 1000:1000 /mnt/user/appdata/ai-recommender`
+once, or add `--user 99:100` (nobody:users) to *Extra Parameters*. If it can't write,
+the app stops at start-up and says so.
 
 ## Exposure (Cloudflare Tunnel)
 
-Point a tunnel at `http://<unraid-ip>:7000` and set `EXTERNAL_URL` to the
-tunnel hostname (e.g. `https://recs.yourdomain.com`) so install links and the
-manifest point somewhere Stremio clients can actually reach. Then:
+Point the tunnel at `http://<host>:7000` and set `EXTERNAL_URL` to the tunnel hostname.
 
-- `/addon/*` — must be publicly reachable **without** auth (Stremio can't do
-  login prompts). Safe: profile tokens are unguessable 128-bit values.
-- `/configure/` and `/api/*` — protected by the shared email-OTP session
-  (`air_sid` cookie, admin profiles only). Optionally layer **Cloudflare
-  Access** on these paths as well.
+- `/addon/*` must be reachable **without** auth (Stremio can't log in). Profile install
+  tokens are unguessable 128-bit values, redacted from request logs.
+- `/configure/` and `/api/*` need an admin session; `/mobile/*` needs any profile's
+  session. Optionally layer Cloudflare Access on top.
+- Sign-in codes: valid 60 minutes, 5 wrong tries, 5 requests per email per hour.
+  Sessions last 30 days.
 
-## Config (env)
+## Troubleshooting
 
-| Var | Default | |
-|---|---|---|
-| `PORT` | 7000 | HTTP port |
-| `DATA_DIR` | `./data` | persistent storage |
-| `STALE_HOURS` | 24 | cache staleness threshold |
-| `BACKOFF_MINUTES` | 30 | retry backoff after failed rebuild |
-| `TRUST_PROXY` | 1 | proxy hops in front of the app |
-| `SECRET_KEY` | — | encrypts all stored secrets at rest (API keys, Trakt tokens, scrobble passwords) and keys the sign-in code hash; `SCROBBLE_KEY` accepted as a legacy alias |
+- **"I've watched that!"** The addon only excludes what Simkl knows. A watched tick in
+  the player usually comes from the app's *local* state. Check the player's Simkl
+  sync, or enable Auto-scrobble.
+- **A list looks short.** Heavily filtered profiles (narrow genres + high rating +
+  short recency + age limit) can exhaust the pool; relax a filter. Calibrated serving
+  under-fills a genre rather than padding it with weak picks.
+- **A catalog didn't appear after enabling it.** Nuvio re-reads manifests on launch
+  (quit and reopen); in Stremio open the install URL again and press Install.
+- **Pages say "locked".** `SECRET_KEY` is missing or wrong — see Encryption at rest.
+- **Logs.** `docker logs ai-recommender`; the Advanced tab shows build progress and
+  `GET /api/governor` shows rate-limit state.
+
+## Project layout
+
+```
+src/            server, portal API, addon routes, engines/, ageVerification/, filterGate/, services/
+public/         Configure portal (single-page, vanilla JS)
+mobile/         Companion: server/ (auth, handlers), public/ (PWA), test/
+test/           offline suites + manual live-API gates (verify-*-live.js)
+scripts/        bench / backtest / admin tools
+docs/           architecture + engine & feature design specs
+```
 
 ## Credits
 
-Prompt constraints, the model-fallback chain, and TMDB resolution fallback
-adapted from [rocsx/stremiorecomendacion](https://github.com/rocsx/stremiorecomendacion)
-(snapshot in `reference/`), restructured from serverless live-generation to a
-long-running cached service.
+Early prompt constraints and TMDB resolution fallbacks were adapted from
+[rocsx/stremiorecomendacion](https://github.com/rocsx/stremiorecomendacion).
+Anime id mapping uses [Fribb's anime-lists](https://github.com/Fribb/anime-lists).

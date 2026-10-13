@@ -1,8 +1,8 @@
 # Taste Trainer — design spec
 
-**Status:** designed 2026-10-01 (James + Claude). **Engine scope:** Marquee only (movies). The
-feedback store and actions are engine-agnostic, so a future engine opts in by reading them; the
-other engines (Genesis, Glass) are being deprecated and are deliberately NOT wired.
+**Status:** BUILT (2026-10-01): portal **Ratings** tab and Companion **Ratings** tab. **Engine scope:** Marquee. The
+feedback store and actions are engine-agnostic, so a future engine opts in by reading them. (Genesis and Glass, which this
+spec says are deliberately not wired, have since been retired.)
 
 A per-profile screen listing the profile's watch history, newest watch first, where the user tells
 the recommender how each watch should count: **rate it**, **love it**, or **ignore it**. It is the

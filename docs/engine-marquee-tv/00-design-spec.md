@@ -1,6 +1,6 @@
 # Marquee TV (and Anime): research and options
 
-**Status:** planning. No cards yet. · **Date:** 2 October 2026 · **Context:** Marquee (now "Marquee Cinema") is live for movies at m4; every profile's series still come from Genesis.
+**Status:** BUILT — this is the research and design rationale behind Marquee TV (`marquee-tv-t2`) and the Marquee Anime lane, both now live (Genesis was retired). Sections written as "planning" or "options" describe the situation on **2 October 2026**; the engines in `src/engines/marqueeTv*` and `marqueeAnime*` are the source of truth. · **Date:** 2 October 2026
 
 All figures below were measured on the live install on 2 October 2026, using read-only Simkl GETs and the live pools.
 

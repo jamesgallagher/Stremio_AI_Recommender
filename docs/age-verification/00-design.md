@@ -1,5 +1,7 @@
 # TV-14 age tier: plan (Marquee TV)
 
+> **Status:** IMPLEMENTED in `src/ageVerification/` (chain, ratings, sources, tiers). Since this plan the chain was extended to all four tiers (10+, 12+, 14+, 15+) and to the anime lane (MAL / Kitsu / AniDB). The decisions and research below are the record of *why*; [`../architecture.md`](../architecture.md#4-safety-gates) has the current shape.
+
 **Date:** 2 October 2026 · **For:** Ciara (turned 14) · **Scope: Marquee TV only.** Anime is excluded from Marquee TV and must never appear in its results. Marquee Cinema, Genesis and the anime lane are out of scope.
 
 ## 1. Decisions (James, 2 October 2026)

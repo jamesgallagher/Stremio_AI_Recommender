@@ -1,6 +1,6 @@
 // Global server settings (v6). Shared infrastructure, one set for the whole
 // addon — as opposed to per-profile identity (Simkl/filters/catalogs, in
-// config.js). See docs/v6-ui.md for the split.
+// config.js). See docs/architecture.md §2 for the split.
 //
 // Holds:
 //   - the LLM chain: custom endpoint (tried first) → Groq primary → Groq backup
@@ -151,7 +151,7 @@ function migrateFromProfiles(profiles) {
 
 // Server Config is "complete" only when the essentials exist: TMDB (all lookups
 // + recommendations) and at least one LLM provider (custom OR groq). Profiles
-// hard-block until this is true (docs/v6-ui.md).
+// hard-block until this is true (docs/architecture.md §2).
 function isComplete(s = getSettings()) {
   if (!s) return false;
   const hasLlm = !!(s.llm.custom_uri || s.llm.groq_api_key);

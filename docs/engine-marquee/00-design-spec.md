@@ -3,11 +3,11 @@
 > **Name (2 October 2026):** this engine is now called **Marquee Cinema** (movies only). Its id stays `marquee`, its settings stay under `settings.marquee`, and stored rows keep `marquee-m*` versions. The separate shows engine is **Marquee TV** (`docs/engine-marquee-tv/`).
 
 
-**Version:** 0.2 · **Status:** BUILT (MVP) — registered, globally disabled
+**Version:** 0.2 · **Status:** BUILT and live (algorithm `marquee-m4`). Written against v7.15.3; the Genesis and Glass engines it compares against have since been retired (v7.5x), and the global enable/disable gate (SC-07) went with them. Treat Genesis/Glass references below as historical context.
 **Kind:** a *candidate-producer* engine, `supportedTypes: ['movie']`
-**Depends on:** [`../engine-abstraction/00-overview.md`](../engine-abstraction/00-overview.md)
-(the seam), [`../engine-abstraction/CONFORMANCE.md`](../engine-abstraction/CONFORMANCE.md)
-(definition of done), and the Glass data layers ([`../engine-glass/`](../engine-glass/)).
+**Depends on:** the engine seam (`src/engines/types.js`, `src/engines/pipeline.js`),
+the shared data layers in `src/engines/shared/`, and [`../architecture.md`](../architecture.md).
+(The engine-abstraction and Glass design docs this originally linked to were retired.)
 
 > **Source sign-off:** every data source below was proposed and approved by James on
 > 2026-09-26: TMDB, Simkl (ratings, `users_recommendations`, trending CDN), MDBList and

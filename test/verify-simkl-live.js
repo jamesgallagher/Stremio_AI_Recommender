@@ -1,5 +1,5 @@
 // MANUAL live-API verification for the two open Simkl build-time gates the MW
-// cluster left behind (docs/mark-watched-review.md → I2, I3). This is the ONLY
+// cluster left behind (mark-watched review items I2, I3 — see git history). This is the ONLY
 // way to close them: the offline suite (test/integration.js J/K + the mobile
 // smoke) pins the request SHAPES, but only a real Simkl account can confirm the
 // API actually ACTS on those shapes.

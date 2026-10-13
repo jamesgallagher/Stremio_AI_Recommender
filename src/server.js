@@ -15,7 +15,7 @@ try { store.ensureDirs(); } catch (err) {
 config.migrateSecrets(); // encrypt plaintext secrets at rest if SECRET_KEY is set (or report state)
 
 // v6 one-time migration: seed global Server Config keys from the "James" profile
-// if settings.json doesn't exist yet (docs/v6-ui.md). No-op once set up.
+// if settings.json doesn't exist yet (docs/architecture.md §2). No-op once set up.
 try {
   const seeded = settings.migrateFromProfiles(config.listProfiles());
   if (seeded) console.log(`[settings] Server Config seeded from profile "${seeded.seededFrom}"`);
