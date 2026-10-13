@@ -4,7 +4,7 @@
 // account via the PIN device flow — the same shape as the old Trakt client, so
 // the portal wiring maps across almost 1:1.
 //
-// Simkl API rules (docs/v6-plan.md §6b), enforced here:
+// Simkl API rules (docs/architecture.md §7), enforced here:
 //   - EVERY request carries client_id + app-name + app-version query params and
 //     a descriptive User-Agent header.
 //   - Reads are 10/s, writes 1/s (the rate governor, a later slice, will pace
@@ -474,7 +474,7 @@ async function authedGet(profile, path, extra = {}) {
 
 // The cheap "what changed" call. Returns { all, movies, tv_shows, anime, ... }
 // ISO timestamps. Compare against the saved value before pulling all-items —
-// mandatory per Simkl's rules (docs/v6-plan §6b).
+// mandatory per Simkl's rules (docs/architecture.md §7).
 async function getActivities(profile) {
   return authedGet(profile, '/sync/activities');
 }

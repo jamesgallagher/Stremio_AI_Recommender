@@ -655,7 +655,7 @@ function setSyncState(profileId, activitiesAll) {
   `).run(profileId, activitiesAll || null, Date.now());
 }
 
-// Activities-gated sync from Simkl (docs/v6-plan §6b compliance):
+// Activities-gated sync from Simkl (docs/architecture.md §7 compliance):
 //   1. GET /sync/activities (cheap). If the overall timestamp is unchanged,
 //      skip entirely — no all-items pull.
 //   2. Phase 1 (first sync): pull each type WITHOUT date_from, sequentially.

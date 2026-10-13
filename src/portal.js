@@ -91,7 +91,7 @@ function publicProfile(p, req) {
     external_url_set: !!normalizeExternal(process.env.EXTERNAL_URL),
     filters: p.filters,
     catalogs: p.catalogs || {},
-    // Per-type engine selection (v7 — see docs/engine-abstraction). The effective
+    // Per-type engine selection (v7 — see docs/architecture.md §3). The effective
     // engine id per type (resolved against the registry + age limit) and the
     // requirement check per type (so the UI can warn "needs Simkl"/"needs a key").
     // engine_movie/engine_series also arrive verbatim inside `filters`; this block

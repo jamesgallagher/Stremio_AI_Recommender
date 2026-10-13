@@ -34,8 +34,8 @@ Contrast, so there's no confusion with the neighbouring cards:
 | | Writes to Simkl? | Reversible automatically? |
 |---|---|---|
 | **WL-AV** (this card) — availability suppression | **No** | **Yes** — reappears when available |
-| [MW-04](remove-from-watchlist.md) — "Remove from Watch Later" (the ✕) | Yes (`removeFromPlanToWatch`) | No — user must re-add |
-| [WL-KW](watch-later-keep-watched.md) — keep watched titles | No | n/a (keeps, doesn't hide) |
+| MW-04 — "Remove from Watch Later" (the ✕) | Yes (`removeFromPlanToWatch`) | No — user must re-add |
+| WL-KW — keep watched titles | No | n/a (keeps, doesn't hide) |
 
 A user who queued an upcoming film "on hype" keeps it — they just don't see an
 unwatchable entry cluttering the row until it lands.

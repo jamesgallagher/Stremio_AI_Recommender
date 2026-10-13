@@ -1,6 +1,6 @@
 // SC-06 conformance fixtures — the canonical fake engines used across the test
 // suites (main smoke + mobile smoke) as the living example of a conformant
-// engine (see docs/engine-abstraction/CONFORMANCE.md, Part B).
+// engine (see test/engines-marquee-only.js for the conformance expectations).
 //
 // TWO stubs, both fully conformant against CONFORMANCE.md Part A:
 //   • `fake`      — a GATED engine (unrestricted:false). Safe for any profile via

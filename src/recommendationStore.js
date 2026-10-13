@@ -377,7 +377,7 @@ async function refreshStaleRatings(profileId, mdblistKey, log = console, { now =
 // the LLM). Only sources with a non-zero count are listed.
 const AGE_SOURCE_ORDER = ['csm', 'mal', 'au', 'us', 'tvdb-au', 'tvdb-us', 'kitsu', 'simkl', 'mdblist', 'tmdb-gb', 'tmdb-ie', 'tmdb-nz', 'tmdb-ca', 'tvdb-gbr', 'tvdb-irl', 'tvdb-nzl', 'tvdb-can', 'hard-floor', 'llm', 'llm-review'];
 
-// Age-gate the pool (docs/v6-features F5). Reuses the shipped v5.2 stack:
+// Age-gate the pool (docs/architecture.md §3). Reuses the shipped v5.2 stack:
 //   1. NSFW blacklist + anime age band (ALL profiles) via rebuild.applyAnimeGate
 //      — porn is dropped for everyone; anime over the band for age-limited ones.
 //      The MAL band it resolves is stored as age_classification.

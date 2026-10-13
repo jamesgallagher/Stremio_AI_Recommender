@@ -37,7 +37,7 @@ const DEFAULT_FILTERS = {
   title_decay_enabled: false,
   title_decay_days: 60, // sustained-visibility window in days when enabled (clamped 14–365)
   // Which engine builds each catalog's candidates (v7 — see
-  // docs/engine-abstraction). Per-type so Movies and Series can run different
+  // docs/architecture.md §3). Per-type so Movies and Series can run different
   // engines. The valid-id source of truth is the engine registry
   // (src/engines), not a hardcoded list — so there's no drift; any unknown or
   // type-unsupported id falls back to the type's default at read (migrate) and
@@ -177,7 +177,7 @@ function applyMigrations(p) {
     p.filters.min_year = recency.decadeFromMaxAge(p.filters.max_age_years);
     p.filters.max_age_years = 0;
   }
-  // v7: per-type engine selection (see docs/engine-abstraction). Retire the dead
+  // v7: per-type engine selection (see docs/architecture.md §3). Retire the dead
   // single-engine field (the v5 Trakt/AI concept, never actually wired) and add
   // engine_movie/engine_series. Any unknown or type-unsupported id (incl. the
   // old 'trakt'/'ai', 'genesis', 'glass', or a hand-edited value) coerces to the
@@ -380,7 +380,7 @@ function updateProfile(id, patch) {
       if (f.list_size !== undefined) profile.filters.list_size = Math.min(50, Math.max(5, parseInt(f.list_size, 10) || 20));
       if (f.vote_count_floor !== undefined) profile.filters.vote_count_floor = Math.max(0, parseInt(f.vote_count_floor, 10) || 0);
       // v7: per-type engine choice, validated against the registry AND the
-      // profile's age limit (I7 / docs/engine-abstraction §5.5). An unknown,
+      // profile's age limit (I7 / docs/architecture.md §3). An unknown,
       // type-unsupported, or age-inappropriate id silently lands on the type's
       // default — never an error, never a disabled type, never open content on a
       // kids profile (safety over strictness). Judged on the EFFECTIVE age limit:

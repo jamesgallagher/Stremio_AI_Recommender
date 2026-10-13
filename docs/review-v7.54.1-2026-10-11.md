@@ -3,7 +3,8 @@
 Replaces the earlier review of v7.15.3 (that tree was ~40 versions behind `origin/v7`; see "What went wrong" at the end).
 Target: `origin/v7` @ `cd2bbc0` (Merge PR #66), the line that becomes `main` after this review.
 
-## Status: hardening applied on branch `v7-hardening` (worktree `AI_Recommender-v7review`), 7.54.2-beta, uncommitted
+## Status: hardening MERGED to `v7` as 7.54.2-beta (PR #67) and now on `main`
+_Point-in-time review dated 2026-10-11; the findings below describe v7.54.1. Items under "Done" shipped in 7.54.2; "Not done / later" is the open backlog._
 Full `npm test` is green (EXIT 0), including two new suites (`test/hardening-p1.js`, `test/hardening-p2.js`).
 Done: F3 (re-ask once; unjudged ⇒ dropped, not cached), F4 (age-limited profiles only serve rows something positively
 vetted; `built_at` stamped after the gate), F5 (shared `src/searchGate.js` for Stremio + Companion search; adults skip the

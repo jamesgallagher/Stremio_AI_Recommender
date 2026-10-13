@@ -1,4 +1,4 @@
-// Marquee ME-00 (docs/engine-marquee/cards/ME-00-live-verify.md): MANUAL
+// Marquee ME-00 live-verify gate (docs/engine-marquee/00-design-spec.md): MANUAL
 // live-API verification of the assumptions the Marquee design cannot confirm
 // from the docs alone — the Simkl ratings shape, users_recommendations
 // presence, and whether TMDB certification.lte / with_release_type behave as

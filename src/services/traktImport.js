@@ -2,7 +2,7 @@
 // into the app so it shares the profile's stored Simkl token and, critically,
 // the central rate governor — a second, uncoordinated throttle would double the
 // live API load and risk the client_id suspension Simkl hands out without appeal
-// (docs/v6-plan §6b; the "once and done" migration path from Trakt).
+// (docs/architecture.md §7; the "once and done" migration path from Trakt).
 //
 // Flow: read the Trakt export ZIP -> collect watched-history-*.json rows ->
 // collapse repeat plays to the EARLIEST watch (never a rewatch) -> drop anything
