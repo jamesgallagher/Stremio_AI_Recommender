@@ -167,7 +167,7 @@ on a 429. It is a pacer, not a retry layer. Stats at `GET /api/governor`.
 | MDBList | ~4/s + daily counter | free tier ~1000/day; circuit breaker |
 | TVDB | 5/s | country certifications |
 | MAL / Kitsu / AniList / Tenrai | ~1/s – 30/min | anime ratings, with breakers |
-| Groq | ~28/min | LLM chain order: custom → Groq primary → Groq backup |
+| Groq (primary / backup) | ~28/min each | separate lanes per key; LLM chain order: custom → Groq primary → Groq backup, with health-based failover (`llm.js`) |
 
 **Simkl compliance (mandatory — Simkl suspends non-compliant client IDs without
 appeal).** Every request carries `client_id`, `app-name` and `app-version` query

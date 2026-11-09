@@ -86,7 +86,10 @@ npm test
 4. **Server Config** (top bar) — shared infrastructure, entered once:
    - **LLM**: a custom OpenAI-compatible endpoint (tried first; the **Test** button
      checks it can do this app's JSON tasks) and/or a **Groq** key, plus an optional
-     Groq backup key. At least one provider is required.
+     Groq backup key. At least one provider is required. If the local LLM goes down
+     (or a Groq key runs out of credits / quota) requests fail over automatically —
+     local → Groq → Groq backup — and a parked provider is skipped, then re-probed
+     after a cooldown. State: `GET /api/llm-health`.
    - **TMDB** key — required.
    - Optional: **MDBList** (curated catalogs, IMDb ratings), **RPDB** (ratings on
      posters; pre-set to RPDB's generic free key), **TVDB** (country certifications for
@@ -172,6 +175,7 @@ All API keys are entered in the web UI (Server Config / per profile) and stored 
 | `MOBILE_MAIL_FROM`, `MOBILE_MAIL_FROM_NAME` | — , `AI Recommender` | Verified sender address and display name |
 | `MOBILE_INSECURE_COOKIE` | — | `1` drops the cookie `Secure` flag for bare-HTTP LAN testing only |
 | `GROQ_MODELS` | built-in | Comma-separated Groq model fallback chain, best first |
+| `LLM_DOWN_COOLDOWN_MS`, `LLM_EXHAUSTED_COOLDOWN_MS` | `30000`, `900000` | Failover cooldowns: first outage (doubles to 5 min) and key/credit failure (401/402/403) |
 | `GROQ_TIMEOUT_MS`, `CUSTOM_LLM_TIMEOUT_MS`, `MARQUEE_LLM_TIMEOUT_MS` | `8000`, `25000`, per-engine | LLM call timeouts |
 | `TVDB_API_KEY` | — | Fallback for the TVDB key (prefer Server Config) |
 | `MARQUEE_TRENDING_TTL_MS`, `MARQUEE_SIMKL_RECS_TTL_MS`, `IMDB_RATING_TTL_MS`, `SIMKL_CDN_BASE` | 6 h, 30 d, 14 d, Simkl CDN | Cache/endpoint tuning |

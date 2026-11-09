@@ -47,6 +47,10 @@ const LIMITS = {
   tenrai: { minIntervalMs: 1050, breaker: { threshold: 5, cooldownMs: 60000 } },
   anilist: { minIntervalMs: 2000, breaker: { threshold: 5, cooldownMs: 60000 } },
   groq: { minIntervalMs: 2100 },
+  // The backup Groq key has its OWN lane: rate limits (and a 429 Retry-After /
+  // exhausted quota) are per key, so a throttled primary must not stall the
+  // backup that exists precisely to cover it.
+  groq_backup: { minIntervalMs: 2100 },
   // MyAnimeList API v2 (AN-1a): the first source for anime age ratings when a
   // client id is available. Paced at 1 req/s with a breaker.
   mal: { minIntervalMs: 1000, breaker: { threshold: 5, cooldownMs: 60000 } },
