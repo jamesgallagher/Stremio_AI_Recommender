@@ -27,6 +27,68 @@ const chatUrl = (base) => `${String(base).replace(/\/+$/, '')}${CHAT_PATH}`;
 const GROQ_TIMEOUT_MS = Number(process.env.GROQ_TIMEOUT_MS) || 8000;
 const CUSTOM_TIMEOUT_MS = Number(process.env.CUSTOM_LLM_TIMEOUT_MS) || 25000;
 const timeoutFor = (provider) => (provider.type === 'groq' ? GROQ_TIMEOUT_MS : CUSTOM_TIMEOUT_MS);
+// Each Groq key has its OWN governor lane: rate limits (and a 429 Retry-After /
+// exhausted quota) are per key, so a throttled primary must not stall the backup.
+const groqLane = (provider) => (provider.label === 'groq-backup' ? 'groq_backup' : 'groq');
+
+// ---- Provider health / failover ------------------------------------------------
+// The chain (custom → groq-primary → groq-backup) always fell through on error,
+// but every call still re-tried a dead provider first: a down local box cost a
+// full 25s timeout PER call, and an exhausted Groq key was re-hit before the
+// backup was reached. This tracks which providers are currently unavailable so
+// the chain skips straight past them:
+//   - connection error / timeout / 5xx  → "down": cooldown that doubles per
+//     consecutive failure (30s → 5min cap). When it lapses the next call is a
+//     half-open probe — success clears it, failure re-arms a longer cooldown.
+//   - 401/402/403 (bad key, out of credits/billing) → long cooldown (15min).
+//   - 429 with a long Retry-After (quota) → cooldown for that window (≤1h).
+// If EVERY provider is cooling down we still try them all (a stale cooldown must
+// never turn into "no answer"; callers fail-closed on a throw).
+const DOWN_BASE_MS = Number(process.env.LLM_DOWN_COOLDOWN_MS) || 30000;
+const DOWN_MAX_MS = 5 * 60000;
+const EXHAUSTED_MS = Number(process.env.LLM_EXHAUSTED_COOLDOWN_MS) || 15 * 60000;
+const MAX_INLINE_WAIT_MS = 10000; // a Groq 429 backoff longer than this → fail over, don't sleep
+const health = new Map(); // label -> { downUntil, fails, reason }
+const labelOf = (p) => p.label || p.type;
+
+function isCoolingDown(provider, now = Date.now()) {
+  const h = health.get(labelOf(provider));
+  return !!h && h.downUntil > now;
+}
+function markDown(provider, reason, ms, log = console, now = Date.now()) {
+  const label = labelOf(provider);
+  const h = health.get(label) || { fails: 0 };
+  h.fails += 1;
+  const wait = ms != null ? ms : Math.min(DOWN_BASE_MS * 2 ** (h.fails - 1), DOWN_MAX_MS);
+  const wasUp = !h.downUntil || h.downUntil <= now;
+  h.downUntil = now + wait;
+  h.reason = reason;
+  health.set(label, h);
+  if (wasUp) log.warn(`[llm] ${label} unavailable (${reason}) — failing over; retry in ${Math.round(wait / 1000)}s`);
+}
+function markUp(provider, log = console) {
+  const label = labelOf(provider);
+  if (health.delete(label)) log.log(`[llm] ${label} recovered`);
+}
+// 'down' (transport/5xx/timeout), 'exhausted' (key/credit), 'rate' (429), 'other'
+// (bad content etc. — says nothing about provider health).
+function classify(err) {
+  const st = err && err.status;
+  if (st === 401 || st === 402 || st === 403) return 'exhausted';
+  if (st === 429) return 'rate';
+  if (st >= 500) return 'down';
+  if (err && (err.transport || err.timedOut)) return 'down';
+  return 'other';
+}
+// Diagnostics (GET /api/llm-health): labels + state only, never keys.
+function healthSnapshot(now = Date.now()) {
+  const out = {};
+  for (const [label, h] of health) {
+    out[label] = { available: h.downUntil <= now, reason: h.reason, retry_in_ms: Math.max(0, h.downUntil - now), consecutive_failures: h.fails };
+  }
+  return out;
+}
+function _resetHealth() { health.clear(); }
 
 // One request to one model on one provider. Returns the message content string.
 // Groq: strict json_object + reasoning_effort:low on gpt-oss (proven in v5.2.1).
@@ -67,17 +129,36 @@ async function callProvider(provider, model, messages, { temperature = 0, timeou
   };
   let res;
   try {
-    res = isGroq ? await governor.schedule('groq', doFetch) : await doFetch();
+    if (isGroq) {
+      // The governor sleeps through a 429 backoff (Retry-After) — fine for a few
+      // seconds, but an exhausted quota would stall the request for minutes.
+      // Past MAX_INLINE_WAIT_MS fail over instead of waiting.
+      const lane = groqLane(provider);
+      const wait = governor.pendingWait(lane);
+      if (wait > MAX_INLINE_WAIT_MS) {
+        const e = new Error(`${provider.label || provider.type}/${model} rate-limited (backoff ${Math.round(wait / 1000)}s)`);
+        e.status = 429; e.retryAfterMs = wait;
+        throw e;
+      }
+      res = await governor.schedule(lane, doFetch);
+    } else {
+      res = await doFetch();
+    }
   } catch (err) {
     if (err.name === 'AbortError') {
-      throw new Error(`${provider.label || provider.type}/${model} timed out after ${timeoutMs}ms`);
+      const e = new Error(`${provider.label || provider.type}/${model} timed out after ${timeoutMs}ms`);
+      e.timedOut = true;
+      throw e;
     }
+    if (!err.status && !err.retryAfterMs) err.transport = true; // fetch failed: refused/DNS/reset
     throw err;
   }
   if (!res.ok) {
     const detail = (await res.text().catch(() => '')).slice(0, 200);
     const err = new Error(`${provider.label || provider.type}/${model} failed (${res.status})${detail ? `: ${detail}` : ''}`);
     err.status = res.status;
+    const ra = Number(res.headers && res.headers.get && res.headers.get('retry-after'));
+    if (Number.isFinite(ra) && ra > 0) err.retryAfterMs = ra * 1000;
     throw err;
   }
   const data = await res.json();
@@ -100,13 +181,29 @@ async function chat(chain, messages, { temperature = 0, validate = (t) => t, sys
   if (!chain.length) throw new Error('No LLM provider configured (set a custom endpoint or a Groq key in Server Config)');
   const msgs = system ? [{ role: 'system', content: system }, ...messages] : messages;
   let lastErr = null;
-  for (const provider of chain) {
+  // Skip providers known to be unavailable; if that leaves nothing, try them all.
+  const live = chain.filter((p) => !isCoolingDown(p));
+  for (const provider of (live.length ? live : chain)) {
     for (const model of modelsFor(provider)) {
       try {
-        return validate(await callProvider(provider, model, msgs, { temperature, timeoutMs }));
+        const out = validate(await callProvider(provider, model, msgs, { temperature, timeoutMs }));
+        markUp(provider, log);
+        return out;
       } catch (err) {
         lastErr = err;
-        log.warn(`[llm] ${provider.label || provider.type}/${model}: ${err.message} — trying next`);
+        const kind = classify(err);
+        log.warn(`[llm] ${labelOf(provider)}/${model}: ${err.message} — trying next`);
+        // Provider-level failures end this provider's turn (its other models share
+        // the outage/key) and park it so later calls skip straight to the next one.
+        if (kind === 'down') {
+          markDown(provider, err.timedOut ? 'timeout' : (err.status ? `HTTP ${err.status}` : 'unreachable'), null, log);
+          break;
+        }
+        if (kind === 'exhausted') { markDown(provider, `HTTP ${err.status} — key/credits`, EXHAUSTED_MS, log); break; }
+        if (kind === 'rate' && err.retryAfterMs > MAX_INLINE_WAIT_MS) {
+          markDown(provider, 'rate/quota limited', Math.min(err.retryAfterMs, 60 * 60000), log);
+          break;
+        }
       }
     }
   }
@@ -188,4 +285,4 @@ async function testCustomLlm({ name, uri, apiKey, step } = {}, log = console) {
   return { ok: checks.length === TEST_STEPS.length && checks.every((c) => c.ok), checks };
 }
 
-module.exports = { chat, callProvider, testCustomLlm, extractArray, TEST_STEPS, STEP_LABELS, GROQ_MODELS, chatUrl };
+module.exports = { chat, callProvider, testCustomLlm, extractArray, TEST_STEPS, STEP_LABELS, GROQ_MODELS, chatUrl, healthSnapshot, _resetHealth };

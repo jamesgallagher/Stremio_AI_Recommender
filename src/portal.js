@@ -60,6 +60,12 @@ router.get('/governor', (req, res) => {
   res.json({ stats: require('./services/governor').publicStats() });
 });
 
+// LLM failover state: which providers (custom / groq-primary / groq-backup) are
+// currently parked and why. Labels + reasons only — never keys.
+router.get('/llm-health', (req, res) => {
+  res.json({ providers: llm.healthSnapshot() });
+});
+
 function redactKey(v) {
   if (!v) return '';
   return v.length > 8 ? `${v.slice(0, 4)}…${v.slice(-4)}` : '••••';
